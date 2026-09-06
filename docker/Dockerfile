@@ -4,6 +4,9 @@ COPY . .
 RUN cargo build --release --workspace
 
 FROM debian:bookworm-slim AS runtime
+LABEL org.opencontainers.image.source="https://github.com/lesecuritae/clawforge" \
+      org.opencontainers.image.title="Clawforge Security Platform" \
+      org.opencontainers.image.description="Rust security intelligence API and worker"
 RUN apt-get update \
     && apt-get install --no-install-recommends -y ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
