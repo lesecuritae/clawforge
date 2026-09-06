@@ -1,29 +1,22 @@
-# Clawforge
+<div align="center">
+  <img src="assets/branding/clawforge-horizontal.svg" width="600" alt="Clawforge Security Platform">
+  <h1>Clawforge Security Platform</h1>
+  <p><strong>Security intelligence for observable, policy-driven protection.</strong></p>
+</div>
 
-Clawforge is an independent Rust security-intelligence service. This repository is the new implementation boundary; the KorbKlar Python prototype is reference material only and is not a runtime dependency.
+[🇩🇪 Deutsch](README.de.md) · [🇬🇧 English](README.en.md)
 
-The initial workspace contains the API, worker, intelligence domain, risk engine, policy boundary, and PostgreSQL storage crates. The first migration creates provider, indicator, ASN, BGP, risk/trust history, audit, and trusted-network tables.
+![Clawforge Security Platform](assets/branding/rebranding-announcement.png)
 
-## Start locally with Docker
+Clawforge is an independent Rust security-intelligence service. It combines threat feeds, network intelligence, risk and trust scoring, PostgreSQL persistence, and a policy boundary. The current implementation is a backend foundation with an Axum API and Tokio worker; no provider result can block traffic directly.
 
-```sh
+## Quick start
+
+```bash
 cp .env.example .env
-# set a private POSTGRES_PASSWORD in .env
-docker compose up --build
-curl http://localhost:8080/health
+docker compose up -d --build
+curl http://127.0.0.1:8080/health
+curl http://127.0.0.1:8080/ready
 ```
 
-The worker currently provides the runtime lifecycle and database health loop. Feed adapters and scheduled synchronization are migrated incrementally; no new provider is enabled by this scaffold and no feed can block traffic directly.
-
-## Layout
-
-- `api/`: Axum REST entry point
-- `worker/`: Tokio worker lifecycle and future feed scheduler
-- `intelligence/`: provider-independent normalized domain types
-- `risk/`: bounded risk/trust calculation
-- `policy/`: multi-signal decision boundary
-- `storage/`: PostgreSQL/sqlx abstraction and migrations
-- `migrations/`: sqlx migration files
-- `docs/`: architecture, security, runtime, and migration notes
-
-See [docs/architecture.md](docs/architecture.md) for the migration plan.
+Read the [German documentation](README.de.md) or [English documentation](README.en.md) for configuration, providers, deployment, and security details.
