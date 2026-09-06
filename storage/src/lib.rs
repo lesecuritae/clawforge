@@ -91,16 +91,21 @@ impl PostgresStore {
         Ok(())
     }
 
-    pub async fn provider_succeeded(&self, provider_id: &str, next_run: chrono::DateTime<chrono::Utc>) -> Result<()> {
-        sqlx::query("INSERT INTO provider_status (provider_id, state, last_success_at, next_run_at, consecutive_failures, last_error, updated_at) VALUES ($1,'ok',NOW(),$2,0,NULL,NOW()) ON CONFLICT (provider_id) DO UPDATE SET state='ok', last_success_at=NOW(), next_run_at=$2, consecutive_failures=0, last_error=NULL, updated_at=NOW()")
-            .bind(provider_id).bind(next_run).execute(&self.pool).await?;
+    pub async fn provider_succeeded(&self, provider_id: &str, next_run: chrono::DateTime<chrono::Utc>, indicator_count: i32, sync_duration_ms: i64) -> Result<()> {
+        sqlx::query("INSERT INTO provider_status (provider_id, state, last_success_at, next_run_at, consecutive_failures, last_error, indicator_count, sync_duration_ms, updated_at) VALUES ($1,'ok',NOW(),$2,0,NULL,$3,$4,NOW()) ON CONFLICT (provider_id) DO UPDATE SET state='ok', last_success_at=NOW(), next_run_at=$2, consecutive_failures=0, last_error=NULL, indicator_count=$3, sync_duration_ms=$4, updated_at=NOW()")
+            .bind(provider_id).bind(next_run).bind(indicator_count).bind(sync_duration_ms).execute(&self.pool).await?;
         Ok(())
     }
 
-    pub async fn provider_failed(&self, provider_id: &str, error: &str, next_run: chrono::DateTime<chrono::Utc>) -> Result<()> {
-        sqlx::query("INSERT INTO provider_status (provider_id, state, next_run_at, consecutive_failures, last_error, updated_at) VALUES ($1,'error',$2,1,$3,NOW()) ON CONFLICT (provider_id) DO UPDATE SET state='error', next_run_at=$2, consecutive_failures=provider_status.consecutive_failures+1, last_error=$3, updated_at=NOW()")
-            .bind(provider_id).bind(next_run).bind(error).execute(&self.pool).await?;
+    pub async fn provider_failed(&self, provider_id: &str, error: &str, next_run: chrono::DateTime<chrono::Utc>, indicator_count: i32, sync_duration_ms: i64) -> Result<()> {
+        sqlx::query("INSERT INTO provider_status (provider_id, state, next_run_at, consecutive_failures, last_error, indicator_count, sync_duration_ms, updated_at) VALUES ($1,'error',$2,1,$3,$4,$5,NOW()) ON CONFLICT (provider_id) DO UPDATE SET state='error', next_run_at=$2, consecutive_failures=provider_status.consecutive_failures+1, last_error=$3, indicator_count=$4, sync_duration_ms=$5, updated_at=NOW()")
+            .bind(provider_id).bind(next_run).bind(error).bind(indicator_count).bind(sync_duration_ms).execute(&self.pool).await?;
         Ok(())
+    }
+
+    pub async fn expire_indicators(&self, now: chrono::DateTime<chrono::Utc>) -> Result<u64> {
+        let result = sqlx::query("DELETE FROM indicators WHERE expires_at <= $1").bind(now).execute(&self.pool).await?;
+        Ok(result.rows_affected())
     }
 
     pub async fn upsert_indicator(&self, indicator: &Indicator) -> Result<i64> {
@@ -151,7 +156,7 @@ impl IndicatorSink for PostgresStore {
     async fn upsert_indicators(&self, indicators: &[Indicator]) -> Result<usize, ProviderError> {
         let mut count = 0;
         for indicator in indicators {
-            self.upsert_indicator(indicator).await.map_err(|error| ProviderError::Validation(error.to_string()))?;
+            self.upsert_indicator(indicator).await.map_err(|error| ProviderError::Validation(format!("indicator storage failed: {error}")))?;
             count += 1;
         }
         Ok(count)

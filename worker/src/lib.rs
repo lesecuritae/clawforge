@@ -55,6 +55,9 @@ impl Scheduler {
     pub fn provider_count(&self) -> usize { self.jobs.len() }
 
     pub async fn run_due(&mut self, store: &PostgresStore) {
+        if let Err(error) = store.expire_indicators(Utc::now()).await {
+            warn!(%error, "indicator expiry cleanup failed");
+        }
         let now = Instant::now();
         for job in &mut self.jobs {
             if job.next_run > now { continue; }
@@ -67,12 +70,14 @@ impl Scheduler {
             if let Err(error) = store.provider_started(&provider.id).await {
                 error!(provider = %provider.id, %error, "cannot persist provider start");
             }
+            let started = Instant::now();
             match Self::sync_provider(job.adapter.as_ref(), store, &self.consumer).await {
                 Ok(count) => {
                     job.failures = 0;
                     job.next_run = Instant::now() + job.interval;
                     let next = Utc::now() + ChronoDuration::from_std(job.interval).unwrap_or_else(|_| ChronoDuration::minutes(15));
-                    if let Err(error) = store.provider_succeeded(&provider.id, next).await { error!(provider = %provider.id, %error, "cannot persist provider success"); }
+                    let duration_ms = started.elapsed().as_millis().min(i64::MAX as u128) as i64;
+                    if let Err(error) = store.provider_succeeded(&provider.id, next, count as i32, duration_ms).await { error!(provider = %provider.id, %error, "cannot persist provider success"); }
                     info!(provider = %provider.id, indicators = count, "provider synchronization completed");
                 }
                 Err(error) => {
@@ -81,7 +86,8 @@ impl Scheduler {
                     let backoff = job.interval.checked_mul(2u32.pow(exponent)).unwrap_or(Duration::from_secs(3600)).min(Duration::from_secs(3600));
                     job.next_run = Instant::now() + backoff;
                     let next = Utc::now() + ChronoDuration::from_std(backoff).unwrap_or_else(|_| ChronoDuration::hours(1));
-                    if let Err(status_error) = store.provider_failed(&provider.id, &error.to_string(), next).await { error!(provider = %provider.id, %status_error, "cannot persist provider failure"); }
+                    let duration_ms = started.elapsed().as_millis().min(i64::MAX as u128) as i64;
+                    if let Err(status_error) = store.provider_failed(&provider.id, &error.to_string(), next, 0, duration_ms).await { error!(provider = %provider.id, %status_error, "cannot persist provider failure"); }
                     warn!(provider = %provider.id, failures = job.failures, %error, "provider synchronization failed; backing off");
                 }
             }

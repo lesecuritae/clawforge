@@ -1,5 +1,5 @@
 use clawforge_storage::PostgresStore;
-use clawforge_intelligence::{Indicator, IndicatorType};
+use clawforge_intelligence::{Indicator, IndicatorType, Provider};
 use chrono::{Duration, Utc};
 use serde_json::json;
 
@@ -30,6 +30,16 @@ async fn migrations_and_restart_persist() -> anyhow::Result<()> {
     let updated = Indicator { confidence: 90, ..indicator.clone() };
     assert_eq!(restarted.upsert_indicator(&updated).await?, id);
     restarted.record_risk_event(id, &updated, 20, 20, 0, "test indicator").await?;
+    let provider = Provider { id: "test-provider".into(), name: "Test Provider".into(), source: "test".into(), interval_seconds: 900, confidence: 80, enabled: true };
+    restarted.upsert_provider(&provider).await?;
+    let next_run = now + Duration::minutes(15);
+    restarted.provider_succeeded(&provider.id, next_run, 1, 42).await?;
+    let metrics: (i32, i64) = sqlx::query_as("SELECT indicator_count, sync_duration_ms FROM provider_status WHERE provider_id = $1")
+        .bind(&provider.id).fetch_one(restarted.pool()).await?;
+    assert_eq!(metrics, (1, 42));
+    let expired = Indicator { value: "198.51.100.11".into(), expires_at: now - Duration::minutes(1), ..updated.clone() };
+    restarted.upsert_indicator(&expired).await?;
+    assert_eq!(restarted.expire_indicators(now).await?, 1);
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM risk_history WHERE indicator_id = $1")
         .bind(id).fetch_one(restarted.pool()).await?;
     assert_eq!(count, 1);

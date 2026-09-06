@@ -9,6 +9,7 @@
 | `CLAWFORGE_WORKER_POLL_SECONDS` | `60` | Scheduler tick interval, with a five-second minimum |
 | `CLAWFORGE_ENABLE_FEEDS` | `false` | Enables the prepared phase‑1 feed jobs |
 | `THREATFOX_AUTH_KEY` | unset | ThreatFox API key, required when feeds are enabled |
+| `URLHAUS_AUTH_KEY` | unset | URLhaus API key, required by the current API |
 | `MALWAREBAZAAR_AUTH_KEY` | unset | MalwareBazaar API key, required when feeds are enabled |
 | `RUST_LOG` | `info` | Structured log filter |
 

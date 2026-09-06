@@ -1,0 +1,4 @@
+ALTER TABLE provider_status
+    ADD COLUMN IF NOT EXISTS indicator_count INTEGER NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS sync_duration_ms BIGINT NOT NULL DEFAULT 0;
+
