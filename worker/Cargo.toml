@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+chrono.workspace = true
 clawforge-intelligence = { path = "../intelligence" }
 clawforge-policy = { path = "../policy" }
 clawforge-risk = { path = "../risk" }
