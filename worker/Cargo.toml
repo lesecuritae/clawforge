@@ -1,0 +1,15 @@
+[package]
+name = "clawforge-worker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clawforge-intelligence = { path = "../intelligence" }
+clawforge-policy = { path = "../policy" }
+clawforge-risk = { path = "../risk" }
+clawforge-storage = { path = "../storage" }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

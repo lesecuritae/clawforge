@@ -1,0 +1,10 @@
+[package]
+name = "clawforge-risk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+clawforge-intelligence = { path = "../intelligence" }
+ipnet.workspace = true
+serde.workspace = true
