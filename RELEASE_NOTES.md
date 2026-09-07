@@ -1,6 +1,6 @@
 # Clawforge v0.1.0
 
-Release candidate for the standalone Rust security-intelligence platform.
+Final v0.1.0 release for the standalone Rust security-intelligence platform.
 
 ## Included
 
@@ -10,12 +10,14 @@ Release candidate for the standalone Rust security-intelligence platform.
 - Docker Compose services for API, worker, PostgreSQL, frontend, scheduled backups, and optional Redis.
 - Secret-file configuration, non-root application containers, read-only filesystems, capability dropping, and readiness checks.
 - Backup/restore and update/rollback workflows.
+- Role-aware global and endpoint-specific API limits with 429 responses, retry headers, and audit events.
 
 ## Validation
 
 - `cargo fmt --all -- --check`
 - `cargo test --workspace`
 - `cargo clippy --workspace --all-targets -- -D warnings`
+- API rate-limit tests for limits, roles, 429 responses, retry headers, and audit events
 - PostgreSQL migration/restart integration test
 - Backup/restore integrity test
 - Live Feodo and Spamhaus DROP/EDROP/ASN feed checks
