@@ -1,22 +1,18 @@
 [package]
-name = "clawforge-api"
+name = "clawforge-analyzer"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-argon2.workspace = true
+async-trait.workspace = true
 axum.workspace = true
-chrono.workspace = true
-rand_core = { version = "0.6", features = ["getrandom"] }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sha2.workspace = true
-uuid.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-clawforge-storage = { path = "../storage" }
-clawforge-intelligence = { path = "../intelligence" }
+uuid.workspace = true

@@ -6,12 +6,13 @@ RUN cargo build --release --workspace
 FROM debian:bookworm-slim AS runtime
 LABEL org.opencontainers.image.source="https://github.com/lesecuritae/clawforge" \
       org.opencontainers.image.title="Clawforge Security Platform" \
-      org.opencontainers.image.description="Rust security intelligence API and worker"
+      org.opencontainers.image.description="Rust security intelligence API, worker, and optional incident analyzer"
 RUN apt-get update \
     && apt-get install --no-install-recommends -y ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /src/target/release/clawforge-api /usr/local/bin/clawforge-api
 COPY --from=builder /src/target/release/clawforge-worker /usr/local/bin/clawforge-worker
+COPY --from=builder /src/target/release/clawforge-analyzer /usr/local/bin/clawforge-analyzer
 USER 10001:10001
 EXPOSE 8080
 CMD ["/usr/local/bin/clawforge-api"]

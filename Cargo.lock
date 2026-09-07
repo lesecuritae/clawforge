@@ -233,6 +233,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "clawforge-analyzer"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "clawforge-api"
 version = "0.1.0"
 dependencies = [
@@ -243,6 +260,7 @@ dependencies = [
  "clawforge-intelligence",
  "clawforge-storage",
  "rand_core 0.6.4",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2",

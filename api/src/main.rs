@@ -38,6 +38,8 @@ struct AppState {
 struct RuntimeConfig {
     bind: SocketAddr,
     database_configured: bool,
+    analyzer_url: Option<String>,
+    analyzer_token: Option<String>,
 }
 
 #[derive(Clone)]
@@ -706,6 +708,19 @@ fn configured_bootstrap_token() -> Option<String> {
     env::var("CLAWFORGE_ADMIN_BOOTSTRAP_TOKEN")
         .ok()
         .filter(|v| !v.trim().is_empty())
+}
+
+fn configured_analyzer_token() -> Option<String> {
+    if let Ok(path) = env::var("CLAWFORGE_ANALYZER_TOKEN_FILE") {
+        if let Ok(value) = fs::read_to_string(path) {
+            if !value.trim().is_empty() {
+                return Some(value.trim().to_string());
+            }
+        }
+    }
+    env::var("CLAWFORGE_ANALYZER_TOKEN")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
 }
 
 fn bearer(headers: &HeaderMap) -> Option<&str> {
@@ -1730,6 +1745,185 @@ async fn incident_analysis(
     Ok(envelope(value, None))
 }
 
+#[derive(Serialize)]
+struct AnalyzerRequest {
+    incident_id: Uuid,
+    input: serde_json::Value,
+}
+
+async fn request_incident_analysis(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> ApiResult<(StatusCode, Json<ApiEnvelope<serde_json::Value>>)> {
+    let principal = authenticate(&state, &headers).await?;
+    require_role(&principal, &["Administrator", "Operator"])?;
+    let input = state
+        .store
+        .incident_analysis_input(id)
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "incident analysis unavailable",
+            )
+        })?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "incident not found"))?;
+    let analyzer_url = state.config.analyzer_url.as_deref().ok_or_else(|| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "analyzer is not configured",
+        )
+    })?;
+    let analyzer_token = state.config.analyzer_token.as_deref().ok_or_else(|| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "analyzer token is not configured",
+        )
+    })?;
+    let response = reqwest::Client::builder()
+        .timeout(StdDuration::from_secs(15))
+        .build()
+        .map_err(|_| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "analyzer client unavailable",
+            )
+        })?
+        .post(format!("{}/analyze", analyzer_url.trim_end_matches('/')))
+        .bearer_auth(analyzer_token)
+        .json(&AnalyzerRequest {
+            incident_id: id,
+            input,
+        })
+        .send()
+        .await
+        .map_err(|_| api_error(StatusCode::BAD_GATEWAY, "analyzer request failed"))?;
+    if !response.status().is_success() {
+        return Err(api_error(
+            StatusCode::BAD_GATEWAY,
+            "analyzer rejected the request",
+        ));
+    }
+    audit(
+        &state,
+        &principal,
+        "incident_analysis_requested",
+        &id.to_string(),
+        serde_json::json!({"mode":"analysis_only"}),
+    )
+    .await;
+    Ok((
+        StatusCode::ACCEPTED,
+        envelope(
+            serde_json::json!({"incident_id":id,"status":"accepted"}),
+            None,
+        ),
+    ))
+}
+
+#[derive(Deserialize)]
+struct StoredAnalysisRequest {
+    incident_id: Uuid,
+    provider: String,
+    model: String,
+    confidence: f32,
+    summary: String,
+    observations: Vec<String>,
+    recommendations: Vec<String>,
+}
+
+fn forbidden_analysis_text(value: &str) -> bool {
+    let value = value.to_ascii_lowercase();
+    [
+        "block",
+        "grant trust",
+        "change polic",
+        "activate provider",
+        "change permission",
+    ]
+    .iter()
+    .any(|term| value.contains(term))
+}
+
+async fn store_internal_analysis(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<StoredAnalysisRequest>,
+) -> ApiResult<Json<ApiEnvelope<serde_json::Value>>> {
+    let expected = state.config.analyzer_token.as_deref().ok_or_else(|| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "analyzer token is not configured",
+        )
+    })?;
+    let provided = bearer(&headers)
+        .ok_or_else(|| api_error(StatusCode::UNAUTHORIZED, "analyzer service token required"))?;
+    if digest(provided) != digest(expected) {
+        return Err(api_error(
+            StatusCode::UNAUTHORIZED,
+            "invalid analyzer service token",
+        ));
+    }
+    if request.provider.trim().is_empty()
+        || request.provider.len() > 128
+        || request.model.trim().is_empty()
+        || request.model.len() > 256
+        || request.summary.trim().is_empty()
+        || request.summary.len() > 4_000
+        || !(0.0..=1.0).contains(&request.confidence)
+        || request.observations.len() > 32
+        || request.recommendations.len() > 32
+        || request
+            .observations
+            .iter()
+            .chain(request.recommendations.iter())
+            .any(|value| value.len() > 1_000 || forbidden_analysis_text(value))
+        || forbidden_analysis_text(&request.summary)
+    {
+        return Err(api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "analysis output failed safety validation",
+        ));
+    }
+    let id = state
+        .store
+        .store_incident_analysis(
+            request.incident_id,
+            &request.provider,
+            &request.model,
+            request.confidence,
+            &request.summary,
+            &serde_json::to_value(&request.observations).expect("serializable observations"),
+            &serde_json::to_value(&request.recommendations).expect("serializable recommendations"),
+        )
+        .await
+        .map_err(|error| {
+            if error.to_string().contains("incident not found") {
+                api_error(StatusCode::NOT_FOUND, "incident not found")
+            } else {
+                api_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "analysis storage unavailable",
+                )
+            }
+        })?;
+    state
+        .store
+        .record_audit_event(
+            "analyzer",
+            "incident_analysis_stored",
+            &request.incident_id.to_string(),
+            serde_json::json!({"analysis_id":id,"provider":request.provider,"model":request.model,"confidence":request.confidence}),
+        )
+        .await
+        .map_err(|_| api_error(StatusCode::SERVICE_UNAVAILABLE, "analysis audit unavailable"))?;
+    Ok(envelope(
+        serde_json::json!({"id":id,"incident_id":request.incident_id,"status":"stored"}),
+        None,
+    ))
+}
+
 #[derive(Deserialize)]
 struct IncidentStatusRequest {
     status: String,
@@ -1802,6 +1996,10 @@ async fn main() -> anyhow::Result<()> {
         config: RuntimeConfig {
             bind: address,
             database_configured: true,
+            analyzer_url: env::var("CLAWFORGE_ANALYZER_URL")
+                .ok()
+                .filter(|value| !value.trim().is_empty()),
+            analyzer_token: configured_analyzer_token(),
         },
         rate_limiter: RateLimiter::default(),
     };
@@ -1841,7 +2039,12 @@ async fn main() -> anyhow::Result<()> {
         .route("/incidents/{id}", get(incident))
         .route("/incidents/{id}/events", get(incident_events))
         .route("/incidents/{id}/analysis", get(incident_analysis))
+        .route(
+            "/incidents/{id}/analysis/request",
+            post(request_incident_analysis),
+        )
         .route("/incidents/{id}/status", post(update_incident_status))
+        .route("/internal/analyzer/analyses", post(store_internal_analysis))
         .route("/incidents/export", get(export_incidents))
         .route("/intelligence/indicators/export", get(export_indicators))
         .route("/audit/events/export", get(export_audit_events))
@@ -1979,6 +2182,14 @@ mod tests {
         let identity = header_client_identity(&HeaderMap::new());
         assert_eq!(identity, "unknown");
         assert_ne!(digest(&identity), identity);
+    }
+
+    #[test]
+    fn analysis_output_cannot_contain_control_actions() {
+        assert!(forbidden_analysis_text("block this address"));
+        assert!(forbidden_analysis_text("grant trust to this node"));
+        assert!(forbidden_analysis_text("change policy threshold"));
+        assert!(!forbidden_analysis_text("review the correlated events"));
     }
 
     #[test]

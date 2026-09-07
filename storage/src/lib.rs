@@ -286,10 +286,14 @@ impl PostgresStore {
     }
 
     pub async fn incident_analysis(&self, id: Uuid) -> Result<Option<serde_json::Value>> {
-        let Some(incident) = self.get_incident(id).await? else {
+        let Some(input) = self.incident_analysis_input(id).await? else {
             return Ok(None);
         };
-        let events = self.list_incident_events(id).await?;
+        let events = input
+            .get("events")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
         let mut sources = events
             .iter()
             .filter_map(|event| event.get("source").and_then(serde_json::Value::as_str))
@@ -300,14 +304,98 @@ impl PostgresStore {
             .iter()
             .filter_map(|event| event.get("event_type").and_then(serde_json::Value::as_str))
             .collect::<Vec<_>>();
+        let analyses = self.list_incident_analyses(id).await?;
         Ok(Some(serde_json::json!({
-            "incident": incident,
+            "incident": input.get("incident").cloned().unwrap_or(serde_json::Value::Null),
             "event_count": events.len(),
             "sources": sources,
             "event_types": event_types,
-            "explanation": "Structured correlation of stored intelligence events. No blocking or policy decision was made.",
-            "llm_input": {"incident": incident, "events": events}
+            "analyses": analyses,
+            "analysis_available": !analyses.is_empty(),
+            "explanation": "Structured incident context and optional analysis results. No blocking, trust, policy, provider, or permission decision is made."
         })))
+    }
+
+    /// Build the only payload that may leave the core system for analysis.
+    /// Secrets, raw feed payloads, and identifying IP values are removed or
+    /// anonymized before the optional analyzer receives the request.
+    pub async fn incident_analysis_input(&self, id: Uuid) -> Result<Option<serde_json::Value>> {
+        let Some(incident) = self.get_incident(id).await? else {
+            return Ok(None);
+        };
+        let events = self.list_incident_events(id).await?;
+        let incident = sanitize_analysis_value(incident, None);
+        let events = events
+            .into_iter()
+            .map(|event| sanitize_analysis_value(event, None))
+            .collect::<Vec<_>>();
+        Ok(Some(serde_json::json!({
+            "incident": incident,
+            "events": events,
+            "constraints": {
+                "purpose": "explanation_only",
+                "raw_feeds_removed": true,
+                "secrets_removed": true,
+                "ips_anonymized": analysis_anonymize_ips(),
+                "forbidden_actions": ["block", "grant_trust", "change_policy", "activate_provider", "change_permissions"]
+            }
+        })))
+    }
+
+    pub async fn list_incident_analyses(&self, id: Uuid) -> Result<Vec<serde_json::Value>> {
+        let rows = sqlx::query("SELECT id, incident_id, provider, model, analyzed_at, confidence, summary, observations, recommendations FROM incident_analysis WHERE incident_id=$1 ORDER BY analyzed_at DESC")
+            .bind(id)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                serde_json::json!({
+                    "id": row.get::<Uuid,_>("id"),
+                    "incident_id": row.get::<Uuid,_>("incident_id"),
+                    "provider": row.get::<String,_>("provider"),
+                    "model": row.get::<String,_>("model"),
+                    "timestamp": row.get::<chrono::DateTime<chrono::Utc>,_>("analyzed_at"),
+                    "confidence": row.get::<f32,_>("confidence"),
+                    "summary": row.get::<String,_>("summary"),
+                    "observations": row.get::<serde_json::Value,_>("observations"),
+                    "recommendations": row.get::<serde_json::Value,_>("recommendations")
+                })
+            })
+            .collect())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn store_incident_analysis(
+        &self,
+        incident_id: Uuid,
+        provider: &str,
+        model: &str,
+        confidence: f32,
+        summary: &str,
+        observations: &serde_json::Value,
+        recommendations: &serde_json::Value,
+    ) -> Result<Uuid> {
+        let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM incidents WHERE id=$1)")
+            .bind(incident_id)
+            .fetch_one(&self.pool)
+            .await?;
+        if !exists {
+            anyhow::bail!("incident not found");
+        }
+        let id = Uuid::new_v4();
+        sqlx::query("INSERT INTO incident_analysis (id, incident_id, provider, model, confidence, summary, observations, recommendations) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)")
+            .bind(id)
+            .bind(incident_id)
+            .bind(provider)
+            .bind(model)
+            .bind(confidence)
+            .bind(summary)
+            .bind(observations)
+            .bind(recommendations)
+            .execute(&self.pool)
+            .await?;
+        Ok(id)
     }
 
     /// Persist an administrator's trusted-network registration and leave an
@@ -954,6 +1042,65 @@ fn normalize_incident_severity(value: &str) -> String {
         _ => "info",
     }
     .to_string()
+}
+
+fn analysis_anonymize_ips() -> bool {
+    !matches!(
+        env::var("CLAWFORGE_ANALYZER_ANONYMIZE_IPS").as_deref(),
+        Ok("false") | Ok("0")
+    )
+}
+
+fn sensitive_analysis_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    [
+        "raw", "payload", "feed", "secret", "token", "password", "api_key", "apikey",
+    ]
+    .iter()
+    .any(|part| key.contains(part))
+}
+
+fn ip_analysis_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    matches!(
+        key.as_str(),
+        "ip" | "ip_address" | "source_ip" | "destination_ip" | "client_ip"
+    )
+}
+
+fn sanitize_analysis_value(value: serde_json::Value, key: Option<&str>) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(values) => serde_json::Value::Object(
+            values
+                .into_iter()
+                .filter(|(name, _)| !sensitive_analysis_key(name))
+                .map(|(name, value)| {
+                    let value = if analysis_anonymize_ips() && ip_analysis_key(&name) {
+                        serde_json::Value::String("<anonymized-ip>".to_string())
+                    } else {
+                        sanitize_analysis_value(value, Some(&name))
+                    };
+                    (name, value)
+                })
+                .collect(),
+        ),
+        serde_json::Value::Array(values) => serde_json::Value::Array(
+            values
+                .into_iter()
+                .map(|value| sanitize_analysis_value(value, key))
+                .collect(),
+        ),
+        serde_json::Value::String(value)
+            if analysis_anonymize_ips()
+                && key.is_some_and(|name| {
+                    name == "resource" || name == "correlation_key" || ip_analysis_key(name)
+                })
+                && value.parse::<std::net::IpAddr>().is_ok() =>
+        {
+            serde_json::Value::String("<anonymized-ip>".to_string())
+        }
+        other => other,
+    }
 }
 
 fn max_incident_severity(current: &str, incoming: &str) -> String {

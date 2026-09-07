@@ -14,4 +14,6 @@ The API is protected by the administration bearer authentication:
 
 Administrators and operators may change status. Every status change is written to audit_events.
 
-The analysis endpoint returns structured incident data, event types, sources, and a safe explanation. This is the complete input boundary for a future LLM summarizer. The LLM has no tool or endpoint for blocking, changing policies, activating providers, or granting trust.
+The analysis endpoint returns structured incident data, event types, sources, and stored analysis results. Operators and administrators can request an optional analysis through `POST /incidents/{id}/analysis/request` when `clawforge-analyzer` is enabled. The analyzer receives a sanitized payload through the internal network and stores only structured `incident_analysis` results through the protected internal API.
+
+The analyzer defaults to an offline mock provider. OpenAI-compatible APIs, local models, and OpenRouter can be selected with the same provider configuration; no vendor is required. Secrets are mounted from Docker Secrets, raw feed fields are removed, and IP values are anonymized by default. Analysis is explanatory only: it cannot block, grant trust, change policies, activate providers, or change permissions. Analyzer failures and requests are recorded in `audit_events`.

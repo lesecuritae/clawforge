@@ -128,6 +128,28 @@ async fn migrations_and_restart_persist() -> anyhow::Result<()> {
         .fetch_one(restarted.pool())
         .await?;
     assert_eq!(incident_status, "Investigating");
+    let analysis_id = restarted
+        .store_incident_analysis(
+            incident_row.0,
+            "mock",
+            "offline",
+            0.5,
+            "Structured context only",
+            &json!(["one observation"]),
+            &json!(["review the correlated events"]),
+        )
+        .await?;
+    let analysis_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM incident_analysis WHERE id=$1 AND incident_id=$2")
+            .bind(analysis_id)
+            .bind(incident_row.0)
+            .fetch_one(restarted.pool())
+            .await?;
+    assert_eq!(analysis_count, 1);
+    assert!(restarted
+        .incident_analysis_input(incident_row.0)
+        .await?
+        .is_some());
     restarted
         .record_intelligence_event(&IntelligenceEvent {
             event_type: "bgp_change".into(),
@@ -206,6 +228,7 @@ async fn migrations_and_restart_persist() -> anyhow::Result<()> {
         "admin_sessions",
         "admin_config",
         "provider_sync_requests",
+        "incident_analysis",
     ] {
         let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
             .bind(format!("public.{table}"))

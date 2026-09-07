@@ -28,6 +28,9 @@ services:
       CLAWFORGE_API_BIND: 0.0.0.0:8080
       CLAWFORGE_ADMIN_BOOTSTRAP_TOKEN_FILE: /run/secrets/admin_bootstrap_token
       CLAWFORGE_ADMIN_BOOTSTRAP_USERNAME: ${CLAWFORGE_ADMIN_BOOTSTRAP_USERNAME:-admin}
+      CLAWFORGE_ANALYZER_URL: ${CLAWFORGE_ANALYZER_URL:-http://clawforge-analyzer:8081}
+      CLAWFORGE_ANALYZER_TOKEN_FILE: /run/secrets/analyzer_token
+      CLAWFORGE_ANALYZER_ANONYMIZE_IPS: ${CLAWFORGE_ANALYZER_ANONYMIZE_IPS:-true}
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=64m
@@ -41,6 +44,7 @@ services:
     secrets:
       - database_url
       - admin_bootstrap_token
+      - analyzer_token
     networks:
       - backend
       - frontend
@@ -48,6 +52,43 @@ services:
       - "${CLAWFORGE_API_PORT:-8080}:8080"
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/ready >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  clawforge-analyzer:
+    profiles: [analysis]
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    command: ["/usr/local/bin/clawforge-analyzer"]
+    environment:
+      CLAWFORGE_ANALYZER_BIND: 0.0.0.0:8081
+      CLAWFORGE_CORE_API_URL: ${CLAWFORGE_CORE_API_URL:-http://clawforge-api:8080}
+      CLAWFORGE_ANALYZER_PROVIDER: ${CLAWFORGE_ANALYZER_PROVIDER:-mock}
+      CLAWFORGE_ANALYZER_MODEL: ${CLAWFORGE_ANALYZER_MODEL:-offline}
+      CLAWFORGE_ANALYZER_BASE_URL: ${CLAWFORGE_ANALYZER_BASE_URL:-}
+      CLAWFORGE_ANALYZER_TIMEOUT_SECONDS: ${CLAWFORGE_ANALYZER_TIMEOUT_SECONDS:-30}
+      CLAWFORGE_ANALYZER_TOKEN_FILE: /run/secrets/analyzer_token
+      CLAWFORGE_ANALYZER_API_KEY_FILE: /run/secrets/analyzer_api_key
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    depends_on:
+      clawforge-api:
+        condition: service_healthy
+    secrets:
+      - analyzer_token
+      - analyzer_api_key
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8081/health >/dev/null"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -190,3 +231,7 @@ secrets:
     file: ${CLAWFORGE_MALWAREBAZAAR_SECRET_FILE:-./secrets/malwarebazaar_auth_key.example}
   admin_bootstrap_token:
     file: ${CLAWFORGE_ADMIN_BOOTSTRAP_SECRET_FILE:-./secrets/admin_bootstrap_token.example}
+  analyzer_token:
+    file: ${CLAWFORGE_ANALYZER_SECRET_FILE:-./secrets/analyzer_token.example}
+  analyzer_api_key:
+    file: ${CLAWFORGE_ANALYZER_API_KEY_SECRET_FILE:-./secrets/analyzer_api_key.example}

@@ -12,6 +12,13 @@
 | `CLAWFORGE_THREATFOX_SECRET_FILE` | `./secrets/threatfox_auth_key.example` | Docker secret file mounted as the ThreatFox credential |
 | `CLAWFORGE_URLHAUS_SECRET_FILE` | `./secrets/urlhaus_auth_key.example` | Docker secret file mounted as the URLhaus credential |
 | `CLAWFORGE_MALWAREBAZAAR_SECRET_FILE` | `./secrets/malwarebazaar_auth_key.example` | Docker secret file mounted as the MalwareBazaar credential |
+| `CLAWFORGE_ANALYZER_PROVIDER` | `mock` | Optional analyzer provider (`mock` or an OpenAI-compatible provider name) |
+| `CLAWFORGE_ANALYZER_MODEL` | `offline` | Model identifier passed to the analyzer provider |
+| `CLAWFORGE_ANALYZER_BASE_URL` | unset | OpenAI-compatible `/chat/completions` base URL for non-mock providers |
+| `CLAWFORGE_ANALYZER_SECRET_FILE` | `./secrets/analyzer_token.example` | Internal API token shared by API and analyzer |
+| `CLAWFORGE_ANALYZER_API_KEY_SECRET_FILE` | `./secrets/analyzer_api_key.example` | Optional provider API key Docker Secret |
+| `CLAWFORGE_ANALYZER_TIMEOUT_SECONDS` | `30` | Provider request timeout |
+| `CLAWFORGE_ANALYZER_ANONYMIZE_IPS` | `true` | Removes identifying IP values from analysis payloads by default |
 | `CLAWFORGE_RIPESTAT_RESOURCE` | `AS3333` | ASN resource for RIPEstat |
 | `CLAWFORGE_BGPVIEW_RESOURCE` | `3333` | ASN resource for BGPView |
 | `CLAWFORGE_PEERINGDB_RESOURCE` | `3333` | ASN resource for PeeringDB |

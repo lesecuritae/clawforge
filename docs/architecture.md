@@ -16,4 +16,4 @@ provider -> normalizer -> indicator/network store -> risk + trust -> policy -> r
 
 Network providers use the same boundary for ASN, BGP, and RPKI data. Their normalized records are persisted in PostgreSQL and converted into evaluated evidence before policy handling. Network providers never perform blocking actions themselves.
 
-Raw feeds do not reach an LLM or a blocking action. An LLM, when added, receives evaluated evidence and explanations only.
+Raw feeds do not reach an LLM or a blocking action. The optional `clawforge-analyzer` service receives only the API's sanitized incident context through an internal API and stores structured explanations. It cannot change risk, trust, policy, providers, or permissions.

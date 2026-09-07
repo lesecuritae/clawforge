@@ -118,6 +118,26 @@ paths:
         '401': { description: Authentication required }
         '403': { description: Role denied }
         '429': { $ref: '#/components/responses/RateLimited' }
+  /incidents/{id}/analysis:
+    get:
+      security: [{ bearerAuth: [] }]
+      description: Viewer, Operator, or Administrator. Returns sanitized context and stored analysis results.
+      responses:
+        '200': { description: Incident analysis envelope }
+        '401': { description: Authentication required }
+        '403': { description: Role denied }
+        '404': { description: Incident not found }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /incidents/{id}/analysis/request:
+    post:
+      security: [{ bearerAuth: [] }]
+      description: Operator or Administrator. Queues an optional explanation-only analysis.
+      responses:
+        '202': { description: Analysis accepted }
+        '401': { description: Authentication required }
+        '403': { description: Role denied }
+        '502': { description: Analyzer unavailable or rejected the request }
+        '429': { $ref: '#/components/responses/RateLimited' }
   /audit/events:
     get:
       security: [{ bearerAuth: [] }]
