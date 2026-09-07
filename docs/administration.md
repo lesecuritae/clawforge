@@ -27,3 +27,7 @@ Trusted networks are managed at `/admin/trust-networks`. New registrations start
 `/admin/config` stores only allow-listed non-secret JSON settings such as intervals, thresholds, and network settings. Keys containing `secret`, `password`, `token`, or `api_key` are rejected. Provider credentials remain Docker Secret files and are injected through environment variables ending in `_FILE`; they are not returned by the API or persisted in the database.
 
 The bootstrap secret must be replaced before deployment. Revoke sessions and rotate API tokens after an operator or administrator leaves the system.
+
+## Rate limiting
+
+The API protection layer limits login, bootstrap, export, read, and write endpoints independently and also enforces a global per-credential bucket. Health and readiness probes are excluded. Rate-limit responses use HTTP 429 with `Retry-After`; the limit event is recorded in `audit_events`. Limits are process-local, so a multi-instance deployment should keep a single API instance or place a shared gateway limit in front of it.

@@ -8,3 +8,7 @@
 - Production backup, restore, update, migration, and container-hardening workflows.
 
 [Unreleased]: https://github.com/lesecuritae/clawforge/compare/v0.1.0...HEAD
+
+## Unreleased
+
+- Added role-aware global and endpoint-specific API rate limits with 429 retry headers and audit events.

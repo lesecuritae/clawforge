@@ -1,13 +1,20 @@
-use std::{env, fs, net::SocketAddr};
+use std::{
+    collections::HashMap,
+    env, fs,
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+    time::{Duration as StdDuration, Instant},
+};
 
 use argon2::{
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
 };
 use axum::{
-    extract::{Path, Query, State},
-    http::{header, HeaderMap, StatusCode},
-    response::Response,
+    extract::{ConnectInfo, Path, Query, Request, State},
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -24,12 +31,246 @@ use uuid::Uuid;
 struct AppState {
     store: PostgresStore,
     config: RuntimeConfig,
+    rate_limiter: RateLimiter,
 }
 
 #[derive(Clone)]
 struct RuntimeConfig {
     bind: SocketAddr,
     database_configured: bool,
+}
+
+#[derive(Clone)]
+struct RateLimiter {
+    buckets: Arc<Mutex<HashMap<String, RateBucket>>>,
+}
+
+#[derive(Clone, Copy)]
+struct RateBucket {
+    started: Instant,
+    count: u32,
+}
+
+#[derive(Clone, Copy)]
+struct RatePolicy {
+    class: &'static str,
+    limit: u32,
+    window: StdDuration,
+}
+
+#[derive(Clone, Copy)]
+struct RateDecision {
+    allowed: bool,
+    remaining: u32,
+    retry_after: StdDuration,
+}
+
+impl Default for RateLimiter {
+    fn default() -> Self {
+        Self {
+            buckets: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+impl RateLimiter {
+    fn check(&self, key: &str, limit: u32, window: StdDuration) -> RateDecision {
+        let now = Instant::now();
+        let mut buckets = self.buckets.lock().expect("rate limiter mutex poisoned");
+        if buckets.len() > 10_000 {
+            buckets.retain(|_, bucket| now.duration_since(bucket.started) < window);
+        }
+        let bucket = buckets.entry(key.to_string()).or_insert(RateBucket {
+            started: now,
+            count: 0,
+        });
+        if now.duration_since(bucket.started) >= window {
+            bucket.started = now;
+            bucket.count = 0;
+        }
+        let elapsed = now.duration_since(bucket.started);
+        let retry_after = window.saturating_sub(elapsed);
+        if bucket.count >= limit {
+            return RateDecision {
+                allowed: false,
+                remaining: 0,
+                retry_after,
+            };
+        }
+        bucket.count += 1;
+        RateDecision {
+            allowed: true,
+            remaining: limit.saturating_sub(bucket.count),
+            retry_after,
+        }
+    }
+}
+
+fn header_client_identity(headers: &HeaderMap) -> String {
+    headers
+        .get("x-forwarded-for")
+        .or_else(|| headers.get("x-real-ip"))
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+fn role_multiplier(role: Option<&str>) -> u32 {
+    match role {
+        Some("Administrator") => 200,
+        Some("Operator") => 150,
+        Some("Viewer") => 100,
+        _ => 50,
+    }
+}
+
+fn global_limit(policy: RatePolicy, role: Option<&str>) -> u32 {
+    let base = match policy.class {
+        "login" => 10,
+        "bootstrap" => 6,
+        _ => 300,
+    };
+    if matches!(policy.class, "login" | "bootstrap") {
+        base
+    } else {
+        base.saturating_mul(role_multiplier(role)) / 100
+    }
+}
+
+fn policy_for(path: &str, method: &Method, role: Option<&str>) -> Option<RatePolicy> {
+    if matches!(path, "/health" | "/ready") {
+        return None;
+    }
+    let (class, base_limit, window): (&str, u32, StdDuration) = if path == "/admin/auth/login" {
+        ("login", 5, StdDuration::from_secs(60))
+    } else if path == "/admin/auth/bootstrap" {
+        ("bootstrap", 3, StdDuration::from_secs(60 * 60))
+    } else if path.ends_with("/export") {
+        ("export", 10, StdDuration::from_secs(60))
+    } else if method == Method::GET || method == Method::HEAD {
+        ("read", 120, StdDuration::from_secs(60))
+    } else {
+        ("write", 60, StdDuration::from_secs(60))
+    };
+    let limit = if matches!(class, "login" | "bootstrap") {
+        base_limit
+    } else {
+        base_limit.saturating_mul(role_multiplier(role)) / 100
+    };
+    Some(RatePolicy {
+        class,
+        limit: limit.max(1),
+        window,
+    })
+}
+
+fn rate_limit_response(policy: RatePolicy, retry_after: StdDuration) -> Response {
+    let seconds = retry_after.as_secs().max(1).to_string();
+    let mut response = (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(ApiError {
+            status: "error",
+            data: None,
+            timestamp: Utc::now(),
+            pagination: None,
+            errors: vec![format!("{} rate limit exceeded", policy.class)],
+        }),
+    )
+        .into_response();
+    response.headers_mut().insert(
+        header::RETRY_AFTER,
+        HeaderValue::from_str(&seconds).expect("valid retry-after value"),
+    );
+    response.headers_mut().insert(
+        "X-RateLimit-Limit",
+        HeaderValue::from_str(&policy.limit.to_string()).expect("valid limit value"),
+    );
+    response
+        .headers_mut()
+        .insert("X-RateLimit-Remaining", HeaderValue::from_static("0"));
+    response
+}
+
+async fn rate_limit_middleware(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let path = request.uri().path().to_string();
+    let Some(_) = policy_for(&path, request.method(), None) else {
+        return next.run(request).await;
+    };
+    let headers = request.headers();
+    let source = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|info| info.0.ip().to_string())
+        .unwrap_or_else(|| header_client_identity(headers));
+    let bearer_token = bearer(headers);
+    let principal = if let Some(token) = bearer_token {
+        state
+            .store
+            .authenticate_credential(&digest(token))
+            .await
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
+    let role = principal.as_ref().map(|value| value.role.as_str());
+    let policy = policy_for(&path, request.method(), role).expect("non-exempt policy");
+    let identity = bearer_token.map(digest).unwrap_or_else(|| digest(&source));
+    let global_limit = global_limit(policy, role).max(1);
+    let global = state.rate_limiter.check(
+        &format!("global:{}:{}", identity, policy.window.as_secs()),
+        global_limit,
+        policy.window,
+    );
+    let endpoint = state.rate_limiter.check(
+        &format!("endpoint:{}:{}:{}", policy.class, path, identity),
+        policy.limit,
+        policy.window,
+    );
+    if !global.allowed || !endpoint.allowed {
+        let retry_after = if global.retry_after > endpoint.retry_after {
+            global.retry_after
+        } else {
+            endpoint.retry_after
+        };
+        let actor = principal
+            .as_ref()
+            .map(|value| value.username.as_str())
+            .unwrap_or("anonymous");
+        let _ = state
+            .store
+            .record_audit_event(
+                actor,
+                "api_rate_limit_exceeded",
+                &path,
+                serde_json::json!({
+                    "class": policy.class,
+                    "role": role.unwrap_or("anonymous"),
+                    "source_hash": digest(&source),
+                    "retry_after_seconds": retry_after.as_secs().max(1),
+                }),
+            )
+            .await;
+        return rate_limit_response(policy, retry_after);
+    }
+    let remaining = global.remaining.min(endpoint.remaining);
+    let mut response = next.run(request).await;
+    response.headers_mut().insert(
+        "X-RateLimit-Limit",
+        HeaderValue::from_str(&policy.limit.to_string()).expect("valid limit value"),
+    );
+    response.headers_mut().insert(
+        "X-RateLimit-Remaining",
+        HeaderValue::from_str(&remaining.to_string()).expect("valid remaining value"),
+    );
+    response
 }
 
 #[derive(Serialize)]
@@ -1556,6 +1797,14 @@ async fn main() -> anyhow::Result<()> {
     runtime_store
         .set_runtime_status("api", "running", None)
         .await?;
+    let app_state = AppState {
+        store,
+        config: RuntimeConfig {
+            bind: address,
+            database_configured: true,
+        },
+        rate_limiter: RateLimiter::default(),
+    };
     let app = Router::new()
         .route("/health", get(health))
         .route("/ready", get(ready))
@@ -1596,17 +1845,18 @@ async fn main() -> anyhow::Result<()> {
         .route("/incidents/export", get(export_incidents))
         .route("/intelligence/indicators/export", get(export_indicators))
         .route("/audit/events/export", get(export_audit_events))
-        .with_state(AppState {
-            store,
-            config: RuntimeConfig {
-                bind: address,
-                database_configured: true,
-            },
-        });
+        .layer(middleware::from_fn_with_state(
+            app_state.clone(),
+            rate_limit_middleware,
+        ))
+        .with_state(app_state);
     tracing::info!(%address, "Clawforge API listening");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
     runtime_store
         .set_runtime_status("api", "stopped", None)
         .await?;
@@ -1659,6 +1909,76 @@ mod tests {
         assert!(Argon2::default()
             .verify_password(b"wrong-password", &parsed)
             .is_err());
+    }
+
+    #[test]
+    fn rate_limit_bucket_returns_retry_after_when_exhausted() {
+        let limiter = RateLimiter::default();
+        let window = StdDuration::from_secs(60);
+        assert!(limiter.check("test", 1, window).allowed);
+        let decision = limiter.check("test", 1, window);
+        assert!(!decision.allowed);
+        assert_eq!(decision.remaining, 0);
+        assert!(decision.retry_after > StdDuration::ZERO);
+        let response = rate_limit_response(
+            RatePolicy {
+                class: "login",
+                limit: 1,
+                window,
+            },
+            decision.retry_after,
+        );
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(response.headers().contains_key(header::RETRY_AFTER));
+        assert_eq!(response.headers()["X-RateLimit-Remaining"], "0");
+    }
+
+    #[test]
+    fn rate_limit_policies_exempt_health_and_scale_by_role() {
+        assert!(policy_for("/health", &Method::GET, None).is_none());
+        assert_eq!(
+            policy_for("/admin/auth/login", &Method::POST, None)
+                .unwrap()
+                .limit,
+            5
+        );
+        assert_eq!(
+            policy_for("/incidents/export", &Method::GET, Some("Viewer"))
+                .unwrap()
+                .limit,
+            10
+        );
+        assert_eq!(
+            policy_for("/incidents/export", &Method::GET, Some("Operator"))
+                .unwrap()
+                .limit,
+            15
+        );
+        assert_eq!(
+            policy_for("/incidents/export", &Method::GET, Some("Administrator"))
+                .unwrap()
+                .limit,
+            20
+        );
+        assert_eq!(
+            policy_for("/incidents", &Method::GET, Some("Administrator"))
+                .unwrap()
+                .class,
+            "read"
+        );
+        assert_eq!(
+            policy_for("/incidents", &Method::POST, Some("Viewer"))
+                .unwrap()
+                .class,
+            "write"
+        );
+    }
+
+    #[test]
+    fn rate_limit_identity_is_hashed() {
+        let identity = header_client_identity(&HeaderMap::new());
+        assert_eq!(identity, "unknown");
+        assert_ne!(digest(&identity), identity);
     }
 
     #[test]

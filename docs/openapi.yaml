@@ -3,6 +3,7 @@ info:
   title: Clawforge API
   version: 0.1.0
   description: Backend-only intelligence, incident, and administration API.
+  x-rate-limit-contract: Responses may include X-RateLimit-Limit and X-RateLimit-Remaining; 429 responses include Retry-After.
   x-response-contract: Every JSON endpoint returns status, data, timestamp, pagination, and errors.
 servers:
   - url: http://localhost:8080
@@ -35,6 +36,22 @@ components:
         page_size: { type: integer, minimum: 1, maximum: 500 }
         total: { type: integer, minimum: 0 }
         has_next: { type: boolean }
+  responses:
+    RateLimited:
+      description: Endpoint or global rate limit exceeded.
+      headers:
+        Retry-After:
+          description: Seconds until the client may retry.
+          schema: { type: integer, minimum: 1 }
+        X-RateLimit-Limit:
+          description: Requests allowed in the current endpoint window.
+          schema: { type: integer, minimum: 1 }
+        X-RateLimit-Remaining:
+          description: Requests remaining in the current endpoint window.
+          schema: { type: integer, minimum: 0 }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiEnvelope' }
 paths:
   /health:
     get:
@@ -58,6 +75,7 @@ paths:
         - { in: query, name: confidence, schema: { type: integer, minimum: 0, maximum: 100 } }
       responses:
         '200': { description: Paginated indicator envelope }
+        '429': { $ref: '#/components/responses/RateLimited' }
   /network/asn:
     get:
       parameters:
@@ -68,6 +86,7 @@ paths:
         - { in: query, name: to, schema: { type: string, format: date-time } }
       responses:
         '200': { description: Paginated ASN envelope }
+        '429': { $ref: '#/components/responses/RateLimited' }
   /network/bgp:
     get:
       parameters:
@@ -79,6 +98,7 @@ paths:
         - { in: query, name: to, schema: { type: string, format: date-time } }
       responses:
         '200': { description: Paginated BGP envelope }
+        '429': { $ref: '#/components/responses/RateLimited' }
   /incidents:
     get:
       security: [{ bearerAuth: [] }]
@@ -87,6 +107,7 @@ paths:
         '200': { description: Paginated incident envelope }
         '401': { description: Authentication required }
         '403': { description: Role denied }
+        '429': { $ref: '#/components/responses/RateLimited' }
   /incidents/{id}/status:
     post:
       security: [{ bearerAuth: [] }]
@@ -96,6 +117,7 @@ paths:
         '400': { description: Invalid lifecycle status }
         '401': { description: Authentication required }
         '403': { description: Role denied }
+        '429': { $ref: '#/components/responses/RateLimited' }
   /audit/events:
     get:
       security: [{ bearerAuth: [] }]
@@ -103,19 +125,23 @@ paths:
       responses:
         '200': { description: Paginated audit envelope }
         '401': { description: Authentication required }
+        '429': { $ref: '#/components/responses/RateLimited' }
   /incidents/export:
     get:
       security: [{ bearerAuth: [] }]
       description: Use format=csv for CSV; the default is the standard JSON envelope.
       responses:
         '200': { description: Incident export }
+        '429': { $ref: '#/components/responses/RateLimited' }
   /intelligence/indicators/export:
     get:
       security: [{ bearerAuth: [] }]
       responses:
         '200': { description: Indicator export }
+        '429': { $ref: '#/components/responses/RateLimited' }
   /audit/events/export:
     get:
       security: [{ bearerAuth: [] }]
       responses:
         '200': { description: Audit export }
+        '429': { $ref: '#/components/responses/RateLimited' }
