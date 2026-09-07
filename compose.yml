@@ -31,6 +31,8 @@ services:
       CLAWFORGE_ANALYZER_URL: ${CLAWFORGE_ANALYZER_URL:-http://clawforge-analyzer:8081}
       CLAWFORGE_ANALYZER_TOKEN_FILE: /run/secrets/analyzer_token
       CLAWFORGE_ANALYZER_ANONYMIZE_IPS: ${CLAWFORGE_ANALYZER_ANONYMIZE_IPS:-true}
+      CLAWFORGE_NOTIFIER_TOKEN_FILE: /run/secrets/notifier_token
+      CLAWFORGE_EVENTS_TOKEN_FILE: /run/secrets/events_token
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=64m
@@ -45,6 +47,8 @@ services:
       - database_url
       - admin_bootstrap_token
       - analyzer_token
+      - notifier_token
+      - events_token
     networks:
       - backend
       - frontend
@@ -70,6 +74,8 @@ services:
       CLAWFORGE_ANALYZER_MODEL: ${CLAWFORGE_ANALYZER_MODEL:-offline}
       CLAWFORGE_ANALYZER_BASE_URL: ${CLAWFORGE_ANALYZER_BASE_URL:-}
       CLAWFORGE_ANALYZER_TIMEOUT_SECONDS: ${CLAWFORGE_ANALYZER_TIMEOUT_SECONDS:-30}
+      CLAWFORGE_ANALYZER_EVENT_CONSUMER: ${CLAWFORGE_ANALYZER_EVENT_CONSUMER:-false}
+      CLAWFORGE_ANALYZER_EVENT_POLL_SECONDS: ${CLAWFORGE_ANALYZER_EVENT_POLL_SECONDS:-10}
       CLAWFORGE_ANALYZER_TOKEN_FILE: /run/secrets/analyzer_token
       CLAWFORGE_ANALYZER_API_KEY_FILE: /run/secrets/analyzer_api_key
     read_only: true
@@ -89,6 +95,69 @@ services:
       - backend
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8081/health >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  clawforge-notifier:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    command: ["/usr/local/bin/clawforge-notifier"]
+    environment:
+      CLAWFORGE_CORE_API_URL: ${CLAWFORGE_CORE_API_URL:-http://clawforge-api:8080}
+      CLAWFORGE_NOTIFIER_TOKEN_FILE: /run/secrets/notifier_token
+      CLAWFORGE_NOTIFIER_POLL_SECONDS: ${CLAWFORGE_NOTIFIER_POLL_SECONDS:-5}
+      CLAWFORGE_NOTIFIER_TIMEOUT_SECONDS: ${CLAWFORGE_NOTIFIER_TIMEOUT_SECONDS:-15}
+      RUST_LOG: ${RUST_LOG:-info}
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=32m
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    depends_on:
+      clawforge-api:
+        condition: service_healthy
+    secrets:
+      - notifier_token
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "kill -0 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  clawforge-events:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    command: ["/usr/local/bin/clawforge-events"]
+    environment:
+      CLAWFORGE_CORE_API_URL: ${CLAWFORGE_CORE_API_URL:-http://clawforge-api:8080}
+      CLAWFORGE_EVENTS_TOKEN_FILE: /run/secrets/events_token
+      CLAWFORGE_EVENTS_POLL_SECONDS: ${CLAWFORGE_EVENTS_POLL_SECONDS:-5}
+      RUST_LOG: ${RUST_LOG:-info}
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=32m
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    depends_on:
+      clawforge-api:
+        condition: service_healthy
+    secrets:
+      - events_token
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "kill -0 1"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -182,8 +251,10 @@ services:
       PGUSER: ${POSTGRES_USER:-clawforge}
       BACKUP_INTERVAL_SECONDS: ${CLAWFORGE_BACKUP_INTERVAL_SECONDS:-86400}
       BACKUP_RETENTION_DAYS: ${CLAWFORGE_BACKUP_RETENTION_DAYS:-14}
+      CLAWFORGE_CORE_API_URL: ${CLAWFORGE_CORE_API_URL:-http://clawforge-api:8080}
     secrets:
       - postgres_password
+      - notifier_token
     volumes:
       - clawforge-backups:/backups
     networks:
@@ -199,10 +270,22 @@ services:
       - -ec
       - |
         export PGPASSWORD="$$(cat /run/secrets/postgres_password)"
+        notify_error() {
+          reason="$${1:-backup operation failed}"
+          token="$$(cat /run/secrets/notifier_token)"
+          escaped="$$(printf '%s' "$${reason}" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+          wget -q -O /dev/null --header="Authorization: Bearer $${token}" --header="Content-Type: application/json" --post-data="{\"event_type\":\"backup_error\",\"source\":\"backup\",\"severity\":\"high\",\"reason\":\"$${escaped}\",\"resource\":\"postgres\"}" "$${CLAWFORGE_CORE_API_URL}/internal/notifier/operational-events" 2>/dev/null || true
+        }
         while :; do
           stamp="$$(date -u +%Y%m%dT%H%M%SZ)"
-          pg_dump --format=custom --no-owner --file="/backups/clawforge-$${stamp}.dump"
-          pg_restore --list "/backups/clawforge-$${stamp}.dump" >/dev/null
+          if ! pg_dump --format=custom --no-owner --file="/backups/clawforge-$${stamp}.dump"; then
+            notify_error "PostgreSQL backup failed"
+            sleep "$${BACKUP_INTERVAL_SECONDS}"
+            continue
+          fi
+          if ! pg_restore --list "/backups/clawforge-$${stamp}.dump" >/dev/null; then
+            notify_error "PostgreSQL backup integrity check failed"
+          fi
           find /backups -type f -name 'clawforge-*.dump' -mtime +"$${BACKUP_RETENTION_DAYS}" -delete
           sleep "$${BACKUP_INTERVAL_SECONDS}"
         done
@@ -235,3 +318,7 @@ secrets:
     file: ${CLAWFORGE_ANALYZER_SECRET_FILE:-./secrets/analyzer_token.example}
   analyzer_api_key:
     file: ${CLAWFORGE_ANALYZER_API_KEY_SECRET_FILE:-./secrets/analyzer_api_key.example}
+  notifier_token:
+    file: ${CLAWFORGE_NOTIFIER_SECRET_FILE:-./secrets/notifier_token.example}
+  events_token:
+    file: ${CLAWFORGE_EVENTS_SECRET_FILE:-./secrets/events_token.example}

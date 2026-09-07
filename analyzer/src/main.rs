@@ -12,7 +12,7 @@ use clawforge_analyzer::{
     AnalysisError, AnalysisOutput, AnalysisProvider, AnalysisRequest, MockProvider,
     OpenAiCompatibleProvider,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
@@ -36,6 +36,11 @@ struct AcceptedResponse {
     status: &'static str,
     incident_id: Uuid,
     provider: String,
+}
+
+#[derive(Deserialize)]
+struct EventEnvelope<T> {
+    data: T,
 }
 
 fn bearer(headers: &HeaderMap) -> Option<&str> {
@@ -175,6 +180,79 @@ async fn persist_output(
     Ok(())
 }
 
+async fn event_consumer_loop(state: AppState) {
+    let interval_seconds = env::var("CLAWFORGE_ANALYZER_EVENT_POLL_SECONDS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(10);
+    let mut interval = tokio::time::interval(Duration::from_secs(interval_seconds));
+    loop {
+        interval.tick().await;
+        let response = match state
+            .client
+            .get(format!(
+                "{}/internal/events/consume?consumer=analyzer&limit=10",
+                state.core_api_url.trim_end_matches('/')
+            ))
+            .bearer_auth(&state.token)
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                tracing::warn!(%error, "analyzer event consumer poll failed");
+                continue;
+            }
+        };
+        let envelope = match response
+            .json::<EventEnvelope<Vec<serde_json::Value>>>()
+            .await
+        {
+            Ok(envelope) => envelope,
+            Err(error) => {
+                tracing::warn!(%error, "analyzer event envelope invalid");
+                continue;
+            }
+        };
+        for event in envelope.data {
+            let delivery_id = event.get("delivery_id").and_then(serde_json::Value::as_str);
+            let event_type = event
+                .get("event_type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if event_type == "incident.created" {
+                if let Some(incident_id) = event
+                    .get("payload")
+                    .and_then(|payload| payload.get("incident_id"))
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|value| Uuid::parse_str(value).ok())
+                {
+                    let request = AnalysisRequest {
+                        incident_id,
+                        input: json!({"event": event}),
+                    };
+                    if let Ok(output) = state.provider.analyze(&request.input).await {
+                        let _ = persist_output(&state, incident_id, &output).await;
+                    }
+                }
+            }
+            if let Some(delivery_id) = delivery_id {
+                let _ = state
+                    .client
+                    .post(format!(
+                        "{}/internal/events/{}/result",
+                        state.core_api_url.trim_end_matches('/'),
+                        delivery_id
+                    ))
+                    .bearer_auth(&state.token)
+                    .json(&json!({"success":true}))
+                    .send()
+                    .await;
+            }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -199,6 +277,11 @@ async fn main() -> Result<()> {
         provider,
         client,
     };
+    if env::var("CLAWFORGE_ANALYZER_EVENT_CONSUMER")
+        .is_ok_and(|value| value.eq_ignore_ascii_case("true"))
+    {
+        tokio::spawn(event_consumer_loop(state.clone()));
+    }
     let listener = tokio::net::TcpListener::bind(address).await?;
     tracing::info!(%address, "Clawforge analyzer listening on internal network");
     axum::serve(

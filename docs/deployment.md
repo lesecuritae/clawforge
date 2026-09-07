@@ -1,6 +1,6 @@
 # Deployment
 
-Clawforge runs as API, worker, frontend, PostgreSQL, and scheduled backup Compose services. `clawforge-analyzer` is isolated behind the `analysis` profile; Redis is optional under the `cache` profile and is not required for correctness. The analyzer stays on the internal backend network and can be enabled with `docker compose --profile analysis up -d`.
+Clawforge runs as API, worker, event backbone, notifier, frontend, PostgreSQL, and scheduled backup Compose services. `clawforge-analyzer` is isolated behind the `analysis` profile; Redis is optional under the `cache` profile and is not required for correctness. The analyzer, event backbone, and notifier stay on the internal backend network and can be enabled with `docker compose --profile analysis up -d`.
 
 1. Copy `.env.example` to `.env`.
 2. Create private secret files from `secrets/*.example` and set the corresponding `CLAWFORGE_*_SECRET_FILE` variables in `.env`.

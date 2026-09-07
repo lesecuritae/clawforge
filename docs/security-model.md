@@ -11,3 +11,12 @@ Trusted infrastructure is administrator-registered and must be `Verified`. Tails
 The API applies an in-process global bucket and an endpoint bucket keyed by a hashed bearer token. Unauthenticated login and bootstrap requests are keyed by the connection address; raw tokens and addresses are never written to audit details. `/health` and `/ready` are exempt for orchestration probes.
 
 The default endpoint windows are five login attempts per minute, three bootstrap attempts per hour, ten export requests per minute, 120 reads per minute, and 60 writes per minute. Administrator, Operator, and Viewer credentials receive role-specific read/write/export limits. A rejected request returns `429 Too Many Requests`, `Retry-After`, `X-RateLimit-Limit`, and `X-RateLimit-Remaining` headers. Each rejection creates an `api_rate_limit_exceeded` audit event.
+
+## Internal events
+
+The event backbone accepts only structured, filtered payloads. Keys containing
+raw feeds, secrets, tokens, passwords, or API keys are removed before an event
+is persisted. Event and consumer endpoints require an internal Docker Secret
+service token; administrative event reads require an Administrator or Operator
+credential. Delivery retries are bounded and dead-lettered without triggering
+security actions.

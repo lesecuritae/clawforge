@@ -1,5 +1,5 @@
 [workspace]
-members = ["api", "worker", "intelligence", "risk", "policy", "storage", "analyzer"]
+members = ["api", "worker", "intelligence", "risk", "policy", "storage", "analyzer", "notifier", "events"]
 resolver = "2"
 
 [workspace.package]
@@ -19,9 +19,10 @@ redis = { version = "0.32", default-features = false, features = ["tokio-comp"] 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1", "tokio1-rustls-tls"] }
 sqlx = { version = "0.8", default-features = false, features = ["chrono", "json", "macros", "migrate", "postgres", "runtime-tokio-rustls", "uuid"] }
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "time"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 uuid = { version = "1", features = ["serde", "v4"] }

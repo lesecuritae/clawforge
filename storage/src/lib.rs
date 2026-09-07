@@ -111,17 +111,29 @@ impl PostgresStore {
         action: &str,
         resource: &str,
         details: serde_json::Value,
-    ) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO audit_events (actor, action, resource, details) VALUES ($1, $2, $3, $4)",
+    ) -> Result<i64> {
+        let id = sqlx::query_scalar::<_, i64>(
+            "INSERT INTO audit_events (actor, action, resource, details) VALUES ($1, $2, $3, $4) RETURNING id",
         )
         .bind(actor)
         .bind(action)
         .bind(resource)
-        .bind(details)
-        .execute(&self.pool)
+        .bind(&details)
+        .fetch_one(&self.pool)
         .await?;
-        Ok(())
+        let _ = self
+            .publish_event(
+                action,
+                "audit",
+                "info",
+                chrono::Utc::now(),
+                Some(resource),
+                details,
+                serde_json::json!({"audit_event_id": id}),
+                &format!("audit:{id}"),
+            )
+            .await;
+        Ok(id)
     }
 
     pub async fn record_intelligence_event(&self, event: &IntelligenceEvent) -> Result<()> {
@@ -138,7 +150,74 @@ impl PostgresStore {
             .await?
             ;
         self.correlate_incident(event_id, event).await?;
+        self.publish_event(
+            &event.event_type,
+            &event.source,
+            &event.severity,
+            event.timestamp,
+            Some(&event.resource),
+            event.details.clone(),
+            serde_json::json!({"audit_event_id": event_id}),
+            &format!(
+                "{}:{}:{}",
+                event.event_type,
+                event.resource,
+                event.timestamp.timestamp_nanos_opt().unwrap_or_default()
+            ),
+        )
+        .await?;
+        self.enqueue_notification_event(
+            Some(event_id),
+            &event.event_type,
+            &event.severity,
+            &event.resource,
+            serde_json::json!({
+                "event_type": event.event_type,
+                "source": event.source,
+                "severity": event.severity,
+                "reason": event.reason,
+                "resource": event.resource,
+                "timestamp": event.timestamp,
+            }),
+            &event.event_type,
+        )
+        .await?;
         Ok(())
+    }
+
+    pub async fn record_operational_event(
+        &self,
+        event_type: &str,
+        source: &str,
+        severity: &str,
+        reason: &str,
+        resource: &str,
+        details: serde_json::Value,
+    ) -> Result<i64> {
+        let timestamp = chrono::Utc::now();
+        let event_id: i64 = sqlx::query_scalar("INSERT INTO audit_events (actor, action, resource, details, event_type, source, severity, reason, recorded_at) VALUES ('system',$1,$2,$3,$1,$4,$5,$6,$7) RETURNING id")
+            .bind(event_type).bind(resource).bind(&details).bind(source).bind(severity).bind(reason).bind(timestamp)
+            .fetch_one(&self.pool).await?;
+        self.publish_event(
+            event_type,
+            source,
+            severity,
+            timestamp,
+            Some(resource),
+            details.clone(),
+            serde_json::json!({"audit_event_id": event_id}),
+            &format!(
+                "{}:{}:{}",
+                event_type,
+                resource,
+                timestamp.timestamp_nanos_opt().unwrap_or_default()
+            ),
+        )
+        .await?;
+        self.enqueue_notification_event(Some(event_id), event_type, severity, resource,
+            serde_json::json!({"event_type":event_type,"source":source,"severity":severity,"reason":reason,"resource":resource,"timestamp":timestamp}),
+            event_type).await?;
+        Ok(event_id)
     }
 
     async fn correlate_incident(&self, event_id: i64, event: &IntelligenceEvent) -> Result<()> {
@@ -173,15 +252,17 @@ impl PostgresStore {
         .bind(&event.resource)
         .fetch_optional(&mut *tx)
         .await?;
-        let incident_id = if let Some((id, current_severity)) = existing {
+        let (incident_id, created, escalated) = if let Some((id, current_severity)) = existing {
+            let next_severity = max_incident_severity(&current_severity, &severity);
+            let escalated = next_severity != current_severity;
             sqlx::query("UPDATE incidents SET severity=$2, risk_score=LEAST(100, risk_score+$3), summary=$4, updated_at=NOW() WHERE id=$1")
                 .bind(id)
-                .bind(max_incident_severity(&current_severity, &severity))
+                .bind(&next_severity)
                 .bind(increment.clamp(0, 100) as i16)
                 .bind(format!("{}: {}", event.event_type, event.reason))
                 .execute(&mut *tx)
                 .await?;
-            id
+            (id, false, escalated)
         } else {
             let id = Uuid::new_v4();
             sqlx::query("INSERT INTO incidents (id,status,severity,risk_score,summary,correlation_key,created_at,updated_at) VALUES ($1,'Open',$2,$3,$4,$5,$6,$6)")
@@ -193,7 +274,7 @@ impl PostgresStore {
                 .bind(event.timestamp)
                 .execute(&mut *tx)
                 .await?;
-            id
+            (id, true, false)
         };
         sqlx::query("INSERT INTO incident_events (incident_id,event_id,timestamp) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING")
             .bind(incident_id)
@@ -202,6 +283,375 @@ impl PostgresStore {
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
+        if created {
+            self.publish_event(
+                "incident.created",
+                "incident-correlator",
+                &severity,
+                event.timestamp,
+                Some(&incident_id.to_string()),
+                serde_json::json!({"incident_id": incident_id, "event_type": event.event_type, "severity": severity, "reason": event.reason, "risk_score": increment.clamp(0, 100)}),
+                serde_json::json!({"source_event_id": event_id}),
+                &format!("incident.created:{incident_id}:{event_id}"),
+            ).await?;
+            self.enqueue_notification_event(
+                Some(event_id),
+                "incident_created",
+                &severity,
+                &incident_id.to_string(),
+                serde_json::json!({"incident_id": incident_id, "event_type": event.event_type, "severity": severity, "reason": event.reason, "risk_score": increment.clamp(0, 100)}),
+                &format!("incident_created:{incident_id}"),
+            )
+            .await?;
+        } else if escalated {
+            self.publish_event(
+                "incident.updated",
+                "incident-correlator",
+                &severity,
+                event.timestamp,
+                Some(&incident_id.to_string()),
+                serde_json::json!({"incident_id": incident_id, "event_type": event.event_type, "severity": severity, "reason": event.reason}),
+                serde_json::json!({"source_event_id": event_id}),
+                &format!("incident.updated:{incident_id}:{event_id}"),
+            ).await?;
+            self.enqueue_notification_event(
+                Some(event_id),
+                "incident_severity_changed",
+                &severity,
+                &incident_id.to_string(),
+                serde_json::json!({"incident_id": incident_id, "event_type": event.event_type, "severity": severity, "reason": event.reason}),
+                &format!("incident_severity_changed:{incident_id}:{event_id}"),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Fan an audited event out to the currently active notification rules.
+    /// The queue contains only a safe, structured payload and a secret
+    /// reference; credentials themselves never enter PostgreSQL.
+    pub async fn enqueue_notification_event(
+        &self,
+        source_event_id: Option<i64>,
+        event_type: &str,
+        severity: &str,
+        resource: &str,
+        payload: serde_json::Value,
+        dedupe_suffix: &str,
+    ) -> Result<u64> {
+        let severity_rank = notification_severity_rank(severity);
+        let rules = sqlx::query(
+            "SELECT r.id, r.minimum_severity, r.channel_id, c.channel_type, c.target\n             FROM notification_rules r\n             JOIN notification_channels c ON c.id = r.channel_id\n             WHERE r.enabled AND c.enabled AND (r.event_type = $1 OR r.event_type = '*')",
+        )
+        .bind(event_type)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut inserted = 0;
+        for rule in rules {
+            let minimum = rule.get::<String, _>("minimum_severity");
+            if severity_rank < notification_severity_rank(&minimum) {
+                continue;
+            }
+            let channel_id = rule.get::<Uuid, _>("channel_id");
+            let rule_id = rule.get::<Uuid, _>("id");
+            let key = format!(
+                "{}:{}:{}:{}:{}",
+                source_event_id.unwrap_or_default(),
+                event_type,
+                resource,
+                channel_id,
+                dedupe_suffix
+            );
+            let result = sqlx::query("INSERT INTO notification_events (id,source_event_id,rule_id,channel_id,event_type,severity,resource,target,channel_type,payload,dedupe_key) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT (dedupe_key) DO NOTHING")
+                .bind(Uuid::new_v4())
+                .bind(source_event_id)
+                .bind(rule_id)
+                .bind(channel_id)
+                .bind(event_type)
+                .bind(severity)
+                .bind(resource)
+                .bind(rule.get::<String, _>("target"))
+                .bind(rule.get::<String, _>("channel_type"))
+                .bind(&payload)
+                .bind(key)
+                .execute(&self.pool)
+                .await?;
+            inserted += result.rows_affected();
+        }
+        Ok(inserted)
+    }
+
+    pub async fn ensure_event_consumer(&self, name: &str) -> Result<Uuid> {
+        let id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO event_consumers (id,name) VALUES ($1,$2) ON CONFLICT (name) DO UPDATE SET enabled=TRUE RETURNING id",
+        )
+        .bind(Uuid::new_v4())
+        .bind(name)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(id)
+    }
+
+    pub async fn heartbeat_event_consumer(&self, name: &str) -> Result<()> {
+        sqlx::query("UPDATE event_consumers SET last_heartbeat_at=NOW() WHERE name=$1")
+            .bind(name)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Persist a canonical event and fan it out to all enabled consumers.
+    /// Payloads and metadata are filtered before they cross the persistence
+    /// boundary, so raw feeds and credentials cannot enter the event bus.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn publish_event(
+        &self,
+        event_type: &str,
+        source: &str,
+        severity: &str,
+        occurred_at: chrono::DateTime<chrono::Utc>,
+        correlation_id: Option<&str>,
+        payload: serde_json::Value,
+        metadata: serde_json::Value,
+        dedupe_key: &str,
+    ) -> Result<Uuid> {
+        let event_id = Uuid::new_v4();
+        let payload = sanitize_analysis_value(payload, None);
+        let metadata = sanitize_analysis_value(metadata, None);
+        let mut tx = self.pool.begin().await?;
+        let inserted = sqlx::query("INSERT INTO events (event_id,event_type,source,severity,occurred_at,correlation_id,payload,metadata,dedupe_key) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (dedupe_key) DO NOTHING")
+            .bind(event_id).bind(event_type).bind(source).bind(severity).bind(occurred_at).bind(correlation_id)
+            .bind(&payload).bind(&metadata).bind(dedupe_key).execute(&mut *tx).await?;
+        if inserted.rows_affected() == 0 {
+            let existing =
+                sqlx::query_scalar::<_, Uuid>("SELECT event_id FROM events WHERE dedupe_key=$1")
+                    .bind(dedupe_key)
+                    .fetch_one(&mut *tx)
+                    .await?;
+            tx.commit().await?;
+            return Ok(existing);
+        }
+        let consumers = sqlx::query("SELECT id FROM event_consumers WHERE enabled")
+            .fetch_all(&mut *tx)
+            .await?;
+        for consumer in consumers {
+            sqlx::query("INSERT INTO event_delivery (id,event_id,consumer_id) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING")
+                .bind(Uuid::new_v4()).bind(event_id).bind(consumer.get::<Uuid,_>("id"))
+                .execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+        Ok(event_id)
+    }
+
+    pub async fn list_events(
+        &self,
+        event_type: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<serde_json::Value>> {
+        let rows = sqlx::query("SELECT event_id,event_type,source,severity,occurred_at,correlation_id,payload,metadata,created_at FROM events WHERE ($1::text IS NULL OR event_type=$1) ORDER BY occurred_at DESC LIMIT $2")
+            .bind(event_type).bind(limit.clamp(1, 500)).fetch_all(&self.pool).await?;
+        Ok(rows.into_iter().map(|row| serde_json::json!({
+            "event_id": row.get::<Uuid,_>("event_id"), "event_type": row.get::<String,_>("event_type"),
+            "source": row.get::<String,_>("source"), "severity": row.get::<String,_>("severity"),
+            "timestamp": row.get::<chrono::DateTime<chrono::Utc>,_>("occurred_at"),
+            "correlation_id": row.get::<Option<String>,_>("correlation_id"), "payload": row.get::<serde_json::Value,_>("payload"),
+            "metadata": row.get::<serde_json::Value,_>("metadata"), "created_at": row.get::<chrono::DateTime<chrono::Utc>,_>("created_at")
+        })).collect())
+    }
+
+    pub async fn get_event(&self, id: Uuid) -> Result<Option<serde_json::Value>> {
+        let row = sqlx::query("SELECT event_id,event_type,source,severity,occurred_at,correlation_id,payload,metadata,created_at FROM events WHERE event_id=$1")
+            .bind(id).fetch_optional(&self.pool).await?;
+        Ok(row.map(|row| serde_json::json!({
+            "event_id": row.get::<Uuid,_>("event_id"), "event_type": row.get::<String,_>("event_type"),
+            "source": row.get::<String,_>("source"), "severity": row.get::<String,_>("severity"),
+            "timestamp": row.get::<chrono::DateTime<chrono::Utc>,_>("occurred_at"),
+            "correlation_id": row.get::<Option<String>,_>("correlation_id"), "payload": row.get::<serde_json::Value,_>("payload"),
+            "metadata": row.get::<serde_json::Value,_>("metadata"), "created_at": row.get::<chrono::DateTime<chrono::Utc>,_>("created_at")
+        })))
+    }
+
+    pub async fn event_status(&self) -> Result<serde_json::Value> {
+        let row = sqlx::query("SELECT COUNT(*) FILTER (WHERE status='pending') AS pending, COUNT(*) FILTER (WHERE status='processing') AS processing, COUNT(*) FILTER (WHERE status='processed') AS processed, COUNT(*) FILTER (WHERE status='failed') AS failed, COUNT(*) FILTER (WHERE status='dead') AS dead FROM event_delivery")
+            .fetch_one(&self.pool).await?;
+        Ok(
+            serde_json::json!({"pending":row.get::<i64,_>("pending"),"processing":row.get::<i64,_>("processing"),"processed":row.get::<i64,_>("processed"),"failed":row.get::<i64,_>("failed"),"dead_letter":row.get::<i64,_>("dead")}),
+        )
+    }
+
+    pub async fn claim_event_deliveries(
+        &self,
+        consumer: &str,
+        limit: i64,
+    ) -> Result<Vec<serde_json::Value>> {
+        let consumer_id = self.ensure_event_consumer(consumer).await?;
+        let mut tx = self.pool.begin().await?;
+        let rows = sqlx::query("SELECT d.id,e.event_id,e.event_type,e.source,e.severity,e.occurred_at,e.correlation_id,e.payload,e.metadata,d.attempts FROM event_delivery d JOIN events e ON e.event_id=d.event_id WHERE d.consumer_id=$1 AND d.available_at <= NOW() AND d.attempts < 5 AND (d.status IN ('pending','failed') OR (d.status='processing' AND d.processing_started_at < NOW()-INTERVAL '10 minutes')) ORDER BY d.created_at FOR UPDATE SKIP LOCKED LIMIT $2")
+            .bind(consumer_id).bind(limit.clamp(1, 100)).fetch_all(&mut *tx).await?;
+        let mut result = Vec::with_capacity(rows.len());
+        for row in rows {
+            let id = row.get::<Uuid, _>("id");
+            sqlx::query("UPDATE event_delivery SET status='processing',attempts=attempts+1,processing_started_at=NOW() WHERE id=$1").bind(id).execute(&mut *tx).await?;
+            result.push(serde_json::json!({"delivery_id":id,"event_id":row.get::<Uuid,_>("event_id"),"event_type":row.get::<String,_>("event_type"),"source":row.get::<String,_>("source"),"severity":row.get::<String,_>("severity"),"timestamp":row.get::<chrono::DateTime<chrono::Utc>,_>("occurred_at"),"correlation_id":row.get::<Option<String>,_>("correlation_id"),"payload":row.get::<serde_json::Value,_>("payload"),"metadata":row.get::<serde_json::Value,_>("metadata"),"attempts":row.get::<i32,_>("attempts")+1}));
+        }
+        tx.commit().await?;
+        self.heartbeat_event_consumer(consumer).await?;
+        Ok(result)
+    }
+
+    pub async fn complete_event_delivery(
+        &self,
+        delivery_id: Uuid,
+        success: bool,
+        error: Option<&str>,
+    ) -> Result<()> {
+        if success {
+            sqlx::query("UPDATE event_delivery SET status='processed',processed_at=NOW(),error=NULL WHERE id=$1").bind(delivery_id).execute(&self.pool).await?;
+        } else {
+            sqlx::query("UPDATE event_delivery SET status=CASE WHEN attempts >= 5 THEN 'dead' ELSE 'failed' END, available_at=NOW() + (LEAST(3600, POWER(2, attempts)) * INTERVAL '1 second'), error=$2 WHERE id=$1").bind(delivery_id).bind(error.map(|value| value.chars().take(1000).collect::<String>())).execute(&self.pool).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn claim_notification_events(&self, limit: i64) -> Result<Vec<serde_json::Value>> {
+        let mut tx = self.pool.begin().await?;
+        let rows = sqlx::query("SELECT e.id,e.event_type,e.severity,e.resource,e.target,e.channel_type,e.payload,e.retry_count,c.secret_ref,c.config FROM notification_events e JOIN notification_channels c ON c.id=e.channel_id WHERE c.enabled AND e.available_at <= NOW() AND (e.status='pending' OR (e.status='processing' AND e.last_attempt_at < NOW() - INTERVAL '10 minutes')) ORDER BY e.created_at FOR UPDATE SKIP LOCKED LIMIT $1")
+            .bind(limit.clamp(1, 100))
+            .fetch_all(&mut *tx)
+            .await?;
+        let mut events = Vec::with_capacity(rows.len());
+        for row in rows {
+            let id = row.get::<Uuid, _>("id");
+            sqlx::query("UPDATE notification_events SET status='processing', retry_count=retry_count+1, last_attempt_at=NOW() WHERE id=$1")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            events.push(serde_json::json!({
+                "id": id,
+                "event_type": row.get::<String,_>("event_type"),
+                "severity": row.get::<String,_>("severity"),
+                "resource": row.get::<String,_>("resource"),
+                "target": row.get::<String,_>("target"),
+                "channel_type": row.get::<String,_>("channel_type"),
+                "payload": row.get::<serde_json::Value,_>("payload"),
+                "retry_count": row.get::<i32,_>("retry_count") + 1,
+                "secret_ref": row.get::<Option<String>,_>("secret_ref"),
+                "config": row.get::<serde_json::Value,_>("config"),
+            }));
+        }
+        tx.commit().await?;
+        Ok(events)
+    }
+
+    pub async fn complete_notification_event(
+        &self,
+        id: Uuid,
+        success: bool,
+        error: Option<&str>,
+    ) -> Result<()> {
+        if success {
+            sqlx::query(
+                "UPDATE notification_events SET status='sent',sent_at=NOW(),error=NULL WHERE id=$1",
+            )
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        } else {
+            sqlx::query("UPDATE notification_events SET status=CASE WHEN retry_count >= 5 THEN 'failed' ELSE 'pending' END, available_at=NOW() + (LEAST(3600, POWER(2, retry_count)) * INTERVAL '1 second'), error=$2 WHERE id=$1")
+                .bind(id)
+                .bind(error.map(|value| value.chars().take(1000).collect::<String>()))
+                .execute(&self.pool)
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn list_notification_channels(&self) -> Result<Vec<serde_json::Value>> {
+        let rows = sqlx::query("SELECT id,name,channel_type,target,secret_ref,config,enabled,created_at,updated_at FROM notification_channels ORDER BY name")
+            .fetch_all(&self.pool).await?;
+        Ok(rows.into_iter().map(|row| serde_json::json!({
+            "id": row.get::<Uuid,_>("id"), "name": row.get::<String,_>("name"),
+            "channel_type": row.get::<String,_>("channel_type"), "target": row.get::<String,_>("target"),
+            "secret_ref": row.get::<Option<String>,_>("secret_ref"), "config": row.get::<serde_json::Value,_>("config"),
+            "enabled": row.get::<bool,_>("enabled"), "created_at": row.get::<chrono::DateTime<chrono::Utc>,_>("created_at"),
+            "updated_at": row.get::<chrono::DateTime<chrono::Utc>,_>("updated_at")
+        })).collect())
+    }
+
+    pub async fn create_notification_channel(
+        &self,
+        name: &str,
+        channel_type: &str,
+        target: &str,
+        secret_ref: Option<&str>,
+        config: serde_json::Value,
+    ) -> Result<Uuid> {
+        let target_lower = target.to_ascii_lowercase();
+        if !matches!(channel_type, "webhook" | "smtp" | "matrix")
+            || name.trim().is_empty()
+            || target.trim().is_empty()
+            || ["token=", "secret=", "password=", "api_key="]
+                .iter()
+                .any(|marker| target_lower.contains(marker))
+        {
+            anyhow::bail!("invalid notification channel");
+        }
+        let id = Uuid::new_v4();
+        sqlx::query("INSERT INTO notification_channels (id,name,channel_type,target,secret_ref,config) VALUES ($1,$2,$3,$4,$5,$6)")
+            .bind(id).bind(name.trim()).bind(channel_type).bind(target.trim()).bind(secret_ref.map(str::trim)).bind(config)
+            .execute(&self.pool).await?;
+        Ok(id)
+    }
+
+    pub async fn set_notification_channel_status(&self, id: Uuid, enabled: bool) -> Result<()> {
+        let result =
+            sqlx::query("UPDATE notification_channels SET enabled=$2,updated_at=NOW() WHERE id=$1")
+                .bind(id)
+                .bind(enabled)
+                .execute(&self.pool)
+                .await?;
+        if result.rows_affected() == 0 {
+            anyhow::bail!("notification channel not found");
+        }
+        Ok(())
+    }
+
+    pub async fn list_notification_rules(&self) -> Result<Vec<serde_json::Value>> {
+        let rows = sqlx::query("SELECT r.id,r.event_type,r.minimum_severity,r.channel_id,r.enabled,r.created_at,r.updated_at,c.name AS channel_name FROM notification_rules r JOIN notification_channels c ON c.id=r.channel_id ORDER BY r.created_at DESC")
+            .fetch_all(&self.pool).await?;
+        Ok(rows.into_iter().map(|row| serde_json::json!({
+            "id": row.get::<Uuid,_>("id"), "event_type": row.get::<String,_>("event_type"),
+            "minimum_severity": row.get::<String,_>("minimum_severity"), "channel_id": row.get::<Uuid,_>("channel_id"),
+            "channel_name": row.get::<String,_>("channel_name"), "enabled": row.get::<bool,_>("enabled"),
+            "created_at": row.get::<chrono::DateTime<chrono::Utc>,_>("created_at"), "updated_at": row.get::<chrono::DateTime<chrono::Utc>,_>("updated_at")
+        })).collect())
+    }
+
+    pub async fn create_notification_rule(
+        &self,
+        event_type: &str,
+        minimum_severity: &str,
+        channel_id: Uuid,
+    ) -> Result<Uuid> {
+        if event_type.trim().is_empty() || notification_severity_rank(minimum_severity) > 4 {
+            anyhow::bail!("invalid notification rule");
+        }
+        let id = Uuid::new_v4();
+        sqlx::query("INSERT INTO notification_rules (id,event_type,minimum_severity,channel_id) VALUES ($1,$2,$3,$4)")
+            .bind(id).bind(event_type.trim()).bind(minimum_severity).bind(channel_id).execute(&self.pool).await?;
+        Ok(id)
+    }
+
+    pub async fn set_notification_rule_status(&self, id: Uuid, enabled: bool) -> Result<()> {
+        let result =
+            sqlx::query("UPDATE notification_rules SET enabled=$2,updated_at=NOW() WHERE id=$1")
+                .bind(id)
+                .bind(enabled)
+                .execute(&self.pool)
+                .await?;
+        if result.rows_affected() == 0 {
+            anyhow::bail!("notification rule not found");
+        }
         Ok(())
     }
 
@@ -281,6 +731,18 @@ impl PostgresStore {
             .await?;
         if result.rows_affected() == 0 {
             anyhow::bail!("incident not found");
+        }
+        if matches!(status, "Resolved" | "Ignored") {
+            let _ = self
+                .enqueue_notification_event(
+                    None,
+                    "incident_closed",
+                    "info",
+                    &id.to_string(),
+                    serde_json::json!({"incident_id": id, "status": status}),
+                    &format!("incident_closed:{id}:{status}"),
+                )
+                .await;
         }
         Ok(())
     }
@@ -572,6 +1034,25 @@ impl PostgresStore {
                 .await?;
         let worker_up: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runtime_status WHERE component = 'worker' AND state = 'running' AND last_heartbeat_at > NOW() - INTERVAL '2 minutes'")
             .fetch_one(&self.pool).await?;
+        let events_created: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events")
+            .fetch_one(&self.pool)
+            .await?;
+        let events_processed: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM event_delivery WHERE status='processed'")
+                .fetch_one(&self.pool)
+                .await?;
+        let events_failed: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM event_delivery WHERE status IN ('failed','dead')",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        let event_queue: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM event_delivery WHERE status IN ('pending','processing')",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        let event_processing_seconds: f64 = sqlx::query_scalar("SELECT COALESCE(AVG(EXTRACT(EPOCH FROM (processed_at - processing_started_at))), 0) FROM event_delivery WHERE status='processed' AND processed_at IS NOT NULL AND processing_started_at IS NOT NULL")
+            .fetch_one(&self.pool).await?;
         let provider_rows = sqlx::query("SELECT p.id, COALESCE(s.state, 'never') AS state FROM providers p LEFT JOIN provider_status s ON s.provider_id = p.id ORDER BY p.id")
             .fetch_all(&self.pool).await?;
         let provider_status = provider_rows
@@ -591,7 +1072,7 @@ impl PostgresStore {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        Ok(format!("# TYPE clawforge_provider_sync_total counter\nclawforge_provider_sync_total {providers}\n# TYPE clawforge_provider_errors_total counter\nclawforge_provider_errors_total {errors}\n# TYPE clawforge_indicators_total gauge\nclawforge_indicators_total {indicators}\n# TYPE clawforge_risk_events_total counter\nclawforge_risk_events_total {risks}\n# TYPE clawforge_bgp_changes_total counter\nclawforge_bgp_changes_total {bgp}\n# TYPE clawforge_worker_up gauge\nclawforge_worker_up {worker_up}\n# TYPE clawforge_database_up gauge\nclawforge_database_up 1\n# TYPE clawforge_provider_sync_status gauge\n{provider_status}\n"))
+        Ok(format!("# TYPE clawforge_provider_sync_total counter\nclawforge_provider_sync_total {providers}\n# TYPE clawforge_provider_errors_total counter\nclawforge_provider_errors_total {errors}\n# TYPE clawforge_indicators_total gauge\nclawforge_indicators_total {indicators}\n# TYPE clawforge_risk_events_total counter\nclawforge_risk_events_total {risks}\n# TYPE clawforge_bgp_changes_total counter\nclawforge_bgp_changes_total {bgp}\n# TYPE clawforge_events_created_total counter\nclawforge_events_created_total {events_created}\n# TYPE clawforge_events_processed_total counter\nclawforge_events_processed_total {events_processed}\n# TYPE clawforge_events_failed_total counter\nclawforge_events_failed_total {events_failed}\n# TYPE clawforge_event_queue_size gauge\nclawforge_event_queue_size {event_queue}\n# TYPE clawforge_event_processing_duration_seconds gauge\nclawforge_event_processing_duration_seconds {event_processing_seconds}\n# TYPE clawforge_worker_up gauge\nclawforge_worker_up {worker_up}\n# TYPE clawforge_database_up gauge\nclawforge_database_up 1\n# TYPE clawforge_provider_sync_status gauge\n{provider_status}\n"))
     }
 
     pub async fn set_runtime_status(
@@ -607,6 +1088,17 @@ impl PostgresStore {
             .bind(last_error)
             .execute(&self.pool)
             .await?;
+        if state == "error" {
+            self.record_operational_event(
+                "system_health_error",
+                component,
+                "high",
+                last_error.unwrap_or("runtime component entered error state"),
+                component,
+                serde_json::json!({"component": component, "state": state}),
+            )
+            .await?;
+        }
         Ok(())
     }
 
@@ -1042,6 +1534,16 @@ fn normalize_incident_severity(value: &str) -> String {
         _ => "info",
     }
     .to_string()
+}
+
+fn notification_severity_rank(value: &str) -> i16 {
+    match value.to_ascii_lowercase().as_str() {
+        "critical" => 4,
+        "high" => 3,
+        "medium" | "warning" => 2,
+        "low" => 1,
+        _ => 0,
+    }
 }
 
 fn analysis_anonymize_ips() -> bool {

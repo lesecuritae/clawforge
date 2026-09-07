@@ -93,6 +93,81 @@ async fn migrations_and_restart_persist() -> anyhow::Result<()> {
             details: json!({"test": true}),
         })
         .await?;
+    restarted.ensure_event_consumer("integration").await?;
+    let backbone_event = restarted
+        .publish_event(
+            "provider.failed",
+            "integration",
+            "high",
+            now + Duration::seconds(3),
+            Some("test-provider"),
+            json!({"provider":"test-provider","token":"removed"}),
+            json!({"test":true}),
+            "integration-provider-failed-1",
+        )
+        .await?;
+    assert_eq!(
+        restarted
+            .publish_event(
+                "provider.failed",
+                "integration",
+                "high",
+                now + Duration::seconds(3),
+                Some("test-provider"),
+                json!({"provider":"test-provider"}),
+                json!({}),
+                "integration-provider-failed-1",
+            )
+            .await?,
+        backbone_event
+    );
+    let deliveries = restarted.claim_event_deliveries("integration", 10).await?;
+    assert_eq!(deliveries.len(), 1);
+    assert!(deliveries[0]["payload"].get("token").is_none());
+    let delivery_id: uuid::Uuid = deliveries[0]["delivery_id"].as_str().unwrap().parse()?;
+    restarted
+        .complete_event_delivery(delivery_id, true, None)
+        .await?;
+    let channel_id = restarted
+        .create_notification_channel(
+            "integration-webhook",
+            "webhook",
+            "http://127.0.0.1:9/mock",
+            Some("CLAWFORGE_TEST_WEBHOOK_SECRET"),
+            json!({}),
+        )
+        .await?;
+    let _rule_id = restarted
+        .create_notification_rule("provider_error", "high", channel_id)
+        .await?;
+    restarted
+        .record_intelligence_event(&IntelligenceEvent {
+            event_type: "provider_error".into(),
+            timestamp: now + Duration::seconds(2),
+            source: "test-provider".into(),
+            severity: "high".into(),
+            reason: "mock provider unavailable".into(),
+            resource: "test-provider".into(),
+            details: json!({"secret": "must-not-be-forwarded"}),
+        })
+        .await?;
+    let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM notification_events WHERE event_type='provider_error' AND status='pending'")
+        .fetch_one(restarted.pool()).await?;
+    assert_eq!(pending, 1);
+    let claimed = restarted.claim_notification_events(10).await?;
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0]["payload"]["source"], "test-provider");
+    assert!(claimed[0]["payload"].get("secret").is_none());
+    let event_id: uuid::Uuid = claimed[0]["id"].as_str().unwrap().parse()?;
+    restarted
+        .complete_notification_event(event_id, false, Some("mock failure"))
+        .await?;
+    let retry_count: i32 =
+        sqlx::query_scalar("SELECT retry_count FROM notification_events WHERE id=$1")
+            .bind(event_id)
+            .fetch_one(restarted.pool())
+            .await?;
+    assert_eq!(retry_count, 1);
     let event: (String, String, String) = sqlx::query_as(
         "SELECT event_type, source, reason FROM audit_events WHERE resource = $1 ORDER BY id DESC LIMIT 1",
     )
@@ -229,6 +304,12 @@ async fn migrations_and_restart_persist() -> anyhow::Result<()> {
         "admin_config",
         "provider_sync_requests",
         "incident_analysis",
+        "notification_channels",
+        "notification_rules",
+        "notification_events",
+        "events",
+        "event_consumers",
+        "event_delivery",
     ] {
         let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
             .bind(format!("public.{table}"))

@@ -19,6 +19,13 @@
 | `CLAWFORGE_ANALYZER_API_KEY_SECRET_FILE` | `./secrets/analyzer_api_key.example` | Optional provider API key Docker Secret |
 | `CLAWFORGE_ANALYZER_TIMEOUT_SECONDS` | `30` | Provider request timeout |
 | `CLAWFORGE_ANALYZER_ANONYMIZE_IPS` | `true` | Removes identifying IP values from analysis payloads by default |
+| `CLAWFORGE_ANALYZER_EVENT_CONSUMER` | `false` | Optional analyzer consumption of `incident.created` events |
+| `CLAWFORGE_ANALYZER_EVENT_POLL_SECONDS` | `10` | Optional analyzer event polling interval |
+| `CLAWFORGE_NOTIFIER_SECRET_FILE` | `./secrets/notifier_token.example` | Internal API token shared by the notifier and API; the value is mounted as a Docker Secret |
+| `CLAWFORGE_NOTIFIER_POLL_SECONDS` | `5` | Notification queue polling interval |
+| `CLAWFORGE_NOTIFIER_TIMEOUT_SECONDS` | `15` | Webhook and notification request timeout |
+| `CLAWFORGE_EVENTS_SECRET_FILE` | `./secrets/events_token.example` | Internal event-backbone service token |
+| `CLAWFORGE_EVENTS_POLL_SECONDS` | `5` | Event-backbone polling interval |
 | `CLAWFORGE_RIPESTAT_RESOURCE` | `AS3333` | ASN resource for RIPEstat |
 | `CLAWFORGE_BGPVIEW_RESOURCE` | `3333` | ASN resource for BGPView |
 | `CLAWFORGE_PEERINGDB_RESOURCE` | `3333` | ASN resource for PeeringDB |

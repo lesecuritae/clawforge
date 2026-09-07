@@ -40,6 +40,8 @@ struct RuntimeConfig {
     database_configured: bool,
     analyzer_url: Option<String>,
     analyzer_token: Option<String>,
+    notifier_token: Option<String>,
+    events_token: Option<String>,
 }
 
 #[derive(Clone)]
@@ -719,6 +721,32 @@ fn configured_analyzer_token() -> Option<String> {
         }
     }
     env::var("CLAWFORGE_ANALYZER_TOKEN")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn configured_notifier_token() -> Option<String> {
+    if let Ok(path) = env::var("CLAWFORGE_NOTIFIER_TOKEN_FILE") {
+        if let Ok(value) = fs::read_to_string(path) {
+            if !value.trim().is_empty() {
+                return Some(value.trim().to_string());
+            }
+        }
+    }
+    env::var("CLAWFORGE_NOTIFIER_TOKEN")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn configured_events_token() -> Option<String> {
+    if let Ok(path) = env::var("CLAWFORGE_EVENTS_TOKEN_FILE") {
+        if let Ok(value) = fs::read_to_string(path) {
+            if !value.trim().is_empty() {
+                return Some(value.trim().to_string());
+            }
+        }
+    }
+    env::var("CLAWFORGE_EVENTS_TOKEN")
         .ok()
         .filter(|value| !value.trim().is_empty())
 }
@@ -1948,6 +1976,19 @@ async fn update_incident_status(
                 api_error(StatusCode::BAD_REQUEST, "invalid incident status")
             }
         })?;
+    if matches!(request.status.as_str(), "Resolved" | "Ignored") {
+        let _ = state
+            .store
+            .enqueue_notification_event(
+                None,
+                "incident_closed",
+                "info",
+                &id.to_string(),
+                serde_json::json!({"incident_id": id, "status": request.status}),
+                &format!("incident_closed:{id}:{}", request.status),
+            )
+            .await;
+    }
     audit(
         &state,
         &principal,
@@ -1958,6 +1999,427 @@ async fn update_incident_status(
     .await;
     Ok(envelope(
         serde_json::json!({"id":id,"status":request.status}),
+        None,
+    ))
+}
+
+#[derive(Deserialize)]
+struct NotificationChannelRequest {
+    name: String,
+    channel_type: String,
+    target: String,
+    secret_ref: Option<String>,
+    config: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct NotificationRuleRequest {
+    event_type: String,
+    minimum_severity: String,
+    channel_id: Uuid,
+}
+
+#[derive(Deserialize)]
+struct NotificationStatusRequest {
+    enabled: bool,
+}
+
+async fn admin_notification_channels(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<ApiEnvelope<Vec<serde_json::Value>>>> {
+    let principal = authenticate(&state, &headers).await?;
+    require_role(&principal, &["Administrator", "Operator", "Viewer"])?;
+    state
+        .store
+        .list_notification_channels()
+        .await
+        .map(|data| envelope(data, None))
+        .map_err(|_| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "notification channels unavailable",
+            )
+        })
+}
+
+async fn admin_create_notification_channel(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<NotificationChannelRequest>,
+) -> ApiResult<Json<ApiEnvelope<serde_json::Value>>> {
+    let principal = authenticate(&state, &headers).await?;
+    require_role(&principal, &["Administrator"])?;
+    let id = state
+        .store
+        .create_notification_channel(
+            &request.name,
+            &request.channel_type,
+            &request.target,
+            request.secret_ref.as_deref(),
+            request.config.unwrap_or_else(|| serde_json::json!({})),
+        )
+        .await
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "invalid notification channel"))?;
+    audit(&state, &principal, "notification_channel_created", &id.to_string(), serde_json::json!({"name":request.name,"channel_type":request.channel_type,"target":request.target,"secret_ref":request.secret_ref})).await;
+    Ok(envelope(
+        serde_json::json!({"id":id,"status":"enabled"}),
+        None,
+    ))
+}
+
+async fn admin_notification_channel_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(request): Json<NotificationStatusRequest>,
+) -> ApiResult<Json<ApiEnvelope<serde_json::Value>>> {
+    let principal = authenticate(&state, &headers).await?;
+    require_role(&principal, &["Administrator"])?;
+    state
+        .store
+        .set_notification_channel_status(id, request.enabled)
+        .await
+        .map_err(|_| api_error(StatusCode::NOT_FOUND, "notification channel not found"))?;
+    audit(
+        &state,
+        &principal,
+        "notification_channel_status_changed",
+        &id.to_string(),
+        serde_json::json!({"enabled":request.enabled}),
+    )
+    .await;
+    Ok(envelope(
+        serde_json::json!({"id":id,"enabled":request.enabled}),
+        None,
+    ))
+}
+
+async fn admin_notification_rules(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<ApiEnvelope<Vec<serde_json::Value>>>> {
+    let principal = authenticate(&state, &headers).await?;
+    require_role(&principal, &["Administrator", "Operator", "Viewer"])?;
+    state
+        .store
+        .list_notification_rules()
+        .await
+        .map(|data| envelope(data, None))
+        .map_err(|_| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "notification rules unavailable",
+            )
+        })
+}
+
+async fn admin_create_notification_rule(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<NotificationRuleRequest>,
+) -> ApiResult<Json<ApiEnvelope<serde_json::Value>>> {
+    let principal = authenticate(&state, &headers).await?;
+    require_role(&principal, &["Administrator"])?;
+    let id = state
+        .store
+        .create_notification_rule(
+            &request.event_type,
+            &request.minimum_severity,
+            request.channel_id,
+        )
+        .await
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "invalid notification rule"))?;
+    audit(&state, &principal, "notification_rule_created", &id.to_string(), serde_json::json!({"event_type":request.event_type,"minimum_severity":request.minimum_severity,"channel_id":request.channel_id})).await;
+    Ok(envelope(
+        serde_json::json!({"id":id,"status":"enabled"}),
+        None,
+    ))
+}
+
+async fn admin_notification_rule_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(request): Json<NotificationStatusRequest>,
+) -> ApiResult<Json<ApiEnvelope<serde_json::Value>>> {
+    let principal = authenticate(&state, &headers).await?;
+    require_role(&principal, &["Administrator"])?;
+    state
+        .store
+        .set_notification_rule_status(id, request.enabled)
+        .await
+        .map_err(|_| api_error(StatusCode::NOT_FOUND, "notification rule not found"))?;
+    audit(
+        &state,
+        &principal,
+        "notification_rule_status_changed",
+        &id.to_string(),
+        serde_json::json!({"enabled":request.enabled}),
+    )
+    .await;
+    Ok(envelope(
+        serde_json::json!({"id":id,"enabled":request.enabled}),
+        None,
+    ))
+}
+
+#[derive(Deserialize)]
+struct EventQuery {
+    event_type: Option<String>,
+    limit: Option<i64>,
+}
+
+async fn events_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<EventQuery>,
+) -> ApiResult<Json<ApiEnvelope<Vec<serde_json::Value>>>> {
+    let principal = authenticate(&state, &headers).await?;
+    require_role(&principal, &["Administrator", "Operator"])?;
+    state
+        .store
+        .list_events(query.event_type.as_deref(), query.limit.unwrap_or(100))
+        .await
+        .map(|data| envelope(data, None))
+        .map_err(|_| api_error(StatusCode::SERVICE_UNAVAILABLE, "event list unavailable"))
+}
+
+async fn event_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<ApiEnvelope<serde_json::Value>>> {
+    let principal = authenticate(&state, &headers).await?;
+    require_role(&principal, &["Administrator", "Operator"])?;
+    let event = state
+        .store
+        .get_event(id)
+        .await
+        .map_err(|_| api_error(StatusCode::SERVICE_UNAVAILABLE, "event unavailable"))?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "event not found"))?;
+    Ok(envelope(event, None))
+}
+
+async fn events_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<ApiEnvelope<serde_json::Value>>> {
+    let principal = authenticate(&state, &headers).await?;
+    require_role(&principal, &["Administrator", "Operator"])?;
+    state
+        .store
+        .event_status()
+        .await
+        .map(|data| envelope(data, None))
+        .map_err(|_| api_error(StatusCode::SERVICE_UNAVAILABLE, "event status unavailable"))
+}
+
+fn notifier_authorized(state: &AppState, headers: &HeaderMap) -> bool {
+    let Some(expected) = state.config.notifier_token.as_deref() else {
+        return false;
+    };
+    bearer(headers).is_some_and(|provided| digest(provided) == digest(expected))
+}
+
+fn events_authorized(state: &AppState, headers: &HeaderMap) -> bool {
+    let provided = bearer(headers);
+    state
+        .config
+        .events_token
+        .as_deref()
+        .is_some_and(|expected| provided.is_some_and(|value| digest(value) == digest(expected)))
+        || notifier_authorized(state, headers)
+        || state
+            .config
+            .analyzer_token
+            .as_deref()
+            .is_some_and(|expected| provided.is_some_and(|value| digest(value) == digest(expected)))
+}
+
+async fn internal_notifier_events(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> ApiResult<Json<ApiEnvelope<Vec<serde_json::Value>>>> {
+    if !notifier_authorized(&state, &headers) {
+        return Err(api_error(
+            StatusCode::UNAUTHORIZED,
+            "invalid notifier token",
+        ));
+    }
+    let limit = query
+        .get("limit")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(25);
+    state
+        .store
+        .claim_notification_events(limit)
+        .await
+        .map(|data| envelope(data, None))
+        .map_err(|_| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "notification queue unavailable",
+            )
+        })
+}
+
+#[derive(Deserialize)]
+struct NotificationResultRequest {
+    success: bool,
+    error: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct InternalOperationalEventRequest {
+    event_type: String,
+    source: String,
+    severity: String,
+    reason: String,
+    resource: String,
+    details: Option<serde_json::Value>,
+}
+
+async fn internal_operational_event(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<InternalOperationalEventRequest>,
+) -> ApiResult<Json<ApiEnvelope<serde_json::Value>>> {
+    if !events_authorized(&state, &headers) {
+        return Err(api_error(
+            StatusCode::UNAUTHORIZED,
+            "invalid notifier token",
+        ));
+    }
+    if !matches!(
+        request.event_type.as_str(),
+        "backup_error" | "system_health_error"
+    ) {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "unsupported operational event",
+        ));
+    }
+    let id = state
+        .store
+        .record_operational_event(
+            &request.event_type,
+            &request.source,
+            &request.severity,
+            &request.reason,
+            &request.resource,
+            request.details.unwrap_or_else(|| serde_json::json!({})),
+        )
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "operational event unavailable",
+            )
+        })?;
+    Ok(envelope(serde_json::json!({"event_id": id}), None))
+}
+
+async fn internal_events_consume(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> ApiResult<Json<ApiEnvelope<Vec<serde_json::Value>>>> {
+    if !events_authorized(&state, &headers) {
+        return Err(api_error(
+            StatusCode::UNAUTHORIZED,
+            "invalid event service token",
+        ));
+    }
+    let consumer = query
+        .get("consumer")
+        .map(String::as_str)
+        .unwrap_or("events");
+    state
+        .store
+        .claim_event_deliveries(
+            consumer,
+            query
+                .get("limit")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(25),
+        )
+        .await
+        .map(|data| envelope(data, None))
+        .map_err(|_| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "event delivery unavailable",
+            )
+        })
+}
+
+async fn internal_event_result(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(request): Json<NotificationResultRequest>,
+) -> ApiResult<Json<ApiEnvelope<serde_json::Value>>> {
+    if !events_authorized(&state, &headers) {
+        return Err(api_error(
+            StatusCode::UNAUTHORIZED,
+            "invalid event service token",
+        ));
+    }
+    state
+        .store
+        .complete_event_delivery(id, request.success, request.error.as_deref())
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "event delivery result unavailable",
+            )
+        })?;
+    Ok(envelope(
+        serde_json::json!({"delivery_id":id,"success":request.success}),
+        None,
+    ))
+}
+
+async fn internal_notifier_result(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(request): Json<NotificationResultRequest>,
+) -> ApiResult<Json<ApiEnvelope<serde_json::Value>>> {
+    if !notifier_authorized(&state, &headers) {
+        return Err(api_error(
+            StatusCode::UNAUTHORIZED,
+            "invalid notifier token",
+        ));
+    }
+    state
+        .store
+        .complete_notification_event(id, request.success, request.error.as_deref())
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "notification result unavailable",
+            )
+        })?;
+    let _ = state
+        .store
+        .record_audit_event(
+            "notifier",
+            if request.success {
+                "notification_sent"
+            } else {
+                "notification_failed"
+            },
+            &id.to_string(),
+            serde_json::json!({"error":request.error}),
+        )
+        .await;
+    Ok(envelope(
+        serde_json::json!({"id":id,"success":request.success}),
         None,
     ))
 }
@@ -1986,6 +2448,11 @@ async fn main() -> anyhow::Result<()> {
         .parse()
         .map_err(|error| anyhow::anyhow!("invalid CLAWFORGE_API_BIND: {error}"))?;
     let store = PostgresStore::connect(&database_url).await?;
+    // Register internal consumers before accepting events. Consumers remain
+    // independent; disabled services can simply leave their delivery rows
+    // pending until they are started.
+    store.ensure_event_consumer("notifier").await?;
+    store.ensure_event_consumer("events").await?;
     let runtime_store = store.clone();
     let listener = tokio::net::TcpListener::bind(address).await?;
     runtime_store
@@ -2000,6 +2467,8 @@ async fn main() -> anyhow::Result<()> {
                 .ok()
                 .filter(|value| !value.trim().is_empty()),
             analyzer_token: configured_analyzer_token(),
+            notifier_token: configured_notifier_token(),
+            events_token: configured_events_token(),
         },
         rate_limiter: RateLimiter::default(),
     };
@@ -2007,6 +2476,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/health", get(health))
         .route("/ready", get(ready))
         .route("/version", get(version))
+        .route("/events", get(events_list))
+        .route("/events/{id}", get(event_get))
+        .route("/events/status", get(events_status))
         .route("/intelligence/providers", get(intelligence_providers))
         .route("/intelligence/status", get(intelligence_status))
         .route("/intelligence/indicators", get(intelligence_indicators))
@@ -2024,6 +2496,22 @@ async fn main() -> anyhow::Result<()> {
         .route("/admin/providers", get(admin_providers))
         .route("/admin/providers/{id}", post(admin_update_provider))
         .route("/admin/providers/{id}/sync", post(admin_sync_provider))
+        .route(
+            "/admin/notifications/channels",
+            get(admin_notification_channels).post(admin_create_notification_channel),
+        )
+        .route(
+            "/admin/notifications/channels/{id}/status",
+            post(admin_notification_channel_status),
+        )
+        .route(
+            "/admin/notifications/rules",
+            get(admin_notification_rules).post(admin_create_notification_rule),
+        )
+        .route(
+            "/admin/notifications/rules/{id}/status",
+            post(admin_notification_rule_status),
+        )
         .route(
             "/admin/trust-networks",
             get(admin_trust_networks).post(admin_create_trust_network),
@@ -2045,6 +2533,17 @@ async fn main() -> anyhow::Result<()> {
         )
         .route("/incidents/{id}/status", post(update_incident_status))
         .route("/internal/analyzer/analyses", post(store_internal_analysis))
+        .route("/internal/notifier/events", get(internal_notifier_events))
+        .route(
+            "/internal/notifier/events/{id}/result",
+            post(internal_notifier_result),
+        )
+        .route("/internal/events/consume", get(internal_events_consume))
+        .route("/internal/events/{id}/result", post(internal_event_result))
+        .route(
+            "/internal/notifier/operational-events",
+            post(internal_operational_event),
+        )
         .route("/incidents/export", get(export_incidents))
         .route("/intelligence/indicators/export", get(export_indicators))
         .route("/audit/events/export", get(export_audit_events))

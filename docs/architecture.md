@@ -17,3 +17,11 @@ provider -> normalizer -> indicator/network store -> risk + trust -> policy -> r
 Network providers use the same boundary for ASN, BGP, and RPKI data. Their normalized records are persisted in PostgreSQL and converted into evaluated evidence before policy handling. Network providers never perform blocking actions themselves.
 
 Raw feeds do not reach an LLM or a blocking action. The optional `clawforge-analyzer` service receives only the API's sanitized incident context through an internal API and stores structured explanations. It cannot change risk, trust, policy, providers, or permissions.
+
+## Event backbone
+
+Canonical events are persisted in `events` and fanned out through
+`event_consumers` and `event_delivery`. The event service and notifier use
+internal service tokens, retry failed deliveries with backoff, and move
+repeated failures to a dead-letter state. Event payloads are filtered before
+storage; consumers cannot change risk, trust, policy, or provider state.

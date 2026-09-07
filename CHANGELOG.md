@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+- Added PostgreSQL-backed notification channels, rules, retries, and internal delivery worker.
+- Added the canonical event backbone with consumer delivery, deduplication, retry/dead-letter handling, internal service authentication, and event metrics.
+- Added optional event consumption for the notifier and analyzer services.
+
 ## [0.1.0] - 2026-09-07
 
 - Rust API and worker runtime with PostgreSQL/sqlx migrations.
