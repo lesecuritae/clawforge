@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+chrono.workspace = true
 clawforge-intelligence = { path = "../intelligence" }
 ipnet.workspace = true
 serde.workspace = true

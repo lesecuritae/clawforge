@@ -3,4 +3,7 @@
 *.log
 /secrets/*
 !/secrets/*.example
+/backups/
 .DS_Store
+/frontend/node_modules/
+/frontend/dist/

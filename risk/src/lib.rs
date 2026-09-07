@@ -3,7 +3,10 @@
 use std::collections::HashSet;
 use std::net::IpAddr;
 
-use clawforge_intelligence::{BgpStatus, Indicator, NetworkObservation, RpkiStatus, TrustedNetwork};
+use clawforge_intelligence::{
+    AsnRecord, BgpEvent, BgpStatus, Indicator, NetworkObservation, RpkiRecord, RpkiStatus,
+    TrustedNetwork,
+};
 use ipnet::IpNet;
 use serde::Serialize;
 
@@ -13,8 +16,47 @@ pub struct RiskSignals {
     pub asn_reputation: u8,
     pub behavior: u8,
     pub history: u8,
+    pub hosting_context: bool,
+    pub bgp_hijack: bool,
     pub sources: HashSet<String>,
     pub reasons: Vec<String>,
+}
+
+impl RiskSignals {
+    pub fn from_asn(record: &AsnRecord) -> Self {
+        let network_type = record.network_type.to_ascii_lowercase();
+        Self {
+            asn_reputation: record.reputation,
+            hosting_context: network_type.contains("hosting")
+                || network_type.contains("cloud")
+                || network_type.contains("bulletproof"),
+            reasons: vec![format!("ASN context from {}", record.provider)],
+            ..Self::default()
+        }
+    }
+
+    pub fn from_bgp(event: &BgpEvent) -> Self {
+        Self {
+            bgp_hijack: matches!(event.status, BgpStatus::Anomalous),
+            reasons: event
+                .change
+                .as_ref()
+                .map(|change| vec![change.clone()])
+                .unwrap_or_default(),
+            ..Self::default()
+        }
+    }
+
+    pub fn from_rpki(record: &RpkiRecord) -> Self {
+        Self {
+            reasons: vec![format!(
+                "RPKI {} from {}",
+                format!("{:?}", record.status).to_ascii_uppercase(),
+                record.source
+            )],
+            ..Self::default()
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -36,15 +78,17 @@ impl TrustEngine {
         self.registrations.push(network);
     }
 
-    pub fn verified_match(&self, observation: &NetworkObservation) -> Option<(&TrustedNetwork, bool)> {
+    pub fn verified_match(
+        &self,
+        observation: &NetworkObservation,
+    ) -> Option<(&TrustedNetwork, bool)> {
         self.registrations
             .iter()
             .filter(|network| network.is_verified())
             .find_map(|network| {
-                let identifier_match = observation
-                    .identifier
-                    .as_ref()
-                    .is_some_and(|value| !network.identifier.is_empty() && value == &network.identifier);
+                let identifier_match = observation.identifier.as_ref().is_some_and(|value| {
+                    !network.identifier.is_empty() && value == &network.identifier
+                });
                 let node_match = observation
                     .node_identity
                     .as_ref()
@@ -52,7 +96,9 @@ impl TrustEngine {
                 let network_match = observation.ip.as_ref().is_some_and(|ip| {
                     ip.parse::<IpAddr>().ok().is_some_and(|address| {
                         network.networks.iter().any(|cidr| {
-                            cidr.parse::<IpNet>().ok().is_some_and(|range| range.contains(&address))
+                            cidr.parse::<IpNet>()
+                                .ok()
+                                .is_some_and(|range| range.contains(&address))
                         })
                     })
                 });
@@ -93,15 +139,27 @@ impl RiskEngine {
             + u16::from(signals.asn_reputation.min(30))
             + u16::from(signals.behavior.min(50))
             + u16::from(signals.history.min(20))
+            + if signals.hosting_context { 5 } else { 0 }
+            + if signals.bgp_hijack { 30 } else { 0 }
             + match observation.bgp_status {
                 BgpStatus::Changed => 10,
                 BgpStatus::Anomalous => 20,
                 _ => 0,
             }
-            + if matches!(observation.rpki_status, RpkiStatus::Invalid) { 20 } else { 0 })
-            .min(100);
+            + if matches!(observation.rpki_status, RpkiStatus::Invalid) {
+                20
+            } else {
+                0
+            })
+        .min(100);
         if matches!(observation.rpki_status, RpkiStatus::Invalid) {
             reasons.push("RPKI invalid".to_string());
+        }
+        if signals.hosting_context {
+            reasons.push("known hosting or cloud ASN context".to_string());
+        }
+        if signals.bgp_hijack {
+            reasons.push("BGP hijack or route anomaly signal".to_string());
         }
         let mut trust_adjustment: i16 = 0;
         if let Some((_network, node_match)) = self.trust.verified_match(observation) {
@@ -139,10 +197,51 @@ mod tests {
     #[test]
     fn scores_are_bounded_and_rpki_invalid_adds_risk() {
         let engine = RiskEngine::default();
-        let mut observation = NetworkObservation::default();
-        observation.rpki_status = RpkiStatus::Invalid;
+        let observation = NetworkObservation {
+            rpki_status: RpkiStatus::Invalid,
+            ..NetworkObservation::default()
+        };
         let assessment = engine.evaluate(&observation, &[], &RiskSignals::default());
         assert_eq!(assessment.risk_score, 20);
-        assert!(assessment.reasons.iter().any(|reason| reason == "RPKI invalid"));
+        assert!(assessment
+            .reasons
+            .iter()
+            .any(|reason| reason == "RPKI invalid"));
+    }
+
+    #[test]
+    fn network_signals_are_scored_and_explained() {
+        let engine = RiskEngine::default();
+        let event = BgpEvent {
+            prefix: "198.51.100.0/24".into(),
+            origin_asn: "AS64500".into(),
+            previous_asn: Some("AS64501".into()),
+            new_asn: Some("AS64500".into()),
+            timestamp: chrono::Utc::now(),
+            source: "ripe_ris".into(),
+            status: BgpStatus::Anomalous,
+            rpki_status: RpkiStatus::Invalid,
+            first_seen: chrono::Utc::now(),
+            last_seen: chrono::Utc::now(),
+            change: Some("origin changed".into()),
+        };
+        let assessment = engine.evaluate(
+            &NetworkObservation {
+                bgp_status: event.status.clone(),
+                rpki_status: event.rpki_status.clone(),
+                ..NetworkObservation::default()
+            },
+            &[],
+            &RiskSignals {
+                bgp_hijack: true,
+                hosting_context: true,
+                ..RiskSignals::from_bgp(&event)
+            },
+        );
+        assert!(assessment.risk_score >= 70);
+        assert!(assessment
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("BGP hijack")));
     }
 }

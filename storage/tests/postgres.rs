@@ -1,13 +1,16 @@
-use clawforge_storage::PostgresStore;
-use clawforge_intelligence::{Indicator, IndicatorType, Provider};
 use chrono::{Duration, Utc};
+use clawforge_intelligence::{
+    AsnRecord, BgpEvent, BgpStatus, Indicator, IndicatorType, IntelligenceEvent, Provider,
+    RpkiRecord, RpkiStatus,
+};
+use clawforge_storage::PostgresStore;
 use serde_json::json;
 
 #[tokio::test]
 #[ignore = "requires an isolated PostgreSQL test container"]
 async fn migrations_and_restart_persist() -> anyhow::Result<()> {
-    let url = std::env::var("CLAWFORGE_TEST_DATABASE_URL")
-        .or_else(|_| std::env::var("DATABASE_URL"))?;
+    let url =
+        std::env::var("CLAWFORGE_TEST_DATABASE_URL").or_else(|_| std::env::var("DATABASE_URL"))?;
     let store = PostgresStore::connect(&url).await?;
     store.healthcheck().await?;
     assert!(store.migration_version().await?.is_some());
@@ -27,21 +30,214 @@ async fn migrations_and_restart_persist() -> anyhow::Result<()> {
         metadata: json!({"test": true}),
     };
     let id = restarted.upsert_indicator(&indicator).await?;
-    let updated = Indicator { confidence: 90, ..indicator.clone() };
+    let updated = Indicator {
+        confidence: 90,
+        ..indicator.clone()
+    };
     assert_eq!(restarted.upsert_indicator(&updated).await?, id);
-    restarted.record_risk_event(id, &updated, 20, 20, 0, "test indicator").await?;
-    let provider = Provider { id: "test-provider".into(), name: "Test Provider".into(), source: "test".into(), interval_seconds: 900, confidence: 80, enabled: true };
+    restarted
+        .record_risk_event(id, &updated, 20, 20, 0, "test indicator")
+        .await?;
+    let provider = Provider {
+        id: "test-provider".into(),
+        name: "Test Provider".into(),
+        source: "test".into(),
+        interval_seconds: 900,
+        confidence: 80,
+        enabled: true,
+    };
     restarted.upsert_provider(&provider).await?;
+    restarted
+        .update_provider_admin(&provider.id, Some(false), Some(1200))
+        .await?;
+    restarted.upsert_provider(&provider).await?;
+    let provider_settings: (bool, i64) =
+        sqlx::query_as("SELECT enabled, interval_seconds FROM providers WHERE id=$1")
+            .bind(&provider.id)
+            .fetch_one(restarted.pool())
+            .await?;
+    assert_eq!(provider_settings, (false, 1200));
     let next_run = now + Duration::minutes(15);
-    restarted.provider_succeeded(&provider.id, next_run, 1, 42).await?;
-    let metrics: (i32, i64) = sqlx::query_as("SELECT indicator_count, sync_duration_ms FROM provider_status WHERE provider_id = $1")
+    restarted
+        .provider_succeeded(&provider.id, next_run, 1, 42, Some(now))
+        .await?;
+    let metrics: (i32, i64, Option<chrono::DateTime<Utc>>) = sqlx::query_as("SELECT indicator_count, sync_duration_ms, last_data_at FROM provider_status WHERE provider_id = $1")
         .bind(&provider.id).fetch_one(restarted.pool()).await?;
-    assert_eq!(metrics, (1, 42));
-    let expired = Indicator { value: "198.51.100.11".into(), expires_at: now - Duration::minutes(1), ..updated.clone() };
+    assert_eq!((metrics.0, metrics.1), (1, 42));
+    assert_eq!(
+        metrics.2.map(|value| value.timestamp_micros()),
+        Some(now.timestamp_micros())
+    );
+    let expired = Indicator {
+        value: "198.51.100.11".into(),
+        expires_at: now - Duration::minutes(1),
+        ..updated.clone()
+    };
     restarted.upsert_indicator(&expired).await?;
     assert_eq!(restarted.expire_indicators(now).await?, 1);
-    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM risk_history WHERE indicator_id = $1")
-        .bind(id).fetch_one(restarted.pool()).await?;
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM risk_history WHERE indicator_id = $1")
+            .bind(id)
+            .fetch_one(restarted.pool())
+            .await?;
     assert_eq!(count, 1);
+
+    restarted
+        .record_intelligence_event(&IntelligenceEvent {
+            event_type: "new_threat_indicator".into(),
+            timestamp: now,
+            source: "test".into(),
+            severity: "warning".into(),
+            reason: "fixture event".into(),
+            resource: updated.value.clone(),
+            details: json!({"test": true}),
+        })
+        .await?;
+    let event: (String, String, String) = sqlx::query_as(
+        "SELECT event_type, source, reason FROM audit_events WHERE resource = $1 ORDER BY id DESC LIMIT 1",
+    )
+    .bind(&updated.value)
+    .fetch_one(restarted.pool())
+    .await?;
+    assert_eq!(
+        event,
+        (
+            "new_threat_indicator".into(),
+            "test".into(),
+            "fixture event".into()
+        )
+    );
+    let incident_row: (uuid::Uuid, i16) = sqlx::query_as(
+        "SELECT id, risk_score FROM incidents WHERE correlation_key=$1 AND status='Open' LIMIT 1",
+    )
+    .bind(&updated.value)
+    .fetch_one(restarted.pool())
+    .await?;
+    assert!(incident_row.1 > 0);
+    let incident_events: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM incident_events WHERE incident_id=$1")
+            .bind(incident_row.0)
+            .fetch_one(restarted.pool())
+            .await?;
+    assert_eq!(incident_events, 1);
+    restarted
+        .update_incident_status(incident_row.0, "Investigating")
+        .await?;
+    let incident_status: String = sqlx::query_scalar("SELECT status FROM incidents WHERE id=$1")
+        .bind(incident_row.0)
+        .fetch_one(restarted.pool())
+        .await?;
+    assert_eq!(incident_status, "Investigating");
+    restarted
+        .record_intelligence_event(&IntelligenceEvent {
+            event_type: "bgp_change".into(),
+            timestamp: now + Duration::seconds(1),
+            source: "ripe_ris".into(),
+            severity: "high".into(),
+            reason: "origin changed".into(),
+            resource: updated.value.clone(),
+            details: json!({"risk_score": 25}),
+        })
+        .await?;
+    let correlated_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM incidents WHERE correlation_key=$1")
+            .bind(&updated.value)
+            .fetch_one(restarted.pool())
+            .await?;
+    assert_eq!(correlated_count, 1);
+    let correlated_events: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM incident_events WHERE incident_id=$1")
+            .bind(incident_row.0)
+            .fetch_one(restarted.pool())
+            .await?;
+    assert_eq!(correlated_events, 2);
+
+    let asn = AsnRecord {
+        asn: "AS64500".into(),
+        name: "Example Hosting".into(),
+        organisation: "Example Org".into(),
+        provider: "ripestat_asn".into(),
+        country: "DE".into(),
+        registry: "RIPE".into(),
+        prefixes: vec!["198.51.100.0/24".into()],
+        network_type: "hosting".into(),
+        reputation: 10,
+        first_seen: now,
+        last_seen: now,
+    };
+    restarted.upsert_asn_record(&asn).await?;
+    let event = BgpEvent {
+        prefix: "198.51.100.0/24".into(),
+        origin_asn: "AS64500".into(),
+        previous_asn: Some("AS64501".into()),
+        new_asn: Some("AS64500".into()),
+        timestamp: now,
+        source: "ripe_ris".into(),
+        status: BgpStatus::Changed,
+        rpki_status: RpkiStatus::Invalid,
+        first_seen: now,
+        last_seen: now,
+        change: Some("origin changed".into()),
+    };
+    restarted.upsert_bgp_event(&event).await?;
+    restarted.upsert_bgp_event(&event).await?;
+    let bgp_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM bgp_events WHERE prefix = '198.51.100.0/24'")
+            .fetch_one(restarted.pool())
+            .await?;
+    assert_eq!(bgp_count, 1);
+    let rpki = RpkiRecord {
+        prefix: event.prefix.clone(),
+        asn: event.origin_asn.clone(),
+        status: RpkiStatus::Invalid,
+        timestamp: now,
+        source: "rpki_validator".into(),
+    };
+    restarted.upsert_rpki_record(&rpki).await?;
+    let rpki_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM rpki_records WHERE prefix = '198.51.100.0/24'")
+            .fetch_one(restarted.pool())
+            .await?;
+    assert_eq!(rpki_count, 1);
+
+    for table in [
+        "admin_users",
+        "api_tokens",
+        "admin_sessions",
+        "admin_config",
+        "provider_sync_requests",
+    ] {
+        let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+            .bind(format!("public.{table}"))
+            .fetch_one(restarted.pool())
+            .await?;
+        assert!(exists, "missing administration table {table}");
+    }
+    let admin_id = restarted
+        .create_admin_user("storage-admin", "Administrator", "argon2-hash")
+        .await?;
+    let raw_token = "token-is-never-stored";
+    let token_hash = "hashed-token-value";
+    let token_id = restarted
+        .create_api_token(admin_id, token_hash, "hashed-to", "integration", None)
+        .await?;
+    let stored_hash: String = sqlx::query_scalar("SELECT token_hash FROM api_tokens WHERE id=$1")
+        .bind(token_id)
+        .fetch_one(restarted.pool())
+        .await?;
+    assert_eq!(stored_hash, token_hash);
+    assert_ne!(stored_hash, raw_token);
+    restarted
+        .set_config("risk_thresholds", json!({"challenge": 40}), admin_id)
+        .await?;
+    let request_id = restarted
+        .queue_provider_sync(&provider.id, admin_id)
+        .await?;
+    let request_status: String =
+        sqlx::query_scalar("SELECT status FROM provider_sync_requests WHERE id=$1")
+            .bind(request_id)
+            .fetch_one(restarted.pool())
+            .await?;
+    assert_eq!(request_status, "pending");
     Ok(())
 }

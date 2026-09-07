@@ -17,7 +17,7 @@ Clawforge ist eine eigenständige Rust-Plattform für Security Intelligence. Sie
 - Risk Engine mit erklärbaren Bewertungen und Multi-Signal-Schutz
 - PostgreSQL mit sqlx-Migrationen, Providerstatus und Risk-History
 - Trusted Infrastructure als explizit registriertes Vertrauenssignal
-- API-Endpunkte `/health` und `/ready` sowie Graceful Shutdown
+- API-Endpunkte für Health/Readiness, Intelligence, Netzwerk, Trust und Prometheus-Metriken sowie Graceful Shutdown
 
 ## Schnellstart
 
@@ -26,9 +26,10 @@ cp .env.example .env
 docker compose up -d --build
 curl http://127.0.0.1:8080/health
 curl http://127.0.0.1:8080/ready
+curl http://127.0.0.1:8080/version
 ```
 
-Feed-Synchronisation bleibt standardmäßig deaktiviert. Für Provider mit Authentifizierung werden `THREATFOX_AUTH_KEY`, `URLHAUS_AUTH_KEY` und `MALWAREBAZAAR_AUTH_KEY` benötigt. Details stehen in [docs/configuration.md](docs/configuration.md), [docs/providers.md](docs/providers.md) und [docs/deployment.md](docs/deployment.md).
+Feed-Synchronisation bleibt standardmäßig deaktiviert. Für Provider mit Authentifizierung werden private Docker-Secret-Dateien benötigt. Details stehen in [docs/configuration.md](docs/configuration.md), [docs/providers.md](docs/providers.md) und [docs/deployment.md](docs/deployment.md).
 
 ## Struktur
 

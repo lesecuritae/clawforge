@@ -8,9 +8,26 @@
 | `CLAWFORGE_API_PORT` | `8080` | Host port in Compose |
 | `CLAWFORGE_WORKER_POLL_SECONDS` | `60` | Scheduler tick interval, with a five-second minimum |
 | `CLAWFORGE_ENABLE_FEEDS` | `false` | Enables the prepared phase‑1 feed jobs |
-| `THREATFOX_AUTH_KEY` | unset | ThreatFox API key, required when feeds are enabled |
-| `URLHAUS_AUTH_KEY` | unset | URLhaus API key, required by the current API |
-| `MALWAREBAZAAR_AUTH_KEY` | unset | MalwareBazaar API key, required when feeds are enabled |
+| `CLAWFORGE_ENABLE_NETWORK` | `false` | Enables ASN, BGP, and RPKI network-provider jobs |
+| `CLAWFORGE_THREATFOX_SECRET_FILE` | `./secrets/threatfox_auth_key.example` | Docker secret file mounted as the ThreatFox credential |
+| `CLAWFORGE_URLHAUS_SECRET_FILE` | `./secrets/urlhaus_auth_key.example` | Docker secret file mounted as the URLhaus credential |
+| `CLAWFORGE_MALWAREBAZAAR_SECRET_FILE` | `./secrets/malwarebazaar_auth_key.example` | Docker secret file mounted as the MalwareBazaar credential |
+| `CLAWFORGE_RIPESTAT_RESOURCE` | `AS3333` | ASN resource for RIPEstat |
+| `CLAWFORGE_BGPVIEW_RESOURCE` | `3333` | ASN resource for BGPView |
+| `CLAWFORGE_PEERINGDB_RESOURCE` | `3333` | ASN resource for PeeringDB |
+| `CLAWFORGE_CAIDA_RESOURCE` | `3333` | ASN resource for CAIDA AS Rank |
+| `CLAWFORGE_TEAM_CYMRU_RESOURCE` | `8.8.8.8` | IP lookup resource for Team Cymru |
+| `CLAWFORGE_RIPE_RIS_RESOURCE` | `AS3333` | ASN resource for RIPE RIS |
+| `CLAWFORGE_ROUTEVIEWS_RESOURCE` | `203.0.113.0/24` | Prefix resource for RouteViews |
+| `CLAWFORGE_BGPSTREAM_RESOURCE` | `203.0.113.0/24` | Prefix/query resource for BGPStream |
+| `CLAWFORGE_RPKI_RESOURCE` | `203.0.113.0/24` | Prefix resource for RPKI validation |
+| `REDIS_URL` | unset | Optional Redis URL used only for the scheduler lock |
+| `CLAWFORGE_SCHEDULER_LOCK_KEY` | `clawforge:scheduler:lock` | Redis lock key for one active worker run |
+| `CLAWFORGE_BACKUP_INTERVAL_SECONDS` | `86400` | Automated PostgreSQL backup interval |
+| `CLAWFORGE_BACKUP_RETENTION_DAYS` | `14` | Backup rotation period |
+| `CLAWFORGE_BACKUP_DIR` | `./backups` | Directory for operator-managed backup scripts |
 | `RUST_LOG` | `info` | Structured log filter |
 
-Feed jobs remain disabled until `CLAWFORGE_ENABLE_FEEDS=true`. Provider intervals are defined by the adapter and are clamped to a safe minimum. Credentials are read from environment variables and never stored in indicators.
+Feed jobs remain disabled until `CLAWFORGE_ENABLE_FEEDS=true`. Provider intervals are defined by the adapter and are clamped to a safe minimum. Credentials are read from Docker secret files and never stored in indicators, provider status, risk history, metrics, or logs.
+
+Network jobs remain disabled until `CLAWFORGE_ENABLE_NETWORK=true`. Their lookup resources can be set with the provider-specific `CLAWFORGE_*_RESOURCE` variables; network observations are persisted and passed through the risk engine without direct blocking.

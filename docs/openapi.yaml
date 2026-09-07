@@ -1,0 +1,121 @@
+openapi: 3.0.3
+info:
+  title: Clawforge API
+  version: 0.1.0
+  description: Backend-only intelligence, incident, and administration API.
+  x-response-contract: Every JSON endpoint returns status, data, timestamp, pagination, and errors.
+servers:
+  - url: http://localhost:8080
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque-session-or-api-token
+  schemas:
+    ApiEnvelope:
+      type: object
+      required: [status, data, timestamp, pagination, errors]
+      properties:
+        status: { type: string, example: ok }
+        data: {}
+        timestamp: { type: string, format: date-time }
+        pagination:
+          oneOf:
+            - $ref: '#/components/schemas/Pagination'
+            - type: 'null'
+        errors:
+          type: array
+          items: { type: string }
+    Pagination:
+      type: object
+      required: [page, page_size, total, has_next]
+      properties:
+        page: { type: integer, minimum: 1 }
+        page_size: { type: integer, minimum: 1, maximum: 500 }
+        total: { type: integer, minimum: 0 }
+        has_next: { type: boolean }
+paths:
+  /health:
+    get:
+      responses:
+        '200': { description: Process and configuration health }
+        '503': { description: Configuration unavailable }
+  /ready:
+    get:
+      responses:
+        '200': { description: PostgreSQL and migration readiness }
+        '503': { description: Not ready }
+  /intelligence/indicators:
+    get:
+      parameters:
+        - { in: query, name: page, schema: { type: integer, default: 1 } }
+        - { in: query, name: page_size, schema: { type: integer, default: 100, maximum: 500 } }
+        - { in: query, name: source, schema: { type: string } }
+        - { in: query, name: from, schema: { type: string, format: date-time } }
+        - { in: query, name: to, schema: { type: string, format: date-time } }
+        - { in: query, name: severity, schema: { type: string, enum: [low, medium, high, critical] } }
+        - { in: query, name: confidence, schema: { type: integer, minimum: 0, maximum: 100 } }
+      responses:
+        '200': { description: Paginated indicator envelope }
+  /network/asn:
+    get:
+      parameters:
+        - { in: query, name: page, schema: { type: integer, default: 1 } }
+        - { in: query, name: page_size, schema: { type: integer, default: 100, maximum: 500 } }
+        - { in: query, name: asn, schema: { type: string } }
+        - { in: query, name: from, schema: { type: string, format: date-time } }
+        - { in: query, name: to, schema: { type: string, format: date-time } }
+      responses:
+        '200': { description: Paginated ASN envelope }
+  /network/bgp:
+    get:
+      parameters:
+        - { in: query, name: page, schema: { type: integer, default: 1 } }
+        - { in: query, name: page_size, schema: { type: integer, default: 100, maximum: 500 } }
+        - { in: query, name: asn, schema: { type: string } }
+        - { in: query, name: prefix, schema: { type: string } }
+        - { in: query, name: from, schema: { type: string, format: date-time } }
+        - { in: query, name: to, schema: { type: string, format: date-time } }
+      responses:
+        '200': { description: Paginated BGP envelope }
+  /incidents:
+    get:
+      security: [{ bearerAuth: [] }]
+      description: Viewer, Operator, or Administrator.
+      responses:
+        '200': { description: Paginated incident envelope }
+        '401': { description: Authentication required }
+        '403': { description: Role denied }
+  /incidents/{id}/status:
+    post:
+      security: [{ bearerAuth: [] }]
+      description: Operator or Administrator. Every change creates an audit event.
+      responses:
+        '200': { description: Status changed }
+        '400': { description: Invalid lifecycle status }
+        '401': { description: Authentication required }
+        '403': { description: Role denied }
+  /audit/events:
+    get:
+      security: [{ bearerAuth: [] }]
+      description: Viewer, Operator, or Administrator with source, severity, user, and time filters.
+      responses:
+        '200': { description: Paginated audit envelope }
+        '401': { description: Authentication required }
+  /incidents/export:
+    get:
+      security: [{ bearerAuth: [] }]
+      description: Use format=csv for CSV; the default is the standard JSON envelope.
+      responses:
+        '200': { description: Incident export }
+  /intelligence/indicators/export:
+    get:
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: Indicator export }
+  /audit/events/export:
+    get:
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: Audit export }

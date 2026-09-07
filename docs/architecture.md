@@ -6,12 +6,14 @@ The Rust workspace is intentionally a new implementation rather than a line-by-l
 
 ## Current phase
 
-The API starts with `/health` and `/ready`, connects to PostgreSQL, and runs sqlx migrations. The worker starts a Tokio lifecycle loop and records database health. Provider adapters, feed scheduling, and the intelligence consumer are extension points for subsequent phases; no provider is automatically enabled in this scaffold.
+The API connects to PostgreSQL, runs sqlx migrations, and exposes health/readiness, intelligence, network, trust, and Prometheus metrics endpoints. The worker runs a Tokio lifecycle loop with provider and network jobs, retry/backoff, status persistence, risk consumption, typed audit events, and optional Redis run locking. Jobs remain disabled by default and no provider event performs a block action.
 
 ## Data flow
 
 ```text
 provider -> normalizer -> indicator/network store -> risk + trust -> policy -> response
 ```
+
+Network providers use the same boundary for ASN, BGP, and RPKI data. Their normalized records are persisted in PostgreSQL and converted into evaluated evidence before policy handling. Network providers never perform blocking actions themselves.
 
 Raw feeds do not reach an LLM or a blocking action. An LLM, when added, receives evaluated evidence and explanations only.

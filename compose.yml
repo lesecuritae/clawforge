@@ -14,6 +14,8 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+    networks:
+      - backend
 
   clawforge-api:
     build:
@@ -24,15 +26,56 @@ services:
       DATABASE_URL_FILE: /run/secrets/database_url
       RUST_LOG: ${RUST_LOG:-info}
       CLAWFORGE_API_BIND: 0.0.0.0:8080
+      CLAWFORGE_ADMIN_BOOTSTRAP_TOKEN_FILE: /run/secrets/admin_bootstrap_token
+      CLAWFORGE_ADMIN_BOOTSTRAP_USERNAME: ${CLAWFORGE_ADMIN_BOOTSTRAP_USERNAME:-admin}
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
     depends_on:
       postgres:
         condition: service_healthy
     secrets:
       - database_url
+      - admin_bootstrap_token
+    networks:
+      - backend
+      - frontend
     ports:
       - "${CLAWFORGE_API_PORT:-8080}:8080"
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/health >/dev/null"]
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/ready >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  clawforge-frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    entrypoint: ["nginx", "-g", "daemon off;"]
+    depends_on:
+      clawforge-api:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx:rw,noexec,nosuid,nodev,size=32m
+      - /var/run:rw,noexec,nosuid,nodev,size=8m
+      - /tmp:rw,noexec,nosuid,nodev,size=16m
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - frontend
+      - backend
+    ports:
+      - "${CLAWFORGE_FRONTEND_PORT:-3000}:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -47,11 +90,30 @@ services:
       DATABASE_URL_FILE: /run/secrets/database_url
       RUST_LOG: ${RUST_LOG:-info}
       CLAWFORGE_WORKER_POLL_SECONDS: ${CLAWFORGE_WORKER_POLL_SECONDS:-60}
+      CLAWFORGE_ENABLE_FEEDS: ${CLAWFORGE_ENABLE_FEEDS:-false}
+      CLAWFORGE_ENABLE_NETWORK: ${CLAWFORGE_ENABLE_NETWORK:-false}
+      REDIS_URL: ${REDIS_URL:-}
+      CLAWFORGE_SCHEDULER_LOCK_KEY: ${CLAWFORGE_SCHEDULER_LOCK_KEY:-clawforge:scheduler:lock}
+      THREATFOX_AUTH_KEY_FILE: /run/secrets/threatfox_auth_key
+      URLHAUS_AUTH_KEY_FILE: /run/secrets/urlhaus_auth_key
+      MALWAREBAZAAR_AUTH_KEY_FILE: /run/secrets/malwarebazaar_auth_key
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
     depends_on:
       postgres:
         condition: service_healthy
     secrets:
       - database_url
+      - threatfox_auth_key
+      - urlhaus_auth_key
+      - malwarebazaar_auth_key
+    networks:
+      - backend
     healthcheck:
       test: ["CMD-SHELL", "kill -0 1"]
       interval: 10s
@@ -64,13 +126,67 @@ services:
     profiles: [cache]
     volumes:
       - clawforge-redis:/data
+    networks:
+      - backend
+
+  clawforge-backup:
+    image: postgres:16-alpine
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGHOST: postgres
+      PGPORT: 5432
+      PGDATABASE: ${POSTGRES_DB:-clawforge}
+      PGUSER: ${POSTGRES_USER:-clawforge}
+      BACKUP_INTERVAL_SECONDS: ${CLAWFORGE_BACKUP_INTERVAL_SECONDS:-86400}
+      BACKUP_RETENTION_DAYS: ${CLAWFORGE_BACKUP_RETENTION_DAYS:-14}
+    secrets:
+      - postgres_password
+    volumes:
+      - clawforge-backups:/backups
+    networks:
+      - backend
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        export PGPASSWORD="$$(cat /run/secrets/postgres_password)"
+        while :; do
+          stamp="$$(date -u +%Y%m%dT%H%M%SZ)"
+          pg_dump --format=custom --no-owner --file="/backups/clawforge-$${stamp}.dump"
+          pg_restore --list "/backups/clawforge-$${stamp}.dump" >/dev/null
+          find /backups -type f -name 'clawforge-*.dump' -mtime +"$${BACKUP_RETENTION_DAYS}" -delete
+          sleep "$${BACKUP_INTERVAL_SECONDS}"
+        done
+    restart: unless-stopped
 
 volumes:
   clawforge-postgres:
   clawforge-redis:
+  clawforge-backups:
+
+networks:
+  frontend:
+  backend:
+    internal: true
 
 secrets:
   postgres_password:
     file: ${CLAWFORGE_POSTGRES_SECRET_FILE:-./secrets/postgres_password.example}
   database_url:
     file: ${CLAWFORGE_DATABASE_URL_SECRET_FILE:-./secrets/database_url.example}
+  threatfox_auth_key:
+    file: ${CLAWFORGE_THREATFOX_SECRET_FILE:-./secrets/threatfox_auth_key.example}
+  urlhaus_auth_key:
+    file: ${CLAWFORGE_URLHAUS_SECRET_FILE:-./secrets/urlhaus_auth_key.example}
+  malwarebazaar_auth_key:
+    file: ${CLAWFORGE_MALWAREBAZAAR_SECRET_FILE:-./secrets/malwarebazaar_auth_key.example}
+  admin_bootstrap_token:
+    file: ${CLAWFORGE_ADMIN_BOOTSTRAP_SECRET_FILE:-./secrets/admin_bootstrap_token.example}
