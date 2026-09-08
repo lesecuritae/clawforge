@@ -39,6 +39,8 @@ als MCP-Upstream verwendet.
 | MCP-Tool | Agent-API-v1-Upstream | Scope | Stand |
 | --- | --- | --- | --- |
 | `get_status` | `GET /api/v1/status` + Incident-Liste | `agent:system:read` + `agent:incident:read` | direkt nutzbar |
+| `get_agent_context` | `GET /api/v1/context` | `agent:context:read` | direkt nutzbar |
+| `get_decisions` | `GET /api/v1/decisions` | `agent:decision:read` | direkt nutzbar |
 | `list_events` | `GET /api/v1/events` | `agent:events:read` | direkt nutzbar |
 | `list_incidents` | `GET /api/v1/incidents` | `agent:incident:read` | direkt nutzbar |
 | `get_incident` | `GET /api/v1/incidents/{id}` | `agent:incident:read` | direkt nutzbar |
@@ -74,6 +76,29 @@ und im Tool-Vertrag versioniert.
   aktiven Incidents sowie Status-/Severity-Verteilung
 - Erfordert `agent:system:read` und `agent:incident:read`
 - Keine internen Fehlertexte, Secrets oder Zustellinformationen
+
+### `get_agent_context`
+
+- Eingabe: keine
+- Upstream: `/api/v1/context`
+- Scope: `agent:context:read`
+- Ausgabe: konsolidierter Systemstatus, aktive Incidents, gespeicherte
+  Risk-Scores, Trust-Status, wichtige Events und Correlation-Zusammenfassungen
+- Die Antwort stammt ausschließlich aus der Agent API v1 und wird vor der
+  MCP-Ausgabe zusätzlich redigiert
+- Keine Rohpayloads, Secrets, Candidate-IDs oder Korrelationsschlüssel
+
+### `get_decisions`
+
+- Eingabe: keine
+- Upstream: `/api/v1/decisions`
+- Scope: `agent:decision:read`
+- Ausgabe: bestehender Gesamtstatus, Risikoeinschätzung, priorisierte
+  Aufmerksamkeitspunkte, empfohlene Prüfungen und die zugehörige
+  Context-Zusammenfassung
+- Der MCP-Dienst berechnet keine neue Bewertung und löst keine Aktion aus; er
+  reicht ausschließlich die read-only Agent-API-Antwort weiter
+- Keine Rohpayloads, Secrets, Candidate-IDs oder Korrelationsschlüssel
 
 ### `list_events`
 

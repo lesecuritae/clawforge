@@ -29,6 +29,8 @@ const SCOPE_SYSTEM: &str = "agent:system:read";
 const SCOPE_EVENTS: &str = "agent:events:read";
 const SCOPE_INCIDENT: &str = "agent:incident:read";
 const SCOPE_INCIDENTS_LEGACY: &str = "agent:incidents:read";
+const SCOPE_CONTEXT: &str = "agent:context:read";
+const SCOPE_DECISION: &str = "agent:decision:read";
 const SCOPE_SECURITY: &str = "agent:security:read";
 const SCOPE_NETWORK: &str = "agent:network:read";
 const SCOPE_ALL: &str = "agent:read";
@@ -223,6 +225,8 @@ fn parse_scopes(value: &str) -> Result<HashSet<String>> {
         SCOPE_EVENTS,
         SCOPE_INCIDENT,
         SCOPE_INCIDENTS_LEGACY,
+        SCOPE_CONTEXT,
+        SCOPE_DECISION,
         SCOPE_SECURITY,
         SCOPE_NETWORK,
         SCOPE_ALL,
@@ -517,6 +521,30 @@ impl McpServer {
             object.insert("incidents".to_string(), overview);
         }
         Ok(Json(response))
+    }
+
+    #[tool(
+        name = "get_agent_context",
+        description = "Read the consolidated, redacted Clawforge agent context"
+    )]
+    async fn get_agent_context(
+        &self,
+        Parameters(_args): Parameters<EmptyArgs>,
+    ) -> Result<Json<ToolResponse>, ErrorData> {
+        Ok(Json(self.get(SCOPE_CONTEXT, "/api/v1/context", &[]).await?))
+    }
+
+    #[tool(
+        name = "get_decisions",
+        description = "Read the prioritized, read-only Clawforge operations decision summary"
+    )]
+    async fn get_decisions(
+        &self,
+        Parameters(_args): Parameters<EmptyArgs>,
+    ) -> Result<Json<ToolResponse>, ErrorData> {
+        Ok(Json(
+            self.get(SCOPE_DECISION, "/api/v1/decisions", &[]).await?,
+        ))
     }
 
     #[tool(name = "list_events", description = "List normalized Clawforge events")]
@@ -874,6 +902,73 @@ mod tests {
         let server = McpServer::new(test_config(&[SCOPE_EVENTS]));
         let result = server.get_status(Parameters(EmptyArgs::default())).await;
         assert!(result.is_err());
+        assert!(server
+            .get_agent_context(Parameters(EmptyArgs::default()))
+            .await
+            .is_err());
+        assert!(server
+            .get_decisions(Parameters(EmptyArgs::default()))
+            .await
+            .is_err());
+    }
+
+    #[test]
+    fn context_and_decision_scopes_are_independent() {
+        let context = McpServer::new(test_config(&[SCOPE_CONTEXT]));
+        assert!(context.require_scope(SCOPE_CONTEXT).is_ok());
+        assert!(context.require_scope(SCOPE_DECISION).is_err());
+        let decision = McpServer::new(test_config(&[SCOPE_DECISION]));
+        assert!(decision.require_scope(SCOPE_DECISION).is_ok());
+        assert!(decision.require_scope(SCOPE_CONTEXT).is_err());
+    }
+
+    #[tokio::test]
+    async fn upstream_errors_are_sanitized_for_context_and_decisions() {
+        let agent_app = Router::new().fallback(|| async {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                axum::Json(json!({
+                    "status": "error",
+                    "data": null,
+                    "timestamp": "2026-01-01T00:00:00Z",
+                    "pagination": null,
+                    "errors": ["database secret must not be exposed"]
+                })),
+            )
+        });
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let agent_server = tokio::spawn(async move {
+            axum::serve(listener, agent_app).await.unwrap();
+        });
+        let config = Arc::new(Config {
+            agent_api_url: Url::parse(&format!("http://{address}")).unwrap(),
+            agent_api_token: "agent-secret".into(),
+            mcp_auth_token: "mcp-secret".into(),
+            mcp_scopes: [SCOPE_CONTEXT, SCOPE_DECISION]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            timeout: Duration::from_secs(2),
+        });
+        let server = McpServer::new(config);
+        let context_error = match server
+            .get_agent_context(Parameters(EmptyArgs::default()))
+            .await
+        {
+            Ok(_) => panic!("context request unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        let decision_error = match server.get_decisions(Parameters(EmptyArgs::default())).await {
+            Ok(_) => panic!("decision request unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        let serialized = format!("{context_error:?}{decision_error:?}");
+        assert!(serialized.contains("temporarily unavailable"));
+        assert!(!serialized.contains("database secret"));
+        agent_server.abort();
     }
 
     #[test]
@@ -897,6 +992,8 @@ mod tests {
         assert_eq!(
             names,
             vec![
+                "get_agent_context",
+                "get_decisions",
                 "get_incident",
                 "get_incident_relations",
                 "get_incident_timeline",
@@ -1017,7 +1114,7 @@ mod tests {
         );
         let client = ClientInfo::default().serve(transport).await.unwrap();
         let tools = client.list_tools(None).await.unwrap();
-        assert_eq!(tools.tools.len(), 10);
+        assert_eq!(tools.tools.len(), 12);
         client.cancel().await.unwrap();
         server.abort();
     }
@@ -1036,6 +1133,21 @@ mod tests {
             let path = request.uri().path();
             let data = match path {
                 "/api/v1/status" => json!({"service":"clawforge","status":"ok"}),
+                "/api/v1/context" => json!({
+                    "system":{"status":"ok"},
+                    "active_incidents":{"total":1},
+                    "risk_scores":{"highest":70},
+                    "trust":{"total":1},
+                    "important_events":[{"payload":{"secret":"removed"}}],
+                    "correlations":{"candidate_id":"removed"}
+                }),
+                "/api/v1/decisions" => json!({
+                    "overall_status":"high",
+                    "risk_assessment":{"highest_risk_score":70},
+                    "attention_points":[{"payload":{"secret":"removed"},"correlation_key":"removed"}],
+                    "recommended_checks":[{"check":"incident_timelines"}],
+                    "context":{"candidate_id":"removed"}
+                }),
                 "/api/v1/security/overview" => json!({"findings_total":1,"active_findings":1}),
                 "/api/v1/incidents" => json!([
                     {"id":incident_id,"status":"detected","severity":"high","confidence":88,"risk_score":70,"summary":"test incident","raw_payload":{"secret":"removed"}}
@@ -1097,6 +1209,8 @@ mod tests {
             "get_incident",
             "get_incident_timeline",
             "get_incident_relations",
+            "get_agent_context",
+            "get_decisions",
             "get_status",
             "get_security_overview",
         ] {
@@ -1115,8 +1229,17 @@ mod tests {
             let serialized = serde_json::to_string(&result).unwrap();
             assert!(!serialized.contains("raw_payload"));
             assert!(!serialized.contains("private"));
+            assert!(!serialized.contains("candidate_id"));
+            assert!(!serialized.contains("correlation_key"));
+            assert!(!serialized.contains("payload"));
             if matches!(tool, "get_status" | "get_security_overview") {
                 assert!(serialized.contains("\"incidents\""));
+            }
+            if tool == "get_agent_context" {
+                assert!(serialized.contains("\"active_incidents\""));
+            }
+            if tool == "get_decisions" {
+                assert!(serialized.contains("\"overall_status\""));
             }
         }
 
