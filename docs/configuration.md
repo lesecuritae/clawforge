@@ -26,6 +26,7 @@
 | `CLAWFORGE_NOTIFIER_TIMEOUT_SECONDS` | `15` | Webhook and notification request timeout |
 | `CLAWFORGE_EVENTS_SECRET_FILE` | `./secrets/events_token.example` | Internal event-backbone service token |
 | `CLAWFORGE_EVENTS_POLL_SECONDS` | `5` | Event-backbone polling interval |
+| `CLAWFORGE_INCIDENT_POLL_SECONDS` | `5` | Candidate-to-incident promotion interval |
 | `CLAWFORGE_RIPESTAT_RESOURCE` | `AS3333` | ASN resource for RIPEstat |
 | `CLAWFORGE_BGPVIEW_RESOURCE` | `3333` | ASN resource for BGPView |
 | `CLAWFORGE_PEERINGDB_RESOURCE` | `3333` | ASN resource for PeeringDB |

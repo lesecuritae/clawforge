@@ -1275,9 +1275,16 @@ async fn agent_incidents(
 ) -> ApiResult<Json<ApiEnvelope<Vec<serde_json::Value>>>> {
     let principal = authenticate_agent(&state, &headers).await?;
     require_agent_scope(&principal, AGENT_SCOPE_INCIDENTS_READ)?;
+    let status =
+        match query.status.as_deref() {
+            Some(value) => Some(canonical_incident_status(value).ok_or_else(|| {
+                api_error(StatusCode::BAD_REQUEST, "invalid incident status filter")
+            })?),
+            None => None,
+        };
     let mut values = state
         .store
-        .list_incidents(query.status.as_deref(), 500)
+        .list_incidents(status, 500)
         .await
         .map_err(|_| api_error(StatusCode::SERVICE_UNAVAILABLE, "incident list unavailable"))?;
     values.retain(|value| {
@@ -2626,16 +2633,19 @@ async fn export_incidents(
 ) -> ApiResult<Response> {
     let principal = authenticate(&state, &headers).await?;
     require_role(&principal, &["Administrator", "Operator", "Viewer"])?;
-    let values = state
-        .store
-        .list_incidents(query.status.as_deref(), 500)
-        .await
-        .map_err(|_| {
-            api_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "incident export unavailable",
-            )
-        })?;
+    let status =
+        match query.status.as_deref() {
+            Some(value) => Some(canonical_incident_status(value).ok_or_else(|| {
+                api_error(StatusCode::BAD_REQUEST, "invalid incident status filter")
+            })?),
+            None => None,
+        };
+    let values = state.store.list_incidents(status, 500).await.map_err(|_| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "incident export unavailable",
+        )
+    })?;
     if query.format.as_deref() == Some("csv") {
         return csv_response(
             values_as_csv(
@@ -2837,9 +2847,16 @@ async fn incidents(
         serde_json::json!({"status":query.status,"limit":query.limit.unwrap_or(100)}),
     )
     .await;
+    let status =
+        match query.status.as_deref() {
+            Some(value) => Some(canonical_incident_status(value).ok_or_else(|| {
+                api_error(StatusCode::BAD_REQUEST, "invalid incident status filter")
+            })?),
+            None => None,
+        };
     let mut values = state
         .store
-        .list_incidents(query.status.as_deref(), 500)
+        .list_incidents(status, 500)
         .await
         .map_err(|_| api_error(StatusCode::SERVICE_UNAVAILABLE, "incident list unavailable"))?;
     values.retain(|value| {
@@ -2911,6 +2928,143 @@ async fn incident_events(
                 "incident events unavailable",
             )
         })
+}
+
+async fn incident_timeline(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<ApiEnvelope<Vec<serde_json::Value>>>> {
+    let principal = authenticate(&state, &headers).await?;
+    require_role(&principal, &["Administrator", "Operator", "Viewer"])?;
+    let timeline = state
+        .store
+        .incident_timeline(id)
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "incident timeline unavailable",
+            )
+        })?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "incident not found"))?;
+    audit(
+        &state,
+        &principal,
+        "incident_timeline_read",
+        &id.to_string(),
+        serde_json::json!({}),
+    )
+    .await;
+    Ok(envelope(timeline, None))
+}
+
+async fn incident_status_history(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<ApiEnvelope<Vec<serde_json::Value>>>> {
+    let principal = authenticate(&state, &headers).await?;
+    require_role(&principal, &["Administrator", "Operator", "Viewer"])?;
+    if state
+        .store
+        .get_incident(id)
+        .await
+        .map_err(|_| api_error(StatusCode::SERVICE_UNAVAILABLE, "incident unavailable"))?
+        .is_none()
+    {
+        return Err(api_error(StatusCode::NOT_FOUND, "incident not found"));
+    }
+    let history = state
+        .store
+        .list_incident_status_history(id)
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "incident history unavailable",
+            )
+        })?;
+    audit(
+        &state,
+        &principal,
+        "incident_status_history_read",
+        &id.to_string(),
+        serde_json::json!({}),
+    )
+    .await;
+    Ok(envelope(history, None))
+}
+
+async fn incident_notes(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<ApiEnvelope<Vec<serde_json::Value>>>> {
+    let principal = authenticate(&state, &headers).await?;
+    require_role(&principal, &["Administrator", "Operator", "Viewer"])?;
+    if state
+        .store
+        .get_incident(id)
+        .await
+        .map_err(|_| api_error(StatusCode::SERVICE_UNAVAILABLE, "incident unavailable"))?
+        .is_none()
+    {
+        return Err(api_error(StatusCode::NOT_FOUND, "incident not found"));
+    }
+    let notes = state.store.list_incident_notes(id).await.map_err(|_| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "incident notes unavailable",
+        )
+    })?;
+    audit(
+        &state,
+        &principal,
+        "incident_notes_read",
+        &id.to_string(),
+        serde_json::json!({}),
+    )
+    .await;
+    Ok(envelope(notes, None))
+}
+
+#[derive(Deserialize)]
+struct IncidentNoteRequest {
+    body: String,
+}
+
+async fn add_incident_note(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(request): Json<IncidentNoteRequest>,
+) -> ApiResult<Json<ApiEnvelope<serde_json::Value>>> {
+    let principal = authenticate(&state, &headers).await?;
+    require_role(&principal, &["Administrator", "Operator"])?;
+    let note_id = state
+        .store
+        .add_incident_note(id, &principal.username, &request.body)
+        .await
+        .map_err(|error| {
+            if error.to_string().contains("not found") {
+                api_error(StatusCode::NOT_FOUND, "incident not found")
+            } else {
+                api_error(StatusCode::BAD_REQUEST, "invalid incident note")
+            }
+        })?;
+    audit(
+        &state,
+        &principal,
+        "incident_note_added",
+        &id.to_string(),
+        serde_json::json!({"note_id":note_id}),
+    )
+    .await;
+    Ok(envelope(
+        serde_json::json!({"id":note_id,"incident_id":id}),
+        None,
+    ))
 }
 
 async fn incident_analysis(
@@ -3124,6 +3278,19 @@ async fn store_internal_analysis(
 #[derive(Deserialize)]
 struct IncidentStatusRequest {
     status: String,
+    reason: Option<String>,
+}
+
+fn canonical_incident_status(value: &str) -> Option<&'static str> {
+    match value.to_ascii_lowercase().as_str() {
+        "open" | "detected" => Some("detected"),
+        "investigating" => Some("investigating"),
+        "confirmed" => Some("confirmed"),
+        "mitigated" => Some("mitigated"),
+        "resolved" => Some("resolved"),
+        "ignored" | "closed" => Some("closed"),
+        _ => None,
+    }
 }
 
 async fn update_incident_status(
@@ -3134,9 +3301,10 @@ async fn update_incident_status(
 ) -> ApiResult<Json<ApiEnvelope<serde_json::Value>>> {
     let principal = authenticate(&state, &headers).await?;
     require_role(&principal, &["Administrator", "Operator"])?;
+    let reason = request.reason.as_deref().unwrap_or("").trim();
     state
         .store
-        .update_incident_status(id, &request.status)
+        .transition_incident_status(id, &request.status, &principal.username, reason)
         .await
         .map_err(|error| {
             if error.to_string().contains("not found") {
@@ -3145,31 +3313,16 @@ async fn update_incident_status(
                 api_error(StatusCode::BAD_REQUEST, "invalid incident status")
             }
         })?;
-    if matches!(request.status.as_str(), "Resolved" | "Ignored") {
-        let _ = state
-            .store
-            .enqueue_notification_event(
-                None,
-                "incident_closed",
-                "info",
-                &id.to_string(),
-                serde_json::json!({"incident_id": id, "status": request.status}),
-                &format!("incident_closed:{id}:{}", request.status),
-            )
-            .await;
-    }
+    let status = canonical_incident_status(&request.status).unwrap_or(&request.status);
     audit(
         &state,
         &principal,
         "incident_status_changed",
         &id.to_string(),
-        serde_json::json!({"status":request.status}),
+        serde_json::json!({"status":status,"reason":reason}),
     )
     .await;
-    Ok(envelope(
-        serde_json::json!({"id":id,"status":request.status}),
-        None,
-    ))
+    Ok(envelope(serde_json::json!({"id":id,"status":status}), None))
 }
 
 #[derive(Deserialize)]
@@ -3704,6 +3857,15 @@ async fn main() -> anyhow::Result<()> {
         .route("/incidents", get(incidents))
         .route("/incidents/{id}", get(incident))
         .route("/incidents/{id}/events", get(incident_events))
+        .route("/incidents/{id}/timeline", get(incident_timeline))
+        .route(
+            "/incidents/{id}/status-history",
+            get(incident_status_history),
+        )
+        .route(
+            "/incidents/{id}/notes",
+            get(incident_notes).post(add_incident_note),
+        )
         .route("/incidents/{id}/analysis", get(incident_analysis))
         .route(
             "/incidents/{id}/analysis/request",
@@ -3768,6 +3930,27 @@ mod tests {
         assert_ne!(hash, value);
         assert_eq!(hash, digest(value));
         assert_ne!(hash, digest("other-token"));
+    }
+
+    #[test]
+    fn incident_status_model_and_permissions_are_stable() {
+        assert_eq!(canonical_incident_status("detected"), Some("detected"));
+        assert_eq!(canonical_incident_status("Open"), Some("detected"));
+        assert_eq!(canonical_incident_status("closed"), Some("closed"));
+        assert_eq!(canonical_incident_status("invalid"), None);
+        let operator = AdminPrincipal {
+            id: Uuid::new_v4(),
+            username: "operator".into(),
+            role: "Operator".into(),
+            auth_kind: "session".into(),
+            credential_id: Uuid::new_v4(),
+        };
+        let viewer = AdminPrincipal {
+            role: "Viewer".into(),
+            ..operator.clone()
+        };
+        assert!(require_role(&operator, &["Administrator", "Operator"]).is_ok());
+        assert!(require_role(&viewer, &["Administrator", "Operator"]).is_err());
     }
 
     #[test]

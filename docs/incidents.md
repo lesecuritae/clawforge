@@ -1,19 +1,80 @@
 # Incident Management
 
-Clawforge correlates stored intelligence events into incidents. Correlation uses the event resource (for example an IP, prefix, ASN, or trusted-network identifier) and joins events into an open or investigating incident. A new incident starts with Open; its lifecycle is Open, Investigating, Resolved, or Ignored.
+Incident Management ist die Betriebsschicht oberhalb der Event Correlation
+Layer. `clawforge-correlation` erzeugt weiterhin nur Kandidaten; der separate
+`clawforge-incidents`-Dienst übernimmt offene Kandidaten transaktional in
+verwaltbare Incidents. Der Event Backbone und die Correlation Rules bleiben
+unverändert.
 
-Threat indicators, BGP changes, RPKI invalid results, ASN changes, trusted-network changes, and provider errors can create or update an incident. Risk contributions are bounded at 100 and the highest observed severity is retained. A single feed still cannot produce a block action.
+## Lifecycle
 
-The API is protected by the administration bearer authentication:
+Ein neuer Incident startet mit `detected`. Zulässige Statuswerte sind:
 
-- GET /incidents
-- GET /incidents/{id}
-- GET /incidents/{id}/events
-- GET /incidents/{id}/analysis
-- POST /incidents/{id}/status
+`detected` → `investigating` → `confirmed` → `mitigated` → `resolved` → `closed`
 
-Administrators and operators may change status. Every status change is written to audit_events.
+Abkürzungen zu `closed` sind aus jedem offenen Status zulässig. `closed` ist
+terminal. Alte Eingaben `Open` und `Ignored` werden aus
+Kompatibilitätsgründen als `detected` beziehungsweise `closed` interpretiert;
+neue Antworten verwenden ausschließlich die kanonischen Kleinschreibungen.
 
-The analysis endpoint returns structured incident data, event types, sources, and stored analysis results. Operators and administrators can request an optional analysis through `POST /incidents/{id}/analysis/request` when `clawforge-analyzer` is enabled. The analyzer receives a sanitized payload through the internal network and stores only structured `incident_analysis` results through the protected internal API.
+Jeder Statuswechsel speichert den vorherigen Status, den Benutzer, eine
+Begründung und den Zeitpunkt in `incident_status_history`. Zusätzlich werden
+`detected_at`, `confirmed_at`, `mitigated_at`, `resolved_at` und `closed_at`
+am Incident geführt.
 
-The analyzer defaults to an offline mock provider. OpenAI-compatible APIs, local models, and OpenRouter can be selected with the same provider configuration; no vendor is required. Secrets are mounted from Docker Secrets, raw feed fields are removed, and IP values are anonymized by default. Analysis is explanatory only: it cannot block, grant trust, change policies, activate providers, or change permissions. Analyzer failures and requests are recorded in `audit_events`.
+## Candidate-Übernahme
+
+Der Incident-Dienst liest `incident_candidates` mit `status='open'` und nutzt
+PostgreSQL Row Locks, damit ein Kandidat nur einmal übernommen wird. Dabei
+werden Severity, Confidence, Summary, Korrelationsschlüssel und Zeitbereich
+übernommen. Der Kandidat erhält anschließend den Status `promoted`.
+
+Kanonische Event-UUIDs werden als `event`-Relationen gespeichert. Die aus der
+Correlation Layer stammenden Event-Paarbeziehungen werden als
+`event_relationship` erhalten. Ein Korrelationsschlüssel vom Typ
+`indicator:<value>` wird zusätzlich mit passenden gespeicherten Indicators
+verknüpft. Die ursprünglichen Audit-Event-Verknüpfungen älterer Incidents
+bleiben lesbar.
+
+## Datenmodell
+
+Migration `0014_incident_management.sql` ergänzt:
+
+- `incidents.confidence`, `incidents.candidate_id` und Lifecycle-Zeitpunkte,
+- `incident_status_history` für eine unveränderliche Status-Timeline,
+- `incident_notes` für operator-geführte Untersuchungshinweise,
+- `incident_relations` für Events, Event-Beziehungen, Indicators und spätere
+  Incident-Verknüpfungen.
+
+Die Relationstabellen enthalten keine Secrets und verändern weder Risk-, Trust-
+noch Policy-Bewertungen.
+
+## API
+
+Die bestehenden authentifizierten Incident-Routen bleiben erhalten und liefern
+die kanonischen Statuswerte:
+
+- `GET /incidents` — Liste mit Severity, Confidence, Candidate-ID und Event-Anzahl,
+- `GET /incidents/{id}` — Incident-Details,
+- `GET /incidents/{id}/events` — verbundene Events,
+- `GET /incidents/{id}/timeline` — Status-, Notiz- und Relations-Timeline,
+- `GET /incidents/{id}/status-history` — Statushistorie,
+- `GET /incidents/{id}/notes` — Untersuchungsnotizen,
+- `POST /incidents/{id}/notes` — Note für Administratoren und Operatoren,
+- `POST /incidents/{id}/status` — Statuswechsel für Administratoren und
+  Operatoren; optional mit `reason`.
+
+Viewer dürfen lesen, aber keine Statuswechsel oder Notizen schreiben. Jede
+administrative Aktion wird wie bisher auditiert. Agent API und MCP erhalten in
+dieser Phase keine neuen Schreibwerkzeuge oder Aktionen.
+
+## Analyse
+
+Die bestehende Analyse-Route bleibt verfügbar. Sie liest nun auch kanonische
+Event-Relationen aus dem Incident-Timeline-Modell und bleibt erklärend. Sie
+kann weder blockieren noch Trust, Policy, Provider oder Berechtigungen ändern.
+
+Incident Management erzeugt keine Blockierung, ändert keine Policy und vergibt
+keinen Trust. Es macht erkannte Korrelationen für Operatoren nachvollziehbar
+und bereitet eine spätere Read-only-Auswertung über die vorhandenen API-
+Verträge vor.

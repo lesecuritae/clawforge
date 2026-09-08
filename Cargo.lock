@@ -305,6 +305,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "clawforge-incidents"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clawforge-storage",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "clawforge-intelligence"
 version = "0.1.0"
 dependencies = [

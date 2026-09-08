@@ -247,7 +247,7 @@ impl PostgresStore {
             });
         let mut tx = self.pool.begin().await?;
         let existing: Option<(Uuid, String)> = sqlx::query_as(
-            "SELECT id, severity FROM incidents WHERE correlation_key=$1 AND status IN ('Open','Investigating') ORDER BY updated_at DESC LIMIT 1 FOR UPDATE",
+            "SELECT id, severity FROM incidents WHERE correlation_key=$1 AND status IN ('detected','investigating','confirmed','mitigated') ORDER BY updated_at DESC LIMIT 1 FOR UPDATE",
         )
         .bind(&event.resource)
         .fetch_optional(&mut *tx)
@@ -265,9 +265,10 @@ impl PostgresStore {
             (id, false, escalated)
         } else {
             let id = Uuid::new_v4();
-            sqlx::query("INSERT INTO incidents (id,status,severity,risk_score,summary,correlation_key,created_at,updated_at) VALUES ($1,'Open',$2,$3,$4,$5,$6,$6)")
+            sqlx::query("INSERT INTO incidents (id,status,severity,confidence,risk_score,summary,correlation_key,detected_at,created_at,updated_at) VALUES ($1,'detected',$2,$3,$4,$5,$6,$7,$7,$7)")
                 .bind(id)
                 .bind(&severity)
+                .bind(0_i16)
                 .bind(increment.clamp(0, 100) as i16)
                 .bind(format!("{}: {}", event.event_type, event.reason))
                 .bind(&event.resource)
@@ -763,7 +764,7 @@ impl PostgresStore {
         status: Option<&str>,
         limit: i64,
     ) -> Result<Vec<serde_json::Value>> {
-        let rows = sqlx::query("SELECT i.id,i.status,i.severity,i.created_at,i.updated_at,i.risk_score,i.summary,i.correlation_key,COUNT(ie.event_id) AS event_count FROM incidents i LEFT JOIN incident_events ie ON ie.incident_id=i.id WHERE ($1::text IS NULL OR i.status=$1) GROUP BY i.id ORDER BY i.updated_at DESC LIMIT $2")
+        let rows = sqlx::query("SELECT i.id,i.status,i.severity,i.confidence,i.candidate_id,i.created_at,i.updated_at,i.risk_score,i.summary,i.correlation_key,(COUNT(DISTINCT ie.event_id)+COUNT(DISTINCT ir.event_id)) AS event_count FROM incidents i LEFT JOIN incident_events ie ON ie.incident_id=i.id LEFT JOIN incident_relations ir ON ir.incident_id=i.id AND ir.relation_type='event' WHERE ($1::text IS NULL OR i.status=$1) GROUP BY i.id ORDER BY i.updated_at DESC LIMIT $2")
             .bind(status).bind(limit.clamp(1, 500)).fetch_all(&self.pool).await?;
         Ok(rows
             .into_iter()
@@ -772,6 +773,8 @@ impl PostgresStore {
                     "id": row.get::<Uuid,_>("id"),
                     "status": row.get::<String,_>("status"),
                     "severity": row.get::<String,_>("severity"),
+                    "confidence": row.get::<i16,_>("confidence"),
+                    "candidate_id": row.get::<Option<Uuid>,_>("candidate_id"),
                     "created_at": row.get::<chrono::DateTime<chrono::Utc>,_>("created_at"),
                     "updated_at": row.get::<chrono::DateTime<chrono::Utc>,_>("updated_at"),
                     "risk_score": row.get::<i16,_>("risk_score"),
@@ -784,13 +787,15 @@ impl PostgresStore {
     }
 
     pub async fn get_incident(&self, id: Uuid) -> Result<Option<serde_json::Value>> {
-        let row = sqlx::query("SELECT id,status,severity,created_at,updated_at,risk_score,summary,correlation_key FROM incidents WHERE id=$1")
+        let row = sqlx::query("SELECT id,status,severity,confidence,candidate_id,created_at,updated_at,risk_score,summary,correlation_key FROM incidents WHERE id=$1")
             .bind(id).fetch_optional(&self.pool).await?;
         Ok(row.map(|row| {
             serde_json::json!({
                 "id": row.get::<Uuid,_>("id"),
                 "status": row.get::<String,_>("status"),
                 "severity": row.get::<String,_>("severity"),
+                "confidence": row.get::<i16,_>("confidence"),
+                "candidate_id": row.get::<Option<Uuid>,_>("candidate_id"),
                 "created_at": row.get::<chrono::DateTime<chrono::Utc>,_>("created_at"),
                 "updated_at": row.get::<chrono::DateTime<chrono::Utc>,_>("updated_at"),
                 "risk_score": row.get::<i16,_>("risk_score"),
@@ -801,9 +806,9 @@ impl PostgresStore {
     }
 
     pub async fn list_incident_events(&self, id: Uuid) -> Result<Vec<serde_json::Value>> {
-        let rows = sqlx::query("SELECT ie.event_id,ie.timestamp,a.actor,a.action,a.resource,a.details,a.event_type,a.source,a.severity,a.reason,a.recorded_at FROM incident_events ie JOIN audit_events a ON a.id=ie.event_id WHERE ie.incident_id=$1 ORDER BY ie.timestamp ASC")
+        let legacy_rows = sqlx::query("SELECT ie.event_id,ie.timestamp,a.actor,a.action,a.resource,a.details,a.event_type,a.source,a.severity,a.reason,a.recorded_at FROM incident_events ie JOIN audit_events a ON a.id=ie.event_id WHERE ie.incident_id=$1 ORDER BY ie.timestamp ASC")
             .bind(id).fetch_all(&self.pool).await?;
-        Ok(rows
+        let mut events = legacy_rows
             .into_iter()
             .map(|row| {
                 serde_json::json!({
@@ -820,22 +825,82 @@ impl PostgresStore {
                     "recorded_at": row.get::<chrono::DateTime<chrono::Utc>,_>("recorded_at")
                 })
             })
-            .collect())
+            .collect::<Vec<_>>();
+        let canonical_rows = sqlx::query("SELECT r.event_id,e.event_type,e.source,e.severity,e.occurred_at,e.correlation_id,e.payload,e.metadata,r.confidence,r.reason FROM incident_relations r JOIN events e ON e.event_id=r.event_id WHERE r.incident_id=$1 AND r.relation_type='event' ORDER BY e.occurred_at ASC")
+            .bind(id).fetch_all(&self.pool).await?;
+        events.extend(canonical_rows.into_iter().map(|row| {
+            serde_json::json!({
+                "event_id": row.get::<Uuid,_>("event_id"),
+                "timestamp": row.get::<chrono::DateTime<chrono::Utc>,_>("occurred_at"),
+                "actor": "event-backbone",
+                "action": row.get::<String,_>("event_type"),
+                "resource": row.get::<Option<String>,_>("correlation_id"),
+                "details": row.get::<serde_json::Value,_>("payload"),
+                "event_type": row.get::<String,_>("event_type"),
+                "source": row.get::<String,_>("source"),
+                "severity": row.get::<String,_>("severity"),
+                "reason": row.get::<String,_>("reason"),
+                "confidence": row.get::<i16,_>("confidence"),
+                "metadata": row.get::<serde_json::Value,_>("metadata"),
+                "recorded_at": row.get::<chrono::DateTime<chrono::Utc>,_>("occurred_at")
+            })
+        }));
+        events.sort_by(|left, right| {
+            left.get("timestamp")
+                .and_then(serde_json::Value::as_str)
+                .cmp(&right.get("timestamp").and_then(serde_json::Value::as_str))
+        });
+        Ok(events)
     }
 
     pub async fn update_incident_status(&self, id: Uuid, status: &str) -> Result<()> {
-        if !matches!(status, "Open" | "Investigating" | "Resolved" | "Ignored") {
-            anyhow::bail!("invalid incident status");
+        self.transition_incident_status(id, status, "system", "")
+            .await
+    }
+
+    pub async fn transition_incident_status(
+        &self,
+        id: Uuid,
+        requested_status: &str,
+        changed_by: &str,
+        reason: &str,
+    ) -> Result<()> {
+        let status = canonical_incident_status(requested_status)
+            .ok_or_else(|| anyhow::anyhow!("invalid incident status"))?;
+        let reason = reason.trim();
+        if reason.len() > 1_000 {
+            anyhow::bail!("incident status reason is too long");
         }
-        let result = sqlx::query("UPDATE incidents SET status=$2,updated_at=NOW() WHERE id=$1")
+        let mut tx = self.pool.begin().await?;
+        let current: Option<String> =
+            sqlx::query_scalar("SELECT status FROM incidents WHERE id=$1 FOR UPDATE")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some(current) = current else {
+            anyhow::bail!("incident not found");
+        };
+        if current != status && !incident_status_transition_allowed(&current, status) {
+            anyhow::bail!("incident status transition is not allowed");
+        }
+        if current == status {
+            return Ok(());
+        }
+        sqlx::query("UPDATE incidents SET status=$2,updated_at=NOW(),confirmed_at=CASE WHEN $2='confirmed' THEN COALESCE(confirmed_at,NOW()) ELSE confirmed_at END,mitigated_at=CASE WHEN $2='mitigated' THEN COALESCE(mitigated_at,NOW()) ELSE mitigated_at END,resolved_at=CASE WHEN $2='resolved' THEN COALESCE(resolved_at,NOW()) ELSE resolved_at END,closed_at=CASE WHEN $2='closed' THEN COALESCE(closed_at,NOW()) ELSE closed_at END WHERE id=$1")
             .bind(id)
             .bind(status)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
-        if result.rows_affected() == 0 {
-            anyhow::bail!("incident not found");
-        }
-        if matches!(status, "Resolved" | "Ignored") {
+        sqlx::query("INSERT INTO incident_status_history (incident_id,previous_status,new_status,changed_by,reason) VALUES ($1,$2,$3,$4,$5)")
+            .bind(id)
+            .bind(&current)
+            .bind(status)
+            .bind(changed_by)
+            .bind(reason)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        if status == "closed" {
             let _ = self
                 .enqueue_notification_event(
                     None,
@@ -848,6 +913,226 @@ impl PostgresStore {
                 .await;
         }
         Ok(())
+    }
+
+    pub async fn list_incident_status_history(&self, id: Uuid) -> Result<Vec<serde_json::Value>> {
+        let rows = sqlx::query("SELECT id,previous_status,new_status,changed_by,reason,changed_at FROM incident_status_history WHERE incident_id=$1 ORDER BY changed_at ASC,id ASC")
+            .bind(id)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                serde_json::json!({
+                    "id": row.get::<i64,_>("id"),
+                    "previous_status": row.get::<Option<String>,_>("previous_status"),
+                    "status": row.get::<String,_>("new_status"),
+                    "changed_by": row.get::<String,_>("changed_by"),
+                    "reason": row.get::<String,_>("reason"),
+                    "timestamp": row.get::<chrono::DateTime<chrono::Utc>,_>("changed_at")
+                })
+            })
+            .collect())
+    }
+
+    pub async fn list_incident_notes(&self, id: Uuid) -> Result<Vec<serde_json::Value>> {
+        let rows = sqlx::query("SELECT id,author,body,created_at,updated_at FROM incident_notes WHERE incident_id=$1 ORDER BY created_at ASC,id ASC")
+            .bind(id)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                serde_json::json!({
+                    "id": row.get::<Uuid,_>("id"),
+                    "author": row.get::<String,_>("author"),
+                    "body": row.get::<String,_>("body"),
+                    "created_at": row.get::<chrono::DateTime<chrono::Utc>,_>("created_at"),
+                    "updated_at": row.get::<chrono::DateTime<chrono::Utc>,_>("updated_at")
+                })
+            })
+            .collect())
+    }
+
+    pub async fn add_incident_note(&self, id: Uuid, author: &str, body: &str) -> Result<Uuid> {
+        let body = body.trim();
+        if body.is_empty() || body.len() > 10_000 {
+            anyhow::bail!("incident note must contain 1 to 10000 characters");
+        }
+        let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM incidents WHERE id=$1)")
+            .bind(id)
+            .fetch_one(&self.pool)
+            .await?;
+        if !exists {
+            anyhow::bail!("incident not found");
+        }
+        let note_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO incident_notes (id,incident_id,author,body) VALUES ($1,$2,$3,$4)")
+            .bind(note_id)
+            .bind(id)
+            .bind(author)
+            .bind(body)
+            .execute(&self.pool)
+            .await?;
+        Ok(note_id)
+    }
+
+    pub async fn incident_timeline(&self, id: Uuid) -> Result<Option<Vec<serde_json::Value>>> {
+        if self.get_incident(id).await?.is_none() {
+            return Ok(None);
+        }
+        let mut timeline = Vec::new();
+        for entry in self.list_incident_status_history(id).await? {
+            timeline.push(serde_json::json!({
+                "kind": "status",
+                "timestamp": entry.get("timestamp"),
+                "data": entry
+            }));
+        }
+        for entry in self.list_incident_notes(id).await? {
+            timeline.push(serde_json::json!({
+                "kind": "note",
+                "timestamp": entry.get("created_at"),
+                "data": entry
+            }));
+        }
+        let relation_rows = sqlx::query("SELECT r.id,r.relation_type,r.event_id,r.related_event_id,r.indicator_id,r.related_incident_id,r.confidence,r.reason,r.created_at,e.event_type,e.source,e.severity,e.occurred_at,e.correlation_id,i.value AS indicator_value,i.indicator_type FROM incident_relations r LEFT JOIN events e ON e.event_id=r.event_id LEFT JOIN indicators i ON i.id=r.indicator_id WHERE r.incident_id=$1 ORDER BY r.created_at ASC,r.id ASC")
+            .bind(id)
+            .fetch_all(&self.pool)
+            .await?;
+        for row in relation_rows {
+            let event_id = row.get::<Option<Uuid>, _>("event_id");
+            let indicator_id = row.get::<Option<i64>, _>("indicator_id");
+            timeline.push(serde_json::json!({
+                "kind": "relation",
+                "timestamp": row.get::<chrono::DateTime<chrono::Utc>,_>("created_at"),
+                "data": {
+                    "id": row.get::<Uuid,_>("id"),
+                    "relation_type": row.get::<String,_>("relation_type"),
+                    "event_id": event_id,
+                    "related_event_id": row.get::<Option<Uuid>,_>("related_event_id"),
+                    "indicator_id": indicator_id,
+                    "related_incident_id": row.get::<Option<Uuid>,_>("related_incident_id"),
+                    "confidence": row.get::<i16,_>("confidence"),
+                    "reason": row.get::<String,_>("reason"),
+                    "event_type": row.get::<Option<String>,_>("event_type"),
+                    "source": row.get::<Option<String>,_>("source"),
+                    "severity": row.get::<Option<String>,_>("severity"),
+                    "occurred_at": row.get::<Option<chrono::DateTime<chrono::Utc>>,_>("occurred_at"),
+                    "correlation_id": row.get::<Option<String>,_>("correlation_id"),
+                    "indicator": row.get::<Option<String>,_>("indicator_value").map(|value| serde_json::json!({"value":value,"type":row.get::<Option<String>,_>("indicator_type")}))
+                }
+            }));
+        }
+        timeline.sort_by(|left, right| {
+            left.get("timestamp")
+                .and_then(serde_json::Value::as_str)
+                .cmp(&right.get("timestamp").and_then(serde_json::Value::as_str))
+        });
+        Ok(Some(timeline))
+    }
+
+    /// Promote open correlation candidates into managed incidents. The
+    /// correlation service only writes candidates; this method is the
+    /// separate lifecycle boundary and is safe to run concurrently.
+    pub async fn promote_incident_candidates(&self, limit: i64) -> Result<usize> {
+        let mut tx = self.pool.begin().await?;
+        let candidates = sqlx::query("SELECT id,correlation_key,confidence,severity,first_seen,last_seen,summary FROM incident_candidates WHERE status='open' ORDER BY last_seen ASC FOR UPDATE SKIP LOCKED LIMIT $1")
+            .bind(limit.clamp(1, 100))
+            .fetch_all(&mut *tx)
+            .await?;
+        let mut promoted = 0;
+        for candidate in candidates {
+            let candidate_id: Uuid = candidate.get("id");
+            let incident_id = if let Some(id) =
+                sqlx::query_scalar::<_, Uuid>("SELECT id FROM incidents WHERE candidate_id=$1")
+                    .bind(candidate_id)
+                    .fetch_optional(&mut *tx)
+                    .await?
+            {
+                id
+            } else {
+                let id = Uuid::new_v4();
+                let detected_at: chrono::DateTime<chrono::Utc> = candidate.get("first_seen");
+                sqlx::query("INSERT INTO incidents (id,status,severity,confidence,risk_score,summary,correlation_key,candidate_id,detected_at,created_at,updated_at) VALUES ($1,'detected',$2,$3,0,$4,$5,$6,$7,$7,$8)")
+                    .bind(id)
+                    .bind(candidate.get::<String,_>("severity"))
+                    .bind(candidate.get::<i16,_>("confidence").clamp(0,100))
+                    .bind(candidate.get::<String,_>("summary"))
+                    .bind(candidate.get::<String,_>("correlation_key"))
+                    .bind(candidate_id)
+                    .bind(detected_at)
+                    .bind(candidate.get::<chrono::DateTime<chrono::Utc>,_>("last_seen"))
+                    .execute(&mut *tx)
+                    .await?;
+                sqlx::query("INSERT INTO incident_status_history (incident_id,previous_status,new_status,changed_by,reason,changed_at) VALUES ($1,NULL,'detected','correlation','promoted from incident candidate',$2)")
+                    .bind(id)
+                    .bind(detected_at)
+                    .execute(&mut *tx)
+                    .await?;
+                promoted += 1;
+                id
+            };
+            let event_rows = sqlx::query(
+                "SELECT event_id,matched_at FROM incident_candidate_events WHERE candidate_id=$1",
+            )
+            .bind(candidate_id)
+            .fetch_all(&mut *tx)
+            .await?;
+            for event in event_rows {
+                sqlx::query("INSERT INTO incident_relations (id,incident_id,relation_type,event_id,confidence,reason,created_at) VALUES ($1,$2,'event',$3,$4,'correlated event',$5) ON CONFLICT DO NOTHING")
+                    .bind(Uuid::new_v4())
+                    .bind(incident_id)
+                    .bind(event.get::<Uuid,_>("event_id"))
+                    .bind(candidate.get::<i16,_>("confidence").clamp(0,100))
+                    .bind(event.get::<chrono::DateTime<chrono::Utc>,_>("matched_at"))
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            let relationship_rows = sqlx::query("SELECT event_id,related_event_id,relation_type,confidence,reason,created_at FROM event_relationships WHERE candidate_id=$1")
+                .bind(candidate_id)
+                .fetch_all(&mut *tx)
+                .await?;
+            for relation in relationship_rows {
+                sqlx::query("INSERT INTO incident_relations (id,incident_id,relation_type,event_id,related_event_id,confidence,reason,created_at) VALUES ($1,$2,'event_relationship',$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING")
+                    .bind(Uuid::new_v4())
+                    .bind(incident_id)
+                    .bind(relation.get::<Uuid,_>("event_id"))
+                    .bind(relation.get::<Uuid,_>("related_event_id"))
+                    .bind(relation.get::<i16,_>("confidence").clamp(0,100))
+                    .bind(relation.get::<String,_>("reason"))
+                    .bind(relation.get::<chrono::DateTime<chrono::Utc>,_>("created_at"))
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            if let Some(value) = candidate
+                .get::<String, _>("correlation_key")
+                .strip_prefix("indicator:")
+            {
+                let indicator_rows =
+                    sqlx::query("SELECT id FROM indicators WHERE lower(value)=lower($1)")
+                        .bind(value)
+                        .fetch_all(&mut *tx)
+                        .await?;
+                for indicator in indicator_rows {
+                    sqlx::query("INSERT INTO incident_relations (id,incident_id,relation_type,indicator_id,confidence,reason) VALUES ($1,$2,'indicator',$3,$4,'correlation indicator') ON CONFLICT DO NOTHING")
+                        .bind(Uuid::new_v4())
+                        .bind(incident_id)
+                        .bind(indicator.get::<i64,_>("id"))
+                        .bind(candidate.get::<i16,_>("confidence").clamp(0,100))
+                        .execute(&mut *tx)
+                        .await?;
+                }
+            }
+            sqlx::query(
+                "UPDATE incident_candidates SET status='promoted',updated_at=NOW() WHERE id=$1",
+            )
+            .bind(candidate_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(promoted)
     }
 
     pub async fn incident_analysis(&self, id: Uuid) -> Result<Option<serde_json::Value>> {
@@ -1854,6 +2139,30 @@ fn max_incident_severity(current: &str, incoming: &str) -> String {
     }
 }
 
+fn canonical_incident_status(value: &str) -> Option<&'static str> {
+    match value.to_ascii_lowercase().as_str() {
+        "open" | "detected" => Some("detected"),
+        "investigating" => Some("investigating"),
+        "confirmed" => Some("confirmed"),
+        "mitigated" => Some("mitigated"),
+        "resolved" => Some("resolved"),
+        "ignored" | "closed" => Some("closed"),
+        _ => None,
+    }
+}
+
+fn incident_status_transition_allowed(current: &str, next: &str) -> bool {
+    match current {
+        "detected" => matches!(next, "investigating" | "confirmed" | "closed"),
+        "investigating" => matches!(next, "confirmed" | "mitigated" | "resolved" | "closed"),
+        "confirmed" => matches!(next, "mitigated" | "resolved" | "closed"),
+        "mitigated" => matches!(next, "resolved" | "closed"),
+        "resolved" => next == "closed",
+        "closed" => false,
+        _ => false,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct MigrationStatus {
     pub applied: usize,
@@ -1919,5 +2228,36 @@ impl NetworkSink for PostgresStore {
             })?;
         }
         Ok(records.len())
+    }
+}
+
+#[cfg(test)]
+mod incident_lifecycle_tests {
+    use super::{canonical_incident_status, incident_status_transition_allowed};
+
+    #[test]
+    fn candidate_lifecycle_starts_detected_and_allows_forward_progression() {
+        assert_eq!(canonical_incident_status("Open"), Some("detected"));
+        assert!(incident_status_transition_allowed(
+            "detected",
+            "investigating"
+        ));
+        assert!(incident_status_transition_allowed(
+            "investigating",
+            "confirmed"
+        ));
+        assert!(incident_status_transition_allowed("confirmed", "mitigated"));
+        assert!(incident_status_transition_allowed("mitigated", "resolved"));
+        assert!(incident_status_transition_allowed("resolved", "closed"));
+    }
+
+    #[test]
+    fn closed_incidents_are_terminal_and_invalid_statuses_rejected() {
+        assert!(!incident_status_transition_allowed(
+            "closed",
+            "investigating"
+        ));
+        assert_eq!(canonical_incident_status("unknown"), None);
+        assert_eq!(canonical_incident_status("Ignored"), Some("closed"));
     }
 }

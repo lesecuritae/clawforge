@@ -194,6 +194,36 @@ services:
       retries: 5
     restart: unless-stopped
 
+  clawforge-incidents:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    command: ["/usr/local/bin/clawforge-incidents"]
+    environment:
+      DATABASE_URL_FILE: /run/secrets/database_url
+      CLAWFORGE_INCIDENT_POLL_SECONDS: ${CLAWFORGE_INCIDENT_POLL_SECONDS:-5}
+      RUST_LOG: ${RUST_LOG:-info}
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=32m
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    depends_on:
+      postgres:
+        condition: service_healthy
+    secrets:
+      - database_url
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "kill -0 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
   clawforge-mcp:
     build:
       context: .

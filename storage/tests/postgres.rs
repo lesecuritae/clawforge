@@ -183,7 +183,7 @@ async fn migrations_and_restart_persist() -> anyhow::Result<()> {
         )
     );
     let incident_row: (uuid::Uuid, i16) = sqlx::query_as(
-        "SELECT id, risk_score FROM incidents WHERE correlation_key=$1 AND status='Open' LIMIT 1",
+        "SELECT id, risk_score FROM incidents WHERE correlation_key=$1 AND status='detected' LIMIT 1",
     )
     .bind(&updated.value)
     .fetch_one(restarted.pool())
@@ -196,13 +196,13 @@ async fn migrations_and_restart_persist() -> anyhow::Result<()> {
             .await?;
     assert_eq!(incident_events, 1);
     restarted
-        .update_incident_status(incident_row.0, "Investigating")
+        .update_incident_status(incident_row.0, "investigating")
         .await?;
     let incident_status: String = sqlx::query_scalar("SELECT status FROM incidents WHERE id=$1")
         .bind(incident_row.0)
         .fetch_one(restarted.pool())
         .await?;
-    assert_eq!(incident_status, "Investigating");
+    assert_eq!(incident_status, "investigating");
     let analysis_id = restarted
         .store_incident_analysis(
             incident_row.0,

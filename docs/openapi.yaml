@@ -194,7 +194,7 @@ paths:
       parameters:
         - { in: query, name: page, schema: { type: integer, minimum: 1, default: 1 } }
         - { in: query, name: page_size, schema: { type: integer, minimum: 1, maximum: 100, default: 50 } }
-        - { in: query, name: status, schema: { type: string, enum: [Open, Investigating, Resolved, Ignored] } }
+        - { in: query, name: status, schema: { type: string, enum: [detected, investigating, confirmed, mitigated, resolved, closed] } }
         - { in: query, name: severity, schema: { type: string } }
         - { in: query, name: from, schema: { type: string, format: date-time } }
         - { in: query, name: to, schema: { type: string, format: date-time } }
@@ -427,10 +427,89 @@ paths:
         '401': { description: Authentication required }
         '403': { description: Role denied }
         '429': { $ref: '#/components/responses/RateLimited' }
+  /incidents/{id}:
+    get:
+      security: [{ bearerAuth: [] }]
+      description: Viewer, Operator, or Administrator. Returns severity, confidence, candidate provenance, and lifecycle timestamps.
+      responses:
+        '200': { description: Incident detail envelope }
+        '401': { description: Authentication required }
+        '403': { description: Role denied }
+        '404': { description: Incident not found }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /incidents/{id}/events:
+    get:
+      security: [{ bearerAuth: [] }]
+      description: Viewer, Operator, or Administrator. Returns legacy audit events and canonical event relations.
+      responses:
+        '200': { description: Incident event envelope }
+        '401': { description: Authentication required }
+        '403': { description: Role denied }
+        '404': { description: Incident not found }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /incidents/{id}/timeline:
+    get:
+      security: [{ bearerAuth: [] }]
+      description: Viewer, Operator, or Administrator. Returns status changes, notes, events, and relations in time order.
+      responses:
+        '200': { description: Incident timeline envelope }
+        '401': { description: Authentication required }
+        '403': { description: Role denied }
+        '404': { description: Incident not found }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /incidents/{id}/status-history:
+    get:
+      security: [{ bearerAuth: [] }]
+      description: Viewer, Operator, or Administrator.
+      responses:
+        '200': { description: Incident status history envelope }
+        '401': { description: Authentication required }
+        '403': { description: Role denied }
+        '404': { description: Incident not found }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /incidents/{id}/notes:
+    get:
+      security: [{ bearerAuth: [] }]
+      description: Viewer, Operator, or Administrator.
+      responses:
+        '200': { description: Incident notes envelope }
+        '401': { description: Authentication required }
+        '403': { description: Role denied }
+        '404': { description: Incident not found }
+        '429': { $ref: '#/components/responses/RateLimited' }
+    post:
+      security: [{ bearerAuth: [] }]
+      description: Operator or Administrator. Stores an operator investigation note.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [body]
+              properties:
+                body: { type: string, minLength: 1, maxLength: 10000 }
+      responses:
+        '200': { description: Incident note created }
+        '400': { description: Invalid note }
+        '401': { description: Authentication required }
+        '403': { description: Role denied }
+        '404': { description: Incident not found }
+        '429': { $ref: '#/components/responses/RateLimited' }
   /incidents/{id}/status:
     post:
       security: [{ bearerAuth: [] }]
-      description: Operator or Administrator. Every change creates an audit event.
+      description: Operator or Administrator. Status is one of detected, investigating, confirmed, mitigated, resolved, or closed. Every change creates an audit event and status-history row.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status: { type: string, enum: [detected, investigating, confirmed, mitigated, resolved, closed] }
+                reason: { type: string, maxLength: 1000 }
       responses:
         '200': { description: Status changed }
         '400': { description: Invalid lifecycle status }
