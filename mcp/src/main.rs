@@ -45,6 +45,10 @@ const SCOPE_PROVIDER: &str = "agent:provider:read";
 const SCOPE_OPERATIONS: &str = "agent:operations:read";
 const SCOPE_SECURITY: &str = "agent:security:read";
 const SCOPE_NETWORK: &str = "agent:network:read";
+const SCOPE_INCIDENT_REPLAY: &str = "agent:incident:replay";
+const SCOPE_HISTORY: &str = "agent:history:read";
+const SCOPE_SECURITY_BRIEFING: &str = "agent:security:briefing";
+const SCOPE_SYSTEM_GRAPH: &str = "agent:system:graph:read";
 const SCOPE_ALL: &str = "agent:read";
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_REQUEST_BYTES: usize = 256 * 1024;
@@ -120,6 +124,20 @@ struct IncidentArgs {
 struct IncidentIdArgs {
     #[schemars(description = "Incident UUID")]
     id: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+struct HistoryArgs {
+    #[schemars(description = "RFC-3339 start timestamp")]
+    from: Option<String>,
+    #[schemars(description = "RFC-3339 end timestamp")]
+    to: Option<String>,
+    #[schemars(description = "Aggregation interval: hour, day, or week")]
+    interval: Option<String>,
+    #[schemars(description = "1-based page number")]
+    page: Option<i64>,
+    #[schemars(description = "Page size, capped at 100")]
+    page_size: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -310,6 +328,10 @@ fn parse_scopes(value: &str) -> Result<HashSet<String>> {
         SCOPE_OPERATIONS,
         SCOPE_SECURITY,
         SCOPE_NETWORK,
+        SCOPE_INCIDENT_REPLAY,
+        SCOPE_HISTORY,
+        SCOPE_SECURITY_BRIEFING,
+        SCOPE_SYSTEM_GRAPH,
         SCOPE_ALL,
     ];
     if scopes.is_empty()
@@ -876,6 +898,70 @@ impl McpServer {
     ) -> Result<Json<ToolResponse>, ErrorData> {
         Ok(Json(self.get_network_overview(args).await?))
     }
+
+    #[tool(
+        name = "get_incident_replay",
+        description = "Read a complete redacted reconstruction of one incident from stored events, correlation, risk, provider, alert, and status data; requires agent:incident:replay"
+    )]
+    async fn get_incident_replay(
+        &self,
+        Parameters(args): Parameters<IncidentIdArgs>,
+    ) -> Result<Json<ToolResponse>, ErrorData> {
+        let path = incident_path(&args.id, "/replay")?;
+        Ok(Json(self.get(SCOPE_INCIDENT_REPLAY, &path, &[]).await?))
+    }
+
+    #[tool(
+        name = "get_operations_history",
+        description = "Read historical operations snapshots, trends, changes, and anomalies; requires agent:history:read"
+    )]
+    async fn get_operations_history(
+        &self,
+        Parameters(args): Parameters<HistoryArgs>,
+    ) -> Result<Json<ToolResponse>, ErrorData> {
+        let query = pairs([
+            ("from".into(), args.from),
+            ("to".into(), args.to),
+            ("interval".into(), args.interval),
+            ("page".into(), args.page.map(|v| v.to_string())),
+            (
+                "page_size".into(),
+                args.page_size.map(|v| v.clamp(1, 100).to_string()),
+            ),
+        ]);
+        Ok(Json(
+            self.get(SCOPE_HISTORY, "/api/v1/history/summary", &query)
+                .await?,
+        ))
+    }
+
+    #[tool(
+        name = "get_security_briefing",
+        description = "Read a compact redacted security briefing with current risk, incidents, findings, provider issues, and uncertainties; requires agent:security:briefing"
+    )]
+    async fn get_security_briefing(
+        &self,
+        Parameters(_args): Parameters<EmptyArgs>,
+    ) -> Result<Json<ToolResponse>, ErrorData> {
+        Ok(Json(
+            self.get(SCOPE_SECURITY_BRIEFING, "/api/v1/security/briefing", &[])
+                .await?,
+        ))
+    }
+
+    #[tool(
+        name = "get_system_graph",
+        description = "Read the redacted service and provider dependency graph; no actions are possible; requires agent:system:graph:read"
+    )]
+    async fn get_system_graph(
+        &self,
+        Parameters(_args): Parameters<EmptyArgs>,
+    ) -> Result<Json<ToolResponse>, ErrorData> {
+        Ok(Json(
+            self.get(SCOPE_SYSTEM_GRAPH, "/api/v1/system/graph", &[])
+                .await?,
+        ))
+    }
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -1240,13 +1326,17 @@ mod tests {
                 "get_health_overview",
                 "get_incident",
                 "get_incident_relations",
+                "get_incident_replay",
                 "get_incident_timeline",
                 "get_network_overview",
+                "get_operations_history",
                 "get_operations_summary",
                 "get_provider_status",
+                "get_security_briefing",
                 "get_security_overview",
                 "get_security_posture",
                 "get_status",
+                "get_system_graph",
                 "get_trust_status",
                 "list_events",
                 "list_incidents",
@@ -1384,13 +1474,14 @@ mod tests {
         );
         let client = ClientInfo::default().serve(transport).await.unwrap();
         let tools = client.list_tools(None).await.unwrap();
-        assert_eq!(tools.tools.len(), 17);
+        assert_eq!(tools.tools.len(), 21);
         let expected = [
             "get_status",
             "get_agent_status",
             "list_events",
             "list_incidents",
             "get_incident",
+            "get_incident_replay",
             "get_incident_timeline",
             "get_incident_relations",
             "get_security_overview",
@@ -1401,8 +1492,11 @@ mod tests {
             "get_decisions",
             "get_provider_status",
             "get_operations_summary",
+            "get_operations_history",
             "get_health_overview",
+            "get_security_briefing",
             "get_security_posture",
+            "get_system_graph",
         ];
         for name in expected {
             let tool = tools
@@ -1475,6 +1569,10 @@ mod tests {
                 path if path == format!("/api/v1/incidents/{incident_id}/relations") => json!([
                     {"kind":"relation","timestamp":"2026-01-01T00:02:00Z","data":{"relation_type":"event","event_type":"threat.indicator","severity":"high","raw_payload":{"secret":"removed"}}}
                 ]),
+                path if path == format!("/api/v1/incidents/{incident_id}/replay") => json!({"incident":{"id":incident_id},"timeline":[],"alerts":[]}),
+                "/api/v1/history/summary" => json!({"trends":{"overall":{"change_direction":"stable"}},"anomalies":[]}),
+                "/api/v1/security/briefing" => json!({"current_status":"ok","risk_level":"low","top_incidents":[],"provider_problems":[]}),
+                "/api/v1/system/graph" => json!({"nodes":[],"edges":[]}),
                 _ => json!([]),
             };
             axum::Json(json!({
@@ -1519,20 +1617,27 @@ mod tests {
         for tool in [
             "list_incidents",
             "get_incident",
+            "get_incident_replay",
             "get_incident_timeline",
             "get_incident_relations",
             "get_agent_context",
             "get_decisions",
             "get_provider_status",
             "get_operations_summary",
+            "get_operations_history",
             "get_status",
             "get_security_overview",
+            "get_security_briefing",
+            "get_system_graph",
         ] {
             let params = if tool == "list_incidents" {
                 CallToolRequestParams::new(tool)
             } else if matches!(
                 tool,
-                "get_incident" | "get_incident_timeline" | "get_incident_relations"
+                "get_incident"
+                    | "get_incident_replay"
+                    | "get_incident_timeline"
+                    | "get_incident_relations"
             ) {
                 CallToolRequestParams::new(tool).with_arguments(id_arguments.clone())
             } else {

@@ -3,6 +3,11 @@
 ## [Unreleased]
 
 
+- Added v0.4 Incident Reconstruction API/MCP read-only replay, including stored correlation chains, status history, provider origins, and alert grouping without raw payloads.
+- Added historical intelligence summary, Security Briefing, and safe service dependency graph endpoints with dedicated agent scopes and MCP tools.
+- Extended the operations dashboard with Security Briefing, dependency graph, and incident replay views.
+
+
 - Added production observability metrics for API latency/auth/rate limits, MCP tool calls/errors/sessions, correlation activity, provider quality, and agent access.
 - Added optional Prometheus/Grafana Compose observability profile with a Clawforge Overview dashboard.
 - Added read-only `GET /api/v1/agents/status` and the matching `get_agent_status` MCP tool.

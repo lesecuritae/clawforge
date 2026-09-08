@@ -113,19 +113,23 @@ rollenbasierte Exportfunktionen. Zeitangaben sind UTC in RFC-3339-Format.
 | `GET /api/v1/providers` | Provider-Health | Quelle, Status, letzter Erfolg/Fehler, Datenalter, Qualität und Indicator-Anzahl ohne Rohfeeds | `agent:provider:read` |
 | `GET /api/v1/operations/summary` | Operations-Einstiegspunkt | Status, Risk-Level, aktive Incidents, kritische Events, Provider-Health, Attention Points und Recommended Checks | `agent:operations:read` |
 | `GET /api/v1/history` | historische Lagebilder | Operations-Snapshots mit Zeitbereich, Intervall und Trendvergleich | `agent:operations:read` |
+| `GET /api/v1/history/summary` | historische Intelligence | Trends, Veränderungen und Auffälligkeiten nach Stunde/Tag/Woche | `agent:history:read` |
 | `GET /api/v1/events` | aktuelle kanonische Events | Typ, Quelle, Severity, Zeit, Korrelation, begründete Zusammenfassung | `agent:events:read` |
 | `GET /api/v1/incidents` | Incident-Liste | Status, Severity, Confidence, Risiko, Summary, Zeit, Event-Anzahl | `agent:incident:read` |
 | `GET /api/v1/incidents/{id}` | Incident-Details | Status, Severity, Confidence, Risiko, Summary und Zeit | `agent:incident:read` |
 | `GET /api/v1/incidents/{id}/timeline` | Incident-Timeline | Status- und Relationsereignisse, paginiert und redigiert | `agent:incident:read` |
 | `GET /api/v1/incidents/{id}/relations` | Incident-Relationen | Events, Indicators und Incident-Beziehungen ohne Rohpayload | `agent:incident:read` |
+| `GET /api/v1/incidents/{id}/replay` | Incident-Replay | gespeicherte Incident-Rekonstruktion und Timeline ohne Rohpayload | `agent:incident:replay` |
 | `GET /api/v1/security/findings` | Security Findings | Indicator-Finding, Quelle, Confidence, Alter, Ablauf, Risk-/Trust-Werte, Reason | `agent:security:read` |
 | `GET /api/v1/security/overview` | Security-Zusammenfassung | Finding-Anzahl, aktive Findings, Severity-Verteilung, höchste gespeicherte Bewertung | `agent:security:read` |
 | `GET /api/v1/security/posture` | Security Posture | Findings, betroffene Komponenten, Severity-Verteilung und historische Richtung | `agent:security:read` |
+| `GET /api/v1/security/briefing` | Security Briefing | aktuelle Lage, Incidents, Findings, Provider-Probleme und Unsicherheiten | `agent:security:briefing` |
 | `GET /api/v1/network/asn` | ASN-Kontext | ASN, Organisation, Provider, Land, Prefixe, Netzwerktyp, Reputation, Alter | `agent:network:read` |
 | `GET /api/v1/network/prefixes` | Prefix-Kontext | Prefix, ASN, Netzwerktyp, Zeit und Quelle | `agent:network:read` |
 | `GET /api/v1/network/bgp` | Routing-Ereignisse | Prefix, vorherige/neue ASN, Status, Quelle, Zeit, Confidence | `agent:network:read` |
 | `GET /api/v1/network/rpki` | ROA-Bewertung | Prefix, ASN, Valid/Invalid/Unknown, Quelle, Zeit, Trust-Hinweis | `agent:network:read` |
 | `GET /api/v1/network/trust` | Trusted Infrastructure | Name, Typ, Identifier, Status, Zeit, Confidence und gespeicherter Trust-Wert ohne Registry-Interna | `agent:network:read` |
+| `GET /api/v1/system/graph` | Systemgraph | sichere Service-, Datenbank- und Provider-Abhängigkeiten | `agent:system:graph:read` |
 
 Die Agent-Incident-Detail-, Timeline- und Relationsrouten sind read-only. Die
 übrigen Detailrouten für einzelne Events sowie Provider- und
@@ -155,6 +159,10 @@ Scopes sind:
 | `agent:decision:read` | `/api/v1/decisions` |
 | `agent:provider:read` | `/api/v1/providers` |
 | `agent:operations:read` | `/api/v1/operations/summary`, `/api/v1/history` |
+| `agent:history:read` | `/api/v1/history/summary` |
+| `agent:incident:replay` | `/api/v1/incidents/{id}/replay` |
+| `agent:security:briefing` | `/api/v1/security/briefing` |
+| `agent:system:graph:read` | `/api/v1/system/graph` |
 | `agent:read` | explizit erteiltes read-only Gesamtprofil |
 
 Ein fehlender oder ungültiger Bearer-Token liefert `401`, ein gültiger Token

@@ -25,6 +25,11 @@ hardening.
 
 ## Highlights
 
+- Incident replay reconstructs stored event, correlation, indicator, provider, alert, and status history with existing redaction.
+- Historical operations summaries expose bounded trends and anomalies for hour/day/week intervals.
+- Security Briefing and System Graph are available through Agent API v1 and four new read-only MCP tools.
+- Dashboard adds replay, briefing, and dependency graph views; no remediation or write access was added.
+
 - Operations snapshots, history filtering, trend direction, reason, and
   confidence through Agent API v1.
 - Correlation confidence and same-source fallback correlation.

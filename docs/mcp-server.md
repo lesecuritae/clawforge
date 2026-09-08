@@ -2,7 +2,7 @@
 
 Status: Read-only MCP-Adapter produktionsbereit. Der MCP-Dienst ist ein
 isolierter Rust-Service und wurde mit OpenClaw Discovery sowie den
-Operations-Leseabfragen geprüft. Die aktuelle Tool-Liste umfasst 17 Tools.
+Operations-Leseabfragen geprüft. Die aktuelle Tool-Liste umfasst 21 Tools.
 
 Dieses Dokument beschreibt einen separaten, read-only MCP-Dienst für
 OpenClaw. Die Agent API v1 bleibt die einzige Datenquelle. Der MCP-Dienst
@@ -51,16 +51,20 @@ als MCP-Upstream verwendet.
 | `get_provider_status` | `GET /api/v1/providers` | `agent:provider:read` | direkt nutzbar |
 | `get_operations_summary` | `GET /api/v1/operations/summary` | `agent:operations:read` | direkt nutzbar |
 | `get_health_overview` | `GET /api/v1/operations/summary` | `agent:operations:read` | Trend- und Health-Ansicht |
+| `get_operations_history` | `GET /api/v1/history/summary` | `agent:history:read` | historische Trends und Anomalien |
 | `list_events` | `GET /api/v1/events` | `agent:events:read` | direkt nutzbar |
 | `list_incidents` | `GET /api/v1/incidents` | `agent:incident:read` | direkt nutzbar |
 | `get_incident` | `GET /api/v1/incidents/{id}` | `agent:incident:read` | direkt nutzbar |
 | `get_incident_timeline` | `GET /api/v1/incidents/{id}/timeline` | `agent:incident:read` | direkt nutzbar |
 | `get_incident_relations` | `GET /api/v1/incidents/{id}/relations` | `agent:incident:read` | direkt nutzbar |
+| `get_incident_replay` | `GET /api/v1/incidents/{id}/replay` | `agent:incident:replay` | gespeicherte Rekonstruktion |
 | `get_security_overview` | `GET /api/v1/security/overview` + Incident-Liste | `agent:security:read` + `agent:incident:read` | direkt nutzbar |
 | `list_security_findings` | `GET /api/v1/security/findings` | `agent:security:read` | direkt nutzbar |
 | `get_security_posture` | `GET /api/v1/security/posture` | `agent:security:read` | Trend- und Komponentenansicht |
+| `get_security_briefing` | `GET /api/v1/security/briefing` | `agent:security:briefing` | kompakte Lagebewertung |
 | `get_trust_status` | `GET /api/v1/network/trust` | `agent:network:read` | direkt nutzbar |
 | `get_network_overview` | `GET /api/v1/network/asn`, `/prefixes`, `/bgp`, `/rpki` | `agent:network:read` | deterministische Zusammenführung im Adapter |
+| `get_system_graph` | `GET /api/v1/system/graph` | `agent:system:graph:read` | read-only Abhängigkeitsgraph |
 
 `get_trust_status` verwendet ausschließlich den versionierten
 `/api/v1/network/trust`-Vertrag. Die historische Route `/network/trust` bleibt
@@ -175,6 +179,38 @@ und im Tool-Vertrag versioniert.
 - Ausgabe: normalisierte Event-, Indicator- und Incident-Beziehungen ohne
   Rohpayloads oder interne Datenbankfelder
 
+### `get_incident_replay`
+
+- Eingabe: `id` als Incident-UUID
+- Upstream: `/api/v1/incidents/{id}/replay`
+- Scope: `agent:incident:replay`
+- Ausgabe: gespeicherte Ereigniskette, Correlation Chain, Indicators,
+  Provider-Ursprung, Alert-Gruppen, Statuswechsel und redigierte Timeline
+- Keine neue Analyse, keine Notiztexte und keine Rohpayloads
+
+### `get_operations_history`
+
+- Eingabe: `from`, `to`, `interval` (`hour`, `day`, `week`), `page`, `page_size`
+- Upstream: `/api/v1/history/summary`
+- Scope: `agent:history:read`
+- Ausgabe: Snapshots, Trends, Veränderungen und Auffälligkeiten
+
+### `get_security_briefing`
+
+- Eingabe: keine
+- Upstream: `/api/v1/security/briefing`
+- Scope: `agent:security:briefing`
+- Ausgabe: Status, Risiko, priorisierte Incidents, neue Findings,
+  Provider-Probleme und Unsicherheiten ohne Aktionen
+
+### `get_system_graph`
+
+- Eingabe: keine
+- Upstream: `/api/v1/system/graph`
+- Scope: `agent:system:graph:read`
+- Ausgabe: redigierte Service-, Datenbank- und Provider-Knoten sowie Kanten
+- Der Graph wird nicht bewertet und kann keine Konfiguration ändern
+
 ### `get_security_overview`
 
 - Eingabe: keine
@@ -214,7 +250,7 @@ Aktivierung, Policy-Änderungen, Incident-Statusänderungen oder Blockaktionen.
 
 ## Produktionsvertrag und OpenClaw-Vorbereitung
 
-Der MCP-Server ist ein stateless read-only Adapter. Alle 17 Tools verwenden
+Der MCP-Server ist ein stateless read-only Adapter. Alle 21 Tools verwenden
 die versionierte Agent API v1 als einzige Datenquelle; es gibt keine direkte
 PostgreSQL-, Event-Backbone- oder Worker-Verbindung. Upstream-Aufrufe haben
 ein konfigurierbares Timeout (`CLAWFORGE_MCP_UPSTREAM_TIMEOUT_SECONDS`,
@@ -419,7 +455,7 @@ fachliche Zugriffsspur.
 ## Implementierung und Betrieb
 
 1. Das Crate `mcp/` nutzt `rmcp` mit Streamable HTTP und registriert genau die
-   siebzehn read-only Tools.
+   21 read-only Tools.
 2. Der Upstream-Client liest getrennte Agent-API- und MCP-Credentials aus
    Docker Secrets, validiert die Agent-API-Envelope und setzt Timeouts.
 3. Die Compose-Datei startet `clawforge-mcp` intern auf Port 8090. Der Dienst
@@ -433,7 +469,7 @@ fachliche Zugriffsspur.
 
 ## Tests
 
-- `tools/list` enthält genau die siebzehn read-only Tools.
+- `tools/list` enthält genau die 21 read-only Tools.
 - Incident-Tools rufen ausschließlich die vier versionierten Incident-
   Endpunkte der Agent API auf und akzeptieren den kanonischen Scope
   `agent:incident:read` (der alte Plural bleibt kompatibel).

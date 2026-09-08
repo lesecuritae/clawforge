@@ -320,6 +320,23 @@ paths:
         '403': { description: agent:operations:read scope missing }
         '429': { $ref: '#/components/responses/RateLimited' }
         '503': { description: Operations history unavailable }
+  /api/v1/history/summary:
+    get:
+      security: [{ agentBearerAuth: [] }]
+      description: Historical operations intelligence with trend, change, and anomaly summaries. Requires agent:history:read.
+      parameters:
+        - { in: query, name: from, schema: { type: string, format: date-time } }
+        - { in: query, name: to, schema: { type: string, format: date-time } }
+        - { in: query, name: interval, schema: { type: string, enum: [hour, 1h, day, 1d, week, 1w] } }
+        - { in: query, name: page, schema: { type: integer, minimum: 1, default: 1 } }
+        - { in: query, name: page_size, schema: { type: integer, minimum: 1, maximum: 100, default: 100 } }
+      responses:
+        '200': { description: Historical operations summary envelope }
+        '400': { description: Invalid history filter }
+        '401': { description: Agent token missing or invalid }
+        '403': { description: agent:history:read scope missing }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { description: Operations history unavailable }
   /operations/summary:
     get:
       security: [{ bearerAuth: [] }]
@@ -502,6 +519,40 @@ paths:
         '404': { description: Incident not found }
         '429': { $ref: '#/components/responses/RateLimited' }
         '503': { description: Incident storage unavailable }
+  /api/v1/incidents/{id}/replay:
+    get:
+      security: [{ agentBearerAuth: [] }]
+      description: Read-only reconstruction from stored incident timeline, relations, alerts, and provider views. Raw payloads and notes are excluded. Requires agent:incident:replay.
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200': { description: Incident replay envelope }
+        '400': { description: Invalid incident identifier }
+        '401': { description: Agent token missing or invalid }
+        '403': { description: agent:incident:replay scope missing }
+        '404': { description: Incident not found }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { description: Incident replay unavailable }
+  /api/v1/security/briefing:
+    get:
+      security: [{ agentBearerAuth: [] }]
+      description: Compact read-only security briefing from stored operations, findings, incidents, and provider status. Requires agent:security:briefing.
+      responses:
+        '200': { description: Security briefing envelope }
+        '401': { description: Agent token missing or invalid }
+        '403': { description: agent:security:briefing scope missing }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { description: Security briefing unavailable }
+  /api/v1/system/graph:
+    get:
+      security: [{ agentBearerAuth: [] }]
+      description: Read-only service and provider dependency graph derived from runtime status. Requires agent:system:graph:read.
+      responses:
+        '200': { description: System dependency graph envelope }
+        '401': { description: Agent token missing or invalid }
+        '403': { description: agent:system:graph:read scope missing }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { description: System graph unavailable }
   /api/v1/security/findings:
     get:
       security: [{ agentBearerAuth: [] }]

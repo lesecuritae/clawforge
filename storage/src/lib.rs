@@ -315,7 +315,7 @@ impl PostgresStore {
         severity: Option<&str>,
         limit: i64,
     ) -> Result<Vec<serde_json::Value>> {
-        let rows = sqlx::query("SELECT id,source,severity,status,created_at,acknowledged_at,delivery_status,incident_id,summary,updated_at,confidence,last_seen_at,event_count,EXTRACT(EPOCH FROM (NOW()-last_seen_at)) AS age_seconds FROM alerts WHERE ($1::text IS NULL OR status=$1) AND ($2::text IS NULL OR severity=$2) ORDER BY created_at DESC LIMIT $3")
+        let rows = sqlx::query("SELECT id,source,severity,status,created_at,acknowledged_at,delivery_status,incident_id,summary,updated_at,confidence,last_seen_at,event_count,group_key,EXTRACT(EPOCH FROM (NOW()-last_seen_at)) AS age_seconds FROM alerts WHERE ($1::text IS NULL OR status=$1) AND ($2::text IS NULL OR severity=$2) ORDER BY created_at DESC LIMIT $3")
             .bind(status)
             .bind(severity)
             .bind(limit.clamp(1, 500))
@@ -335,6 +335,8 @@ impl PostgresStore {
             "confidence": row.get::<i16, _>("confidence"),
             "last_seen_at": row.get::<chrono::DateTime<chrono::Utc>, _>("last_seen_at"),
             "event_count": row.get::<i32, _>("event_count"),
+            "group_id": row.get::<Option<String>, _>("group_key"),
+            "root_cause": row.get::<String, _>("summary"),
             "age_seconds": row.get::<f64, _>("age_seconds"),
             "aged": row.get::<f64, _>("age_seconds") >= 86_400.0
         })).collect())

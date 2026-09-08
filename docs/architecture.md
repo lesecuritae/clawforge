@@ -25,3 +25,12 @@ Canonical events are persisted in `events` and fanned out through
 internal service tokens, retry failed deliveries with backoff, and move
 repeated failures to a dead-letter state. Event payloads are filtered before
 storage; consumers cannot change risk, trust, policy, or provider state.
+
+
+## v0.4 Intelligence explanation layer
+
+The Agent API v1 now exposes stored incident reconstruction, historical operations
+trends, a redacted security briefing, and a service/provider dependency graph.
+The MCP adapter maps these four read-only resources without direct storage access;
+all new scopes are checked by both adapter and API. The dashboard renders the
+same contracts and never performs new risk or correlation calculations.
