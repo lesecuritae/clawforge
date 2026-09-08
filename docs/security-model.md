@@ -20,3 +20,16 @@ is persisted. Event and consumer endpoints require an internal Docker Secret
 service token; administrative event reads require an Administrator or Operator
 credential. Delivery retries are bounded and dead-lettered without triggering
 security actions.
+
+## Agent and alert boundaries
+
+Agent API v1 and the Rust MCP adapter are read-only. Agent tokens carry
+explicit scopes and the MCP service has no database or Event Backbone access;
+it can only forward redacted API responses. Each successful agent read is
+audited, while credentials and raw payloads are never returned.
+
+High and critical operational events may create an advisory alert record with
+source, severity, lifecycle status and delivery status. Alerts do not change
+risk, trust or policy and do not execute remediation. Acknowledgement,
+resolution and suppression are role-protected and audited. Notification
+delivery remains an independent, optional concern.

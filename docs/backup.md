@@ -20,3 +20,7 @@ docker compose up -d
 
 The restore script recreates the database and uses `pg_restore --exit-on-error`.
 Keep a copy outside the host and periodically perform a separate restore test.
+
+The complete fresh-database procedure, configuration backup and secret
+handling rules are documented in [recovery.md](recovery.md). The backup service
+does not copy Docker secrets or token values.

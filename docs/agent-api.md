@@ -128,6 +128,56 @@ Die Agent-Incident-Detail-, Timeline- und Relationsrouten sind read-only. Die
 übrigen Detailrouten für einzelne Events sowie Provider- und
 Capabilities-Ressourcen bleiben für Phase 2 vorgesehen.
 
+## Eingefrorener v1-Vertrag
+
+`/api/v1` ist der stabile Vertrag für OpenClaw und externe Agents. Innerhalb
+dieser Version sind ausschließlich additive Änderungen erlaubt: neue
+optionale Felder, neue Filter und neue read-only Ressourcen dürfen ergänzt
+werden. Bestehende Feldnamen, Datentypen, Semantik, Statuscodes und Scope-
+Anforderungen werden nicht entfernt oder stillschweigend geändert. Eine
+inkompatible Änderung erhält eine neue Fassung unter `/api/v2`; die v1-Routen
+bleiben während der dokumentierten Übergangszeit verfügbar.
+
+Alle v1-Routen verwenden Bearer-Agent-Tokens. Die aktuell unterstützten
+Scopes sind:
+
+| Scope | Ressourcen |
+| --- | --- |
+| `agent:system:read` | `/api/v1/status` |
+| `agent:events:read` | `/api/v1/events` |
+| `agent:incident:read` | `/api/v1/incidents` und Detail-/Timeline-/Relationsrouten |
+| `agent:security:read` | `/api/v1/security/findings`, `/security/overview` |
+| `agent:network:read` | `/api/v1/network/*` einschließlich Trust |
+| `agent:context:read` | `/api/v1/context` |
+| `agent:decision:read` | `/api/v1/decisions` |
+| `agent:provider:read` | `/api/v1/providers` |
+| `agent:operations:read` | `/api/v1/operations/summary` |
+| `agent:read` | explizit erteiltes read-only Gesamtprofil |
+
+Ein fehlender oder ungültiger Bearer-Token liefert `401`, ein gültiger Token
+ohne erforderlichen Scope `403`. Ungültige Query-Parameter liefern `400`, ein
+nicht vorhandenes Objekt `404`, temporär nicht verfügbare Daten `503` und ein
+überschrittenes API-Limit `429` mit `Retry-After`. Jeder Zugriff wird als
+redigiertes Audit-Ereignis erfasst. Erfolgsantworten verwenden weiterhin die
+gemeinsame Hülle mit `status`, `data`, `timestamp`, `pagination` und `errors`.
+
+Beispiel für einen Fehler:
+
+```json
+{
+  "status": "error",
+  "data": null,
+  "timestamp": "2026-09-08T00:00:00Z",
+  "pagination": null,
+  "errors": [{ "code": "forbidden", "message": "required agent scope is missing" }]
+}
+```
+
+Die OpenAPI-Datei (`docs/openapi.yaml`) ist die maschinenlesbare Quelle für
+Ressourcen, Security-Schemes, Parameter und Beispiele. CI validiert sie vor
+einem Release. MCP ist ein separater read-only Adapter und darf diesen
+Vertrag nicht umgehen.
+
 Die Ressourcen sind ausschließlich `GET`. Es gibt unter `/api/v1` keine
 Provider-Aktivierung, manuelle Synchronisation, Trust-Änderung,
 Incident-Statusänderung, Policy- oder Blockaktion.
@@ -164,7 +214,7 @@ Ein Systemstatus enthält Komponentenstatus statt interner Prozessdetails:
     "service": "clawforge",
     "version": "0.1.0",
     "status": "ok",
-    "migrations": { "current": true, "applied": 15, "expected": 15 },
+    "migrations": { "current": true, "applied": 16, "expected": 16 },
     "runtime": [],
     "events": { "pending": 0, "failed": 0 },
     "providers": { "total": 0, "enabled": 0 }
@@ -335,7 +385,9 @@ Die OpenAPI-Datei enthält jetzt den `/api/v1`-Bereich und die
 - klar zwischen `/api/v1` (externe read-only Fassade) und `/internal/*`
   (Service-Tokens) trennen.
 
-Ein MCP-Server wird erst gegen diese validierte OpenAPI-Spezifikation gebaut.
+Der separate MCP-Adapter ist gegen diese validierte OpenAPI-Spezifikation
+gebaut und darf ausschließlich die hier beschriebenen read-only Routen
+verwenden.
 Er darf keine nicht dokumentierten Felder voraussetzen.
 
 ## Implementierungsreihenfolge und Status
@@ -349,7 +401,9 @@ Er darf keine nicht dokumentierten Felder voraussetzen.
 4. **Erledigt:** OpenAPI-Schemas, Filter und Fehlercodes dokumentieren.
 5. **Erledigt:** Versionierten Trust-Read-Endpunkt mit Registry-Redaktion
    ergänzen.
-6. **Offen:** OpenClaw/MCP erst als separaten, read-only Client anbinden.
+6. **Offen:** Eine produktive OpenClaw-Verbindung muss separat konfiguriert,
+   mit einem dedizierten Token versehen und anhand der MCP-Testfälle geprüft
+   werden. Der MCP-Adapter selbst bleibt bereits verfügbar.
 
 Die Migration `0012_agent_tokens.sql` legt die dedizierte Credential-Tabelle
 für die Fassade an. Sie wird beim normalen Start über den bestehenden

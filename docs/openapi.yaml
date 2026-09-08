@@ -103,7 +103,21 @@ components:
         recommended_checks: { type: array, items: { type: object, additionalProperties: true } }
         correlation_confidence: { type: object, additionalProperties: true }
         trust: { type: object, additionalProperties: true }
+        alerts: { type: object, additionalProperties: { type: integer, minimum: 0 } }
         system_status: { type: string, enum: [ok, degraded, unavailable] }
+    Alert:
+      type: object
+      required: [id, source, severity, status, created_at, delivery_status, summary]
+      properties:
+        id: { type: string, format: uuid }
+        source: { type: string }
+        severity: { type: string, enum: [info, low, medium, high, critical] }
+        status: { type: string, enum: [open, acknowledged, resolved, suppressed] }
+        created_at: { type: string, format: date-time }
+        acknowledged_at: { type: string, format: date-time, nullable: true }
+        delivery_status: { type: string, enum: [pending, sent, partial, failed, not_configured] }
+        incident_id: { type: string, format: uuid, nullable: true }
+        summary: { type: string }
     AgentEvent:
       type: object
       required: [event_id, event_type, source, severity, timestamp]
@@ -273,6 +287,52 @@ paths:
         '403': { description: Viewer, Operator, or Administrator role required }
         '429': { $ref: '#/components/responses/RateLimited' }
         '503': { description: Operations summary unavailable }
+  /admin/alerts:
+    get:
+      security: [{ bearerAuth: [] }]
+      description: Read-only alert explorer. Alerts are advisory records and do not trigger automatic actions.
+      parameters:
+        - { in: query, name: status, schema: { type: string, enum: [open, acknowledged, resolved, suppressed] } }
+        - { in: query, name: severity, schema: { type: string, enum: [info, low, medium, high, critical] } }
+        - { in: query, name: page, schema: { type: integer, minimum: 1, default: 1 } }
+        - { in: query, name: page_size, schema: { type: integer, minimum: 1, maximum: 100, default: 100 } }
+      responses:
+        '200':
+          description: Paginated alert envelope
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiEnvelope'
+                  - type: object
+                    properties:
+                      data: { type: array, items: { $ref: '#/components/schemas/Alert' } }
+        '401': { description: Authentication required }
+        '403': { description: Role denied }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /admin/alerts/{id}/status:
+    post:
+      security: [{ bearerAuth: [] }]
+      description: Operator or Administrator. Acknowledge or resolve an alert; every change is audited.
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status: { type: string, enum: [open, acknowledged, resolved, suppressed] }
+                reason: { type: string, maxLength: 1000 }
+      responses:
+        '200': { description: Alert status changed }
+        '400': { description: Invalid status }
+        '401': { description: Authentication required }
+        '403': { description: Operator or Administrator role required }
+        '404': { description: Alert not found }
+        '429': { $ref: '#/components/responses/RateLimited' }
   /admin/auth/agent-tokens:
     post:
       security: [{ bearerAuth: [] }]
@@ -734,7 +794,13 @@ paths:
   /audit/events:
     get:
       security: [{ bearerAuth: [] }]
-      description: Viewer, Operator, or Administrator with source, severity, user, and time filters.
+      description: Viewer, Operator, or Administrator with source, severity, user, action, result, and time filters. Result searches redacted audit details.
+      parameters:
+        - { in: query, name: user, schema: { type: string } }
+        - { in: query, name: action, schema: { type: string } }
+        - { in: query, name: result, schema: { type: string } }
+        - { in: query, name: from, schema: { type: string, format: date-time } }
+        - { in: query, name: to, schema: { type: string, format: date-time } }
       responses:
         '200': { description: Paginated audit envelope }
         '401': { description: Authentication required }

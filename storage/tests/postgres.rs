@@ -154,6 +154,33 @@ async fn migrations_and_restart_persist() -> anyhow::Result<()> {
     let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM notification_events WHERE event_type='provider_error' AND status='pending'")
         .fetch_one(restarted.pool()).await?;
     assert_eq!(pending, 1);
+    let alert: (uuid::Uuid, String, String, String) = sqlx::query_as(
+        "SELECT id, source, severity, status FROM alerts WHERE source_event_id = (SELECT id FROM audit_events WHERE event_type='provider_error' ORDER BY id DESC LIMIT 1)",
+    )
+    .fetch_one(restarted.pool())
+    .await?;
+    assert_eq!(alert.1, "test-provider");
+    assert_eq!(alert.2, "high");
+    assert_eq!(alert.3, "open");
+    restarted
+        .update_alert_status(
+            alert.0,
+            "acknowledged",
+            "storage-admin",
+            "integration review",
+        )
+        .await?;
+    let alert_status: String = sqlx::query_scalar("SELECT status FROM alerts WHERE id=$1")
+        .bind(alert.0)
+        .fetch_one(restarted.pool())
+        .await?;
+    assert_eq!(alert_status, "acknowledged");
+    let alert_history: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM alert_status_history WHERE alert_id=$1")
+            .bind(alert.0)
+            .fetch_one(restarted.pool())
+            .await?;
+    assert_eq!(alert_history, 1);
     let claimed = restarted.claim_notification_events(10).await?;
     assert_eq!(claimed.len(), 1);
     assert_eq!(claimed[0]["payload"]["source"], "test-provider");
@@ -307,6 +334,8 @@ async fn migrations_and_restart_persist() -> anyhow::Result<()> {
         "notification_channels",
         "notification_rules",
         "notification_events",
+        "alerts",
+        "alert_status_history",
         "events",
         "event_consumers",
         "event_delivery",

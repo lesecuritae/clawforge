@@ -28,3 +28,10 @@ cannot alter risk, trust, policy, or provider state.
 Delivery is idempotent through a unique queue key. Failed attempts use
 exponential retry backoff and become `failed` after five attempts. Every
 delivery result is recorded as an audit event.
+
+High and critical events also create an advisory record in `alerts`. The
+authenticated Alert Explorer (`GET /admin/alerts`) exposes source, severity,
+lifecycle and delivery status; Operators and Administrators may acknowledge or
+resolve a record through `/admin/alerts/{id}/status`. Every status change is
+written to `alert_status_history` and the audit log. Alert records never
+perform a block, policy change, provider activation or trust change.

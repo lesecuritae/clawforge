@@ -2061,6 +2061,12 @@ async fn load_operations_summary(state: &AppState) -> ApiResult<serde_json::Valu
         )
     })?;
     let mut summary = operations_summary_data(&incidents, &indicators, &trust, &events, &providers);
+    let alert_counts = state.store.alert_counts().await.map_err(|_| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "operations alerts unavailable",
+        )
+    })?;
     let provider_health = summary
         .get("provider_health")
         .and_then(|value| value.get("failed"))
@@ -2092,6 +2098,7 @@ async fn load_operations_summary(state: &AppState) -> ApiResult<serde_json::Valu
                 "events": event_status
             }),
         );
+        object.insert("alerts".into(), alert_counts);
     }
     Ok(summary)
 }
@@ -2129,6 +2136,92 @@ async fn admin_operations_summary(
     )
     .await;
     Ok(envelope(summary, None))
+}
+
+#[derive(Deserialize)]
+struct AlertQuery {
+    status: Option<String>,
+    severity: Option<String>,
+    page: Option<i64>,
+    page_size: Option<i64>,
+}
+
+async fn admin_alerts(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AlertQuery>,
+) -> ApiResult<Json<ApiEnvelope<Vec<serde_json::Value>>>> {
+    let principal = authenticate(&state, &headers).await?;
+    require_role(&principal, &["Administrator", "Operator", "Viewer"])?;
+    let values = state
+        .store
+        .list_alerts(query.status.as_deref(), query.severity.as_deref(), 500)
+        .await
+        .map_err(|_| api_error(StatusCode::SERVICE_UNAVAILABLE, "alerts unavailable"))?;
+    audit(
+        &state,
+        &principal,
+        "alerts_read",
+        "alerts",
+        serde_json::json!({"status": query.status, "severity": query.severity}),
+    )
+    .await;
+    let (data, pagination) = paged_values(
+        values,
+        query.page.unwrap_or(1),
+        query.page_size.unwrap_or(100).clamp(1, 100),
+    );
+    Ok(envelope(data, Some(pagination)))
+}
+
+#[derive(Deserialize)]
+struct AlertStatusRequest {
+    status: String,
+    reason: Option<String>,
+}
+
+async fn admin_alert_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(request): Json<AlertStatusRequest>,
+) -> ApiResult<Json<ApiEnvelope<serde_json::Value>>> {
+    let principal = authenticate(&state, &headers).await?;
+    require_role(&principal, &["Administrator", "Operator"])?;
+    if request.reason.as_deref().unwrap_or("").chars().count() > 1000 {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "alert reason is too long",
+        ));
+    }
+    state
+        .store
+        .update_alert_status(
+            id,
+            request.status.trim(),
+            &principal.username,
+            request.reason.as_deref().unwrap_or(""),
+        )
+        .await
+        .map_err(|error| {
+            if error.to_string().contains("not found") {
+                api_error(StatusCode::NOT_FOUND, "alert not found")
+            } else {
+                api_error(StatusCode::BAD_REQUEST, "invalid alert status")
+            }
+        })?;
+    audit(
+        &state,
+        &principal,
+        "alert_status_changed",
+        &id.to_string(),
+        serde_json::json!({"status": request.status, "reason": request.reason}),
+    )
+    .await;
+    Ok(envelope(
+        serde_json::json!({"id": id, "status": request.status}),
+        None,
+    ))
 }
 
 async fn agent_events(
@@ -3560,6 +3653,7 @@ struct AuditQuery {
     severity: Option<String>,
     user: Option<String>,
     action: Option<String>,
+    result: Option<String>,
     limit: Option<i64>,
     page: Option<i64>,
     page_size: Option<i64>,
@@ -3591,6 +3685,7 @@ async fn audit_events(
                 severity: query.severity.as_deref(),
                 actor: query.user.as_deref(),
                 action: query.action.as_deref(),
+                result: query.result.as_deref(),
             },
             500,
         )
@@ -3788,6 +3883,7 @@ async fn export_audit_events(
                 severity: query.severity.as_deref(),
                 actor: query.user.as_deref(),
                 action: query.action.as_deref(),
+                result: query.result.as_deref(),
             },
             500,
         )
@@ -4882,6 +4978,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/admin/providers/{id}", post(admin_update_provider))
         .route("/admin/providers/{id}/sync", post(admin_sync_provider))
         .route("/operations/summary", get(admin_operations_summary))
+        .route("/admin/alerts", get(admin_alerts))
+        .route("/admin/alerts/{id}/status", post(admin_alert_status))
         .route(
             "/admin/notifications/channels",
             get(admin_notification_channels).post(admin_create_notification_channel),

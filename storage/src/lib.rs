@@ -150,6 +150,12 @@ impl PostgresStore {
             .await?
             ;
         self.correlate_incident(event_id, event).await?;
+        let incident_id: Option<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM incidents WHERE correlation_key=$1 ORDER BY updated_at DESC LIMIT 1",
+        )
+        .bind(&event.resource)
+        .fetch_optional(&self.pool)
+        .await?;
         self.publish_event(
             &event.event_type,
             &event.source,
@@ -180,6 +186,16 @@ impl PostgresStore {
                 "timestamp": event.timestamp,
             }),
             &event.event_type,
+        )
+        .await?;
+        self.create_alert_for_event(
+            event_id,
+            &event.event_type,
+            &event.source,
+            &event.severity,
+            &event.resource,
+            &event.reason,
+            incident_id,
         )
         .await?;
         Ok(())
@@ -217,7 +233,144 @@ impl PostgresStore {
         self.enqueue_notification_event(Some(event_id), event_type, severity, resource,
             serde_json::json!({"event_type":event_type,"source":source,"severity":severity,"reason":reason,"resource":resource,"timestamp":timestamp}),
             event_type).await?;
+        self.create_alert_for_event(
+            event_id,
+            event_type,
+            source,
+            severity,
+            resource,
+            reason,
+            Uuid::parse_str(resource).ok(),
+        )
+        .await?;
         Ok(event_id)
+    }
+
+    /// Create a durable operational alert for a high-impact event. Alerts are
+    /// advisory records only; delivery and any external action remain the
+    /// responsibility of the existing notification service and policy layer.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_alert_for_event(
+        &self,
+        source_event_id: i64,
+        event_type: &str,
+        source: &str,
+        severity: &str,
+        resource: &str,
+        reason: &str,
+        incident_id: Option<Uuid>,
+    ) -> Result<Option<Uuid>> {
+        if !matches!(severity, "high" | "critical") {
+            return Ok(None);
+        }
+        let id = Uuid::new_v4();
+        let dedupe_key = format!("{event_type}:{resource}:{source_event_id}");
+        let result = sqlx::query("INSERT INTO alerts (id,source,severity,incident_id,source_event_id,summary,details,dedupe_key) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (dedupe_key) DO NOTHING")
+            .bind(id)
+            .bind(source)
+            .bind(severity)
+            .bind(incident_id)
+            .bind(source_event_id)
+            .bind(reason.chars().take(500).collect::<String>())
+            .bind(serde_json::json!({
+                "event_type": event_type,
+                "resource": resource,
+                "source_event_id": source_event_id
+            }))
+            .bind(&dedupe_key)
+            .execute(&self.pool)
+            .await?;
+        if result.rows_affected() == 0 {
+            return Ok(None);
+        }
+        let has_delivery: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM notification_events WHERE source_event_id=$1)",
+        )
+        .bind(source_event_id)
+        .fetch_one(&self.pool)
+        .await?;
+        if !has_delivery {
+            sqlx::query("UPDATE alerts SET delivery_status='not_configured' WHERE id=$1")
+                .bind(id)
+                .execute(&self.pool)
+                .await?;
+        }
+        Ok(Some(id))
+    }
+
+    pub async fn list_alerts(
+        &self,
+        status: Option<&str>,
+        severity: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<serde_json::Value>> {
+        let rows = sqlx::query("SELECT id,source,severity,status,created_at,acknowledged_at,delivery_status,incident_id,summary,updated_at FROM alerts WHERE ($1::text IS NULL OR status=$1) AND ($2::text IS NULL OR severity=$2) ORDER BY created_at DESC LIMIT $3")
+            .bind(status)
+            .bind(severity)
+            .bind(limit.clamp(1, 500))
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.into_iter().map(|row| serde_json::json!({
+            "id": row.get::<Uuid, _>("id"),
+            "source": row.get::<String, _>("source"),
+            "severity": row.get::<String, _>("severity"),
+            "status": row.get::<String, _>("status"),
+            "created_at": row.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
+            "acknowledged_at": row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("acknowledged_at"),
+            "delivery_status": row.get::<String, _>("delivery_status"),
+            "incident_id": row.get::<Option<Uuid>, _>("incident_id"),
+            "summary": row.get::<String, _>("summary"),
+            "updated_at": row.get::<chrono::DateTime<chrono::Utc>, _>("updated_at")
+        })).collect())
+    }
+
+    pub async fn alert_counts(&self) -> Result<serde_json::Value> {
+        let rows =
+            sqlx::query("SELECT status, COUNT(*)::bigint AS count FROM alerts GROUP BY status")
+                .fetch_all(&self.pool)
+                .await?;
+        let mut counts = serde_json::Map::new();
+        for row in rows {
+            counts.insert(
+                row.get::<String, _>("status"),
+                serde_json::json!(row.get::<i64, _>("count")),
+            );
+        }
+        Ok(serde_json::Value::Object(counts))
+    }
+
+    pub async fn update_alert_status(
+        &self,
+        id: Uuid,
+        status: &str,
+        actor: &str,
+        reason: &str,
+    ) -> Result<()> {
+        if !matches!(status, "open" | "acknowledged" | "resolved" | "suppressed") {
+            anyhow::bail!("invalid alert status");
+        }
+        let mut tx = self.pool.begin().await?;
+        let previous: Option<String> =
+            sqlx::query_scalar("SELECT status FROM alerts WHERE id=$1 FOR UPDATE")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some(previous) = previous else {
+            anyhow::bail!("alert not found")
+        };
+        sqlx::query("UPDATE alerts SET status=$2, acknowledged_at=CASE WHEN $2='acknowledged' THEN COALESCE(acknowledged_at,NOW()) ELSE acknowledged_at END, updated_at=NOW() WHERE id=$1")
+            .bind(id).bind(status).execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO alert_status_history (alert_id,previous_status,new_status,actor,reason) VALUES ($1,$2,$3,$4,$5)")
+            .bind(id).bind(previous).bind(status).bind(actor).bind(reason).execute(&mut *tx).await?;
+        tx.commit().await?;
+        self.record_audit_event(
+            actor,
+            "alert_status_changed",
+            &id.to_string(),
+            serde_json::json!({"status": status, "reason": reason}),
+        )
+        .await?;
+        Ok(())
     }
 
     async fn correlate_incident(&self, event_id: i64, event: &IntelligenceEvent) -> Result<()> {
@@ -1878,8 +2031,8 @@ impl PostgresStore {
         filter: AuditEventFilter<'_>,
         limit: i64,
     ) -> Result<Vec<serde_json::Value>> {
-        let rows = sqlx::query("SELECT id, actor, action, resource, details, event_type, source, severity, reason, recorded_at FROM audit_events WHERE ($1::timestamptz IS NULL OR recorded_at >= $1) AND ($2::timestamptz IS NULL OR recorded_at <= $2) AND ($3::text IS NULL OR source=$3) AND ($4::text IS NULL OR severity=$4) AND ($5::text IS NULL OR actor=$5) AND ($6::text IS NULL OR action=$6) ORDER BY recorded_at DESC LIMIT $7")
-            .bind(filter.from).bind(filter.to).bind(filter.source).bind(filter.severity).bind(filter.actor).bind(filter.action).bind(limit.clamp(1, 1000)).fetch_all(&self.pool).await?;
+        let rows = sqlx::query("SELECT id, actor, action, resource, details, event_type, source, severity, reason, recorded_at FROM audit_events WHERE ($1::timestamptz IS NULL OR recorded_at >= $1) AND ($2::timestamptz IS NULL OR recorded_at <= $2) AND ($3::text IS NULL OR source=$3) AND ($4::text IS NULL OR severity=$4) AND ($5::text IS NULL OR actor=$5) AND ($6::text IS NULL OR action=$6) AND ($7::text IS NULL OR details::text ILIKE '%' || $7 || '%') ORDER BY recorded_at DESC LIMIT $8")
+            .bind(filter.from).bind(filter.to).bind(filter.source).bind(filter.severity).bind(filter.actor).bind(filter.action).bind(filter.result).bind(limit.clamp(1, 1000)).fetch_all(&self.pool).await?;
         Ok(rows.into_iter().map(|r| serde_json::json!({
             "id": r.get::<i64,_>("id"), "actor": r.get::<String,_>("actor"), "action": r.get::<String,_>("action"),
             "resource": r.get::<String,_>("resource"), "details": r.get::<serde_json::Value,_>("details"),
@@ -2179,6 +2332,7 @@ pub struct AuditEventFilter<'a> {
     pub severity: Option<&'a str>,
     pub actor: Option<&'a str>,
     pub action: Option<&'a str>,
+    pub result: Option<&'a str>,
 }
 
 pub fn database_url_from_env() -> Result<String> {

@@ -1162,6 +1162,33 @@ mod tests {
         let client = ClientInfo::default().serve(transport).await.unwrap();
         let tools = client.list_tools(None).await.unwrap();
         assert_eq!(tools.tools.len(), 14);
+        let expected = [
+            "get_status",
+            "list_events",
+            "list_incidents",
+            "get_incident",
+            "get_incident_timeline",
+            "get_incident_relations",
+            "get_security_overview",
+            "list_security_findings",
+            "get_trust_status",
+            "get_network_overview",
+            "get_agent_context",
+            "get_decisions",
+            "get_provider_status",
+            "get_operations_summary",
+        ];
+        for name in expected {
+            let tool = tools
+                .tools
+                .iter()
+                .find(|tool| tool.name == name)
+                .unwrap_or_else(|| panic!("missing MCP tool {name}"));
+            assert!(tool
+                .description
+                .as_deref()
+                .is_some_and(|description| !description.trim().is_empty()));
+        }
         client.cancel().await.unwrap();
         server.abort();
     }

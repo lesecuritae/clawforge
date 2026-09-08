@@ -195,6 +195,40 @@ und im Tool-Vertrag versioniert.
 Keines der Tools unterstützt `POST`, `PUT`, `PATCH`, `DELETE`, Provider-
 Aktivierung, Policy-Änderungen, Incident-Statusänderungen oder Blockaktionen.
 
+## Produktionsvertrag und OpenClaw-Vorbereitung
+
+Der MCP-Server ist ein stateless read-only Adapter. Alle 14 Tools verwenden
+die versionierte Agent API v1 als einzige Datenquelle; es gibt keine direkte
+PostgreSQL-, Event-Backbone- oder Worker-Verbindung. Upstream-Aufrufe haben
+ein konfigurierbares Timeout (`CLAWFORGE_MCP_UPSTREAM_TIMEOUT_SECONDS`,
+Standard 15 Sekunden). Netzwerk-, HTTP- und JSON-Fehler werden in eine
+strukturierte, redigierte MCP-Fehlermeldung übersetzt; Upstream-Body,
+Credentials und interne Stacktraces werden nicht weitergegeben.
+
+Jedes Tool hat ein explizites Read-Scope. Der MCP-Eingang wird mit einem
+separaten MCP-Token geschützt; das ausgehende Agent-API-Token wird nur über
+Docker Secret oder Environment-Datei injiziert. Kein Token wird geloggt oder
+in PostgreSQL gespeichert. Die zulässigen Scopes und die Zuordnung zu den
+Tools sind in der Tabelle oben und in `docs/agent-api.md` eingefroren.
+
+### OpenClaw-Testplan (noch keine produktive Verbindung)
+
+1. MCP-Endpunkt intern auf `http://clawforge-mcp:8090/mcp` auflösen.
+2. MCP-Token und Agent-API-Token als getrennte Secrets bereitstellen.
+3. Nur `agent:system:read`, `agent:events:read`,
+   `agent:incident:read`, `agent:security:read`, `agent:network:read`,
+   `agent:context:read`, `agent:decision:read`, `agent:operations:read` und
+   `agent:provider:read` erteilen, soweit das Agent-Profil es benötigt.
+4. Tools auflisten und für jedes Tool einen erfolgreichen Read-Aufruf prüfen.
+5. Fehlender Token, falscher Scope, abgelaufener/widerrufener Token,
+   Upstream-Timeout und `401`/`429`/`5xx` testen.
+6. Sicherstellen, dass Antworten keine Secrets, Rohpayloads, Candidate-IDs,
+   Korrelationsschlüssel oder internen Zustellinformationen enthalten.
+
+OpenClaw-Konfigurationsdateien werden in dieser Phase nicht geändert. Eine
+spätere Verbindung muss den MCP-Token rotieren können, ohne das
+Agent-API-Credential zu ändern.
+
 ## Sprache und SDK
 
 Der MCP-Dienst ist in Rust als eigenes Workspace-Mitglied umgesetzt. Das passt
