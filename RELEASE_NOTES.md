@@ -1,6 +1,29 @@
-# Clawforge v0.1.0
+# Clawforge v0.3.0
 
-Final v0.1.0 release for the standalone Rust security-intelligence platform.
+Production OpenClaw live-integration validation for the standalone Rust
+security-intelligence platform.
+
+## OpenClaw integration
+
+- Isolated `clawforge-mcp` Streamable HTTP adapter remains read-only and uses
+  Agent API v1 as its only data source.
+- MCP discovery exposes all 14 documented tools.
+- Operations Agent access uses a separate, scoped Agent API token injected as
+  a secret; no token value is stored in the repository.
+- Live reads of operations summary, agent context, and incidents were
+  verified, including redacted Agent API audit records.
+- A controlled three-event correlation produced one critical incident without
+  duplicate incident records. Provider-failure validation remains dependent
+  on enabling a provider feed; feeds stay disabled by default.
+
+## Release validation
+
+The release checklist covers Compose configuration, complete service builds,
+fresh migrations, backup/restore, MCP discovery, OpenClaw read-only calls,
+health/readiness checks, and secret scans. The full command results are kept
+in the release work log and must be rerun before deployment.
+
+The previous v0.1.0 foundation is retained below for historical reference.
 
 ## Included
 

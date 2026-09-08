@@ -1,8 +1,8 @@
-# OpenClaw-Integration (Vorbereitung)
+# OpenClaw-Integration
 
-Diese Anleitung beschreibt den späteren Anschluss von OpenClaw an den
-read-only MCP-Adapter. In dieser Phase wird keine OpenClaw-Konfiguration
-geändert und keine produktive Verbindung aktiviert.
+Diese Anleitung beschreibt den produktiven, read-only Anschluss von OpenClaw
+an den MCP-Adapter. OpenClaw verwendet ausschließlich die versionierte Agent
+API v1 über den separaten MCP-Dienst.
 
 ## Endpunkt und Geheimnisse
 
@@ -50,3 +50,26 @@ bewusst breit lesendes Profil verwendet werden. Für `get_status`,
 Die OpenAPI-Spezifikation unter `docs/openapi.yaml` und
 `docs/agent-api.md` bleiben der Vertrag für den Upstream. OpenClaw darf keine
 historischen ungeschützten Routen verwenden.
+
+## Live-Abnahme
+
+Die produktive Testverbindung wurde mit einem getrennten MCP-Token und einem
+separaten Agent-API-Token geprüft. Die MCP-Discovery liefert alle 14
+read-only Tools. Erfolgreich geprüft wurden `get_operations_summary`,
+`get_agent_context` und `list_incidents`; die Agent-API-Auditspur enthält
+Quelle, Ressource und Zeitpunkt, aber keine Tokenwerte.
+
+Der Operations-Agent ist als read-only Rolle definiert. Er darf den Zustand
+bewerten, Incidents erklären und Prüfungen empfehlen. Er darf weder Policies,
+Provider, Trust, Benutzerrechte oder Incident-Status ändern noch Blockierungen
+oder andere Remediation auslösen.
+
+Tool-Aufrufe werden über MCP-Zähler, OpenClaw-Aufrufmetadaten und die
+redigierte Agent-API-Auditspur beobachtbar. Die derzeitigen MCP-Metriken sind
+aggregiert; Toolname und Laufzeit stammen aus der OpenClaw-Aufrufspur.
+
+Die kontrollierte Correlation-Abnahme hat drei Events gleicher Quelle zu
+einem kritischen Incident mit einer Korrelation und ohne Incident-Duplikate
+zusammengeführt. Provider-Ausfalltests benötigen mindestens einen aktivierten
+Provider; bei deaktivierter Feed-Synchronisation bleibt der Providerstatus
+leer und wird nicht als erfolgreicher Feedtest gewertet.

@@ -30,7 +30,7 @@ curl http://127.0.0.1:8080/ready
 curl http://127.0.0.1:8080/version
 ```
 
-Feed-Synchronisation bleibt standardmäßig deaktiviert. Für Provider mit Authentifizierung werden private Docker-Secret-Dateien benötigt. Details stehen in [docs/configuration.md](docs/configuration.md), [docs/providers.md](docs/providers.md), [docs/production.md](docs/production.md) und [docs/openclaw-integration.md](docs/openclaw-integration.md).
+Feed-Synchronisation bleibt standardmäßig deaktiviert. Für Provider mit Authentifizierung werden private Docker-Secret-Dateien benötigt. Details stehen in [docs/configuration.md](docs/configuration.md), [docs/providers.md](docs/providers.md), [docs/production.md](docs/production.md), [docs/openclaw-integration.md](docs/openclaw-integration.md), [docs/openclaw-architecture.md](docs/openclaw-architecture.md) und [docs/openclaw-config.example.json](docs/openclaw-config.example.json).
 
 ## Struktur
 

@@ -1,0 +1,33 @@
+{
+  "mcp": {
+    "servers": {
+      "clawforge": {
+        "url": "https://clawforge.example.internal/mcp",
+        "transport": "streamable-http",
+        "headers": {
+          "Authorization": "Bearer ${CLAWFORGE_MCP_TOKEN}"
+        },
+        "connectTimeout": 5,
+        "timeout": 20,
+        "toolFilter": {
+          "include": [
+            "get_status",
+            "list_events",
+            "list_incidents",
+            "get_incident",
+            "get_incident_timeline",
+            "get_incident_relations",
+            "get_security_overview",
+            "list_security_findings",
+            "get_trust_status",
+            "get_network_overview",
+            "get_agent_context",
+            "get_decisions",
+            "get_provider_status",
+            "get_operations_summary"
+          ]
+        }
+      }
+    }
+  }
+}

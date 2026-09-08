@@ -20,4 +20,4 @@ curl http://127.0.0.1:8080/ready
 ```
 
 Read the [German documentation](README.de.md) or [English documentation](README.en.md) for configuration, providers, deployment, and security details.
-See [production.md](docs/production.md) and [openclaw-integration.md](docs/openclaw-integration.md) for production operation and the OpenClaw MCP contract.
+See [production.md](docs/production.md), [openclaw-integration.md](docs/openclaw-integration.md), [openclaw-architecture.md](docs/openclaw-architecture.md), and [openclaw-config.example.json](docs/openclaw-config.example.json) for production operation and the OpenClaw MCP contract.

@@ -1,7 +1,8 @@
 # Clawforge MCP Server
 
-Status: Read-only MCP-Adapter implementiert. Der MCP-Dienst ist ein isolierter
-Rust-Service. OpenClaw ist noch nicht angebunden.
+Status: Read-only MCP-Adapter produktionsbereit. Der MCP-Dienst ist ein
+isolierter Rust-Service und wurde mit OpenClaw Discovery sowie den
+Operations-Leseabfragen geprüft.
 
 Dieses Dokument beschreibt einen separaten, read-only MCP-Dienst für
 OpenClaw. Die Agent API v1 bleibt die einzige Datenquelle. Der MCP-Dienst
@@ -29,6 +30,11 @@ Der MCP-Dienst ist eine Protokoll- und Authentifizierungsbrücke. Er übersetzt
 MCP-Tool-Aufrufe in dokumentierte `GET`-Aufrufe der Agent API und gibt deren
 bereits bereinigte Antwort weiter. Er berechnet keine Scores, korreliert keine
 neuen Events und führt keine Aktionen aus.
+
+Für OpenClaw wird ein read-only Agent-Token mit den minimal benötigten Scopes
+über einen Secret-Mechanismus injiziert. Die Beispielkonfiguration in
+`docs/openclaw-config.example.json` enthält ausschließlich einen
+Umgebungsplatzhalter und keinen Tokenwert.
 
 Die Agent API bleibt der einzige Upstream-Vertrag. Insbesondere werden die alten,
 unversionierten `/intelligence/*`, `/network/*` und `/internal/*`-Routen nicht
