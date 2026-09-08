@@ -99,6 +99,59 @@ paths:
       responses:
         '200': { description: Paginated BGP envelope }
         '429': { $ref: '#/components/responses/RateLimited' }
+  /visualization/events:
+    get:
+      security: [{ bearerAuth: [] }]
+      description: Read-only event timeline data for all authenticated roles.
+      parameters:
+        - { in: query, name: page, schema: { type: integer, default: 1 } }
+        - { in: query, name: page_size, schema: { type: integer, default: 50, maximum: 500 } }
+        - { in: query, name: event_type, schema: { type: string } }
+        - { in: query, name: source, schema: { type: string } }
+        - { in: query, name: severity, schema: { type: string } }
+        - { in: query, name: from, schema: { type: string, format: date-time } }
+        - { in: query, name: to, schema: { type: string, format: date-time } }
+      responses:
+        '200': { description: Paginated event timeline envelope }
+        '401': { description: Authentication required }
+        '403': { description: Role denied }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /visualization/network:
+    get:
+      security: [{ bearerAuth: [] }]
+      description: Read-only IP, prefix, ASN, provider, and BGP relationship graph.
+      parameters:
+        - { in: query, name: page, schema: { type: integer, default: 1 } }
+        - { in: query, name: page_size, schema: { type: integer, default: 100, maximum: 500 } }
+      responses:
+        '200': { description: Paginated network graph envelope }
+        '401': { description: Authentication required }
+        '403': { description: Role denied }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /visualization/incidents:
+    get:
+      security: [{ bearerAuth: [] }]
+      description: Read-only incident, event, indicator, ASN, and provider relationship graph.
+      parameters:
+        - { in: query, name: page, schema: { type: integer, default: 1 } }
+        - { in: query, name: page_size, schema: { type: integer, default: 25, maximum: 100 } }
+      responses:
+        '200': { description: Paginated incident graph envelope }
+        '401': { description: Authentication required }
+        '403': { description: Role denied }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /visualization/trust:
+    get:
+      security: [{ bearerAuth: [] }]
+      description: Read-only trusted infrastructure states grouped by Verified, Pending, and Revoked.
+      parameters:
+        - { in: query, name: page, schema: { type: integer, default: 1 } }
+        - { in: query, name: page_size, schema: { type: integer, default: 50, maximum: 500 } }
+      responses:
+        '200': { description: Paginated trust visualization envelope }
+        '401': { description: Authentication required }
+        '403': { description: Role denied }
+        '429': { $ref: '#/components/responses/RateLimited' }
   /incidents:
     get:
       security: [{ bearerAuth: [] }]

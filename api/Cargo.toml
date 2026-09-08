@@ -8,6 +8,7 @@ license.workspace = true
 anyhow.workspace = true
 argon2.workspace = true
 axum.workspace = true
+ipnet.workspace = true
 chrono.workspace = true
 rand_core = { version = "0.6", features = ["getrandom"] }
 reqwest.workspace = true

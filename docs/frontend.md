@@ -10,7 +10,7 @@ Development:
 
 The Vite development proxy forwards the /api path to http://localhost:8080. The production container uses Nginx to serve the static bundle and proxy /api to clawforge-api.
 
-The console provides Overview, Incident Center, Threat Intelligence, Network Intelligence, Trust Management, Administration, and Audit views. It stores only the short-lived API session token in browser session storage. Provider secrets and database credentials never enter the frontend bundle.
+The console provides an Operations Overview, Incident Center, Threat Intelligence, Network Intelligence, Visualization, Event Stream, Trust Management, Administration, and Audit views. The overview combines API/readiness health, open incidents, provider freshness, event metrics, and Prometheus values. Visualization and the Event Stream are read-only: timelines, SVG graphs, filters, and trust summaries are assembled from API responses. It stores only the short-lived API session token in browser session storage. Provider secrets and database credentials never enter the frontend bundle.
 
 Build:
 

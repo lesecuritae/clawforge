@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env, fs,
     net::SocketAddr,
     sync::{Arc, Mutex},
@@ -572,6 +572,386 @@ struct NetworkQuery {
     prefix: Option<String>,
     from: Option<String>,
     to: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct VisualizationQuery {
+    page: Option<i64>,
+    page_size: Option<i64>,
+    event_type: Option<String>,
+    source: Option<String>,
+    severity: Option<String>,
+    from: Option<String>,
+    to: Option<String>,
+}
+
+fn graph_node(
+    id: impl Into<String>,
+    label: impl Into<String>,
+    node_type: &str,
+) -> serde_json::Value {
+    serde_json::json!({"id": id.into(), "label": label.into(), "type": node_type})
+}
+
+fn graph_edge(
+    source: impl Into<String>,
+    target: impl Into<String>,
+    edge_type: &str,
+) -> serde_json::Value {
+    serde_json::json!({"source": source.into(), "target": target.into(), "type": edge_type})
+}
+
+fn visualization_authorized(principal: &AdminPrincipal) -> ApiResult<()> {
+    require_role(principal, &["Administrator", "Operator", "Viewer"])
+}
+
+async fn visualization_events(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<VisualizationQuery>,
+) -> ApiResult<Json<ApiEnvelope<Vec<serde_json::Value>>>> {
+    let principal = authenticate(&state, &headers).await?;
+    visualization_authorized(&principal)?;
+    let mut values = state
+        .store
+        .list_events(query.event_type.as_deref(), 500)
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "visualization events unavailable",
+            )
+        })?;
+    values.retain(|value| {
+        let source_ok = query.source.as_deref().is_none_or(|source| {
+            value.get("source").and_then(serde_json::Value::as_str) == Some(source)
+        });
+        let severity_ok = query.severity.as_deref().is_none_or(|severity| {
+            value.get("severity").and_then(serde_json::Value::as_str) == Some(severity)
+        });
+        let timestamp = value
+            .get("timestamp")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        source_ok
+            && severity_ok
+            && query.from.as_deref().is_none_or(|from| timestamp >= from)
+            && query.to.as_deref().is_none_or(|to| timestamp <= to)
+    });
+    let (data, pagination) = paged_values(
+        values,
+        query.page.unwrap_or(1),
+        query.page_size.unwrap_or(50),
+    );
+    Ok(envelope(data, Some(pagination)))
+}
+
+async fn visualization_network(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<VisualizationQuery>,
+) -> ApiResult<Json<ApiEnvelope<serde_json::Value>>> {
+    let principal = authenticate(&state, &headers).await?;
+    visualization_authorized(&principal)?;
+    let asn_values = network_view(State(state.clone()), "asn")
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "network visualization unavailable",
+            )
+        })?;
+    let bgp_values = network_view(State(state.clone()), "bgp")
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "network visualization unavailable",
+            )
+        })?;
+    let indicator_values = state.store.list_indicator_views(1000).await.map_err(|_| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "network visualization unavailable",
+        )
+    })?;
+
+    let mut nodes = Vec::new();
+    let mut edges = Vec::new();
+    let mut node_ids = HashSet::new();
+    let mut edge_keys = HashSet::new();
+    let mut known_prefixes = Vec::<(String, ipnet::IpNet)>::new();
+    let mut add_node = |id: String, label: String, kind: &str| {
+        if node_ids.insert(id.clone()) {
+            nodes.push(graph_node(id, label, kind));
+        }
+    };
+    let mut add_edge = |source: String, target: String, kind: &str| {
+        let key = format!("{source}:{target}:{kind}");
+        if edge_keys.insert(key) {
+            edges.push(graph_edge(source, target, kind));
+        }
+    };
+    for record in &asn_values {
+        let Some(asn) = record.get("asn").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let asn_id = format!("asn:{asn}");
+        add_node(asn_id.clone(), format!("ASN {asn}"), "asn");
+        if let Some(prefixes) = record.get("prefixes").and_then(serde_json::Value::as_array) {
+            for prefix in prefixes.iter().filter_map(serde_json::Value::as_str) {
+                let prefix_id = format!("prefix:{prefix}");
+                add_node(prefix_id.clone(), prefix.to_string(), "prefix");
+                add_edge(asn_id.clone(), prefix_id, "announces");
+                if let Ok(network) = prefix.parse::<ipnet::IpNet>() {
+                    known_prefixes.push((format!("prefix:{prefix}"), network));
+                }
+            }
+        }
+    }
+    for (index, record) in bgp_values.iter().enumerate() {
+        let Some(prefix) = record.get("prefix").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let prefix_id = format!("prefix:{prefix}");
+        add_node(prefix_id.clone(), prefix.to_string(), "prefix");
+        if let Ok(network) = prefix.parse::<ipnet::IpNet>() {
+            known_prefixes.push((prefix_id.clone(), network));
+        }
+        if let Some(asn) = record.get("origin_asn").and_then(serde_json::Value::as_str) {
+            let asn_id = format!("asn:{asn}");
+            add_node(asn_id.clone(), format!("ASN {asn}"), "asn");
+            add_edge(prefix_id.clone(), asn_id, "origin");
+        }
+        let event_id = format!("bgp:{prefix}:{index}");
+        add_node(event_id.clone(), "BGP change".to_string(), "bgp_event");
+        add_edge(prefix_id, event_id.clone(), "changed");
+        if let Some(source) = record.get("source").and_then(serde_json::Value::as_str) {
+            let provider_id = format!("provider:{source}");
+            add_node(provider_id.clone(), source.to_string(), "provider");
+            add_edge(event_id, provider_id, "observed_by");
+        }
+    }
+    for record in indicator_values {
+        let Some(value) = record.get("value").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let Ok(ip) = value.parse::<std::net::IpAddr>() else {
+            continue;
+        };
+        let ip_id = format!("ip:{value}");
+        add_node(ip_id.clone(), value.to_string(), "ip");
+        if let Some(prefix) = record
+            .get("metadata")
+            .and_then(|v| v.get("prefix"))
+            .and_then(serde_json::Value::as_str)
+        {
+            let prefix_id = format!("prefix:{prefix}");
+            add_node(prefix_id.clone(), prefix.to_string(), "prefix");
+            add_edge(ip_id, prefix_id, "belongs_to");
+        } else {
+            for (prefix_id, network) in &known_prefixes {
+                if network.contains(&ip) {
+                    add_edge(ip_id.clone(), prefix_id.clone(), "belongs_to");
+                }
+            }
+        }
+    }
+    let (selected_nodes, pagination) = paged_values(
+        nodes,
+        query.page.unwrap_or(1),
+        query.page_size.unwrap_or(100),
+    );
+    let selected_ids = selected_nodes
+        .iter()
+        .filter_map(|node| node.get("id").and_then(serde_json::Value::as_str))
+        .collect::<HashSet<_>>();
+    let selected_edges = edges
+        .into_iter()
+        .filter(|edge| {
+            edge.get("source")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|id| selected_ids.contains(id))
+                && edge
+                    .get("target")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|id| selected_ids.contains(id))
+        })
+        .collect::<Vec<_>>();
+    Ok(envelope(
+        serde_json::json!({"nodes": selected_nodes, "edges": selected_edges}),
+        Some(pagination),
+    ))
+}
+
+async fn visualization_incidents(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<VisualizationQuery>,
+) -> ApiResult<Json<ApiEnvelope<serde_json::Value>>> {
+    let principal = authenticate(&state, &headers).await?;
+    visualization_authorized(&principal)?;
+    let incidents = state.store.list_incidents(None, 500).await.map_err(|_| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "incident visualization unavailable",
+        )
+    })?;
+    let (selected_incidents, pagination) = paged_values(
+        incidents,
+        query.page.unwrap_or(1),
+        query.page_size.unwrap_or(25).clamp(1, 100),
+    );
+    let mut nodes = Vec::new();
+    let mut edges = Vec::new();
+    let mut node_ids = HashSet::new();
+    let mut edge_keys = HashSet::new();
+    for incident in selected_incidents {
+        let Some(id) = incident.get("id").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let incident_id = format!("incident:{id}");
+        node_ids.insert(incident_id.clone());
+        nodes.push(graph_node(
+            incident_id.clone(),
+            incident
+                .get("summary")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("Incident"),
+            "incident",
+        ));
+        let incident_uuid = Uuid::parse_str(id).map_err(|_| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "invalid incident identifier",
+            )
+        })?;
+        let events = state
+            .store
+            .list_incident_events(incident_uuid)
+            .await
+            .map_err(|_| {
+                api_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "incident visualization unavailable",
+                )
+            })?;
+        for (index, event) in events.iter().enumerate() {
+            let event_id = event
+                .get("event_id")
+                .map(ToString::to_string)
+                .unwrap_or_else(|| index.to_string());
+            let event_node = format!("event:{event_id}");
+            if node_ids.insert(event_node.clone()) {
+                nodes.push(graph_node(
+                    event_node.clone(),
+                    event
+                        .get("event_type")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("Event"),
+                    "event",
+                ));
+            }
+            let key = format!("{incident_id}:{event_node}:contains");
+            if edge_keys.insert(key) {
+                edges.push(graph_edge(
+                    incident_id.clone(),
+                    event_node.clone(),
+                    "contains",
+                ));
+            }
+            if let Some(source) = event.get("source").and_then(serde_json::Value::as_str) {
+                let provider_id = format!("provider:{source}");
+                if node_ids.insert(provider_id.clone()) {
+                    nodes.push(graph_node(provider_id.clone(), source, "provider"));
+                }
+                let key = format!("{event_node}:{provider_id}:source");
+                if edge_keys.insert(key) {
+                    edges.push(graph_edge(event_node.clone(), provider_id, "source"));
+                }
+            }
+            if let Some(resource) = event
+                .get("resource")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.is_empty())
+            {
+                let indicator_id = format!("indicator:{resource}");
+                if node_ids.insert(indicator_id.clone()) {
+                    nodes.push(graph_node(indicator_id.clone(), resource, "indicator"));
+                }
+                let key = format!("{event_node}:{indicator_id}:indicator");
+                if edge_keys.insert(key) {
+                    edges.push(graph_edge(event_node.clone(), indicator_id, "indicator"));
+                }
+            }
+            if let Some(details) = event.get("details") {
+                for key in ["asn", "origin_asn"] {
+                    if let Some(asn) = details.get(key).and_then(serde_json::Value::as_str) {
+                        let asn_id = format!("asn:{asn}");
+                        if node_ids.insert(asn_id.clone()) {
+                            nodes.push(graph_node(asn_id.clone(), format!("ASN {asn}"), "asn"));
+                        }
+                        let key = format!("{event_node}:{asn_id}:asn");
+                        if edge_keys.insert(key) {
+                            edges.push(graph_edge(event_node.clone(), asn_id, "asn"));
+                        }
+                    }
+                }
+                if let Some(prefix) = details.get("prefix").and_then(serde_json::Value::as_str) {
+                    let prefix_id = format!("prefix:{prefix}");
+                    if node_ids.insert(prefix_id.clone()) {
+                        nodes.push(graph_node(prefix_id.clone(), prefix, "prefix"));
+                    }
+                    let key = format!("{event_node}:{prefix_id}:prefix");
+                    if edge_keys.insert(key) {
+                        edges.push(graph_edge(event_node.clone(), prefix_id, "prefix"));
+                    }
+                }
+            }
+        }
+    }
+    Ok(envelope(
+        serde_json::json!({"nodes": nodes, "edges": edges}),
+        Some(pagination),
+    ))
+}
+
+async fn visualization_trust(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<VisualizationQuery>,
+) -> ApiResult<Json<ApiEnvelope<serde_json::Value>>> {
+    let principal = authenticate(&state, &headers).await?;
+    visualization_authorized(&principal)?;
+    let values = network_view(State(state), "trust").await.map_err(|_| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "trust visualization unavailable",
+        )
+    })?;
+    let mut summary = serde_json::Map::new();
+    for status in ["Verified", "Pending", "Revoked"] {
+        summary.insert(
+            status.to_ascii_lowercase(),
+            serde_json::Value::from(
+                values
+                    .iter()
+                    .filter(|network| {
+                        network.get("status").and_then(serde_json::Value::as_str) == Some(status)
+                    })
+                    .count() as u64,
+            ),
+        );
+    }
+    let (networks, pagination) = paged_values(
+        values,
+        query.page.unwrap_or(1),
+        query.page_size.unwrap_or(50),
+    );
+    Ok(envelope(
+        serde_json::json!({"networks": networks, "summary": summary}),
+        Some(pagination),
+    ))
 }
 
 async fn network_asn(
@@ -2486,6 +2866,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/network/bgp", get(network_bgp))
         .route("/network/rpki", get(network_rpki))
         .route("/network/trust", get(network_trust))
+        .route("/visualization/events", get(visualization_events))
+        .route("/visualization/network", get(visualization_network))
+        .route("/visualization/incidents", get(visualization_incidents))
+        .route("/visualization/trust", get(visualization_trust))
         .route("/metrics", get(metrics))
         .route("/admin/auth/bootstrap", post(admin_bootstrap))
         .route("/admin/auth/login", post(admin_login))
@@ -2712,5 +3096,29 @@ mod tests {
         assert!(response.get("timestamp").is_some());
         assert!(response.get("pagination").is_some());
         assert!(response.get("errors").is_some());
+    }
+
+    #[test]
+    fn visualization_graph_contract_is_typed_and_read_only() {
+        let node = graph_node("asn:64500", "ASN 64500", "asn");
+        let edge = graph_edge("prefix:203.0.113.0/24", "asn:64500", "origin");
+        assert_eq!(node["type"], "asn");
+        assert_eq!(edge["source"], "prefix:203.0.113.0/24");
+        assert_eq!(edge["target"], "asn:64500");
+    }
+
+    #[test]
+    fn visualization_allows_only_read_roles() {
+        let principal = |role: &str| AdminPrincipal {
+            id: Uuid::new_v4(),
+            username: "test".into(),
+            role: role.into(),
+            auth_kind: "session".into(),
+            credential_id: Uuid::new_v4(),
+        };
+        assert!(visualization_authorized(&principal("Viewer")).is_ok());
+        assert!(visualization_authorized(&principal("Operator")).is_ok());
+        assert!(visualization_authorized(&principal("Administrator")).is_ok());
+        assert!(visualization_authorized(&principal("Unknown")).is_err());
     }
 }

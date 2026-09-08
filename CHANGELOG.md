@@ -5,6 +5,8 @@
 - Added PostgreSQL-backed notification channels, rules, retries, and internal delivery worker.
 - Added the canonical event backbone with consumer delivery, deduplication, retry/dead-letter handling, internal service authentication, and event metrics.
 - Added optional event consumption for the notifier and analyzer services.
+- Added read-only visualization APIs and an SVG-based frontend view for event timelines, network relationships, incident correlations, and trusted infrastructure.
+- Expanded the frontend into an operations dashboard with runtime cards, Prometheus monitoring values, filtered event streaming, incident relationship details, and richer ASN/BGP/RPKI tables.
 
 ## [0.1.0] - 2026-09-07
 

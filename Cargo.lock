@@ -265,6 +265,7 @@ dependencies = [
  "chrono",
  "clawforge-intelligence",
  "clawforge-storage",
+ "ipnet",
  "rand_core 0.6.4",
  "reqwest",
  "serde",
