@@ -24,7 +24,9 @@
             "get_agent_context",
             "get_decisions",
             "get_provider_status",
-            "get_operations_summary"
+            "get_operations_summary",
+            "get_health_overview",
+            "get_security_posture"
           ]
         }
       }

@@ -111,6 +111,7 @@ rollenbasierte Exportfunktionen. Zeitangaben sind UTC in RFC-3339-Format.
 | `GET /api/v1/decisions` | priorisierte read-only Lageeinschätzung | Gesamtstatus, bestehende Risikowerte, Aufmerksamkeitspunkte, empfohlene Prüfungen und Context-Zusammenfassung | `agent:decision:read` |
 | `GET /api/v1/providers` | Provider-Health | Quelle, Status, letzter Erfolg/Fehler, Datenalter, Qualität und Indicator-Anzahl ohne Rohfeeds | `agent:provider:read` |
 | `GET /api/v1/operations/summary` | Operations-Einstiegspunkt | Status, Risk-Level, aktive Incidents, kritische Events, Provider-Health, Attention Points und Recommended Checks | `agent:operations:read` |
+| `GET /api/v1/history` | historische Lagebilder | Operations-Snapshots mit Zeitbereich, Intervall und Trendvergleich | `agent:operations:read` |
 | `GET /api/v1/events` | aktuelle kanonische Events | Typ, Quelle, Severity, Zeit, Korrelation, begründete Zusammenfassung | `agent:events:read` |
 | `GET /api/v1/incidents` | Incident-Liste | Status, Severity, Confidence, Risiko, Summary, Zeit, Event-Anzahl | `agent:incident:read` |
 | `GET /api/v1/incidents/{id}` | Incident-Details | Status, Severity, Confidence, Risiko, Summary und Zeit | `agent:incident:read` |
@@ -118,6 +119,7 @@ rollenbasierte Exportfunktionen. Zeitangaben sind UTC in RFC-3339-Format.
 | `GET /api/v1/incidents/{id}/relations` | Incident-Relationen | Events, Indicators und Incident-Beziehungen ohne Rohpayload | `agent:incident:read` |
 | `GET /api/v1/security/findings` | Security Findings | Indicator-Finding, Quelle, Confidence, Alter, Ablauf, Risk-/Trust-Werte, Reason | `agent:security:read` |
 | `GET /api/v1/security/overview` | Security-Zusammenfassung | Finding-Anzahl, aktive Findings, Severity-Verteilung, höchste gespeicherte Bewertung | `agent:security:read` |
+| `GET /api/v1/security/posture` | Security Posture | Findings, betroffene Komponenten, Severity-Verteilung und historische Richtung | `agent:security:read` |
 | `GET /api/v1/network/asn` | ASN-Kontext | ASN, Organisation, Provider, Land, Prefixe, Netzwerktyp, Reputation, Alter | `agent:network:read` |
 | `GET /api/v1/network/prefixes` | Prefix-Kontext | Prefix, ASN, Netzwerktyp, Zeit und Quelle | `agent:network:read` |
 | `GET /api/v1/network/bgp` | Routing-Ereignisse | Prefix, vorherige/neue ASN, Status, Quelle, Zeit, Confidence | `agent:network:read` |
@@ -146,12 +148,12 @@ Scopes sind:
 | `agent:system:read` | `/api/v1/status` |
 | `agent:events:read` | `/api/v1/events` |
 | `agent:incident:read` | `/api/v1/incidents` und Detail-/Timeline-/Relationsrouten |
-| `agent:security:read` | `/api/v1/security/findings`, `/security/overview` |
+| `agent:security:read` | `/api/v1/security/findings`, `/security/overview`, `/security/posture` |
 | `agent:network:read` | `/api/v1/network/*` einschließlich Trust |
 | `agent:context:read` | `/api/v1/context` |
 | `agent:decision:read` | `/api/v1/decisions` |
 | `agent:provider:read` | `/api/v1/providers` |
-| `agent:operations:read` | `/api/v1/operations/summary` |
+| `agent:operations:read` | `/api/v1/operations/summary`, `/api/v1/history` |
 | `agent:read` | explizit erteiltes read-only Gesamtprofil |
 
 Ein fehlender oder ungültiger Bearer-Token liefert `401`, ein gültiger Token

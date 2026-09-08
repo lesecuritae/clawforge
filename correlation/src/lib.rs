@@ -80,6 +80,17 @@ pub fn correlate(
     let left_values = extract_indicators(&left.payload);
     let right_values = extract_indicators(&right.payload);
     let shared = left_values.intersection(&right_values).next().cloned();
+    if shared.is_none() && left.source == right.source && !left.source.trim().is_empty() {
+        return Some(CorrelationMatch {
+            correlation_key: format!("source:{}", left.source),
+            relation_type: "shared-source".into(),
+            confidence: 68,
+            reason: format!(
+                "events share source {} within the correlation window",
+                left.source
+            ),
+        });
+    }
     let shared = shared?;
     let different_types = left.event_type != right.event_type;
     let same_source = left.source == right.source;
@@ -277,6 +288,21 @@ mod tests {
         let matched = correlate(&left, &right, Duration::seconds(60)).unwrap();
         assert_eq!(matched.relation_type, "event-chain");
         assert!(matched.correlation_key.contains("198.51.100.7"));
+    }
+
+    #[test]
+    fn correlates_events_from_same_source_without_shared_payload() {
+        let left = event(1, "provider_error", "threatfox", 10, serde_json::json!({}));
+        let right = event(
+            2,
+            "new_threat_indicator",
+            "threatfox",
+            20,
+            serde_json::json!({}),
+        );
+        let matched = correlate(&left, &right, Duration::seconds(60)).unwrap();
+        assert_eq!(matched.relation_type, "shared-source");
+        assert_eq!(matched.confidence, 68);
     }
 
     #[test]

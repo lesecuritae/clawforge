@@ -1,3 +1,34 @@
+# Clawforge v0.4.0
+
+Historical Operations Intelligence release with controlled security-audit
+hardening.
+
+## Highlights
+
+- Operations snapshots, history filtering, trend direction, reason, and
+  confidence through Agent API v1.
+- Correlation confidence and same-source fallback correlation.
+- Alert grouping, deduplication, aging, and event counts.
+- Security Posture API, MCP tool, and frontend view.
+- Security audit report with fixes for empty alert aggregation and malformed
+  incident identifier error disclosure.
+
+## Validation
+
+- Rust format, workspace tests, Clippy, frontend tests/build, OpenAPI parsing.
+- Docker Compose configuration, complete service builds, migration/readiness
+  checks, health checks, PostgreSQL persistence, and backup/restore.
+- Agent API and MCP authentication, authorization, rate-limit, redaction, and
+  read-only checks.
+
+The `cargo audit` result contains the documented medium advisory for the
+optional, unused `sqlx-mysql` dependency; Clawforge builds PostgreSQL only and
+there is no upstream fixed version yet.
+
+The previous v0.3.0 release notes follow.
+
+---
+
 # Clawforge v0.3.0
 
 Production OpenClaw live-integration validation for the standalone Rust

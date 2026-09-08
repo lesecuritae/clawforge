@@ -265,7 +265,16 @@ impl PostgresStore {
         }
         let id = Uuid::new_v4();
         let dedupe_key = format!("{event_type}:{resource}:{source_event_id}");
-        let result = sqlx::query("INSERT INTO alerts (id,source,severity,incident_id,source_event_id,summary,details,dedupe_key) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (dedupe_key) DO NOTHING")
+        let group_key = incident_id
+            .map(|value| format!("incident:{value}"))
+            .unwrap_or_else(|| format!("{event_type}:{resource}"));
+        let confidence: i16 = if severity == "critical" { 100 } else { 85 };
+        let grouped = sqlx::query("UPDATE alerts SET last_seen_at=NOW(), event_count=event_count+1, confidence=GREATEST(confidence,$2), updated_at=NOW() WHERE group_key=$1 AND status IN ('open','acknowledged')")
+            .bind(&group_key).bind(confidence).execute(&self.pool).await?;
+        if grouped.rows_affected() > 0 {
+            return Ok(None);
+        }
+        let result = sqlx::query("INSERT INTO alerts (id,source,severity,incident_id,source_event_id,summary,details,dedupe_key,group_key,confidence,last_seen_at,event_count) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW(),1) ON CONFLICT (dedupe_key) DO NOTHING")
             .bind(id)
             .bind(source)
             .bind(severity)
@@ -278,6 +287,8 @@ impl PostgresStore {
                 "source_event_id": source_event_id
             }))
             .bind(&dedupe_key)
+            .bind(&group_key)
+            .bind(confidence)
             .execute(&self.pool)
             .await?;
         if result.rows_affected() == 0 {
@@ -304,7 +315,7 @@ impl PostgresStore {
         severity: Option<&str>,
         limit: i64,
     ) -> Result<Vec<serde_json::Value>> {
-        let rows = sqlx::query("SELECT id,source,severity,status,created_at,acknowledged_at,delivery_status,incident_id,summary,updated_at FROM alerts WHERE ($1::text IS NULL OR status=$1) AND ($2::text IS NULL OR severity=$2) ORDER BY created_at DESC LIMIT $3")
+        let rows = sqlx::query("SELECT id,source,severity,status,created_at,acknowledged_at,delivery_status,incident_id,summary,updated_at,confidence,last_seen_at,event_count,EXTRACT(EPOCH FROM (NOW()-last_seen_at)) AS age_seconds FROM alerts WHERE ($1::text IS NULL OR status=$1) AND ($2::text IS NULL OR severity=$2) ORDER BY created_at DESC LIMIT $3")
             .bind(status)
             .bind(severity)
             .bind(limit.clamp(1, 500))
@@ -320,7 +331,12 @@ impl PostgresStore {
             "delivery_status": row.get::<String, _>("delivery_status"),
             "incident_id": row.get::<Option<Uuid>, _>("incident_id"),
             "summary": row.get::<String, _>("summary"),
-            "updated_at": row.get::<chrono::DateTime<chrono::Utc>, _>("updated_at")
+            "updated_at": row.get::<chrono::DateTime<chrono::Utc>, _>("updated_at"),
+            "confidence": row.get::<i16, _>("confidence"),
+            "last_seen_at": row.get::<chrono::DateTime<chrono::Utc>, _>("last_seen_at"),
+            "event_count": row.get::<i32, _>("event_count"),
+            "age_seconds": row.get::<f64, _>("age_seconds"),
+            "aged": row.get::<f64, _>("age_seconds") >= 86_400.0
         })).collect())
     }
 
@@ -336,7 +352,89 @@ impl PostgresStore {
                 serde_json::json!(row.get::<i64, _>("count")),
             );
         }
+        let aggregate = sqlx::query_as::<_, (i64, i64, i64)>("SELECT COALESCE(COUNT(DISTINCT group_key) FILTER (WHERE status IN ('open','acknowledged')), 0)::bigint, COALESCE(SUM(event_count) FILTER (WHERE status IN ('open','acknowledged')),0)::bigint, COALESCE(COUNT(*) FILTER (WHERE status IN ('open','acknowledged') AND last_seen_at < NOW()-INTERVAL '24 hours'), 0)::bigint FROM alerts")
+            .fetch_one(&self.pool).await?;
+        counts.insert("groups".into(), serde_json::json!(aggregate.0));
+        counts.insert("grouped_events".into(), serde_json::json!(aggregate.1));
+        counts.insert("aged".into(), serde_json::json!(aggregate.2));
         Ok(serde_json::Value::Object(counts))
+    }
+
+    /// Capture a bounded operations snapshot. The snapshot contains only
+    /// aggregate health values and is safe to compare through the Agent API.
+    pub async fn capture_operations_snapshot(&self) -> Result<()> {
+        let active_incidents: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM incidents WHERE status NOT IN ('resolved','closed')",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        let alert_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM alerts WHERE status='open'")
+                .fetch_one(&self.pool)
+                .await?;
+        let providers = self.list_provider_views().await?;
+        let provider_health = serde_json::json!({
+            "total": providers.len(),
+            "enabled": providers.iter().filter(|p| p.get("enabled").and_then(serde_json::Value::as_bool) == Some(true)).count(),
+            "healthy": providers.iter().filter(|p| matches!(p.get("status").and_then(serde_json::Value::as_str), Some("ok" | "healthy"))).count(),
+            "failed": providers.iter().filter(|p| matches!(p.get("status").and_then(serde_json::Value::as_str), Some("error" | "failed"))).count()
+        });
+        let runtime = self.runtime_status_views().await?;
+        let system_health = serde_json::json!({
+            "components": runtime.iter().map(|value| serde_json::json!({
+                "component": value.get("component"),
+                "state": value.get("state"),
+                "updated_at": value.get("updated_at")
+            })).collect::<Vec<_>>()
+        });
+        let runtime_degraded = runtime
+            .iter()
+            .any(|value| value.get("state").and_then(serde_json::Value::as_str) == Some("error"));
+        let provider_failed = provider_health
+            .get("failed")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+            > 0;
+        let risk_level: String = sqlx::query_scalar("SELECT COALESCE((SELECT severity FROM incidents WHERE status NOT IN ('resolved','closed') ORDER BY CASE severity WHEN 'critical' THEN 5 WHEN 'high' THEN 4 WHEN 'medium' THEN 3 WHEN 'low' THEN 2 ELSE 1 END DESC LIMIT 1), 'info')")
+            .fetch_one(&self.pool).await?;
+        let overall_status = if runtime_degraded {
+            "unavailable"
+        } else if risk_level == "critical" {
+            "critical"
+        } else if provider_failed {
+            "degraded"
+        } else {
+            "ok"
+        };
+        sqlx::query("INSERT INTO operations_snapshots (overall_status,risk_level,active_incident_count,alert_count,provider_health,system_health) VALUES ($1,$2,$3,$4,$5,$6)")
+            .bind(overall_status).bind(&risk_level).bind(active_incidents).bind(alert_count).bind(provider_health).bind(system_health)
+            .execute(&self.pool).await?;
+        Ok(())
+    }
+
+    pub async fn list_operations_snapshots(
+        &self,
+        from: Option<chrono::DateTime<chrono::Utc>>,
+        to: Option<chrono::DateTime<chrono::Utc>>,
+        limit: i64,
+    ) -> Result<Vec<serde_json::Value>> {
+        let rows = sqlx::query("SELECT id,captured_at,overall_status,risk_level,active_incident_count,alert_count,provider_health,system_health FROM operations_snapshots WHERE ($1::timestamptz IS NULL OR captured_at >= $1) AND ($2::timestamptz IS NULL OR captured_at <= $2) ORDER BY captured_at DESC LIMIT $3")
+            .bind(from).bind(to).bind(limit.clamp(1, 2000)).fetch_all(&self.pool).await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                serde_json::json!({
+                    "id": row.get::<i64,_>("id"),
+                    "timestamp": row.get::<chrono::DateTime<chrono::Utc>,_>("captured_at"),
+                    "overall_status": row.get::<String,_>("overall_status"),
+                    "risk_level": row.get::<String,_>("risk_level"),
+                    "active_incident_count": row.get::<i32,_>("active_incident_count"),
+                    "alert_count": row.get::<i32,_>("alert_count"),
+                    "provider_health": row.get::<serde_json::Value,_>("provider_health"),
+                    "system_health": row.get::<serde_json::Value,_>("system_health")
+                })
+            })
+            .collect())
     }
 
     pub async fn update_alert_status(

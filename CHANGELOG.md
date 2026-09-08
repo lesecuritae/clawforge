@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+- Added the controlled security-audit report and hardened Agent API incident
+  identifier validation so malformed IDs return generic authenticated errors.
+- Fixed PostgreSQL alert aggregation so the Operations Summary remains
+  available when no alerts exist.
+- Added historical operations snapshots, trend signals, grouped alert aging,
+  correlation confidence, Security Posture, and matching read-only MCP tools.
 - Added PostgreSQL-backed notification channels, rules, retries, and internal delivery worker.
 - Added the canonical event backbone with consumer delivery, deduplication, retry/dead-letter handling, internal service authentication, and event metrics.
 - Added optional event consumption for the notifier and analyzer services.
@@ -9,6 +15,17 @@
 - Expanded the frontend into an operations dashboard with runtime cards, Prometheus monitoring values, filtered event streaming, incident relationship details, and richer ASN/BGP/RPKI tables.
 - Added provider quality and failure metadata, the read-only provider status and operations summary APIs, and matching MCP tools.
 - Added an Operations Summary dashboard view, source/time incident filters, audit explorer filters, and retention documentation.
+
+## [0.4.0] - 2026-09-08
+
+- Added operations snapshots and bounded historical/trend views through Agent
+  API v1.
+- Added correlation confidence, same-source correlation, grouped alert
+  deduplication, aging, and confidence metadata.
+- Added Security Posture API/MCP views and dashboard presentation.
+- Completed the controlled security audit, fixed empty-alert aggregation and
+  malformed incident identifier error disclosure, and documented the remaining
+  optional sqlx-mysql advisory.
 
 ## [0.3.0] - 2026-09-08
 
@@ -27,5 +44,6 @@
 - Production backup, restore, update, migration, and container-hardening workflows.
 - Role-aware global and endpoint-specific API rate limits with 429 retry headers and audit events.
 
-[Unreleased]: https://github.com/lesecuritae/clawforge/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/lesecuritae/clawforge/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/lesecuritae/clawforge/releases/tag/v0.4.0
 [0.3.0]: https://github.com/lesecuritae/clawforge/releases/tag/v0.3.0

@@ -684,6 +684,20 @@ impl McpServer {
     }
 
     #[tool(
+        name = "get_health_overview",
+        description = "Read current operations health together with historical risk and provider trends; no actions are performed; requires agent:operations:read"
+    )]
+    async fn get_health_overview(
+        &self,
+        Parameters(_args): Parameters<EmptyArgs>,
+    ) -> Result<Json<ToolResponse>, ErrorData> {
+        Ok(Json(
+            self.get(SCOPE_OPERATIONS, "/api/v1/operations/summary", &[])
+                .await?,
+        ))
+    }
+
+    #[tool(
         name = "list_events",
         description = "List paginated normalized events with optional source, severity, type, correlation, and time filters; requires agent:events:read"
     )]
@@ -766,6 +780,20 @@ impl McpServer {
             object.insert("incidents".to_string(), incidents?);
         }
         Ok(Json(response))
+    }
+
+    #[tool(
+        name = "get_security_posture",
+        description = "Read security findings posture, affected components, severity distribution, and trend; read-only and requires agent:security:read"
+    )]
+    async fn get_security_posture(
+        &self,
+        Parameters(_args): Parameters<EmptyArgs>,
+    ) -> Result<Json<ToolResponse>, ErrorData> {
+        Ok(Json(
+            self.get(SCOPE_SECURITY, "/api/v1/security/posture", &[])
+                .await?,
+        ))
     }
 
     #[tool(
@@ -1167,6 +1195,7 @@ mod tests {
             vec![
                 "get_agent_context",
                 "get_decisions",
+                "get_health_overview",
                 "get_incident",
                 "get_incident_relations",
                 "get_incident_timeline",
@@ -1174,6 +1203,7 @@ mod tests {
                 "get_operations_summary",
                 "get_provider_status",
                 "get_security_overview",
+                "get_security_posture",
                 "get_status",
                 "get_trust_status",
                 "list_events",
@@ -1289,7 +1319,7 @@ mod tests {
         );
         let client = ClientInfo::default().serve(transport).await.unwrap();
         let tools = client.list_tools(None).await.unwrap();
-        assert_eq!(tools.tools.len(), 14);
+        assert_eq!(tools.tools.len(), 16);
         let expected = [
             "get_status",
             "list_events",
@@ -1305,6 +1335,8 @@ mod tests {
             "get_decisions",
             "get_provider_status",
             "get_operations_summary",
+            "get_health_overview",
+            "get_security_posture",
         ];
         for name in expected {
             let tool = tools

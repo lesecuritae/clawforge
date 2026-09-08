@@ -2,7 +2,7 @@
 
 Status: Read-only MCP-Adapter produktionsbereit. Der MCP-Dienst ist ein
 isolierter Rust-Service und wurde mit OpenClaw Discovery sowie den
-Operations-Leseabfragen geprüft.
+Operations-Leseabfragen geprüft. Die aktuelle Tool-Liste umfasst 16 Tools.
 
 Dieses Dokument beschreibt einen separaten, read-only MCP-Dienst für
 OpenClaw. Die Agent API v1 bleibt die einzige Datenquelle. Der MCP-Dienst
@@ -49,6 +49,7 @@ als MCP-Upstream verwendet.
 | `get_decisions` | `GET /api/v1/decisions` | `agent:decision:read` | direkt nutzbar |
 | `get_provider_status` | `GET /api/v1/providers` | `agent:provider:read` | direkt nutzbar |
 | `get_operations_summary` | `GET /api/v1/operations/summary` | `agent:operations:read` | direkt nutzbar |
+| `get_health_overview` | `GET /api/v1/operations/summary` | `agent:operations:read` | Trend- und Health-Ansicht |
 | `list_events` | `GET /api/v1/events` | `agent:events:read` | direkt nutzbar |
 | `list_incidents` | `GET /api/v1/incidents` | `agent:incident:read` | direkt nutzbar |
 | `get_incident` | `GET /api/v1/incidents/{id}` | `agent:incident:read` | direkt nutzbar |
@@ -56,6 +57,7 @@ als MCP-Upstream verwendet.
 | `get_incident_relations` | `GET /api/v1/incidents/{id}/relations` | `agent:incident:read` | direkt nutzbar |
 | `get_security_overview` | `GET /api/v1/security/overview` + Incident-Liste | `agent:security:read` + `agent:incident:read` | direkt nutzbar |
 | `list_security_findings` | `GET /api/v1/security/findings` | `agent:security:read` | direkt nutzbar |
+| `get_security_posture` | `GET /api/v1/security/posture` | `agent:security:read` | Trend- und Komponentenansicht |
 | `get_trust_status` | `GET /api/v1/network/trust` | `agent:network:read` | direkt nutzbar |
 | `get_network_overview` | `GET /api/v1/network/asn`, `/prefixes`, `/bgp`, `/rpki` | `agent:network:read` | deterministische Zusammenführung im Adapter |
 
@@ -203,11 +205,11 @@ Aktivierung, Policy-Änderungen, Incident-Statusänderungen oder Blockaktionen.
 
 ## Produktionsvertrag und OpenClaw-Vorbereitung
 
-Der MCP-Server ist ein stateless read-only Adapter. Alle 14 Tools verwenden
+Der MCP-Server ist ein stateless read-only Adapter. Alle 16 Tools verwenden
 die versionierte Agent API v1 als einzige Datenquelle; es gibt keine direkte
 PostgreSQL-, Event-Backbone- oder Worker-Verbindung. Upstream-Aufrufe haben
 ein konfigurierbares Timeout (`CLAWFORGE_MCP_UPSTREAM_TIMEOUT_SECONDS`,
-Standard 15 Sekunden). Netzwerk-, HTTP- und JSON-Fehler werden in eine
+Standard 10 Sekunden). Netzwerk-, HTTP- und JSON-Fehler werden in eine
 strukturierte, redigierte MCP-Fehlermeldung übersetzt; Upstream-Body,
 Credentials und interne Stacktraces werden nicht weitergegeben.
 

@@ -21,7 +21,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use clawforge_intelligence::{NetworkType, TrustedNetwork, VerificationStatus};
 use clawforge_storage::{
     database_url_from_env, AdminPrincipal, AgentPrincipal, AuditEventFilter, MigrationStatus,
@@ -1093,6 +1093,7 @@ struct AgentQuery {
     rpki_status: Option<String>,
     from: Option<String>,
     to: Option<String>,
+    interval: Option<String>,
 }
 
 fn agent_page(query: &AgentQuery, default: i64) -> (i64, i64) {
@@ -1713,6 +1714,112 @@ fn operations_summary_data(
     })
 }
 
+fn trend_rank(value: &str) -> i16 {
+    match value {
+        "critical" => 5,
+        "high" => 4,
+        "medium" => 3,
+        "low" => 2,
+        "info" | "ok" => 1,
+        "degraded" => 2,
+        "unavailable" => 5,
+        _ => 0,
+    }
+}
+
+fn trend_direction(current: i64, previous: i64) -> &'static str {
+    match current.cmp(&previous) {
+        std::cmp::Ordering::Greater => "increasing",
+        std::cmp::Ordering::Less => "decreasing",
+        std::cmp::Ordering::Equal => "stable",
+    }
+}
+
+fn operations_trend(
+    summary: &serde_json::Value,
+    snapshots: &[serde_json::Value],
+) -> serde_json::Value {
+    let Some(previous) = snapshots.first() else {
+        return serde_json::json!({
+            "risk_level": {"value": summary.get("risk_level"), "change_direction": "stable", "change_reason": "no historical snapshot available", "confidence": 0},
+            "active_incidents": {"value": summary.get("active_incidents"), "change_direction": "stable", "change_reason": "no historical snapshot available", "confidence": 0},
+            "alerts": {"value": summary.get("alerts").and_then(|value| value.get("open")).cloned().unwrap_or_default(), "change_direction": "stable", "change_reason": "no historical snapshot available", "confidence": 0},
+            "provider_failures": {"value": summary.get("provider_health").and_then(|value| value.get("failed")).cloned().unwrap_or_default(), "change_direction": "stable", "change_reason": "no historical snapshot available", "confidence": 0},
+            "overall": {"change_direction": "stable", "change_reason": "no historical snapshot available", "confidence": 0}
+        });
+    };
+    let current_risk = summary
+        .get("risk_level")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("info");
+    let previous_risk = previous
+        .get("risk_level")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("info");
+    let current_incidents = summary
+        .get("active_incidents")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+    let previous_incidents = previous
+        .get("active_incident_count")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+    let current_alerts = summary
+        .get("alerts")
+        .and_then(|value| value.get("open"))
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+    let previous_alerts = previous
+        .get("alert_count")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+    let current_failures = summary
+        .get("provider_health")
+        .and_then(|value| value.get("failed"))
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+    let previous_failures = previous
+        .get("provider_health")
+        .and_then(|value| value.get("failed"))
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+    let risk_delta = trend_rank(current_risk) - trend_rank(previous_risk);
+    let overall_direction = if risk_delta > 0
+        || current_incidents > previous_incidents
+        || current_alerts > previous_alerts
+        || current_failures > previous_failures
+    {
+        "increasing"
+    } else if risk_delta < 0
+        || current_incidents < previous_incidents
+        || current_alerts < previous_alerts
+        || current_failures < previous_failures
+    {
+        "decreasing"
+    } else {
+        "stable"
+    };
+    let overall_reason = if current_risk != previous_risk {
+        format!("risk level changed from {previous_risk} to {current_risk}")
+    } else if current_incidents != previous_incidents {
+        format!("active incidents changed from {previous_incidents} to {current_incidents}")
+    } else if current_failures != previous_failures {
+        format!("provider failures changed from {previous_failures} to {current_failures}")
+    } else if current_alerts != previous_alerts {
+        format!("open alerts changed from {previous_alerts} to {current_alerts}")
+    } else {
+        "no material change since the previous snapshot".to_string()
+    };
+    let confidence = 80;
+    serde_json::json!({
+        "risk_level": {"value": current_risk, "previous": previous_risk, "change_direction": if risk_delta > 0 { "increasing" } else if risk_delta < 0 { "decreasing" } else { "stable" }, "change_reason": if current_risk == previous_risk { "risk level is unchanged" } else { "risk level changed" }, "confidence": confidence},
+        "active_incidents": {"value": current_incidents, "previous": previous_incidents, "change_direction": trend_direction(current_incidents, previous_incidents), "change_reason": "active incident count comparison", "confidence": confidence},
+        "alerts": {"value": current_alerts, "previous": previous_alerts, "change_direction": trend_direction(current_alerts, previous_alerts), "change_reason": "open alert count comparison", "confidence": confidence},
+        "provider_failures": {"value": current_failures, "previous": previous_failures, "change_direction": trend_direction(current_failures, previous_failures), "change_reason": "provider failure count comparison", "confidence": confidence},
+        "overall": {"change_direction": overall_direction, "change_reason": overall_reason, "confidence": confidence}
+    })
+}
+
 async fn agent_status(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2097,6 +2204,17 @@ async fn load_operations_summary(state: &AppState) -> ApiResult<serde_json::Valu
     } else {
         "unavailable"
     };
+    let snapshots = state
+        .store
+        .list_operations_snapshots(None, None, 100)
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "operations history unavailable",
+            )
+        })?;
+    let trend = operations_trend(&summary, &snapshots);
     if let Some(object) = summary.as_object_mut() {
         object.insert(
             "system_status".into(),
@@ -2112,8 +2230,178 @@ async fn load_operations_summary(state: &AppState) -> ApiResult<serde_json::Valu
             }),
         );
         object.insert("alerts".into(), alert_counts);
+        object.insert("trend".into(), trend.clone());
+        object.insert(
+            "change_direction".into(),
+            trend
+                .get("overall")
+                .and_then(|value| value.get("change_direction"))
+                .cloned()
+                .unwrap_or_else(|| serde_json::Value::from("stable")),
+        );
+        object.insert(
+            "change_reason".into(),
+            trend
+                .get("overall")
+                .and_then(|value| value.get("change_reason"))
+                .cloned()
+                .unwrap_or_else(|| serde_json::Value::from("no historical snapshot available")),
+        );
+        object.insert(
+            "confidence".into(),
+            trend
+                .get("overall")
+                .and_then(|value| value.get("confidence"))
+                .cloned()
+                .unwrap_or_else(|| serde_json::Value::from(0)),
+        );
     }
     Ok(summary)
+}
+
+fn parse_agent_time(value: Option<&str>) -> ApiResult<Option<DateTime<Utc>>> {
+    value
+        .map(|raw| {
+            DateTime::parse_from_rfc3339(raw)
+                .map(|parsed| parsed.with_timezone(&Utc))
+                .map_err(|_| api_error(StatusCode::BAD_REQUEST, "invalid RFC3339 time filter"))
+        })
+        .transpose()
+}
+
+fn parse_agent_uuid(value: &str) -> ApiResult<Uuid> {
+    Uuid::parse_str(value)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "invalid incident identifier"))
+}
+
+async fn agent_history(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AgentQuery>,
+) -> ApiResult<Json<ApiEnvelope<Vec<serde_json::Value>>>> {
+    let principal = authenticate_agent(&state, &headers).await?;
+    require_agent_scope(&principal, AGENT_SCOPE_OPERATIONS_READ)?;
+    let from = parse_agent_time(query.from.as_deref())?;
+    let to = parse_agent_time(query.to.as_deref())?;
+    let mut values = state
+        .store
+        .list_operations_snapshots(from, to, 2000)
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "operations history unavailable",
+            )
+        })?;
+    if let Some(interval) = query.interval.as_deref() {
+        let seconds = match interval {
+            "5m" => 300,
+            "15m" => 900,
+            "hour" | "1h" => 3600,
+            "day" | "1d" => 86_400,
+            _ => {
+                return Err(api_error(
+                    StatusCode::BAD_REQUEST,
+                    "interval must be 5m, 15m, hour, or day",
+                ))
+            }
+        };
+        let mut seen = std::collections::HashSet::new();
+        values.retain(|value| {
+            let timestamp = value
+                .get("timestamp")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let bucket = DateTime::parse_from_rfc3339(timestamp)
+                .ok()
+                .map(|time| time.timestamp() / seconds);
+            bucket.is_some_and(|key| seen.insert(key))
+        });
+    }
+    let (page, page_size) = agent_page(&query, 100);
+    let (data, pagination) = paged_values(values, page, page_size);
+    audit_agent_read(
+        &state,
+        &principal,
+        "/api/v1/history",
+        AGENT_SCOPE_OPERATIONS_READ,
+    )
+    .await;
+    Ok(envelope(data, Some(pagination)))
+}
+
+async fn agent_security_posture(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<ApiEnvelope<serde_json::Value>>> {
+    let principal = authenticate_agent(&state, &headers).await?;
+    require_agent_scope(&principal, AGENT_SCOPE_SECURITY_READ)?;
+    let values = state.store.list_indicator_views(1000).await.map_err(|_| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "security posture unavailable",
+        )
+    })?;
+    let active = values
+        .iter()
+        .filter(|value| value.get("status").and_then(serde_json::Value::as_str) == Some("active"))
+        .count();
+    let highest_risk = values
+        .iter()
+        .filter_map(|value| value.get("risk_score").and_then(serde_json::Value::as_i64))
+        .max()
+        .unwrap_or(0);
+    let mut by_severity = serde_json::Map::new();
+    for severity in ["info", "low", "medium", "high", "critical"] {
+        by_severity.insert(
+            severity.to_string(),
+            serde_json::Value::from(
+                values
+                    .iter()
+                    .filter(|value| {
+                        value
+                            .get("risk_score")
+                            .and_then(serde_json::Value::as_i64)
+                            .is_some_and(|score| risk_severity(score) == severity)
+                    })
+                    .count() as u64,
+            ),
+        );
+    }
+    let components = values
+        .iter()
+        .filter_map(|value| value.get("source").and_then(serde_json::Value::as_str))
+        .collect::<std::collections::BTreeSet<_>>();
+    let snapshots = state
+        .store
+        .list_operations_snapshots(None, None, 2)
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "security posture history unavailable",
+            )
+        })?;
+    let current = serde_json::json!({"risk_level": risk_severity(highest_risk), "active_incidents": 0, "alerts": {"open": 0}, "provider_health": {"failed": 0}});
+    let trend = operations_trend(&current, &snapshots);
+    audit_agent_read(
+        &state,
+        &principal,
+        "/api/v1/security/posture",
+        AGENT_SCOPE_SECURITY_READ,
+    )
+    .await;
+    Ok(envelope(
+        serde_json::json!({
+            "findings_total": values.len(),
+            "active_findings": active,
+            "highest_risk_score": highest_risk,
+            "by_severity": by_severity,
+            "affected_components": components,
+            "trend": trend.get("risk_level").cloned().unwrap_or_default()
+        }),
+        None,
+    ))
 }
 
 async fn agent_operations_summary(
@@ -2314,10 +2602,11 @@ async fn agent_incidents(
 async fn agent_incident_detail(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(id): Path<Uuid>,
+    Path(raw_id): Path<String>,
 ) -> ApiResult<Json<ApiEnvelope<serde_json::Value>>> {
     let principal = authenticate_agent(&state, &headers).await?;
     require_agent_incident_scope(&principal)?;
+    let id = parse_agent_uuid(&raw_id)?;
     let value = state
         .store
         .get_incident(id)
@@ -2337,11 +2626,12 @@ async fn agent_incident_detail(
 async fn agent_incident_timeline(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(id): Path<Uuid>,
+    Path(raw_id): Path<String>,
     Query(query): Query<AgentQuery>,
 ) -> ApiResult<Json<ApiEnvelope<Vec<serde_json::Value>>>> {
     let principal = authenticate_agent(&state, &headers).await?;
     require_agent_incident_scope(&principal)?;
+    let id = parse_agent_uuid(&raw_id)?;
     let timeline = state
         .store
         .incident_timeline(id)
@@ -2387,11 +2677,12 @@ async fn agent_incident_timeline(
 async fn agent_incident_relations(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(id): Path<Uuid>,
+    Path(raw_id): Path<String>,
     Query(query): Query<AgentQuery>,
 ) -> ApiResult<Json<ApiEnvelope<Vec<serde_json::Value>>>> {
     let principal = authenticate_agent(&state, &headers).await?;
     require_agent_incident_scope(&principal)?;
+    let id = parse_agent_uuid(&raw_id)?;
     let timeline = state
         .store
         .incident_timeline(id)
@@ -5066,6 +5357,7 @@ async fn main() -> anyhow::Result<()> {
                 .route("/decisions", get(agent_decisions))
                 .route("/providers", get(agent_provider_status))
                 .route("/operations/summary", get(agent_operations_summary))
+                .route("/history", get(agent_history))
                 .route("/events", get(agent_events))
                 .route("/incidents", get(agent_incidents))
                 .route("/incidents/{id}", get(agent_incident_detail))
@@ -5073,6 +5365,7 @@ async fn main() -> anyhow::Result<()> {
                 .route("/incidents/{id}/relations", get(agent_incident_relations))
                 .route("/security/findings", get(agent_findings))
                 .route("/security/overview", get(agent_security_overview))
+                .route("/security/posture", get(agent_security_posture))
                 .route("/network/asn", get(agent_asn))
                 .route("/network/prefixes", get(agent_prefixes))
                 .route("/network/bgp", get(agent_bgp))
@@ -5606,5 +5899,13 @@ mod tests {
             ..AgentQuery::default()
         };
         assert!(agent_time_matches(&value, &query));
+    }
+
+    #[test]
+    fn agent_path_identifier_errors_are_generic() {
+        let (status, body) =
+            parse_agent_uuid("not-a-uuid").expect_err("invalid id must be rejected");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body.0.errors, vec!["invalid incident identifier"]);
     }
 }

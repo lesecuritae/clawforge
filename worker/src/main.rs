@@ -56,6 +56,9 @@ async fn main() -> anyhow::Result<()> {
                     let _ = store.set_runtime_status("worker", "error", Some(&error.to_string())).await;
                 } else {
                     scheduler.run_due(&store).await;
+                    if let Err(error) = store.capture_operations_snapshot().await {
+                        tracing::warn!(%error, "operations snapshot persistence failed");
+                    }
                 }
             }
             _ = shutdown_signal() => {

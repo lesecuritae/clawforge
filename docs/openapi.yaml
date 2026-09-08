@@ -277,6 +277,23 @@ paths:
         '403': { description: agent:operations:read scope missing }
         '429': { $ref: '#/components/responses/RateLimited' }
         '503': { description: Operations summary unavailable }
+  /api/v1/history:
+    get:
+      security: [{ agentBearerAuth: [] }]
+      description: Paginated historical operations snapshots with optional time range and interval bucketing. Requires agent:operations:read.
+      parameters:
+        - { in: query, name: page, schema: { type: integer, minimum: 1, default: 1 } }
+        - { in: query, name: page_size, schema: { type: integer, minimum: 1, maximum: 100, default: 100 } }
+        - { in: query, name: from, schema: { type: string, format: date-time } }
+        - { in: query, name: to, schema: { type: string, format: date-time } }
+        - { in: query, name: interval, schema: { type: string, enum: [5m, 15m, hour, 1h, day, 1d] } }
+      responses:
+        '200': { description: Operations snapshot history envelope }
+        '400': { description: Invalid time or interval filter }
+        '401': { description: Agent token missing or invalid }
+        '403': { description: agent:operations:read scope missing }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { description: Operations history unavailable }
   /operations/summary:
     get:
       security: [{ bearerAuth: [] }]
@@ -488,6 +505,16 @@ paths:
         '403': { description: Required agent scope missing }
         '429': { $ref: '#/components/responses/RateLimited' }
         '503': { description: Finding storage unavailable }
+  /api/v1/security/posture:
+    get:
+      security: [{ agentBearerAuth: [] }]
+      description: Read-only security posture with severity distribution, affected components, and historical risk direction. Requires agent:security:read.
+      responses:
+        '200': { description: Security posture envelope }
+        '401': { description: Agent token missing or invalid }
+        '403': { description: agent:security:read scope missing }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { description: Security posture unavailable }
   /api/v1/network/asn:
     get:
       security: [{ agentBearerAuth: [] }]
