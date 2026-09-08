@@ -145,6 +145,9 @@ async fn main() -> Result<()> {
     let store = PostgresStore::connect(&database_url_from_env()?).await?;
     store.ensure_event_consumer("correlation").await?;
     store.heartbeat_event_consumer("correlation").await?;
+    store
+        .set_runtime_status("correlation", "running", None)
+        .await?;
     info!(?window, "Clawforge event correlation layer started");
     let mut interval = tokio::time::interval(poll);
     loop {
@@ -152,6 +155,9 @@ async fn main() -> Result<()> {
             _ = interval.tick() => {
                 if let Err(error) = store.heartbeat_event_consumer("correlation").await {
                     warn!(%error, "could not heartbeat correlation consumer");
+                }
+                if let Err(error) = store.set_runtime_status("correlation", "running", None).await {
+                    warn!(%error, "could not heartbeat correlation runtime status");
                 }
                 match store.claim_event_deliveries("correlation", 50).await {
                     Ok(deliveries) => for delivery in deliveries {
@@ -174,6 +180,9 @@ async fn main() -> Result<()> {
             _ = shutdown_signal() => { info!("Clawforge event correlation layer shutting down"); break; }
         }
     }
+    store
+        .set_runtime_status("correlation", "stopped", None)
+        .await?;
     Ok(())
 }
 

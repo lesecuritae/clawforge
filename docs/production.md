@@ -83,3 +83,26 @@ docker compose build
 Vor dem Push zusätzlich Compose-Neustart, Healthchecks, OpenAPI-Parsing,
 MCP-Discovery/Tool-Listing und ein gültiges sowie ein abgewiesenes Token
 prüfen.
+
+## Optional Prometheus und Grafana
+
+Für die zentrale Betriebsansicht kann das Observability-Profil gestartet
+werden:
+
+```sh
+docker compose --profile observability up -d prometheus grafana
+```
+
+Die Konfiguration und das Dashboard liegen unter `monitoring/`. Die Dienste
+sind standardmäßig nur über Loopback-Ports erreichbar; PostgreSQL bleibt die
+Source of Truth und wird nicht durch Grafana oder Prometheus verändert.
+
+## CI/CD und Abhängigkeitsscans
+
+`.github/workflows/ci.yml` führt bei Pushes und Pull Requests Formatprüfung,
+Workspace-Tests, Clippy, Frontend-Test/Build, npm Audit, Trivy-Dateiscan,
+Compose-Validierung und Docker-Builds aus. `cargo audit` meldet derzeit nur
+RUSTSEC-2023-0071 für die optionale, im PostgreSQL-Produktionsbuild nicht
+kompilierte `sqlx-mysql`/`rsa`-Kette; RustSec weist dafür weiterhin keine
+behobene Version aus. Dieser Restbefund ist in den Release-Unterlagen
+festgehalten und wird bei jedem Release erneut geprüft.

@@ -16,6 +16,9 @@ fn poll_interval() -> Duration {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     let store = PostgresStore::connect(&database_url_from_env()?).await?;
+    store
+        .set_runtime_status("incidents", "running", None)
+        .await?;
     let poll = poll_interval();
     info!(?poll, "Clawforge incident management started");
     let mut interval = tokio::time::interval(poll);
@@ -32,6 +35,9 @@ async fn main() -> Result<()> {
             }
         }
     }
+    store
+        .set_runtime_status("incidents", "stopped", None)
+        .await?;
     Ok(())
 }
 

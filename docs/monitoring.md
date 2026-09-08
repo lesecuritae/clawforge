@@ -17,3 +17,25 @@ status is zero, provider errors increase unexpectedly, or
 `clawforge_alerts_open` grows without operator acknowledgement. MCP exposes
 separate request/error/auth-failure counters at its internal `/metrics`
 endpoint.
+
+## Observability Stack
+
+Prometheus und Grafana sind als optionales Compose-Profil enthalten. Beide
+Dienste verwenden nur das interne Backend-Netzwerk; ihre Host-Ports sind
+standardmäßig an Loopback gebunden.
+
+```sh
+docker compose --profile observability up -d prometheus grafana
+```
+
+Das vorinstallierte Dashboard **Clawforge Overview** zeigt API-, MCP-,
+Datenbank-, Incident-, Alert-, Correlation-, Provider- und Agent-Metriken.
+Prometheus ist unter `http://127.0.0.1:${CLAWFORGE_PROMETHEUS_PORT:-9090}` und
+Grafana unter `http://127.0.0.1:${CLAWFORGE_GRAFANA_PORT:-3001}` erreichbar.
+Die optionale Profil-Installation wird nicht benötigt, damit die Kernplattform
+startet.
+
+Zusätzliche Metriken umfassen Antwortzeiten, Authentifizierungsfehler,
+MCP-Tool-Aufrufe, Tool-Fehler, aktive Streamable-HTTP-Sessions,
+Correlation-Beziehungen, durchschnittliche Provider-Qualität und Agent-API-
+Zugriffe. Ein Session-Wert beschreibt die aktuell aktiven MCP-HTTP-Anfragen.

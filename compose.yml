@@ -17,6 +17,50 @@ services:
     networks:
       - backend
 
+  prometheus:
+    profiles: [observability]
+    image: prom/prometheus:v2.55.1
+    command: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.path=/prometheus"]
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - clawforge-prometheus:/prometheus
+    ports:
+      - "${CLAWFORGE_PROMETHEUS_HOST:-127.0.0.1}:${CLAWFORGE_PROMETHEUS_PORT:-9090}:9090"
+    networks:
+      - backend
+      - frontend
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9090/-/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  grafana:
+    profiles: [observability]
+    image: grafana/grafana:11.3.0
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - clawforge-grafana:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "${CLAWFORGE_GRAFANA_HOST:-127.0.0.1}:${CLAWFORGE_GRAFANA_PORT:-3001}:3000"
+    networks:
+      - backend
+      - frontend
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:3000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
   clawforge-api:
     build:
       context: .
@@ -391,6 +435,8 @@ volumes:
   clawforge-postgres:
   clawforge-redis:
   clawforge-backups:
+  clawforge-prometheus:
+  clawforge-grafana:
 
 networks:
   frontend:

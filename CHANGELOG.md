@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+
+- Added production observability metrics for API latency/auth/rate limits, MCP tool calls/errors/sessions, correlation activity, provider quality, and agent access.
+- Added optional Prometheus/Grafana Compose observability profile with a Clawforge Overview dashboard.
+- Added read-only `GET /api/v1/agents/status` and the matching `get_agent_status` MCP tool.
+- Added CI validation for Rust, frontend, security scanning, Compose configuration, and Docker builds.
 - Completed the application security audit for v1 readiness: protected all
   legacy intelligence/network read routes with authentication, role checks,
   and audit records, added a 256 KiB MCP request-size limit, and normalized

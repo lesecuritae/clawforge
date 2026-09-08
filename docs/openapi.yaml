@@ -52,6 +52,13 @@ components:
         runtime: { type: array, items: { type: object, additionalProperties: true } }
         events: { type: object, additionalProperties: true }
         providers: { type: object, additionalProperties: true }
+    AgentHealthStatus:
+      type: object
+      required: [status, components, agent]
+      properties:
+        status: { type: string, enum: [healthy, degraded] }
+        components: { type: array, items: { type: object, additionalProperties: true } }
+        agent: { type: object, additionalProperties: true }
     AgentContext:
       type: object
       required: [system, active_incidents, open_incident_severity, risk_scores, trust, important_events, correlations]
@@ -196,6 +203,25 @@ paths:
         '403': { description: Required agent scope missing }
         '429': { $ref: '#/components/responses/RateLimited' }
         '503': { description: PostgreSQL or migration status unavailable }
+  /api/v1/agents/status:
+    get:
+      security: [{ agentBearerAuth: [] }]
+      description: Read-only health and access status for agent integrations. Requires agent:system:read.
+      responses:
+        '200':
+          description: Agent health envelope
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiEnvelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/AgentHealthStatus' }
+        '401': { description: Agent token missing or invalid }
+        '403': { description: agent:system:read scope missing }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { description: Runtime status unavailable }
   /api/v1/context:
     get:
       security: [{ agentBearerAuth: [] }]

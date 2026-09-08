@@ -1,5 +1,12 @@
 # Clawforge v0.4.0
 
+## Production operations update
+
+- Expanded API and MCP Prometheus metrics for response latency, authentication failures, tool calls, active sessions, correlations, provider quality, and agent access.
+- Added optional Prometheus/Grafana deployment and the Clawforge Overview dashboard.
+- Added the read-only agent health endpoint and MCP adapter tool.
+- Added GitHub CI checks for tests, linting, frontend builds, security scans, Compose validation, and Docker builds.
+
 Historical Operations Intelligence release with controlled security-audit
 hardening.
 

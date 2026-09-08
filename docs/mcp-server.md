@@ -2,7 +2,7 @@
 
 Status: Read-only MCP-Adapter produktionsbereit. Der MCP-Dienst ist ein
 isolierter Rust-Service und wurde mit OpenClaw Discovery sowie den
-Operations-Leseabfragen geprüft. Die aktuelle Tool-Liste umfasst 16 Tools.
+Operations-Leseabfragen geprüft. Die aktuelle Tool-Liste umfasst 17 Tools.
 
 Dieses Dokument beschreibt einen separaten, read-only MCP-Dienst für
 OpenClaw. Die Agent API v1 bleibt die einzige Datenquelle. Der MCP-Dienst
@@ -45,6 +45,7 @@ als MCP-Upstream verwendet.
 | MCP-Tool | Agent-API-v1-Upstream | Scope | Stand |
 | --- | --- | --- | --- |
 | `get_status` | `GET /api/v1/status` + Incident-Liste | `agent:system:read` + `agent:incident:read` | direkt nutzbar |
+| `get_agent_status` | `GET /api/v1/agents/status` | `agent:system:read` | Agent-Zugriffsstatus |
 | `get_agent_context` | `GET /api/v1/context` | `agent:context:read` | direkt nutzbar |
 | `get_decisions` | `GET /api/v1/decisions` | `agent:decision:read` | direkt nutzbar |
 | `get_provider_status` | `GET /api/v1/providers` | `agent:provider:read` | direkt nutzbar |
@@ -86,6 +87,14 @@ und im Tool-Vertrag versioniert.
   aktiven Incidents sowie Status-/Severity-Verteilung
 - Erfordert `agent:system:read` und `agent:incident:read`
 - Keine internen Fehlertexte, Secrets oder Zustellinformationen
+
+### `get_agent_status`
+
+- Eingabe: keine
+- Upstream: `/api/v1/agents/status`
+- Scope: `agent:system:read`
+- Ausgabe: abgeleiteter Status der Runtime-Komponenten und Agent-Zugriffsstatus
+- Keine Tokens, Rohpayloads oder internen Datenbankfelder
 
 ### `get_agent_context`
 
@@ -205,7 +214,7 @@ Aktivierung, Policy-Änderungen, Incident-Statusänderungen oder Blockaktionen.
 
 ## Produktionsvertrag und OpenClaw-Vorbereitung
 
-Der MCP-Server ist ein stateless read-only Adapter. Alle 16 Tools verwenden
+Der MCP-Server ist ein stateless read-only Adapter. Alle 17 Tools verwenden
 die versionierte Agent API v1 als einzige Datenquelle; es gibt keine direkte
 PostgreSQL-, Event-Backbone- oder Worker-Verbindung. Upstream-Aufrufe haben
 ein konfigurierbares Timeout (`CLAWFORGE_MCP_UPSTREAM_TIMEOUT_SECONDS`,
@@ -410,7 +419,7 @@ fachliche Zugriffsspur.
 ## Implementierung und Betrieb
 
 1. Das Crate `mcp/` nutzt `rmcp` mit Streamable HTTP und registriert genau die
-   vierzehn read-only Tools.
+   siebzehn read-only Tools.
 2. Der Upstream-Client liest getrennte Agent-API- und MCP-Credentials aus
    Docker Secrets, validiert die Agent-API-Envelope und setzt Timeouts.
 3. Die Compose-Datei startet `clawforge-mcp` intern auf Port 8090. Der Dienst
@@ -424,7 +433,7 @@ fachliche Zugriffsspur.
 
 ## Tests
 
-- `tools/list` enthält genau die vierzehn read-only Tools.
+- `tools/list` enthält genau die siebzehn read-only Tools.
 - Incident-Tools rufen ausschließlich die vier versionierten Incident-
   Endpunkte der Agent API auf und akzeptieren den kanonischen Scope
   `agent:incident:read` (der alte Plural bleibt kompatibel).

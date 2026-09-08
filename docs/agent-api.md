@@ -107,6 +107,7 @@ rollenbasierte Exportfunktionen. Zeitangaben sind UTC in RFC-3339-Format.
 | Endpoint | Zweck | Inhalt | Mindest-Scope |
 | --- | --- | --- | --- |
 | `GET /api/v1/status` | Betriebszustand | API, Worker, PostgreSQL, Migrationen, Event-Consumer, Provider-Zusammenfassung, Versionsstand | `agent:system:read` |
+| `GET /api/v1/agents/status` | Agent-Betriebsstatus | Runtime-Komponenten, letzter erfolgreicher Agent-Zugriff und abgeleiteter Fehlerstatus | `agent:system:read` |
 | `GET /api/v1/context` | konsolidierte Lageabfrage | Systemstatus, aktive Incidents, Severity, Risk-Scores, Trust-Status, wichtige Events und Correlation-Zusammenfassungen | `agent:context:read` |
 | `GET /api/v1/decisions` | priorisierte read-only Lageeinschätzung | Gesamtstatus, bestehende Risikowerte, Aufmerksamkeitspunkte, empfohlene Prüfungen und Context-Zusammenfassung | `agent:decision:read` |
 | `GET /api/v1/providers` | Provider-Health | Quelle, Status, letzter Erfolg/Fehler, Datenalter, Qualität und Indicator-Anzahl ohne Rohfeeds | `agent:provider:read` |

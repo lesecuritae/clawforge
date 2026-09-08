@@ -6,7 +6,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{anyhow, Context, Result};
@@ -51,6 +51,10 @@ const MAX_REQUEST_BYTES: usize = 256 * 1024;
 static MCP_UPSTREAM_REQUESTS: AtomicU64 = AtomicU64::new(0);
 static MCP_UPSTREAM_ERRORS: AtomicU64 = AtomicU64::new(0);
 static MCP_AUTH_FAILURES: AtomicU64 = AtomicU64::new(0);
+static MCP_TOOL_CALLS: AtomicU64 = AtomicU64::new(0);
+static MCP_TOOL_ERRORS: AtomicU64 = AtomicU64::new(0);
+static MCP_RESPONSE_TIME_US: AtomicU64 = AtomicU64::new(0);
+static MCP_ACTIVE_SESSIONS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone)]
 struct AppState {
@@ -412,10 +416,14 @@ async fn metrics() -> impl IntoResponse {
     (
         StatusCode::OK,
         format!(
-            "# TYPE clawforge_mcp_upstream_requests_total counter\nclawforge_mcp_upstream_requests_total {}\n# TYPE clawforge_mcp_upstream_errors_total counter\nclawforge_mcp_upstream_errors_total {}\n# TYPE clawforge_mcp_auth_failures_total counter\nclawforge_mcp_auth_failures_total {}\n",
+            "# TYPE clawforge_mcp_upstream_requests_total counter\nclawforge_mcp_upstream_requests_total {}\n# TYPE clawforge_mcp_upstream_errors_total counter\nclawforge_mcp_upstream_errors_total {}\n# TYPE clawforge_mcp_auth_failures_total counter\nclawforge_mcp_auth_failures_total {}\n# TYPE clawforge_mcp_tool_calls_total counter\nclawforge_mcp_tool_calls_total {}\n# TYPE clawforge_mcp_tool_errors_total counter\nclawforge_mcp_tool_errors_total {}\n# TYPE clawforge_mcp_response_duration_seconds_sum counter\nclawforge_mcp_response_duration_seconds_sum {:.6}\n# TYPE clawforge_mcp_active_sessions gauge\nclawforge_mcp_active_sessions {}\n",
             MCP_UPSTREAM_REQUESTS.load(Ordering::Relaxed),
             MCP_UPSTREAM_ERRORS.load(Ordering::Relaxed),
             MCP_AUTH_FAILURES.load(Ordering::Relaxed),
+            MCP_TOOL_CALLS.load(Ordering::Relaxed),
+            MCP_TOOL_ERRORS.load(Ordering::Relaxed),
+            MCP_RESPONSE_TIME_US.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+            MCP_ACTIVE_SESSIONS.load(Ordering::Relaxed),
         ),
     )
 }
@@ -479,6 +487,23 @@ impl McpServer {
     }
 
     async fn request(
+        &self,
+        path: &str,
+        query: &[(String, String)],
+    ) -> Result<ToolResponse, ErrorData> {
+        let started = Instant::now();
+        MCP_ACTIVE_SESSIONS.fetch_add(1, Ordering::Relaxed);
+        MCP_TOOL_CALLS.fetch_add(1, Ordering::Relaxed);
+        let result = self.request_inner(path, query).await;
+        MCP_ACTIVE_SESSIONS.fetch_sub(1, Ordering::Relaxed);
+        MCP_RESPONSE_TIME_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        if result.is_err() {
+            MCP_TOOL_ERRORS.fetch_add(1, Ordering::Relaxed);
+        }
+        result
+    }
+
+    async fn request_inner(
         &self,
         path: &str,
         query: &[(String, String)],
@@ -632,6 +657,19 @@ impl McpServer {
             object.insert("incidents".to_string(), overview);
         }
         Ok(Json(response))
+    }
+
+    #[tool(
+        name = "get_agent_status",
+        description = "Read-only health and last-access state for Clawforge agent integrations; requires agent:system:read"
+    )]
+    async fn get_agent_status(
+        &self,
+        Parameters(_args): Parameters<EmptyArgs>,
+    ) -> Result<Json<ToolResponse>, ErrorData> {
+        Ok(Json(
+            self.get(SCOPE_SYSTEM, "/api/v1/agents/status", &[]).await?,
+        ))
     }
 
     #[tool(
@@ -1197,6 +1235,7 @@ mod tests {
             names,
             vec![
                 "get_agent_context",
+                "get_agent_status",
                 "get_decisions",
                 "get_health_overview",
                 "get_incident",
@@ -1345,9 +1384,10 @@ mod tests {
         );
         let client = ClientInfo::default().serve(transport).await.unwrap();
         let tools = client.list_tools(None).await.unwrap();
-        assert_eq!(tools.tools.len(), 16);
+        assert_eq!(tools.tools.len(), 17);
         let expected = [
             "get_status",
+            "get_agent_status",
             "list_events",
             "list_incidents",
             "get_incident",

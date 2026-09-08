@@ -31,10 +31,11 @@ for endpoint in \
   /network/asn \
   /network/bgp \
   /network/rpki \
-  /network/trust \
-  /metrics; do
-  curl --fail --silent "http://127.0.0.1:18080${endpoint}" >/dev/null
+  /network/trust; do
+  status="$(curl --silent --output /dev/null --write-out '%{http_code}' "http://127.0.0.1:18080${endpoint}")"
+  [ "$status" = 401 ] || { echo "expected protected legacy endpoint ${endpoint} to return 401, got ${status}" >&2; exit 1; }
 done
+curl --fail --silent http://127.0.0.1:18080/metrics >/dev/null
 backup_container="$(docker compose -p "$project" ps -q clawforge-backup)"
 until [ -n "$backup_container" ] && docker exec "$backup_container" sh -ec "test -n \"\$(find /backups -maxdepth 1 -name 'clawforge-*.dump' -print -quit)\""; do
   sleep 2

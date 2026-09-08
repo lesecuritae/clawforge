@@ -1673,6 +1673,28 @@ impl PostgresStore {
             .collect())
     }
 
+    /// Returns derived agent-access health without exposing audit details,
+    /// actor names, tokens, or raw request data.
+    pub async fn agent_access_status(&self) -> Result<serde_json::Value> {
+        let summary = sqlx::query(
+            "SELECT COUNT(*)::bigint AS total, MAX(recorded_at) AS last_access, MAX(recorded_at) FILTER (WHERE resource LIKE '%analysis%') AS last_analysis FROM audit_events WHERE actor LIKE 'agent:%' AND action = 'agent_api_read'",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        let latest = sqlx::query(
+            "SELECT recorded_at FROM audit_events WHERE actor LIKE 'agent:%' AND action = 'agent_api_read' ORDER BY recorded_at DESC LIMIT 1",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(serde_json::json!({
+            "total_successful_calls": summary.get::<i64, _>("total"),
+            "last_access": summary.try_get::<chrono::DateTime<chrono::Utc>, _>("last_access").ok(),
+            "last_successful_tool_call_at": latest.and_then(|row| row.try_get::<chrono::DateTime<chrono::Utc>, _>("recorded_at").ok()),
+            "last_analysis_at": summary.try_get::<chrono::DateTime<chrono::Utc>, _>("last_analysis").ok(),
+            "error_status": "none"
+        }))
+    }
+
     pub async fn metrics_text(&self) -> Result<String> {
         let providers: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM audit_events WHERE event_type = 'provider_sync'",
@@ -1702,6 +1724,18 @@ impl PostgresStore {
         let alerts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM alerts WHERE status='open'")
             .fetch_one(&self.pool)
             .await?;
+        let correlations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM event_relationships")
+            .fetch_one(&self.pool)
+            .await?;
+        let provider_quality: f64 =
+            sqlx::query_scalar("SELECT COALESCE(AVG(quality_score), 0)::float8 FROM providers")
+                .fetch_one(&self.pool)
+                .await?;
+        let agent_access: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_events WHERE actor LIKE 'agent:%' AND action = 'agent_api_read'",
+        )
+        .fetch_one(&self.pool)
+        .await?;
         let worker_up: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runtime_status WHERE component = 'worker' AND state = 'running' AND last_heartbeat_at > NOW() - INTERVAL '2 minutes'")
             .fetch_one(&self.pool).await?;
         let events_created: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events")
@@ -1759,7 +1793,24 @@ impl PostgresStore {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        Ok(format!("# TYPE clawforge_provider_sync_total counter\nclawforge_provider_sync_total {providers}\n# TYPE clawforge_provider_errors_total counter\nclawforge_provider_errors_total {errors}\n# TYPE clawforge_indicators_total gauge\nclawforge_indicators_total {indicators}\n# TYPE clawforge_risk_events_total counter\nclawforge_risk_events_total {risks}\n# TYPE clawforge_bgp_changes_total counter\nclawforge_bgp_changes_total {bgp}\n# TYPE clawforge_incidents_active gauge\nclawforge_incidents_active {incidents}\n# TYPE clawforge_alerts_open gauge\nclawforge_alerts_open {alerts}\n# TYPE clawforge_events_created_total counter\nclawforge_events_created_total {events_created}\n# TYPE clawforge_events_processed_total counter\nclawforge_events_processed_total {events_processed}\n# TYPE clawforge_events_failed_total counter\nclawforge_events_failed_total {events_failed}\n# TYPE clawforge_event_queue_size gauge\nclawforge_event_queue_size {event_queue}\n# TYPE clawforge_event_processing_duration_seconds gauge\nclawforge_event_processing_duration_seconds {event_processing_seconds}\n# TYPE clawforge_worker_up gauge\nclawforge_worker_up {worker_up}\n# TYPE clawforge_database_up gauge\nclawforge_database_up 1\n# TYPE clawforge_provider_sync_status gauge\n{provider_status}\n# TYPE clawforge_event_consumer_up gauge\n{consumer_status}\n"))
+        let component_rows = sqlx::query("SELECT component, CASE WHEN state='running' AND updated_at > NOW() - INTERVAL '2 minutes' THEN 1 ELSE 0 END AS up FROM runtime_status ORDER BY component")
+            .fetch_all(&self.pool)
+            .await?;
+        let component_status = component_rows
+            .into_iter()
+            .map(|row| {
+                let component = row
+                    .get::<String, _>("component")
+                    .replace('\\', "\\\\")
+                    .replace('"', "\\\"");
+                format!(
+                    "clawforge_component_up{{component=\"{component}\"}} {}",
+                    row.get::<i32, _>("up")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        Ok(format!("# TYPE clawforge_provider_sync_total counter\nclawforge_provider_sync_total {providers}\n# TYPE clawforge_provider_errors_total counter\nclawforge_provider_errors_total {errors}\n# TYPE clawforge_indicators_total gauge\nclawforge_indicators_total {indicators}\n# TYPE clawforge_risk_events_total counter\nclawforge_risk_events_total {risks}\n# TYPE clawforge_bgp_changes_total counter\nclawforge_bgp_changes_total {bgp}\n# TYPE clawforge_incidents_active gauge\nclawforge_incidents_active {incidents}\n# TYPE clawforge_alerts_open gauge\nclawforge_alerts_open {alerts}\n# TYPE clawforge_correlations_total gauge\nclawforge_correlations_total {correlations}\n# TYPE clawforge_provider_quality_average gauge\nclawforge_provider_quality_average {provider_quality}\n# TYPE clawforge_agent_api_access_total counter\nclawforge_agent_api_access_total {agent_access}\n# TYPE clawforge_events_created_total counter\nclawforge_events_created_total {events_created}\n# TYPE clawforge_events_processed_total counter\nclawforge_events_processed_total {events_processed}\n# TYPE clawforge_events_failed_total counter\nclawforge_events_failed_total {events_failed}\n# TYPE clawforge_event_queue_size gauge\nclawforge_event_queue_size {event_queue}\n# TYPE clawforge_event_processing_duration_seconds gauge\nclawforge_event_processing_duration_seconds {event_processing_seconds}\n# TYPE clawforge_worker_up gauge\nclawforge_worker_up {worker_up}\n# TYPE clawforge_database_up gauge\nclawforge_database_up 1\n# TYPE clawforge_provider_sync_status gauge\n{provider_status}\n# TYPE clawforge_event_consumer_up gauge\n{consumer_status}\n# TYPE clawforge_component_up gauge\n{component_status}\n"))
     }
 
     pub async fn set_runtime_status(
@@ -1790,7 +1841,7 @@ impl PostgresStore {
     }
 
     pub async fn upsert_provider(&self, provider: &Provider) -> Result<()> {
-        sqlx::query("INSERT INTO providers (id, name, source, interval_seconds, confidence, quality_score, enabled) VALUES ($1,$2,$3,$4,$5,$5,$6) ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name, source=EXCLUDED.source, confidence=EXCLUDED.confidence, quality_score=EXCLUDED.quality_score, updated_at=NOW()")
+        sqlx::query("INSERT INTO providers (id, name, source, interval_seconds, confidence, quality_score, enabled) VALUES ($1,$2,$3,$4,$5,$5,$6) ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name, source=EXCLUDED.source, confidence=EXCLUDED.confidence, updated_at=NOW()")
             .bind(&provider.id).bind(&provider.name).bind(&provider.source)
             .bind(provider.interval_seconds).bind(provider.confidence as i16).bind(provider.enabled)
             .execute(&self.pool).await?;
@@ -1832,6 +1883,10 @@ impl PostgresStore {
     ) -> Result<()> {
         sqlx::query("INSERT INTO provider_status (provider_id, state, last_success_at, next_run_at, consecutive_failures, last_error, indicator_count, sync_duration_ms, last_data_at, updated_at) VALUES ($1,'ok',NOW(),$2,0,NULL,$3,$4,$5,NOW()) ON CONFLICT (provider_id) DO UPDATE SET state='ok', last_success_at=NOW(), next_run_at=$2, consecutive_failures=0, last_error=NULL, indicator_count=$3, sync_duration_ms=$4, last_data_at=$5, updated_at=NOW()")
             .bind(provider_id).bind(next_run).bind(indicator_count).bind(sync_duration_ms).bind(last_data_at).execute(&self.pool).await?;
+        sqlx::query("UPDATE providers SET quality_score=LEAST(100, quality_score + 5), updated_at=NOW() WHERE id=$1")
+            .bind(provider_id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -1845,6 +1900,10 @@ impl PostgresStore {
     ) -> Result<()> {
         sqlx::query("INSERT INTO provider_status (provider_id, state, last_failure_at, next_run_at, consecutive_failures, last_error, indicator_count, sync_duration_ms, updated_at) VALUES ($1,'error',NOW(),$2,1,$3,$4,$5,NOW()) ON CONFLICT (provider_id) DO UPDATE SET state='error', last_failure_at=NOW(), next_run_at=$2, consecutive_failures=provider_status.consecutive_failures+1, last_error=$3, indicator_count=$4, sync_duration_ms=$5, updated_at=NOW()")
             .bind(provider_id).bind(next_run).bind(error).bind(indicator_count).bind(sync_duration_ms).execute(&self.pool).await?;
+        sqlx::query("UPDATE providers SET quality_score=GREATEST(0, quality_score - 10), updated_at=NOW() WHERE id=$1")
+            .bind(provider_id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 

@@ -1,0 +1,20 @@
+{
+  "title": "Clawforge Overview",
+  "uid": "clawforge-overview",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": {"from": "now-6h", "to": "now"},
+  "panels": [
+    {"id": 1, "type": "stat", "title": "API status", "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0}, "targets": [{"expr": "clawforge_database_up", "legendFormat": "database"}]},
+    {"id": 2, "type": "stat", "title": "MCP sessions", "gridPos": {"h": 4, "w": 6, "x": 6, "y": 0}, "targets": [{"expr": "clawforge_mcp_active_sessions", "legendFormat": "sessions"}]},
+    {"id": 3, "type": "stat", "title": "Active incidents", "gridPos": {"h": 4, "w": 6, "x": 12, "y": 0}, "targets": [{"expr": "clawforge_incidents_active", "legendFormat": "incidents"}]},
+    {"id": 4, "type": "stat", "title": "Open alerts", "gridPos": {"h": 4, "w": 6, "x": 18, "y": 0}, "targets": [{"expr": "clawforge_alerts_open", "legendFormat": "alerts"}]},
+    {"id": 5, "type": "timeseries", "title": "API request rate", "gridPos": {"h": 8, "w": 12, "x": 0, "y": 4}, "targets": [{"expr": "rate(clawforge_api_requests_total[5m])", "legendFormat": "requests/s"}]},
+    {"id": 6, "type": "timeseries", "title": "Provider quality", "gridPos": {"h": 8, "w": 12, "x": 12, "y": 4}, "targets": [{"expr": "clawforge_provider_quality_average", "legendFormat": "quality"}]},
+    {"id": 7, "type": "timeseries", "title": "Correlation activity", "gridPos": {"h": 8, "w": 12, "x": 0, "y": 12}, "targets": [{"expr": "clawforge_correlations_total", "legendFormat": "relationships"}]},
+    {"id": 8, "type": "timeseries", "title": "Agent and MCP errors", "gridPos": {"h": 8, "w": 12, "x": 12, "y": 12}, "targets": [{"expr": "rate(clawforge_mcp_tool_errors_total[5m])", "legendFormat": "MCP errors"}, {"expr": "rate(clawforge_api_auth_failures_total[5m])", "legendFormat": "auth failures"}]}
+  ],
+  "templating": {"list": []},
+  "annotations": {"list": []}
+}

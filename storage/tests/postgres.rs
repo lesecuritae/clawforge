@@ -68,6 +68,29 @@ async fn migrations_and_restart_persist() -> anyhow::Result<()> {
         metrics.2.map(|value| value.timestamp_micros()),
         Some(now.timestamp_micros())
     );
+    let quality_after_success: i16 =
+        sqlx::query_scalar("SELECT quality_score FROM providers WHERE id=$1")
+            .bind(&provider.id)
+            .fetch_one(restarted.pool())
+            .await?;
+    restarted
+        .provider_failed(&provider.id, "fixture timeout", next_run, 0, 100)
+        .await?;
+    let quality_after_failure: i16 =
+        sqlx::query_scalar("SELECT quality_score FROM providers WHERE id=$1")
+            .bind(&provider.id)
+            .fetch_one(restarted.pool())
+            .await?;
+    assert!(quality_after_failure < quality_after_success);
+    restarted
+        .provider_succeeded(&provider.id, next_run, 1, 42, Some(now))
+        .await?;
+    let quality_after_recovery: i16 =
+        sqlx::query_scalar("SELECT quality_score FROM providers WHERE id=$1")
+            .bind(&provider.id)
+            .fetch_one(restarted.pool())
+            .await?;
+    assert!(quality_after_recovery > quality_after_failure);
     let expired = Indicator {
         value: "198.51.100.11".into(),
         expires_at: now - Duration::minutes(1),

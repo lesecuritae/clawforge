@@ -106,6 +106,9 @@ const AGENT_SCOPES: &[&str] = &[
 static API_REQUESTS: AtomicU64 = AtomicU64::new(0);
 static API_ERRORS: AtomicU64 = AtomicU64::new(0);
 static API_RATE_LIMITED: AtomicU64 = AtomicU64::new(0);
+static API_RESPONSE_TIME_US: AtomicU64 = AtomicU64::new(0);
+static API_RESPONSE_COUNT: AtomicU64 = AtomicU64::new(0);
+static API_AUTH_FAILURES: AtomicU64 = AtomicU64::new(0);
 
 impl Default for RateLimiter {
     fn default() -> Self {
@@ -241,10 +244,14 @@ async fn rate_limit_middleware(
     request: Request,
     next: Next,
 ) -> Response {
+    let started = Instant::now();
     API_REQUESTS.fetch_add(1, Ordering::Relaxed);
     let path = request.uri().path().to_string();
     let Some(_) = policy_for(&path, request.method(), None) else {
-        return next.run(request).await;
+        let response = next.run(request).await;
+        API_RESPONSE_TIME_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        API_RESPONSE_COUNT.fetch_add(1, Ordering::Relaxed);
+        return response;
     };
     let headers = request.headers();
     let source = request
@@ -303,7 +310,10 @@ async fn rate_limit_middleware(
                 }),
             )
             .await;
-        return rate_limit_response(policy, retry_after);
+        let response = rate_limit_response(policy, retry_after);
+        API_RESPONSE_TIME_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        API_RESPONSE_COUNT.fetch_add(1, Ordering::Relaxed);
+        return response;
     }
     let remaining = global.remaining.min(endpoint.remaining);
     let mut response = next.run(request).await;
@@ -318,6 +328,8 @@ async fn rate_limit_middleware(
         "X-RateLimit-Remaining",
         HeaderValue::from_str(&remaining.to_string()).expect("valid remaining value"),
     );
+    API_RESPONSE_TIME_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+    API_RESPONSE_COUNT.fetch_add(1, Ordering::Relaxed);
     response
 }
 
@@ -1954,6 +1966,64 @@ async fn agent_status(
     ))
 }
 
+/// Read-only operational health for agent integrations. This intentionally
+/// exposes derived component state only; it never returns tokens, raw events,
+/// or database fields.
+async fn agent_health_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<ApiEnvelope<serde_json::Value>>> {
+    let principal = authenticate_agent(&state, &headers).await?;
+    require_agent_scope(&principal, AGENT_SCOPE_SYSTEM_READ)?;
+    let runtime = state
+        .store
+        .runtime_status_views()
+        .await
+        .map_err(|_| api_error(StatusCode::SERVICE_UNAVAILABLE, "agent status unavailable"))?;
+    let components = runtime
+        .iter()
+        .map(|component| {
+            serde_json::json!({
+                "component": component.get("component"),
+                "state": component.get("state"),
+                "last_heartbeat_at": component.get("last_heartbeat_at"),
+                "updated_at": component.get("updated_at")
+            })
+        })
+        .collect::<Vec<_>>();
+    let unhealthy = runtime
+        .iter()
+        .filter(|component| {
+            matches!(
+                component.get("state").and_then(serde_json::Value::as_str),
+                Some("error" | "stopped")
+            )
+        })
+        .count();
+    let agent_access = state.store.agent_access_status().await.map_err(|_| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "agent access status unavailable",
+        )
+    })?;
+    audit_agent_read(
+        &state,
+        &principal,
+        "/api/v1/agents/status",
+        AGENT_SCOPE_SYSTEM_READ,
+    )
+    .await;
+    Ok(envelope(
+        serde_json::json!({
+            "status": if unhealthy == 0 { "healthy" } else { "degraded" },
+            "components": components,
+            "agent": agent_access,
+            "runtime_error_status": if unhealthy == 0 { "none" } else { "component_unhealthy" }
+        }),
+        None,
+    ))
+}
+
 async fn agent_context(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3175,10 +3245,13 @@ async fn metrics(State(state): State<AppState>) -> Result<Response, StatusCode> 
         StatusCode::SERVICE_UNAVAILABLE
     })?;
     body.push_str(&format!(
-        "# TYPE clawforge_api_requests_total counter\nclawforge_api_requests_total {}\n# TYPE clawforge_api_errors_total counter\nclawforge_api_errors_total {}\n# TYPE clawforge_api_rate_limited_total counter\nclawforge_api_rate_limited_total {}\n",
+        "# TYPE clawforge_api_requests_total counter\nclawforge_api_requests_total {}\n# TYPE clawforge_api_errors_total counter\nclawforge_api_errors_total {}\n# TYPE clawforge_api_rate_limited_total counter\nclawforge_api_rate_limited_total {}\n# TYPE clawforge_api_response_duration_seconds_sum counter\nclawforge_api_response_duration_seconds_sum {:.6}\n# TYPE clawforge_api_response_duration_seconds_count counter\nclawforge_api_response_duration_seconds_count {}\n# TYPE clawforge_api_auth_failures_total counter\nclawforge_api_auth_failures_total {}\n",
         API_REQUESTS.load(Ordering::Relaxed),
         API_ERRORS.load(Ordering::Relaxed),
         API_RATE_LIMITED.load(Ordering::Relaxed),
+        API_RESPONSE_TIME_US.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+        API_RESPONSE_COUNT.load(Ordering::Relaxed),
+        API_AUTH_FAILURES.load(Ordering::Relaxed),
     ));
     Response::builder()
         .status(StatusCode::OK)
@@ -3281,8 +3354,10 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
 }
 
 async fn authenticate(state: &AppState, headers: &HeaderMap) -> ApiResult<AdminPrincipal> {
-    let token = bearer(headers)
-        .ok_or_else(|| api_error(StatusCode::UNAUTHORIZED, "bearer token required"))?;
+    let token = bearer(headers).ok_or_else(|| {
+        API_AUTH_FAILURES.fetch_add(1, Ordering::Relaxed);
+        api_error(StatusCode::UNAUTHORIZED, "bearer token required")
+    })?;
     state
         .store
         .authenticate_credential(&digest(token))
@@ -3293,12 +3368,17 @@ async fn authenticate(state: &AppState, headers: &HeaderMap) -> ApiResult<AdminP
                 "authentication unavailable",
             )
         })?
-        .ok_or_else(|| api_error(StatusCode::UNAUTHORIZED, "invalid or expired credential"))
+        .ok_or_else(|| {
+            API_AUTH_FAILURES.fetch_add(1, Ordering::Relaxed);
+            api_error(StatusCode::UNAUTHORIZED, "invalid or expired credential")
+        })
 }
 
 async fn authenticate_agent(state: &AppState, headers: &HeaderMap) -> ApiResult<AgentPrincipal> {
-    let token = bearer(headers)
-        .ok_or_else(|| api_error(StatusCode::UNAUTHORIZED, "agent bearer token required"))?;
+    let token = bearer(headers).ok_or_else(|| {
+        API_AUTH_FAILURES.fetch_add(1, Ordering::Relaxed);
+        api_error(StatusCode::UNAUTHORIZED, "agent bearer token required")
+    })?;
     state
         .store
         .authenticate_agent_token(&digest(token))
@@ -3309,7 +3389,10 @@ async fn authenticate_agent(state: &AppState, headers: &HeaderMap) -> ApiResult<
                 "agent authentication unavailable",
             )
         })?
-        .ok_or_else(|| api_error(StatusCode::UNAUTHORIZED, "invalid or expired agent token"))
+        .ok_or_else(|| {
+            API_AUTH_FAILURES.fetch_add(1, Ordering::Relaxed);
+            api_error(StatusCode::UNAUTHORIZED, "invalid or expired agent token")
+        })
 }
 
 fn require_agent_scope(principal: &AgentPrincipal, scope: &str) -> ApiResult<()> {
@@ -5450,6 +5533,7 @@ async fn main() -> anyhow::Result<()> {
             "/api/v1",
             Router::new()
                 .route("/status", get(agent_status))
+                .route("/agents/status", get(agent_health_status))
                 .route("/context", get(agent_context))
                 .route("/decisions", get(agent_decisions))
                 .route("/providers", get(agent_provider_status))
