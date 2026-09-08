@@ -108,6 +108,7 @@ rollenbasierte Exportfunktionen. Zeitangaben sind UTC in RFC-3339-Format.
 | --- | --- | --- | --- |
 | `GET /api/v1/status` | Betriebszustand | API, Worker, PostgreSQL, Migrationen, Event-Consumer, Provider-Zusammenfassung, Versionsstand | `agent:system:read` |
 | `GET /api/v1/context` | konsolidierte Lageabfrage | Systemstatus, aktive Incidents, Severity, Risk-Scores, Trust-Status, wichtige Events und Correlation-Zusammenfassungen | `agent:context:read` |
+| `GET /api/v1/decisions` | priorisierte read-only Lageeinschätzung | Gesamtstatus, bestehende Risikowerte, Aufmerksamkeitspunkte, empfohlene Prüfungen und Context-Zusammenfassung | `agent:decision:read` |
 | `GET /api/v1/events` | aktuelle kanonische Events | Typ, Quelle, Severity, Zeit, Korrelation, begründete Zusammenfassung | `agent:events:read` |
 | `GET /api/v1/incidents` | Incident-Liste | Status, Severity, Confidence, Risiko, Summary, Zeit, Event-Anzahl | `agent:incident:read` |
 | `GET /api/v1/incidents/{id}` | Incident-Details | Status, Severity, Confidence, Risiko, Summary und Zeit | `agent:incident:read` |
@@ -193,6 +194,43 @@ Scope und liefert ausschließlich bereits bewertete, normalisierte Ausschnitte:
 Trust-Registry-Interna, Candidate-IDs oder Korrelationsschlüssel. Incident- und
 Event-IDs erscheinen nur als notwendige Referenzen in den bereits redigierten
 Zusammenfassungen. Jeder Abruf erzeugt einen anonymisierten Audit-Eintrag.
+
+Die read-only Decision Layer unter `/api/v1/decisions` aggregiert diesen
+Context mit den bereits gespeicherten aktiven Incidents, Risk Scores,
+Trust-Statuswerten und Correlation-Confidence-Werten. Sie berechnet keine neue
+Risk- oder Trust-Bewertung. `overall_status` und `risk_assessment` spiegeln
+vorhandene Bewertungen zusammengefasst wider; `attention_points` priorisieren
+redigierte Referenzen und `recommended_checks` sind ausschließlich Hinweise
+für weitere Prüfungen. Die API löst keine Aktion aus, ändert keine Policy und
+vergibt keinen Trust. Jeder Abruf wird mit dem Scope
+`agent:decision:read` auditiert.
+
+Beispiel:
+
+```json
+{
+  "data": {
+    "overall_status": "high",
+    "risk_assessment": {
+      "highest_risk_score": 82,
+      "risk_level": "high",
+      "active_incidents": 1,
+      "correlation_confidence": { "assessed": 1, "highest": 90, "average": 90, "lowest": 90 }
+    },
+    "attention_points": [
+      { "type": "incident", "priority": "high", "incident_id": "incident-123", "reason": "active incident requires review" }
+    ],
+    "recommended_checks": [
+      { "priority": "high", "check": "incident_timelines", "reason": "review active incident timelines and correlated events" }
+    ],
+    "context": { "active_incidents": {}, "risk_scores": {}, "trust": {}, "correlations": {} }
+  }
+}
+```
+
+Die Decision-Antwort enthält weder Rohpayloads, Secrets, Candidate-IDs noch
+Korrelationsschlüssel. Sie verwendet ausschließlich die bestehenden sicheren
+Agent-Views und ist vollständig read-only.
 
 Ein Finding liefert die bereits gespeicherte Bewertung und ihre Herkunft:
 

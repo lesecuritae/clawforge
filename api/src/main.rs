@@ -77,6 +77,7 @@ const AGENT_SCOPE_INCIDENT_READ: &str = "agent:incident:read";
 const AGENT_SCOPE_INCIDENTS_READ_LEGACY: &str = "agent:incidents:read";
 const AGENT_SCOPE_INCIDENTS_READ: &str = "agent:incidents:read";
 const AGENT_SCOPE_CONTEXT_READ: &str = "agent:context:read";
+const AGENT_SCOPE_DECISION_READ: &str = "agent:decision:read";
 const AGENT_SCOPE_SECURITY_READ: &str = "agent:security:read";
 const AGENT_SCOPE_NETWORK_READ: &str = "agent:network:read";
 const AGENT_SCOPE_ALL_READ: &str = "agent:read";
@@ -87,6 +88,7 @@ const AGENT_SCOPES: &[&str] = &[
     AGENT_SCOPE_INCIDENT_READ,
     AGENT_SCOPE_INCIDENTS_READ,
     AGENT_SCOPE_CONTEXT_READ,
+    AGENT_SCOPE_DECISION_READ,
     AGENT_SCOPE_SECURITY_READ,
     AGENT_SCOPE_NETWORK_READ,
     AGENT_SCOPE_ALL_READ,
@@ -1352,6 +1354,236 @@ fn context_important_events(values: &[serde_json::Value]) -> Vec<serde_json::Val
         .collect()
 }
 
+fn decision_severity_rank(value: Option<&str>) -> i64 {
+    match value.unwrap_or("info") {
+        "critical" => 90,
+        "high" => 70,
+        "medium" => 40,
+        "low" => 10,
+        _ => 0,
+    }
+}
+
+fn decision_priority(score: i64, severity: Option<&str>) -> &'static str {
+    match score.max(decision_severity_rank(severity)) {
+        value if value >= 90 => "critical",
+        value if value >= 70 => "high",
+        value if value >= 40 => "medium",
+        value if value > 0 => "low",
+        _ => "info",
+    }
+}
+
+fn decision_priority_rank(value: Option<&str>) -> i64 {
+    decision_severity_rank(value)
+}
+
+fn decision_confidence_data(values: &[serde_json::Value]) -> serde_json::Value {
+    let mut confidences = values
+        .iter()
+        .filter(|value| context_is_active_incident(value))
+        .filter_map(|value| {
+            value
+                .get("confidence")
+                .and_then(serde_json::Value::as_i64)
+                .map(|confidence| confidence.clamp(0, 100))
+        })
+        .collect::<Vec<_>>();
+    confidences.sort_unstable();
+    let assessed = confidences.len();
+    let average = if assessed == 0 {
+        0
+    } else {
+        confidences.iter().sum::<i64>() / assessed as i64
+    };
+    serde_json::json!({
+        "assessed": assessed,
+        "highest": confidences.last().copied().unwrap_or(0),
+        "average": average,
+        "lowest": confidences.first().copied().unwrap_or(0)
+    })
+}
+
+fn decision_attention_points(
+    incidents: &[serde_json::Value],
+    indicators: &[serde_json::Value],
+    events: &[serde_json::Value],
+) -> Vec<serde_json::Value> {
+    let mut points = Vec::new();
+    for value in incidents
+        .iter()
+        .filter(|value| context_is_active_incident(value))
+    {
+        let risk_score = value
+            .get("risk_score")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0);
+        let severity = value
+            .get("severity")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_else(|| risk_severity(risk_score));
+        let incident = agent_incident_view(value);
+        points.push(serde_json::json!({
+            "type": "incident",
+            "priority": decision_priority(risk_score, Some(severity)),
+            "incident_id": incident.get("id"),
+            "severity": incident.get("severity"),
+            "confidence": incident.get("confidence"),
+            "risk_score": incident.get("risk_score"),
+            "summary": incident.get("summary"),
+            "reason": "active incident requires review"
+        }));
+    }
+    for value in indicators.iter().filter(|value| {
+        value
+            .get("risk_score")
+            .and_then(serde_json::Value::as_i64)
+            .is_some_and(|score| score > 0)
+    }) {
+        let score = value
+            .get("risk_score")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0);
+        points.push(serde_json::json!({
+            "type": "risk_finding",
+            "priority": decision_priority(score, None),
+            "source": value.get("source"),
+            "severity": risk_severity(score),
+            "risk_score": score,
+            "confidence": value.get("confidence"),
+            "assessed_at": value.get("assessed_at"),
+            "reason": value.get("reason")
+        }));
+    }
+    for value in context_important_events(events) {
+        let severity = value
+            .get("severity")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("info");
+        points.push(serde_json::json!({
+            "type": "event",
+            "priority": decision_priority(0, Some(severity)),
+            "event_id": value.get("event_id"),
+            "event_type": value.get("event_type"),
+            "source": value.get("source"),
+            "severity": value.get("severity"),
+            "timestamp": value.get("timestamp"),
+            "reason": "important event requires contextual review"
+        }));
+    }
+    points.sort_by_key(|point| {
+        std::cmp::Reverse(decision_priority_rank(
+            point.get("priority").and_then(serde_json::Value::as_str),
+        ))
+    });
+    points.truncate(50);
+    points
+}
+
+fn decision_recommended_checks(
+    incidents: &[serde_json::Value],
+    indicators: &[serde_json::Value],
+    trust: &[serde_json::Value],
+    events: &[serde_json::Value],
+) -> Vec<serde_json::Value> {
+    let active_incidents = incidents
+        .iter()
+        .filter(|value| context_is_active_incident(value))
+        .count();
+    let highest_risk = indicators
+        .iter()
+        .filter_map(|value| value.get("risk_score").and_then(serde_json::Value::as_i64))
+        .max()
+        .unwrap_or(0);
+    let mut checks = Vec::new();
+    if active_incidents > 0 {
+        checks.push(serde_json::json!({
+            "priority": "high",
+            "check": "incident_timelines",
+            "reason": "review active incident timelines and correlated events"
+        }));
+    }
+    if highest_risk >= 70 {
+        checks.push(serde_json::json!({
+            "priority": "high",
+            "check": "risk_findings",
+            "reason": "review the highest stored risk findings and their confidence"
+        }));
+    }
+    if trust
+        .iter()
+        .any(|value| value.get("status").and_then(serde_json::Value::as_str) == Some("Revoked"))
+    {
+        checks.push(serde_json::json!({
+            "priority": "medium",
+            "check": "trust_status",
+            "reason": "review revoked trusted infrastructure records"
+        }));
+    }
+    if events.iter().any(|value| {
+        value
+            .get("event_type")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|event_type| {
+                event_type.to_ascii_lowercase().contains("bgp")
+                    || event_type.to_ascii_lowercase().contains("rpki")
+            })
+    }) {
+        checks.push(serde_json::json!({
+            "priority": "medium",
+            "check": "network_intelligence",
+            "reason": "review recent BGP and RPKI context"
+        }));
+    }
+    if checks.is_empty() {
+        checks.push(serde_json::json!({
+            "priority": "low",
+            "check": "system_health",
+            "reason": "confirm system and provider health remains current"
+        }));
+    }
+    checks
+}
+
+fn decision_risk_assessment(
+    incidents: &[serde_json::Value],
+    indicators: &[serde_json::Value],
+) -> serde_json::Value {
+    let highest_risk_score = indicators
+        .iter()
+        .chain(
+            incidents
+                .iter()
+                .filter(|value| context_is_active_incident(value)),
+        )
+        .filter_map(|value| value.get("risk_score").and_then(serde_json::Value::as_i64))
+        .max()
+        .unwrap_or(0);
+    let highest_incident_severity = incidents
+        .iter()
+        .filter(|value| context_is_active_incident(value))
+        .max_by_key(|value| {
+            decision_severity_rank(value.get("severity").and_then(serde_json::Value::as_str))
+        })
+        .and_then(|value| value.get("severity"))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let incident_score = decision_severity_rank(
+        highest_incident_severity
+            .as_str()
+            .or_else(|| Some(risk_severity(highest_risk_score))),
+    );
+    let overall_score = highest_risk_score.max(incident_score);
+    serde_json::json!({
+        "highest_risk_score": highest_risk_score,
+        "risk_level": risk_severity(highest_risk_score),
+        "overall_status": decision_priority(overall_score, highest_incident_severity.as_str()),
+        "active_incidents": incidents.iter().filter(|value| context_is_active_incident(value)).count(),
+        "highest_incident_severity": highest_incident_severity,
+        "correlation_confidence": decision_confidence_data(incidents)
+    })
+}
+
 async fn agent_status(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1513,6 +1745,122 @@ async fn agent_context(
             "important_events": context_important_events(&important_events),
             "correlations": {
                 "active_incidents": correlations
+            }
+        }),
+        None,
+    ))
+}
+
+async fn agent_decisions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<ApiEnvelope<serde_json::Value>>> {
+    let principal = authenticate_agent(&state, &headers).await?;
+    require_agent_scope(&principal, AGENT_SCOPE_DECISION_READ)?;
+
+    let migration = state
+        .store
+        .readiness()
+        .await
+        .map_err(|_| api_error(StatusCode::SERVICE_UNAVAILABLE, "decision unavailable"))?;
+    let migration_response: MigrationResponse = migration.into();
+    let runtime = state.store.runtime_status_views().await.map_err(|_| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "decision runtime unavailable",
+        )
+    })?;
+    let runtime = runtime
+        .iter()
+        .map(|component| {
+            serde_json::json!({
+                "component": component.get("component"),
+                "state": component.get("state"),
+                "version": component.get("version"),
+                "last_started_at": component.get("last_started_at"),
+                "last_heartbeat_at": component.get("last_heartbeat_at"),
+                "updated_at": component.get("updated_at")
+            })
+        })
+        .collect::<Vec<_>>();
+    let event_status = state.store.event_status().await.map_err(|_| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "decision events unavailable",
+        )
+    })?;
+    let providers = state.store.list_provider_views().await.map_err(|_| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "decision providers unavailable",
+        )
+    })?;
+    let incidents = state.store.list_incidents(None, 500).await.map_err(|_| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "decision incidents unavailable",
+        )
+    })?;
+    let indicators = state.store.list_indicator_views(1000).await.map_err(|_| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "decision risk data unavailable",
+        )
+    })?;
+    let trust = agent_network_values(&state, "trust").await?;
+    let important_events = state.store.list_events(None, 100).await.map_err(|_| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "decision event data unavailable",
+        )
+    })?;
+    let (active_incidents, incident_severity, correlations) = context_incident_data(&incidents);
+    let risk_scores = context_risk_data(&indicators);
+    let trust_summary = context_trust_data(&trust);
+    let safe_events = context_important_events(&important_events);
+    let risk_assessment = decision_risk_assessment(&incidents, &indicators);
+    let overall_status = risk_assessment
+        .get("overall_status")
+        .cloned()
+        .unwrap_or_else(|| serde_json::Value::from("info"));
+    let attention_points = decision_attention_points(&incidents, &indicators, &important_events);
+    let recommended_checks =
+        decision_recommended_checks(&incidents, &indicators, &trust, &important_events);
+    audit_agent_read(
+        &state,
+        &principal,
+        "/api/v1/decisions",
+        AGENT_SCOPE_DECISION_READ,
+    )
+    .await;
+    Ok(envelope(
+        serde_json::json!({
+            "overall_status": overall_status,
+            "risk_assessment": risk_assessment,
+            "attention_points": attention_points,
+            "recommended_checks": recommended_checks,
+            "context": {
+                "system": {
+                    "service": "clawforge",
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "status": "ok",
+                    "migrations": migration_response,
+                    "runtime": runtime,
+                    "events": event_status,
+                    "providers": {
+                        "total": providers.len(),
+                        "enabled": providers.iter().filter(|provider| provider.get("enabled").and_then(serde_json::Value::as_bool) == Some(true)).count()
+                    }
+                },
+                "active_incidents": {
+                    "total": active_incidents.len(),
+                    "items": active_incidents.iter().take(50).collect::<Vec<_>>()
+                },
+                "open_incident_severity": incident_severity,
+                "risk_scores": risk_scores,
+                "trust": trust_summary,
+                "important_events": safe_events,
+                "correlations": { "active_incidents": correlations }
             }
         }),
         None,
@@ -4321,6 +4669,7 @@ async fn main() -> anyhow::Result<()> {
             Router::new()
                 .route("/status", get(agent_status))
                 .route("/context", get(agent_context))
+                .route("/decisions", get(agent_decisions))
                 .route("/events", get(agent_events))
                 .route("/incidents", get(agent_incidents))
                 .route("/incidents/{id}", get(agent_incident_detail))
@@ -4557,6 +4906,9 @@ mod tests {
         assert!(validate_agent_scopes(&[
             AGENT_SCOPE_CONTEXT_READ.to_string()
         ]));
+        assert!(validate_agent_scopes(&[
+            AGENT_SCOPE_DECISION_READ.to_string()
+        ]));
         assert!(validate_agent_scopes(&[AGENT_SCOPE_ALL_READ.to_string()]));
         assert!(!validate_agent_scopes(&["agent:admin:write".to_string()]));
         let principal = AgentPrincipal {
@@ -4630,6 +4982,61 @@ mod tests {
         ]);
         assert_eq!(events.len(), 1);
         assert!(events[0].get("payload").is_none());
+    }
+
+    #[test]
+    fn agent_decisions_prioritize_safe_context_without_actions_or_raw_data() {
+        let incidents = vec![serde_json::json!({
+            "id": "incident-1",
+            "status": "confirmed",
+            "severity": "high",
+            "confidence": 88,
+            "risk_score": 82,
+            "summary": "Correlated threat activity",
+            "candidate_id": "internal-candidate",
+            "correlation_key": "internal-correlation"
+        })];
+        let indicators = vec![serde_json::json!({
+            "source": "ThreatFox",
+            "risk_score": 91,
+            "confidence": 95,
+            "reason": "botnet C2",
+            "payload": {"secret": "must-not-leak"}
+        })];
+        let trust = vec![serde_json::json!({"status": "Revoked", "node_id": "secret"})];
+        let events = vec![serde_json::json!({
+            "event_id": "event-1",
+            "event_type": "rpki.invalid",
+            "source": "network",
+            "severity": "critical",
+            "timestamp": "2026-09-08T00:00:00Z",
+            "payload": {"secret": "must-not-leak"}
+        })];
+
+        let assessment = decision_risk_assessment(&incidents, &indicators);
+        assert_eq!(assessment["highest_risk_score"], 91);
+        assert_eq!(assessment["overall_status"], "critical");
+        assert_eq!(assessment["correlation_confidence"]["highest"], 88);
+
+        let attention = decision_attention_points(&incidents, &indicators, &events);
+        assert_eq!(attention[0]["priority"], "critical");
+        assert!(attention.iter().all(|point| point.get("payload").is_none()));
+        assert!(attention
+            .iter()
+            .all(|point| point.get("candidate_id").is_none()));
+        assert!(attention
+            .iter()
+            .all(|point| point.get("correlation_key").is_none()));
+
+        let checks = decision_recommended_checks(&incidents, &indicators, &trust, &events);
+        assert!(checks
+            .iter()
+            .any(|check| check["check"] == "incident_timelines"));
+        assert!(checks.iter().any(|check| check["check"] == "trust_status"));
+        assert!(checks
+            .iter()
+            .any(|check| check["check"] == "network_intelligence"));
+        assert!(checks.iter().all(|check| check.get("action").is_none()));
     }
 
     #[test]

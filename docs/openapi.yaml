@@ -63,6 +63,15 @@ components:
         trust: { type: object, additionalProperties: true }
         important_events: { type: array, items: { $ref: '#/components/schemas/AgentEvent' } }
         correlations: { type: object, additionalProperties: true }
+    AgentDecision:
+      type: object
+      required: [overall_status, risk_assessment, attention_points, recommended_checks, context]
+      properties:
+        overall_status: { type: string, enum: [info, low, medium, high, critical] }
+        risk_assessment: { type: object, additionalProperties: true }
+        attention_points: { type: array, items: { type: object, additionalProperties: true } }
+        recommended_checks: { type: array, items: { type: object, additionalProperties: true } }
+        context: { $ref: '#/components/schemas/AgentContext' }
     AgentEvent:
       type: object
       required: [event_id, event_type, source, severity, timestamp]
@@ -160,6 +169,25 @@ paths:
         '403': { description: agent:context:read scope missing }
         '429': { $ref: '#/components/responses/RateLimited' }
         '503': { description: PostgreSQL or context dependency unavailable }
+  /api/v1/decisions:
+    get:
+      security: [{ agentBearerAuth: [] }]
+      description: Read-only operational decision summary derived from existing agent context, incident, risk, trust, and correlation data. Requires agent:decision:read. No new risk calculation or automatic action is performed.
+      responses:
+        '200':
+          description: Prioritized agent decision envelope
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiEnvelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/AgentDecision' }
+        '401': { description: Agent token missing or invalid }
+        '403': { description: agent:decision:read scope missing }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { description: PostgreSQL or decision dependency unavailable }
   /admin/auth/agent-tokens:
     post:
       security: [{ bearerAuth: [] }]
@@ -178,7 +206,7 @@ paths:
                   minItems: 1
                   items:
                     type: string
-                    enum: [agent:system:read, agent:events:read, agent:incident:read, agent:incidents:read, agent:context:read, agent:security:read, agent:network:read, agent:read]
+                    enum: [agent:system:read, agent:events:read, agent:incident:read, agent:incidents:read, agent:context:read, agent:decision:read, agent:security:read, agent:network:read, agent:read]
                 expires_in_hours: { type: integer, minimum: 1, maximum: 8760, default: 720 }
       responses:
         '200': { description: Token envelope; the secret is not persisted and is shown once }
