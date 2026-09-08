@@ -63,8 +63,10 @@ and are not included in this report.
   lockfile's optional `sqlx-mysql` dependency. Clawforge enables only
   `sqlx-postgres` (`default-features = false`), so the vulnerable MySQL path is
   not compiled or reachable. RustSec reports no fixed upgrade for that
-  advisory; CI must keep the audit visible and revisit it when an upstream fix
-  is released.
+  advisory. Binary-level `cargo audit bin` scans of the API and MCP release
+  binaries recovered their production dependency sets and reported no
+  advisories. CI must keep both checks visible and revisit the lockfile result
+  when an upstream fix is released.
 
 ## Findings and fixes
 
@@ -87,7 +89,9 @@ generic validator, and return only `400 invalid incident identifier`.
 
 - The optional `sqlx-mysql` lockfile advisory must be monitored until an
   upstream fixed release is available; the production build uses PostgreSQL
-  only.
+  only. A lockfile-only finding cannot be removed without replacing SQLx or
+  changing the database layer, while the compiled production binaries are
+  clean.
 - TLS termination, WAF policy, and external network exposure remain deployment
   responsibilities; the Compose defaults bind the API/frontend ports for the
   local host and do not configure public TLS.
