@@ -52,6 +52,17 @@ components:
         runtime: { type: array, items: { type: object, additionalProperties: true } }
         events: { type: object, additionalProperties: true }
         providers: { type: object, additionalProperties: true }
+    AgentContext:
+      type: object
+      required: [system, active_incidents, open_incident_severity, risk_scores, trust, important_events, correlations]
+      properties:
+        system: { type: object, additionalProperties: true }
+        active_incidents: { type: object, additionalProperties: true }
+        open_incident_severity: { type: object, additionalProperties: true }
+        risk_scores: { type: object, additionalProperties: true }
+        trust: { type: object, additionalProperties: true }
+        important_events: { type: array, items: { $ref: '#/components/schemas/AgentEvent' } }
+        correlations: { type: object, additionalProperties: true }
     AgentEvent:
       type: object
       required: [event_id, event_type, source, severity, timestamp]
@@ -130,6 +141,25 @@ paths:
         '403': { description: Required agent scope missing }
         '429': { $ref: '#/components/responses/RateLimited' }
         '503': { description: PostgreSQL or migration status unavailable }
+  /api/v1/context:
+    get:
+      security: [{ agentBearerAuth: [] }]
+      description: Consolidated, read-only operational context for agents. Requires agent:context:read. Raw payloads, secrets, trust registry internals, candidate IDs, and correlation keys are omitted.
+      responses:
+        '200':
+          description: Consolidated agent context envelope
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiEnvelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/AgentContext' }
+        '401': { description: Agent token missing or invalid }
+        '403': { description: agent:context:read scope missing }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { description: PostgreSQL or context dependency unavailable }
   /admin/auth/agent-tokens:
     post:
       security: [{ bearerAuth: [] }]
@@ -148,7 +178,7 @@ paths:
                   minItems: 1
                   items:
                     type: string
-                    enum: [agent:system:read, agent:events:read, agent:incident:read, agent:incidents:read, agent:security:read, agent:network:read, agent:read]
+                    enum: [agent:system:read, agent:events:read, agent:incident:read, agent:incidents:read, agent:context:read, agent:security:read, agent:network:read, agent:read]
                 expires_in_hours: { type: integer, minimum: 1, maximum: 8760, default: 720 }
       responses:
         '200': { description: Token envelope; the secret is not persisted and is shown once }

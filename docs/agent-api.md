@@ -107,6 +107,7 @@ rollenbasierte Exportfunktionen. Zeitangaben sind UTC in RFC-3339-Format.
 | Endpoint | Zweck | Inhalt | Mindest-Scope |
 | --- | --- | --- | --- |
 | `GET /api/v1/status` | Betriebszustand | API, Worker, PostgreSQL, Migrationen, Event-Consumer, Provider-Zusammenfassung, Versionsstand | `agent:system:read` |
+| `GET /api/v1/context` | konsolidierte Lageabfrage | Systemstatus, aktive Incidents, Severity, Risk-Scores, Trust-Status, wichtige Events und Correlation-Zusammenfassungen | `agent:context:read` |
 | `GET /api/v1/events` | aktuelle kanonische Events | Typ, Quelle, Severity, Zeit, Korrelation, begründete Zusammenfassung | `agent:events:read` |
 | `GET /api/v1/incidents` | Incident-Liste | Status, Severity, Confidence, Risiko, Summary, Zeit, Event-Anzahl | `agent:incident:read` |
 | `GET /api/v1/incidents/{id}` | Incident-Details | Status, Severity, Confidence, Risiko, Summary und Zeit | `agent:incident:read` |
@@ -170,6 +171,28 @@ Ein Systemstatus enthält Komponentenstatus statt interner Prozessdetails:
   "errors": []
 }
 ```
+
+Die konsolidierte Lageabfrage unter `/api/v1/context` verwendet einen eigenen
+Scope und liefert ausschließlich bereits bewertete, normalisierte Ausschnitte:
+
+```json
+{
+  "data": {
+    "system": { "status": "ok", "migrations": {}, "runtime": [] },
+    "active_incidents": { "total": 1, "items": [] },
+    "open_incident_severity": { "total": 1, "by_severity": { "high": 1 } },
+    "risk_scores": { "total": 12, "highest": 82, "average": 31, "top": [] },
+    "trust": { "total": 3, "by_status": { "Verified": 2, "Pending": 1 } },
+    "important_events": [],
+    "correlations": { "active_incidents": [] }
+  }
+}
+```
+
+`agent:context:read` gibt keinen Zugriff auf Rohpayloads, Provider-Secrets,
+Trust-Registry-Interna, Candidate-IDs oder Korrelationsschlüssel. Incident- und
+Event-IDs erscheinen nur als notwendige Referenzen in den bereits redigierten
+Zusammenfassungen. Jeder Abruf erzeugt einen anonymisierten Audit-Eintrag.
 
 Ein Finding liefert die bereits gespeicherte Bewertung und ihre Herkunft:
 
@@ -235,6 +258,8 @@ Incidents ist `agent:incident:read` der kanonische Scope. Der frühere
 Kompatibilitätsgründen weiterhin akzeptiert. Ein
 Agent-Token erhält niemals Schreibrechte. Tokenwerte, IPs und Rohpayloads
 werden weder geloggt noch in Audit-Details abgelegt.
+Die konsolidierte Lageabfrage benötigt ausschließlich `agent:context:read`;
+ihre Teilbereiche erweitern keine granularen Resource-Scopes.
 
 `401` bedeutet fehlende oder ungültige Credentials, `403` fehlende Scopes,
 `404` unbekannte Ressourcen, `429` überschrittenes Limit und `503` nicht

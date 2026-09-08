@@ -76,6 +76,7 @@ const AGENT_SCOPE_EVENTS_READ: &str = "agent:events:read";
 const AGENT_SCOPE_INCIDENT_READ: &str = "agent:incident:read";
 const AGENT_SCOPE_INCIDENTS_READ_LEGACY: &str = "agent:incidents:read";
 const AGENT_SCOPE_INCIDENTS_READ: &str = "agent:incidents:read";
+const AGENT_SCOPE_CONTEXT_READ: &str = "agent:context:read";
 const AGENT_SCOPE_SECURITY_READ: &str = "agent:security:read";
 const AGENT_SCOPE_NETWORK_READ: &str = "agent:network:read";
 const AGENT_SCOPE_ALL_READ: &str = "agent:read";
@@ -85,6 +86,7 @@ const AGENT_SCOPES: &[&str] = &[
     AGENT_SCOPE_EVENTS_READ,
     AGENT_SCOPE_INCIDENT_READ,
     AGENT_SCOPE_INCIDENTS_READ,
+    AGENT_SCOPE_CONTEXT_READ,
     AGENT_SCOPE_SECURITY_READ,
     AGENT_SCOPE_NETWORK_READ,
     AGENT_SCOPE_ALL_READ,
@@ -1219,6 +1221,137 @@ fn agent_network_view(value: &serde_json::Value, fields: &[&str]) -> serde_json:
     serde_json::Value::Object(output)
 }
 
+fn context_is_active_incident(value: &serde_json::Value) -> bool {
+    value
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|status| {
+            matches!(
+                status,
+                "detected" | "investigating" | "confirmed" | "mitigated"
+            )
+        })
+}
+
+fn context_incident_data(
+    values: &[serde_json::Value],
+) -> (
+    Vec<serde_json::Value>,
+    serde_json::Value,
+    Vec<serde_json::Value>,
+) {
+    let active = values
+        .iter()
+        .filter(|value| context_is_active_incident(value))
+        .map(agent_incident_view)
+        .collect::<Vec<_>>();
+    let mut by_severity = serde_json::Map::new();
+    for value in &active {
+        if let Some(severity) = value.get("severity").and_then(serde_json::Value::as_str) {
+            let count = by_severity
+                .entry(severity.to_string())
+                .or_insert_with(|| serde_json::Value::from(0_u64));
+            *count = serde_json::Value::from(count.as_u64().unwrap_or(0) + 1);
+        }
+    }
+    let correlations = active
+        .iter()
+        .take(50)
+        .map(|incident| {
+            serde_json::json!({
+                "incident_id": incident.get("id"),
+                "status": incident.get("status"),
+                "severity": incident.get("severity"),
+                "confidence": incident.get("confidence"),
+                "risk_score": incident.get("risk_score"),
+                "summary": incident.get("summary"),
+                "event_count": incident.get("event_count"),
+                "updated_at": incident.get("updated_at")
+            })
+        })
+        .collect::<Vec<_>>();
+    (
+        active,
+        serde_json::json!({
+            "total": values.iter().filter(|value| context_is_active_incident(value)).count(),
+            "by_severity": by_severity
+        }),
+        correlations,
+    )
+}
+
+fn context_risk_data(values: &[serde_json::Value]) -> serde_json::Value {
+    let mut by_severity = serde_json::Map::new();
+    let mut scores = Vec::new();
+    for value in values {
+        let Some(score) = value.get("risk_score").and_then(serde_json::Value::as_i64) else {
+            continue;
+        };
+        let severity = risk_severity(score);
+        let count = by_severity
+            .entry(severity.to_string())
+            .or_insert_with(|| serde_json::Value::from(0_u64));
+        *count = serde_json::Value::from(count.as_u64().unwrap_or(0) + 1);
+        scores.push((score, value));
+    }
+    scores.sort_by_key(|left| std::cmp::Reverse(left.0));
+    let highest = scores.first().map(|(score, _)| *score).unwrap_or(0);
+    let assessed = scores.len();
+    let average = if scores.is_empty() {
+        0
+    } else {
+        scores.iter().map(|(score, _)| *score).sum::<i64>() / assessed as i64
+    };
+    let top = scores
+        .into_iter()
+        .take(20)
+        .map(|(score, value)| {
+            serde_json::json!({
+                "source": value.get("source"),
+                "severity": risk_severity(score),
+                "risk_score": score,
+                "trust_score": value.get("trust_score"),
+                "assessed_at": value.get("assessed_at")
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "total": values.len(),
+        "assessed": assessed,
+        "highest": highest,
+        "average": average,
+        "by_severity": by_severity,
+        "top": top
+    })
+}
+
+fn context_trust_data(values: &[serde_json::Value]) -> serde_json::Value {
+    let mut by_status = serde_json::Map::new();
+    for value in values {
+        if let Some(status) = value.get("status").and_then(serde_json::Value::as_str) {
+            let count = by_status
+                .entry(status.to_string())
+                .or_insert_with(|| serde_json::Value::from(0_u64));
+            *count = serde_json::Value::from(count.as_u64().unwrap_or(0) + 1);
+        }
+    }
+    serde_json::json!({"total": values.len(), "by_status": by_status})
+}
+
+fn context_important_events(values: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    values
+        .iter()
+        .filter(|value| {
+            matches!(
+                value.get("severity").and_then(serde_json::Value::as_str),
+                Some("high" | "critical")
+            )
+        })
+        .take(20)
+        .map(agent_event_view)
+        .collect()
+}
+
 async fn agent_status(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1279,6 +1412,107 @@ async fn agent_status(
             "providers": {
                 "total": providers.len(),
                 "enabled": providers.iter().filter(|provider| provider.get("enabled").and_then(serde_json::Value::as_bool) == Some(true)).count()
+            }
+        }),
+        None,
+    ))
+}
+
+async fn agent_context(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<ApiEnvelope<serde_json::Value>>> {
+    let principal = authenticate_agent(&state, &headers).await?;
+    require_agent_scope(&principal, AGENT_SCOPE_CONTEXT_READ)?;
+
+    let migration = state
+        .store
+        .readiness()
+        .await
+        .map_err(|_| api_error(StatusCode::SERVICE_UNAVAILABLE, "context unavailable"))?;
+    let migration_response: MigrationResponse = migration.into();
+    let runtime = state.store.runtime_status_views().await.map_err(|_| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "context runtime unavailable",
+        )
+    })?;
+    let runtime = runtime
+        .iter()
+        .map(|component| {
+            serde_json::json!({
+                "component": component.get("component"),
+                "state": component.get("state"),
+                "version": component.get("version"),
+                "last_started_at": component.get("last_started_at"),
+                "last_heartbeat_at": component.get("last_heartbeat_at"),
+                "updated_at": component.get("updated_at")
+            })
+        })
+        .collect::<Vec<_>>();
+    let event_status = state.store.event_status().await.map_err(|_| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "context events unavailable",
+        )
+    })?;
+    let providers = state.store.list_provider_views().await.map_err(|_| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "context providers unavailable",
+        )
+    })?;
+    let incidents = state.store.list_incidents(None, 500).await.map_err(|_| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "context incidents unavailable",
+        )
+    })?;
+    let (active_incidents, incident_severity, correlations) = context_incident_data(&incidents);
+    let indicators = state.store.list_indicator_views(1000).await.map_err(|_| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "context risk data unavailable",
+        )
+    })?;
+    let trust = agent_network_values(&state, "trust").await?;
+    let important_events = state.store.list_events(None, 100).await.map_err(|_| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "context event data unavailable",
+        )
+    })?;
+    audit_agent_read(
+        &state,
+        &principal,
+        "/api/v1/context",
+        AGENT_SCOPE_CONTEXT_READ,
+    )
+    .await;
+    Ok(envelope(
+        serde_json::json!({
+            "system": {
+                "service": "clawforge",
+                "version": env!("CARGO_PKG_VERSION"),
+                "status": "ok",
+                "migrations": migration_response,
+                "runtime": runtime,
+                "events": event_status,
+                "providers": {
+                    "total": providers.len(),
+                    "enabled": providers.iter().filter(|provider| provider.get("enabled").and_then(serde_json::Value::as_bool) == Some(true)).count()
+                }
+            },
+            "active_incidents": {
+                "total": active_incidents.len(),
+                "items": active_incidents.iter().take(50).collect::<Vec<_>>()
+            },
+            "open_incident_severity": incident_severity,
+            "risk_scores": context_risk_data(&indicators),
+            "trust": context_trust_data(&trust),
+            "important_events": context_important_events(&important_events),
+            "correlations": {
+                "active_incidents": correlations
             }
         }),
         None,
@@ -4086,6 +4320,7 @@ async fn main() -> anyhow::Result<()> {
             "/api/v1",
             Router::new()
                 .route("/status", get(agent_status))
+                .route("/context", get(agent_context))
                 .route("/events", get(agent_events))
                 .route("/incidents", get(agent_incidents))
                 .route("/incidents/{id}", get(agent_incident_detail))
@@ -4319,6 +4554,9 @@ mod tests {
         assert!(validate_agent_scopes(&[
             AGENT_SCOPE_INCIDENT_READ.to_string()
         ]));
+        assert!(validate_agent_scopes(&[
+            AGENT_SCOPE_CONTEXT_READ.to_string()
+        ]));
         assert!(validate_agent_scopes(&[AGENT_SCOPE_ALL_READ.to_string()]));
         assert!(!validate_agent_scopes(&["agent:admin:write".to_string()]));
         let principal = AgentPrincipal {
@@ -4327,6 +4565,71 @@ mod tests {
             scopes: vec![AGENT_SCOPE_ALL_READ.into()],
         };
         assert!(require_agent_scope(&principal, AGENT_SCOPE_NETWORK_READ).is_ok());
+    }
+
+    #[test]
+    fn agent_context_is_aggregated_and_redacted() {
+        let incidents = vec![
+            serde_json::json!({
+                "id": "incident-1",
+                "status": "detected",
+                "severity": "high",
+                "confidence": 90,
+                "risk_score": 82,
+                "summary": "Correlated event chain",
+                "event_count": 3,
+                "candidate_id": "candidate-secret",
+                "correlation_key": "internal-secret"
+            }),
+            serde_json::json!({
+                "id": "incident-2",
+                "status": "closed",
+                "severity": "critical",
+                "confidence": 99,
+                "risk_score": 95,
+                "summary": "Closed event chain"
+            }),
+        ];
+        let (active, severity, correlations) = context_incident_data(&incidents);
+        assert_eq!(active.len(), 1);
+        assert_eq!(severity["total"], 1);
+        assert_eq!(severity["by_severity"]["high"], 1);
+        assert_eq!(correlations[0]["incident_id"], "incident-1");
+        assert!(active[0].get("candidate_id").is_none());
+        assert!(correlations[0].get("correlation_key").is_none());
+
+        let risk = context_risk_data(&[
+            serde_json::json!({
+                "source":"threatfox",
+                "risk_score":82,
+                "trust_score":-5,
+                "assessed_at":"2026-09-08T00:00:00Z",
+                "payload":{"secret":"must-not-leak"}
+            }),
+            serde_json::json!({"source":"urlhaus","risk_score":20}),
+        ]);
+        assert_eq!(risk["highest"], 82);
+        assert_eq!(risk["assessed"], 2);
+        assert!(risk.get("payload").is_none());
+
+        let trust = context_trust_data(&[
+            serde_json::json!({"status":"Verified","node_identities":["secret"]}),
+            serde_json::json!({"status":"Pending"}),
+        ]);
+        assert_eq!(trust["total"], 2);
+        assert_eq!(trust["by_status"]["Verified"], 1);
+        assert!(trust.get("node_identities").is_none());
+
+        let events = context_important_events(&[
+            serde_json::json!({
+                "event_id":"event-1","event_type":"threat","source":"feed",
+                "severity":"critical","timestamp":"2026-09-08T00:00:00Z",
+                "payload":{"secret":"must-not-leak"}
+            }),
+            serde_json::json!({"event_id":"event-2","severity":"low"}),
+        ]);
+        assert_eq!(events.len(), 1);
+        assert!(events[0].get("payload").is_none());
     }
 
     #[test]
