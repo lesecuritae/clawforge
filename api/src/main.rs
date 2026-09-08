@@ -20,7 +20,9 @@ use axum::{
 };
 use chrono::{Duration, Utc};
 use clawforge_intelligence::{NetworkType, TrustedNetwork, VerificationStatus};
-use clawforge_storage::{database_url_from_env, AdminPrincipal, MigrationStatus, PostgresStore};
+use clawforge_storage::{
+    database_url_from_env, AdminPrincipal, AgentPrincipal, MigrationStatus, PostgresStore,
+};
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -68,6 +70,22 @@ struct RateDecision {
     remaining: u32,
     retry_after: StdDuration,
 }
+
+const AGENT_SCOPE_SYSTEM_READ: &str = "agent:system:read";
+const AGENT_SCOPE_EVENTS_READ: &str = "agent:events:read";
+const AGENT_SCOPE_INCIDENTS_READ: &str = "agent:incidents:read";
+const AGENT_SCOPE_SECURITY_READ: &str = "agent:security:read";
+const AGENT_SCOPE_NETWORK_READ: &str = "agent:network:read";
+const AGENT_SCOPE_ALL_READ: &str = "agent:read";
+
+const AGENT_SCOPES: &[&str] = &[
+    AGENT_SCOPE_SYSTEM_READ,
+    AGENT_SCOPE_EVENTS_READ,
+    AGENT_SCOPE_INCIDENTS_READ,
+    AGENT_SCOPE_SECURITY_READ,
+    AGENT_SCOPE_NETWORK_READ,
+    AGENT_SCOPE_ALL_READ,
+];
 
 impl Default for RateLimiter {
     fn default() -> Self {
@@ -1032,6 +1050,574 @@ async fn network_trust(
     Ok(envelope(data, Some(pagination)))
 }
 
+#[derive(Deserialize, Default)]
+struct AgentQuery {
+    page: Option<i64>,
+    page_size: Option<i64>,
+    event_type: Option<String>,
+    source: Option<String>,
+    severity: Option<String>,
+    status: Option<String>,
+    correlation_id: Option<String>,
+    confidence_min: Option<u8>,
+    active: Option<bool>,
+    asn: Option<String>,
+    prefix: Option<String>,
+    rpki_status: Option<String>,
+    from: Option<String>,
+    to: Option<String>,
+}
+
+fn agent_page(query: &AgentQuery, default: i64) -> (i64, i64) {
+    (
+        query.page.unwrap_or(1).max(1),
+        query.page_size.unwrap_or(default).clamp(1, 100),
+    )
+}
+
+fn agent_timestamp(value: &serde_json::Value) -> &str {
+    value
+        .get("timestamp")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| value.get("created_at").and_then(serde_json::Value::as_str))
+        .or_else(|| value.get("last_seen").and_then(serde_json::Value::as_str))
+        .unwrap_or_default()
+}
+
+fn agent_time_matches(value: &serde_json::Value, query: &AgentQuery) -> bool {
+    let timestamp = agent_timestamp(value);
+    query.from.as_deref().is_none_or(|from| timestamp >= from)
+        && query.to.as_deref().is_none_or(|to| timestamp <= to)
+}
+
+fn agent_event_view(value: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "event_id": value.get("event_id"),
+        "event_type": value.get("event_type"),
+        "source": value.get("source"),
+        "severity": value.get("severity"),
+        "timestamp": value.get("timestamp"),
+        "correlation_id": value.get("correlation_id"),
+        "created_at": value.get("created_at")
+    })
+}
+
+fn risk_severity(score: i64) -> &'static str {
+    if score >= 90 {
+        "critical"
+    } else if score >= 70 {
+        "high"
+    } else if score >= 40 {
+        "medium"
+    } else if score > 0 {
+        "low"
+    } else {
+        "info"
+    }
+}
+
+fn agent_finding_view(value: &serde_json::Value) -> serde_json::Value {
+    let risk_score = value
+        .get("risk_score")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+    serde_json::json!({
+        "id": value.get("id").map(|id| format!("indicator:{id}")),
+        "kind": value.get("indicator_type"),
+        "subject": value.get("value"),
+        "source": value.get("source"),
+        "severity": risk_severity(risk_score),
+        "confidence": value.get("confidence"),
+        "risk_score": value.get("risk_score"),
+        "trust_score": value.get("trust_score"),
+        "reason": value.get("reason"),
+        "first_seen": value.get("first_seen"),
+        "last_seen": value.get("last_seen"),
+        "expires_at": value.get("expires_at"),
+        "age_seconds": value.get("age_seconds"),
+        "status": value.get("status"),
+        "assessed_at": value.get("assessed_at")
+    })
+}
+
+fn agent_incident_view(value: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "id": value.get("id"),
+        "status": value.get("status"),
+        "severity": value.get("severity"),
+        "risk_score": value.get("risk_score"),
+        "summary": value.get("summary"),
+        "correlation_key": value.get("correlation_key"),
+        "event_count": value.get("event_count"),
+        "created_at": value.get("created_at"),
+        "updated_at": value.get("updated_at")
+    })
+}
+
+fn agent_network_view(value: &serde_json::Value, fields: &[&str]) -> serde_json::Value {
+    let mut output = serde_json::Map::new();
+    for field in fields {
+        if let Some(found) = value.get(*field) {
+            output.insert((*field).to_string(), found.clone());
+        }
+    }
+    serde_json::Value::Object(output)
+}
+
+async fn agent_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<ApiEnvelope<serde_json::Value>>> {
+    let principal = authenticate_agent(&state, &headers).await?;
+    require_agent_scope(&principal, AGENT_SCOPE_SYSTEM_READ)?;
+    let migration = state
+        .store
+        .readiness()
+        .await
+        .map_err(|_| api_error(StatusCode::SERVICE_UNAVAILABLE, "status unavailable"))?;
+    let migration_response: MigrationResponse = migration.into();
+    let runtime = state.store.runtime_status_views().await.map_err(|_| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "runtime status unavailable",
+        )
+    })?;
+    let runtime = runtime
+        .iter()
+        .map(|component| {
+            serde_json::json!({
+                "component": component.get("component"),
+                "state": component.get("state"),
+                "version": component.get("version"),
+                "last_started_at": component.get("last_started_at"),
+                "last_heartbeat_at": component.get("last_heartbeat_at"),
+                "updated_at": component.get("updated_at")
+            })
+        })
+        .collect::<Vec<_>>();
+    let events = state
+        .store
+        .event_status()
+        .await
+        .map_err(|_| api_error(StatusCode::SERVICE_UNAVAILABLE, "event status unavailable"))?;
+    let providers = state.store.list_provider_views().await.map_err(|_| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "provider status unavailable",
+        )
+    })?;
+    audit_agent_read(
+        &state,
+        &principal,
+        "/api/v1/status",
+        AGENT_SCOPE_SYSTEM_READ,
+    )
+    .await;
+    Ok(envelope(
+        serde_json::json!({
+            "service": "clawforge",
+            "version": env!("CARGO_PKG_VERSION"),
+            "status": "ok",
+            "migrations": migration_response,
+            "runtime": runtime,
+            "events": events,
+            "providers": {
+                "total": providers.len(),
+                "enabled": providers.iter().filter(|provider| provider.get("enabled").and_then(serde_json::Value::as_bool) == Some(true)).count()
+            }
+        }),
+        None,
+    ))
+}
+
+async fn agent_events(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AgentQuery>,
+) -> ApiResult<Json<ApiEnvelope<Vec<serde_json::Value>>>> {
+    let principal = authenticate_agent(&state, &headers).await?;
+    require_agent_scope(&principal, AGENT_SCOPE_EVENTS_READ)?;
+    let mut values = state
+        .store
+        .list_events(query.event_type.as_deref(), 500)
+        .await
+        .map_err(|_| api_error(StatusCode::SERVICE_UNAVAILABLE, "event list unavailable"))?;
+    values.retain(|value| {
+        query.source.as_deref().is_none_or(|source| {
+            value.get("source").and_then(serde_json::Value::as_str) == Some(source)
+        }) && query.severity.as_deref().is_none_or(|severity| {
+            value.get("severity").and_then(serde_json::Value::as_str) == Some(severity)
+        }) && query.correlation_id.as_deref().is_none_or(|correlation| {
+            value
+                .get("correlation_id")
+                .and_then(serde_json::Value::as_str)
+                == Some(correlation)
+        }) && agent_time_matches(value, &query)
+    });
+    let values = values.iter().map(agent_event_view).collect::<Vec<_>>();
+    let (page, page_size) = agent_page(&query, 50);
+    let (data, pagination) = paged_values(values, page, page_size);
+    audit_agent_read(
+        &state,
+        &principal,
+        "/api/v1/events",
+        AGENT_SCOPE_EVENTS_READ,
+    )
+    .await;
+    Ok(envelope(data, Some(pagination)))
+}
+
+async fn agent_incidents(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AgentQuery>,
+) -> ApiResult<Json<ApiEnvelope<Vec<serde_json::Value>>>> {
+    let principal = authenticate_agent(&state, &headers).await?;
+    require_agent_scope(&principal, AGENT_SCOPE_INCIDENTS_READ)?;
+    let mut values = state
+        .store
+        .list_incidents(query.status.as_deref(), 500)
+        .await
+        .map_err(|_| api_error(StatusCode::SERVICE_UNAVAILABLE, "incident list unavailable"))?;
+    values.retain(|value| {
+        query.severity.as_deref().is_none_or(|severity| {
+            value.get("severity").and_then(serde_json::Value::as_str) == Some(severity)
+        }) && agent_time_matches(value, &query)
+    });
+    let values = values.iter().map(agent_incident_view).collect::<Vec<_>>();
+    let (page, page_size) = agent_page(&query, 50);
+    let (data, pagination) = paged_values(values, page, page_size);
+    audit_agent_read(
+        &state,
+        &principal,
+        "/api/v1/incidents",
+        AGENT_SCOPE_INCIDENTS_READ,
+    )
+    .await;
+    Ok(envelope(data, Some(pagination)))
+}
+
+async fn agent_findings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AgentQuery>,
+) -> ApiResult<Json<ApiEnvelope<Vec<serde_json::Value>>>> {
+    let principal = authenticate_agent(&state, &headers).await?;
+    require_agent_scope(&principal, AGENT_SCOPE_SECURITY_READ)?;
+    let mut values = state.store.list_indicator_views(1000).await.map_err(|_| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "security findings unavailable",
+        )
+    })?;
+    values.retain(|value| {
+        let score = value
+            .get("risk_score")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0);
+        let severity = risk_severity(score);
+        let active = value.get("status").and_then(serde_json::Value::as_str) == Some("active");
+        query.source.as_deref().is_none_or(|source| {
+            value.get("source").and_then(serde_json::Value::as_str) == Some(source)
+        }) && query
+            .severity
+            .as_deref()
+            .is_none_or(|wanted| wanted == severity)
+            && query.confidence_min.is_none_or(|minimum| {
+                value
+                    .get("confidence")
+                    .and_then(serde_json::Value::as_i64)
+                    .is_some_and(|confidence| confidence >= i64::from(minimum))
+            })
+            && query.active.is_none_or(|wanted| wanted == active)
+            && agent_time_matches(value, &query)
+    });
+    let values = values.iter().map(agent_finding_view).collect::<Vec<_>>();
+    let (page, page_size) = agent_page(&query, 50);
+    let (data, pagination) = paged_values(values, page, page_size);
+    audit_agent_read(
+        &state,
+        &principal,
+        "/api/v1/security/findings",
+        AGENT_SCOPE_SECURITY_READ,
+    )
+    .await;
+    Ok(envelope(data, Some(pagination)))
+}
+
+async fn agent_security_overview(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<ApiEnvelope<serde_json::Value>>> {
+    let principal = authenticate_agent(&state, &headers).await?;
+    require_agent_scope(&principal, AGENT_SCOPE_SECURITY_READ)?;
+    let values = state.store.list_indicator_views(1000).await.map_err(|_| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "security overview unavailable",
+        )
+    })?;
+    let mut by_severity = serde_json::Map::new();
+    for severity in ["info", "low", "medium", "high", "critical"] {
+        by_severity.insert(
+            severity.to_string(),
+            serde_json::Value::from(
+                values
+                    .iter()
+                    .filter(|value| {
+                        let score = value
+                            .get("risk_score")
+                            .and_then(serde_json::Value::as_i64)
+                            .unwrap_or(0);
+                        risk_severity(score) == severity
+                    })
+                    .count() as u64,
+            ),
+        );
+    }
+    let active = values
+        .iter()
+        .filter(|value| value.get("status").and_then(serde_json::Value::as_str) == Some("active"))
+        .count();
+    let highest_risk = values
+        .iter()
+        .filter_map(|value| value.get("risk_score").and_then(serde_json::Value::as_i64))
+        .max()
+        .unwrap_or(0);
+    audit_agent_read(
+        &state,
+        &principal,
+        "/api/v1/security/overview",
+        AGENT_SCOPE_SECURITY_READ,
+    )
+    .await;
+    Ok(envelope(
+        serde_json::json!({
+            "findings_total": values.len(),
+            "active_findings": active,
+            "by_severity": by_severity,
+            "highest_risk_score": highest_risk
+        }),
+        None,
+    ))
+}
+
+async fn agent_network_values(state: &AppState, kind: &str) -> ApiResult<Vec<serde_json::Value>> {
+    state
+        .store
+        .list_network_views(kind)
+        .await
+        .map_err(|_| api_error(StatusCode::SERVICE_UNAVAILABLE, "network data unavailable"))
+}
+
+async fn agent_asn(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AgentQuery>,
+) -> ApiResult<Json<ApiEnvelope<Vec<serde_json::Value>>>> {
+    let principal = authenticate_agent(&state, &headers).await?;
+    require_agent_scope(&principal, AGENT_SCOPE_NETWORK_READ)?;
+    let mut values = agent_network_values(&state, "asn").await?;
+    values.retain(|value| {
+        query
+            .asn
+            .as_deref()
+            .is_none_or(|asn| value.get("asn").and_then(serde_json::Value::as_str) == Some(asn))
+            && agent_time_matches(value, &query)
+    });
+    let values = values
+        .iter()
+        .map(|value| {
+            agent_network_view(
+                value,
+                &[
+                    "asn",
+                    "name",
+                    "organisation",
+                    "provider",
+                    "country",
+                    "registry",
+                    "prefixes",
+                    "network_type",
+                    "reputation",
+                    "first_seen",
+                    "last_seen",
+                    "age_seconds",
+                    "timestamp",
+                    "confidence",
+                    "assessment",
+                ],
+            )
+        })
+        .collect::<Vec<_>>();
+    let (page, page_size) = agent_page(&query, 50);
+    let (data, pagination) = paged_values(values, page, page_size);
+    audit_agent_read(
+        &state,
+        &principal,
+        "/api/v1/network/asn",
+        AGENT_SCOPE_NETWORK_READ,
+    )
+    .await;
+    Ok(envelope(data, Some(pagination)))
+}
+
+async fn agent_prefixes(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AgentQuery>,
+) -> ApiResult<Json<ApiEnvelope<Vec<serde_json::Value>>>> {
+    let principal = authenticate_agent(&state, &headers).await?;
+    require_agent_scope(&principal, AGENT_SCOPE_NETWORK_READ)?;
+    let asn_values = agent_network_values(&state, "asn").await?;
+    let mut values = Vec::new();
+    for value in &asn_values {
+        let Some(asn) = value.get("asn").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let Some(prefixes) = value.get("prefixes").and_then(serde_json::Value::as_array) else {
+            continue;
+        };
+        for prefix in prefixes.iter().filter_map(serde_json::Value::as_str) {
+            values.push(serde_json::json!({
+                "prefix": prefix,
+                "asn": asn,
+                "source": value.get("source"),
+                "country": value.get("country"),
+                "network_type": value.get("network_type"),
+                "first_seen": value.get("first_seen"),
+                "last_seen": value.get("last_seen"),
+                "age_seconds": value.get("age_seconds"),
+                "timestamp": value.get("timestamp"),
+                "confidence": value.get("confidence"),
+                "assessment": value.get("assessment")
+            }));
+        }
+    }
+    values.retain(|value| {
+        query
+            .asn
+            .as_deref()
+            .is_none_or(|asn| value.get("asn").and_then(serde_json::Value::as_str) == Some(asn))
+            && query.prefix.as_deref().is_none_or(|prefix| {
+                value.get("prefix").and_then(serde_json::Value::as_str) == Some(prefix)
+            })
+            && agent_time_matches(value, &query)
+    });
+    let (page, page_size) = agent_page(&query, 50);
+    let (data, pagination) = paged_values(values, page, page_size);
+    audit_agent_read(
+        &state,
+        &principal,
+        "/api/v1/network/prefixes",
+        AGENT_SCOPE_NETWORK_READ,
+    )
+    .await;
+    Ok(envelope(data, Some(pagination)))
+}
+
+async fn agent_bgp(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AgentQuery>,
+) -> ApiResult<Json<ApiEnvelope<Vec<serde_json::Value>>>> {
+    let principal = authenticate_agent(&state, &headers).await?;
+    require_agent_scope(&principal, AGENT_SCOPE_NETWORK_READ)?;
+    let mut values = agent_network_values(&state, "bgp").await?;
+    values.retain(|value| {
+        query.asn.as_deref().is_none_or(|asn| {
+            value.get("origin_asn").and_then(serde_json::Value::as_str) == Some(asn)
+        }) && query.prefix.as_deref().is_none_or(|prefix| {
+            value.get("prefix").and_then(serde_json::Value::as_str) == Some(prefix)
+        }) && query.rpki_status.as_deref().is_none_or(|status| {
+            value.get("rpki_status").and_then(serde_json::Value::as_str) == Some(status)
+        }) && agent_time_matches(value, &query)
+    });
+    let values = values
+        .iter()
+        .map(|value| {
+            agent_network_view(
+                value,
+                &[
+                    "prefix",
+                    "origin_asn",
+                    "previous_asn",
+                    "new_asn",
+                    "timestamp",
+                    "source",
+                    "status",
+                    "rpki_status",
+                    "change",
+                    "age_seconds",
+                    "confidence",
+                    "assessment",
+                ],
+            )
+        })
+        .collect::<Vec<_>>();
+    let (page, page_size) = agent_page(&query, 50);
+    let (data, pagination) = paged_values(values, page, page_size);
+    audit_agent_read(
+        &state,
+        &principal,
+        "/api/v1/network/bgp",
+        AGENT_SCOPE_NETWORK_READ,
+    )
+    .await;
+    Ok(envelope(data, Some(pagination)))
+}
+
+async fn agent_rpki(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AgentQuery>,
+) -> ApiResult<Json<ApiEnvelope<Vec<serde_json::Value>>>> {
+    let principal = authenticate_agent(&state, &headers).await?;
+    require_agent_scope(&principal, AGENT_SCOPE_NETWORK_READ)?;
+    let mut values = agent_network_values(&state, "rpki").await?;
+    values.retain(|value| {
+        query
+            .asn
+            .as_deref()
+            .is_none_or(|asn| value.get("asn").and_then(serde_json::Value::as_str) == Some(asn))
+            && query.prefix.as_deref().is_none_or(|prefix| {
+                value.get("prefix").and_then(serde_json::Value::as_str) == Some(prefix)
+            })
+            && query.rpki_status.as_deref().is_none_or(|status| {
+                value.get("status").and_then(serde_json::Value::as_str) == Some(status)
+            })
+            && agent_time_matches(value, &query)
+    });
+    let values = values
+        .iter()
+        .map(|value| {
+            agent_network_view(
+                value,
+                &[
+                    "prefix",
+                    "asn",
+                    "status",
+                    "timestamp",
+                    "source",
+                    "age_seconds",
+                    "confidence",
+                    "assessment",
+                ],
+            )
+        })
+        .collect::<Vec<_>>();
+    let (page, page_size) = agent_page(&query, 50);
+    let (data, pagination) = paged_values(values, page, page_size);
+    audit_agent_read(
+        &state,
+        &principal,
+        "/api/v1/network/rpki",
+        AGENT_SCOPE_NETWORK_READ,
+    )
+    .await;
+    Ok(envelope(data, Some(pagination)))
+}
+
 async fn metrics(State(state): State<AppState>) -> Result<Response, StatusCode> {
     let body = state
         .store
@@ -1152,6 +1738,58 @@ async fn authenticate(state: &AppState, headers: &HeaderMap) -> ApiResult<AdminP
             )
         })?
         .ok_or_else(|| api_error(StatusCode::UNAUTHORIZED, "invalid or expired credential"))
+}
+
+async fn authenticate_agent(state: &AppState, headers: &HeaderMap) -> ApiResult<AgentPrincipal> {
+    let token = bearer(headers)
+        .ok_or_else(|| api_error(StatusCode::UNAUTHORIZED, "agent bearer token required"))?;
+    state
+        .store
+        .authenticate_agent_token(&digest(token))
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "agent authentication unavailable",
+            )
+        })?
+        .ok_or_else(|| api_error(StatusCode::UNAUTHORIZED, "invalid or expired agent token"))
+}
+
+fn require_agent_scope(principal: &AgentPrincipal, scope: &str) -> ApiResult<()> {
+    if principal
+        .scopes
+        .iter()
+        .any(|value| value == scope || value == AGENT_SCOPE_ALL_READ)
+    {
+        Ok(())
+    } else {
+        Err(api_error(
+            StatusCode::FORBIDDEN,
+            "agent scope is not granted",
+        ))
+    }
+}
+
+async fn audit_agent_read(
+    state: &AppState,
+    principal: &AgentPrincipal,
+    resource: &str,
+    scope: &str,
+) {
+    let actor = format!("agent:{}", principal.name);
+    if let Err(error) = state
+        .store
+        .record_audit_event(
+            &actor,
+            "agent_api_read",
+            resource,
+            serde_json::json!({"scope": scope}),
+        )
+        .await
+    {
+        tracing::warn!(%error, resource, "could not persist agent API audit event");
+    }
 }
 
 fn require_role(principal: &AdminPrincipal, roles: &[&str]) -> ApiResult<()> {
@@ -1442,6 +2080,104 @@ async fn admin_create_token(
     .await;
     Ok(envelope(
         serde_json::json!({"id":id,"token":token,"token_type":"Bearer","expires_at":expires_at}),
+        None,
+    ))
+}
+
+#[derive(Deserialize)]
+struct AgentTokenRequest {
+    name: String,
+    scopes: Vec<String>,
+    expires_in_hours: Option<i64>,
+}
+
+fn validate_agent_scopes(scopes: &[String]) -> bool {
+    !scopes.is_empty()
+        && scopes
+            .iter()
+            .all(|scope| AGENT_SCOPES.contains(&scope.as_str()))
+}
+
+async fn admin_create_agent_token(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<AgentTokenRequest>,
+) -> ApiResult<Json<ApiEnvelope<serde_json::Value>>> {
+    let principal = authenticate(&state, &headers).await?;
+    require_role(&principal, &["Administrator"])?;
+    if request.name.trim().is_empty() || request.name.len() > 128 {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "agent token name must contain 1 to 128 characters",
+        ));
+    }
+    if !validate_agent_scopes(&request.scopes) {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "unsupported or empty agent scope list",
+        ));
+    }
+    let expires_at = Utc::now()
+        + Duration::hours(
+            request
+                .expires_in_hours
+                .unwrap_or(24 * 30)
+                .clamp(1, 24 * 365),
+        );
+    let token = new_secret();
+    let id = state
+        .store
+        .create_agent_token(
+            request.name.trim(),
+            &digest(&token),
+            &token[..8],
+            &request.scopes,
+            expires_at,
+            Some(principal.id),
+        )
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "agent token creation failed",
+            )
+        })?;
+    audit(
+        &state,
+        &principal,
+        "agent_token_created",
+        &id.to_string(),
+        serde_json::json!({"name":request.name.trim(),"scopes":request.scopes,"expires_at":expires_at}),
+    )
+    .await;
+    Ok(envelope(
+        serde_json::json!({"id":id,"token":token,"token_type":"Bearer","scopes":request.scopes,"expires_at":expires_at}),
+        None,
+    ))
+}
+
+async fn admin_revoke_agent_token(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<ApiEnvelope<serde_json::Value>>> {
+    let principal = authenticate(&state, &headers).await?;
+    require_role(&principal, &["Administrator"])?;
+    state
+        .store
+        .revoke_agent_token(id)
+        .await
+        .map_err(|_| api_error(StatusCode::NOT_FOUND, "agent token not found"))?;
+    audit(
+        &state,
+        &principal,
+        "agent_token_revoked",
+        &id.to_string(),
+        serde_json::json!({}),
+    )
+    .await;
+    Ok(envelope(
+        serde_json::json!({"id":id,"status":"revoked"}),
         None,
     ))
 }
@@ -2877,6 +3613,11 @@ async fn main() -> anyhow::Result<()> {
         .route("/admin/auth/users", post(admin_create_user))
         .route("/admin/auth/tokens", post(admin_create_token))
         .route("/admin/auth/tokens/{id}/rotate", post(admin_rotate_token))
+        .route("/admin/auth/agent-tokens", post(admin_create_agent_token))
+        .route(
+            "/admin/auth/agent-tokens/{id}/revoke",
+            post(admin_revoke_agent_token),
+        )
         .route("/admin/providers", get(admin_providers))
         .route("/admin/providers/{id}", post(admin_update_provider))
         .route("/admin/providers/{id}/sync", post(admin_sync_provider))
@@ -2931,6 +3672,19 @@ async fn main() -> anyhow::Result<()> {
         .route("/incidents/export", get(export_incidents))
         .route("/intelligence/indicators/export", get(export_indicators))
         .route("/audit/events/export", get(export_audit_events))
+        .nest(
+            "/api/v1",
+            Router::new()
+                .route("/status", get(agent_status))
+                .route("/events", get(agent_events))
+                .route("/incidents", get(agent_incidents))
+                .route("/security/findings", get(agent_findings))
+                .route("/security/overview", get(agent_security_overview))
+                .route("/network/asn", get(agent_asn))
+                .route("/network/prefixes", get(agent_prefixes))
+                .route("/network/bgp", get(agent_bgp))
+                .route("/network/rpki", get(agent_rpki)),
+        )
         .layer(middleware::from_fn_with_state(
             app_state.clone(),
             rate_limit_middleware,
@@ -3120,5 +3874,63 @@ mod tests {
         assert!(visualization_authorized(&principal("Operator")).is_ok());
         assert!(visualization_authorized(&principal("Administrator")).is_ok());
         assert!(visualization_authorized(&principal("Unknown")).is_err());
+    }
+
+    #[test]
+    fn agent_scopes_are_read_only_and_wildcard_is_supported() {
+        assert!(validate_agent_scopes(
+            &[AGENT_SCOPE_EVENTS_READ.to_string()]
+        ));
+        assert!(validate_agent_scopes(&[AGENT_SCOPE_ALL_READ.to_string()]));
+        assert!(!validate_agent_scopes(&["agent:admin:write".to_string()]));
+        let principal = AgentPrincipal {
+            id: Uuid::new_v4(),
+            name: "test-agent".into(),
+            scopes: vec![AGENT_SCOPE_ALL_READ.into()],
+        };
+        assert!(require_agent_scope(&principal, AGENT_SCOPE_NETWORK_READ).is_ok());
+    }
+
+    #[test]
+    fn agent_views_exclude_raw_event_and_indicator_payloads() {
+        let event = agent_event_view(&serde_json::json!({
+            "event_id": "event-1",
+            "event_type": "provider.failed",
+            "source": "test",
+            "severity": "high",
+            "timestamp": "2026-09-08T00:00:00Z",
+            "payload": {"token": "must-not-leak"},
+            "metadata": {"secret": "must-not-leak"}
+        }));
+        assert!(event.get("payload").is_none());
+        assert!(event.get("metadata").is_none());
+        let finding = agent_finding_view(&serde_json::json!({
+            "id": 7,
+            "indicator_type": "ip",
+            "value": "198.51.100.10",
+            "source": "fixture",
+            "confidence": 80,
+            "risk_score": 75,
+            "metadata": {"raw_feed": "must-not-leak"}
+        }));
+        assert_eq!(finding["severity"], "high");
+        assert!(finding.get("metadata").is_none());
+    }
+
+    #[test]
+    fn agent_pagination_and_time_contract_are_bounded() {
+        let query = AgentQuery {
+            page: Some(0),
+            page_size: Some(1000),
+            ..AgentQuery::default()
+        };
+        assert_eq!(agent_page(&query, 50), (1, 100));
+        let value = serde_json::json!({"created_at":"2026-09-08T00:00:00Z"});
+        let query = AgentQuery {
+            from: Some("2026-09-07T00:00:00Z".into()),
+            to: Some("2026-09-09T00:00:00Z".into()),
+            ..AgentQuery::default()
+        };
+        assert!(agent_time_matches(&value, &query));
     }
 }

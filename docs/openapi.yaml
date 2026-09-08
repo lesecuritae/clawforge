@@ -13,6 +13,11 @@ components:
       type: http
       scheme: bearer
       bearerFormat: opaque-session-or-api-token
+    agentBearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque-agent-api-token
+      description: Agent token issued by an Administrator. Tokens are read-only and carry explicit agent scopes.
   schemas:
     ApiEnvelope:
       type: object
@@ -36,6 +41,47 @@ components:
         page_size: { type: integer, minimum: 1, maximum: 500 }
         total: { type: integer, minimum: 0 }
         has_next: { type: boolean }
+    AgentStatus:
+      type: object
+      required: [service, version, status, migrations, runtime, events, providers]
+      properties:
+        service: { type: string, example: clawforge }
+        version: { type: string, example: 0.1.0 }
+        status: { type: string, enum: [ok] }
+        migrations: { type: object, additionalProperties: true }
+        runtime: { type: array, items: { type: object, additionalProperties: true } }
+        events: { type: object, additionalProperties: true }
+        providers: { type: object, additionalProperties: true }
+    AgentEvent:
+      type: object
+      required: [event_id, event_type, source, severity, timestamp]
+      properties:
+        event_id: { type: string, format: uuid }
+        event_type: { type: string }
+        source: { type: string }
+        severity: { type: string }
+        timestamp: { type: string, format: date-time }
+        correlation_id: { type: string, nullable: true }
+        created_at: { type: string, format: date-time }
+    AgentFinding:
+      type: object
+      required: [id, kind, subject, source, severity, confidence, status]
+      properties:
+        id: { type: string, example: indicator:123 }
+        kind: { type: string }
+        subject: { type: string }
+        source: { type: string }
+        severity: { type: string, enum: [info, low, medium, high, critical] }
+        confidence: { type: integer, minimum: 0, maximum: 100 }
+        risk_score: { type: integer, minimum: 0, maximum: 100, nullable: true }
+        trust_score: { type: integer, minimum: -100, maximum: 0, nullable: true }
+        reason: { type: string, nullable: true }
+        first_seen: { type: string, format: date-time }
+        last_seen: { type: string, format: date-time }
+        expires_at: { type: string, format: date-time }
+        age_seconds: { type: number, nullable: true }
+        status: { type: string, enum: [active, expired] }
+        assessed_at: { type: string, format: date-time, nullable: true }
   responses:
     RateLimited:
       description: Endpoint or global rate limit exceeded.
@@ -53,6 +99,192 @@ components:
         application/json:
           schema: { $ref: '#/components/schemas/ApiEnvelope' }
 paths:
+  /api/v1/status:
+    get:
+      security: [{ agentBearerAuth: [] }]
+      description: Read-only operational status for OpenClaw-compatible agents.
+      responses:
+        '200':
+          description: Agent status envelope
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiEnvelope' }
+        '401': { description: Agent token missing or invalid }
+        '403': { description: Required agent scope missing }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { description: PostgreSQL or migration status unavailable }
+  /admin/auth/agent-tokens:
+    post:
+      security: [{ bearerAuth: [] }]
+      description: Issue a short-lived, read-only agent token. The token value is returned only once.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, scopes]
+              properties:
+                name: { type: string, minLength: 1, maxLength: 128 }
+                scopes:
+                  type: array
+                  minItems: 1
+                  items:
+                    type: string
+                    enum: [agent:system:read, agent:events:read, agent:incidents:read, agent:security:read, agent:network:read, agent:read]
+                expires_in_hours: { type: integer, minimum: 1, maximum: 8760, default: 720 }
+      responses:
+        '200': { description: Token envelope; the secret is not persisted and is shown once }
+        '400': { description: Invalid token name, scope, or lifetime }
+        '401': { description: Administrator credential missing or invalid }
+        '403': { description: Administrator role required }
+        '503': { description: Token storage unavailable }
+  /admin/auth/agent-tokens/{id}/revoke:
+    post:
+      security: [{ bearerAuth: [] }]
+      description: Revoke an agent token. This endpoint never returns the token value.
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200': { description: Revocation envelope }
+        '401': { description: Administrator credential missing or invalid }
+        '403': { description: Administrator role required }
+        '404': { description: Token not found }
+        '503': { description: Token storage unavailable }
+  /api/v1/events:
+    get:
+      security: [{ agentBearerAuth: [] }]
+      description: Read-only canonical events with secret and raw-payload fields removed.
+      parameters:
+        - { in: query, name: page, schema: { type: integer, minimum: 1, default: 1 } }
+        - { in: query, name: page_size, schema: { type: integer, minimum: 1, maximum: 100, default: 50 } }
+        - { in: query, name: event_type, schema: { type: string } }
+        - { in: query, name: source, schema: { type: string } }
+        - { in: query, name: severity, schema: { type: string } }
+        - { in: query, name: correlation_id, schema: { type: string } }
+        - { in: query, name: from, schema: { type: string, format: date-time } }
+        - { in: query, name: to, schema: { type: string, format: date-time } }
+      responses:
+        '200': { description: Paginated agent event envelope }
+        '401': { description: Agent token missing or invalid }
+        '403': { description: Required agent scope missing }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { description: Event storage unavailable }
+  /api/v1/incidents:
+    get:
+      security: [{ agentBearerAuth: [] }]
+      description: Read-only incident list.
+      parameters:
+        - { in: query, name: page, schema: { type: integer, minimum: 1, default: 1 } }
+        - { in: query, name: page_size, schema: { type: integer, minimum: 1, maximum: 100, default: 50 } }
+        - { in: query, name: status, schema: { type: string, enum: [Open, Investigating, Resolved, Ignored] } }
+        - { in: query, name: severity, schema: { type: string } }
+        - { in: query, name: from, schema: { type: string, format: date-time } }
+        - { in: query, name: to, schema: { type: string, format: date-time } }
+      responses:
+        '200': { description: Paginated agent incident envelope }
+        '401': { description: Agent token missing or invalid }
+        '403': { description: Required agent scope missing }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { description: Incident storage unavailable }
+  /api/v1/security/findings:
+    get:
+      security: [{ agentBearerAuth: [] }]
+      description: Normalized, already assessed findings without raw indicator metadata.
+      parameters:
+        - { in: query, name: page, schema: { type: integer, minimum: 1, default: 1 } }
+        - { in: query, name: page_size, schema: { type: integer, minimum: 1, maximum: 100, default: 50 } }
+        - { in: query, name: source, schema: { type: string } }
+        - { in: query, name: severity, schema: { type: string, enum: [info, low, medium, high, critical] } }
+        - { in: query, name: confidence_min, schema: { type: integer, minimum: 0, maximum: 100 } }
+        - { in: query, name: active, schema: { type: boolean } }
+        - { in: query, name: from, schema: { type: string, format: date-time } }
+        - { in: query, name: to, schema: { type: string, format: date-time } }
+      responses:
+        '200': { description: Paginated security finding envelope }
+        '401': { description: Agent token missing or invalid }
+        '403': { description: Required agent scope missing }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { description: Finding storage unavailable }
+  /api/v1/security/overview:
+    get:
+      security: [{ agentBearerAuth: [] }]
+      description: Aggregated counts from stored findings; does not calculate a new risk score.
+      responses:
+        '200': { description: Security overview envelope }
+        '401': { description: Agent token missing or invalid }
+        '403': { description: Required agent scope missing }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { description: Finding storage unavailable }
+  /api/v1/network/asn:
+    get:
+      security: [{ agentBearerAuth: [] }]
+      description: Read-only ASN intelligence records.
+      parameters:
+        - { in: query, name: page, schema: { type: integer, minimum: 1, default: 1 } }
+        - { in: query, name: page_size, schema: { type: integer, minimum: 1, maximum: 100, default: 50 } }
+        - { in: query, name: asn, schema: { type: string } }
+        - { in: query, name: from, schema: { type: string, format: date-time } }
+        - { in: query, name: to, schema: { type: string, format: date-time } }
+      responses:
+        '200': { description: Paginated ASN envelope }
+        '401': { description: Agent token missing or invalid }
+        '403': { description: Required agent scope missing }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { description: ASN storage unavailable }
+  /api/v1/network/prefixes:
+    get:
+      security: [{ agentBearerAuth: [] }]
+      description: Read-only prefixes derived from stored ASN records.
+      parameters:
+        - { in: query, name: page, schema: { type: integer, minimum: 1, default: 1 } }
+        - { in: query, name: page_size, schema: { type: integer, minimum: 1, maximum: 100, default: 50 } }
+        - { in: query, name: asn, schema: { type: string } }
+        - { in: query, name: prefix, schema: { type: string } }
+        - { in: query, name: from, schema: { type: string, format: date-time } }
+        - { in: query, name: to, schema: { type: string, format: date-time } }
+      responses:
+        '200': { description: Paginated prefix envelope }
+        '401': { description: Agent token missing or invalid }
+        '403': { description: Required agent scope missing }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { description: Prefix storage unavailable }
+  /api/v1/network/bgp:
+    get:
+      security: [{ agentBearerAuth: [] }]
+      description: Read-only BGP events from the existing network intelligence layer.
+      parameters:
+        - { in: query, name: page, schema: { type: integer, minimum: 1, default: 1 } }
+        - { in: query, name: page_size, schema: { type: integer, minimum: 1, maximum: 100, default: 50 } }
+        - { in: query, name: asn, schema: { type: string } }
+        - { in: query, name: prefix, schema: { type: string } }
+        - { in: query, name: rpki_status, schema: { type: string, enum: [Valid, Invalid, Unknown] } }
+        - { in: query, name: from, schema: { type: string, format: date-time } }
+        - { in: query, name: to, schema: { type: string, format: date-time } }
+      responses:
+        '200': { description: Paginated BGP envelope }
+        '401': { description: Agent token missing or invalid }
+        '403': { description: Required agent scope missing }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { description: BGP storage unavailable }
+  /api/v1/network/rpki:
+    get:
+      security: [{ agentBearerAuth: [] }]
+      description: Read-only RPKI validation records.
+      parameters:
+        - { in: query, name: page, schema: { type: integer, minimum: 1, default: 1 } }
+        - { in: query, name: page_size, schema: { type: integer, minimum: 1, maximum: 100, default: 50 } }
+        - { in: query, name: asn, schema: { type: string } }
+        - { in: query, name: prefix, schema: { type: string } }
+        - { in: query, name: rpki_status, schema: { type: string, enum: [Valid, Invalid, Unknown] } }
+        - { in: query, name: from, schema: { type: string, format: date-time } }
+        - { in: query, name: to, schema: { type: string, format: date-time } }
+      responses:
+        '200': { description: Paginated RPKI envelope }
+        '401': { description: Agent token missing or invalid }
+        '403': { description: Required agent scope missing }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { description: RPKI storage unavailable }
   /health:
     get:
       responses:

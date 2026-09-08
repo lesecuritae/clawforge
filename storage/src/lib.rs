@@ -1011,6 +1011,26 @@ impl PostgresStore {
         }
     }
 
+    pub async fn runtime_status_views(&self) -> Result<Vec<serde_json::Value>> {
+        let rows = sqlx::query("SELECT component,state,version,last_started_at,last_heartbeat_at,last_error,updated_at FROM runtime_status ORDER BY component")
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                serde_json::json!({
+                    "component": row.get::<String, _>("component"),
+                    "state": row.get::<String, _>("state"),
+                    "version": row.try_get::<String, _>("version").ok(),
+                    "last_started_at": row.try_get::<chrono::DateTime<chrono::Utc>, _>("last_started_at").ok(),
+                    "last_heartbeat_at": row.try_get::<chrono::DateTime<chrono::Utc>, _>("last_heartbeat_at").ok(),
+                    "last_error": row.try_get::<String, _>("last_error").ok(),
+                    "updated_at": row.get::<chrono::DateTime<chrono::Utc>, _>("updated_at")
+                })
+            })
+            .collect())
+    }
+
     pub async fn metrics_text(&self) -> Result<String> {
         let providers: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM audit_events WHERE event_type = 'provider_sync'",
@@ -1407,6 +1427,61 @@ impl PostgresStore {
         Ok(())
     }
 
+    pub async fn create_agent_token(
+        &self,
+        name: &str,
+        token_hash: &str,
+        prefix: &str,
+        scopes: &[String],
+        expires_at: chrono::DateTime<chrono::Utc>,
+        created_by: Option<Uuid>,
+    ) -> Result<Uuid> {
+        let id = Uuid::new_v4();
+        sqlx::query("INSERT INTO agent_tokens (id,name,token_hash,token_prefix,scopes,expires_at,created_by) VALUES ($1,$2,$3,$4,$5,$6,$7)")
+            .bind(id)
+            .bind(name)
+            .bind(token_hash)
+            .bind(prefix)
+            .bind(serde_json::to_value(scopes)?)
+            .bind(expires_at)
+            .bind(created_by)
+            .execute(&self.pool)
+            .await?;
+        Ok(id)
+    }
+
+    pub async fn authenticate_agent_token(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<AgentPrincipal>> {
+        let row = sqlx::query("SELECT id,name,scopes FROM agent_tokens WHERE token_hash=$1 AND revoked_at IS NULL AND expires_at > NOW()")
+            .bind(token_hash)
+            .fetch_optional(&self.pool)
+            .await?;
+        let Some(row) = row else { return Ok(None) };
+        let principal = AgentPrincipal {
+            id: row.get("id"),
+            name: row.get("name"),
+            scopes: serde_json::from_value(row.get("scopes")).unwrap_or_default(),
+        };
+        sqlx::query("UPDATE agent_tokens SET last_used_at=NOW() WHERE id=$1")
+            .bind(principal.id)
+            .execute(&self.pool)
+            .await?;
+        Ok(Some(principal))
+    }
+
+    pub async fn revoke_agent_token(&self, id: Uuid) -> Result<()> {
+        let result = sqlx::query("UPDATE agent_tokens SET revoked_at=NOW() WHERE id=$1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        if result.rows_affected() == 0 {
+            anyhow::bail!("agent token not found");
+        }
+        Ok(())
+    }
+
     pub async fn list_audit_events(
         &self,
         from: Option<chrono::DateTime<chrono::Utc>>,
@@ -1534,6 +1609,13 @@ pub struct AdminPrincipal {
     pub role: String,
     pub auth_kind: String,
     pub credential_id: Uuid,
+}
+
+#[derive(Debug, Clone)]
+pub struct AgentPrincipal {
+    pub id: Uuid,
+    pub name: String,
+    pub scopes: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
