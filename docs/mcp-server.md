@@ -38,10 +38,13 @@ als MCP-Upstream verwendet.
 
 | MCP-Tool | Agent-API-v1-Upstream | Scope | Stand |
 | --- | --- | --- | --- |
-| `get_status` | `GET /api/v1/status` | `agent:system:read` | direkt nutzbar |
+| `get_status` | `GET /api/v1/status` + Incident-Liste | `agent:system:read` + `agent:incident:read` | direkt nutzbar |
 | `list_events` | `GET /api/v1/events` | `agent:events:read` | direkt nutzbar |
-| `list_incidents` | `GET /api/v1/incidents` | `agent:incidents:read` | direkt nutzbar |
-| `get_security_overview` | `GET /api/v1/security/overview` | `agent:security:read` | direkt nutzbar |
+| `list_incidents` | `GET /api/v1/incidents` | `agent:incident:read` | direkt nutzbar |
+| `get_incident` | `GET /api/v1/incidents/{id}` | `agent:incident:read` | direkt nutzbar |
+| `get_incident_timeline` | `GET /api/v1/incidents/{id}/timeline` | `agent:incident:read` | direkt nutzbar |
+| `get_incident_relations` | `GET /api/v1/incidents/{id}/relations` | `agent:incident:read` | direkt nutzbar |
+| `get_security_overview` | `GET /api/v1/security/overview` + Incident-Liste | `agent:security:read` + `agent:incident:read` | direkt nutzbar |
 | `list_security_findings` | `GET /api/v1/security/findings` | `agent:security:read` | direkt nutzbar |
 | `get_trust_status` | `GET /api/v1/network/trust` | `agent:network:read` | direkt nutzbar |
 | `get_network_overview` | `GET /api/v1/network/asn`, `/prefixes`, `/bgp`, `/rpki` | `agent:network:read` | deterministische Zusammenführung im Adapter |
@@ -65,9 +68,11 @@ und im Tool-Vertrag versioniert.
 ### `get_status`
 
 - Eingabe: keine
-- Upstream: `/api/v1/status`
+- Upstream: `/api/v1/status` und `/api/v1/incidents?page_size=100`
 - Ausgabe: Serviceversion, Migrationsstatus, Runtime-Komponenten, Eventstatus
-  und Provider-Zusammenfassung
+- Provider-Zusammenfassung und eine Incident-Übersicht mit Gesamtzahl,
+  aktiven Incidents sowie Status-/Severity-Verteilung
+- Erfordert `agent:system:read` und `agent:incident:read`
 - Keine internen Fehlertexte, Secrets oder Zustellinformationen
 
 ### `list_events`
@@ -83,14 +88,37 @@ und im Tool-Vertrag versioniert.
 
 - Eingabe: `page`, `page_size`, `status`, `severity`, `from`, `to`
 - Upstream: `/api/v1/incidents`
-- Ausgabe: Status, Severity, Risiko, Summary, Korrelation, Zeit und
-  Eventanzahl
+- Ausgabe: Status, Severity, Confidence, Risiko, Summary, Zeit und
+  Eventanzahl; die Agent-API redigiert interne Korrelation und Rohdaten
+
+### `get_incident`
+
+- Eingabe: `id` als Incident-UUID
+- Upstream: `/api/v1/incidents/{id}`
+- Ausgabe: der sichere, bereits bewertete Incident-Kontext ohne Candidate-ID,
+  Korrelation, Notizen oder Rohpayload
+
+### `get_incident_timeline`
+
+- Eingabe: `id`, `page`, `page_size`, `status`, `severity`, `from`, `to`
+- Upstream: `/api/v1/incidents/{id}/timeline`
+- Ausgabe: paginierte Status- und Relationsereignisse; freie Notiztexte werden
+  nicht weitergereicht
+
+### `get_incident_relations`
+
+- Eingabe: `id`, `page`, `page_size`, `relation_type`, `severity`, `from`, `to`
+- Upstream: `/api/v1/incidents/{id}/relations`
+- Ausgabe: normalisierte Event-, Indicator- und Incident-Beziehungen ohne
+  Rohpayloads oder interne Datenbankfelder
 
 ### `get_security_overview`
 
 - Eingabe: keine
-- Upstream: `/api/v1/security/overview`
-- Ausgabe: bereits gespeicherte Finding-Anzahlen und Severity-Verteilung
+- Upstream: `/api/v1/security/overview` und `/api/v1/incidents?page_size=100`
+- Ausgabe: bereits gespeicherte Finding-Anzahlen und Severity-Verteilung sowie
+  dieselbe sichere Incident-Übersicht wie `get_status`
+- Erfordert `agent:security:read` und `agent:incident:read`
 - Der MCP-Dienst berechnet keinen neuen Risk Score
 
 ### `list_security_findings`
@@ -260,7 +288,7 @@ fachliche Zugriffsspur.
 ## Implementierung und Betrieb
 
 1. Das Crate `mcp/` nutzt `rmcp` mit Streamable HTTP und registriert genau die
-   sieben read-only Tools.
+   zehn read-only Tools.
 2. Der Upstream-Client liest getrennte Agent-API- und MCP-Credentials aus
    Docker Secrets, validiert die Agent-API-Envelope und setzt Timeouts.
 3. Die Compose-Datei startet `clawforge-mcp` intern auf Port 8090. Der Dienst
@@ -274,7 +302,13 @@ fachliche Zugriffsspur.
 
 ## Tests
 
-- `tools/list` enthält genau die sieben read-only Tools.
+- `tools/list` enthält genau die zehn read-only Tools.
+- Incident-Tools rufen ausschließlich die vier versionierten Incident-
+  Endpunkte der Agent API auf und akzeptieren den kanonischen Scope
+  `agent:incident:read` (der alte Plural bleibt kompatibel).
+- `get_status` und `get_security_overview` ergänzen nur die aus der Agent API
+  gelesene Incident-Übersicht; sie ändern keine Bewertung und speichern keine
+  zusätzlichen Daten.
 - Jeder Tool-Aufruf verwendet ausschließlich `GET /api/v1`.
 - Fehlende und falsche MCP-Credentials werden abgewiesen.
 - Fehlende MCP-Scopes werden vor dem Upstream-Aufruf verweigert; Ablauf und

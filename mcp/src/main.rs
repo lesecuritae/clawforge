@@ -23,10 +23,12 @@ use rmcp::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use uuid::Uuid;
 
 const SCOPE_SYSTEM: &str = "agent:system:read";
 const SCOPE_EVENTS: &str = "agent:events:read";
-const SCOPE_INCIDENTS: &str = "agent:incidents:read";
+const SCOPE_INCIDENT: &str = "agent:incident:read";
+const SCOPE_INCIDENTS_LEGACY: &str = "agent:incidents:read";
 const SCOPE_SECURITY: &str = "agent:security:read";
 const SCOPE_NETWORK: &str = "agent:network:read";
 const SCOPE_ALL: &str = "agent:read";
@@ -74,6 +76,36 @@ struct IncidentArgs {
     page: Option<i64>,
     page_size: Option<i64>,
     status: Option<String>,
+    severity: Option<String>,
+    from: Option<String>,
+    to: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+struct IncidentIdArgs {
+    #[schemars(description = "Incident UUID")]
+    id: String,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+struct IncidentTimelineArgs {
+    #[schemars(description = "Incident UUID")]
+    id: String,
+    page: Option<i64>,
+    page_size: Option<i64>,
+    status: Option<String>,
+    severity: Option<String>,
+    from: Option<String>,
+    to: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+struct IncidentRelationsArgs {
+    #[schemars(description = "Incident UUID")]
+    id: String,
+    page: Option<i64>,
+    page_size: Option<i64>,
+    relation_type: Option<String>,
     severity: Option<String>,
     from: Option<String>,
     to: Option<String>,
@@ -189,7 +221,8 @@ fn parse_scopes(value: &str) -> Result<HashSet<String>> {
     let allowed = [
         SCOPE_SYSTEM,
         SCOPE_EVENTS,
-        SCOPE_INCIDENTS,
+        SCOPE_INCIDENT,
+        SCOPE_INCIDENTS_LEGACY,
         SCOPE_SECURITY,
         SCOPE_NETWORK,
         SCOPE_ALL,
@@ -230,6 +263,11 @@ fn redact(value: Value) -> Value {
                 "device_tags",
                 "groups",
                 "raw_feed",
+                "raw_payload",
+                "candidate_id",
+                "correlation_key",
+                "body",
+                "author",
                 "token",
                 "secret",
                 "password",
@@ -307,6 +345,25 @@ impl McpServer {
         }
     }
 
+    fn require_scopes(&self, scopes: &[&str]) -> Result<(), ErrorData> {
+        if self.config.mcp_scopes.contains(SCOPE_ALL)
+            || scopes
+                .iter()
+                .any(|scope| self.config.mcp_scopes.contains(*scope))
+        {
+            Ok(())
+        } else {
+            Err(ErrorData::invalid_request(
+                "MCP tool scope is not granted",
+                Some(json!({"required_scopes": scopes})),
+            ))
+        }
+    }
+
+    fn require_incident_scope(&self) -> Result<(), ErrorData> {
+        self.require_scopes(&[SCOPE_INCIDENT, SCOPE_INCIDENTS_LEGACY])
+    }
+
     async fn get(
         &self,
         scope: &str,
@@ -314,6 +371,23 @@ impl McpServer {
         query: &[(String, String)],
     ) -> Result<ToolResponse, ErrorData> {
         self.require_scope(scope)?;
+        self.request(path, query).await
+    }
+
+    async fn get_incident(
+        &self,
+        path: &str,
+        query: &[(String, String)],
+    ) -> Result<ToolResponse, ErrorData> {
+        self.require_incident_scope()?;
+        self.request(path, query).await
+    }
+
+    async fn request(
+        &self,
+        path: &str,
+        query: &[(String, String)],
+    ) -> Result<ToolResponse, ErrorData> {
         let mut url = self.config.agent_api_url.clone();
         let base_path = url.path().trim_end_matches('/').to_string();
         url.set_path(&format!("{base_path}{path}"));
@@ -336,12 +410,43 @@ impl McpServer {
             .await
             .map_err(|_| ErrorData::internal_error("Agent API response invalid", None))?;
         if !status.is_success() || body.status != "ok" {
-            return Err(ErrorData::internal_error(
-                "Agent API request was not successful",
-                Some(json!({"upstream_status": status.as_u16()})),
-            ));
+            let status_code = status.as_u16();
+            return Err(match status {
+                StatusCode::UNAUTHORIZED => ErrorData::invalid_request(
+                    "Agent API authentication failed",
+                    Some(json!({"upstream_status": status_code})),
+                ),
+                StatusCode::FORBIDDEN => ErrorData::invalid_request(
+                    "Agent API scope is not granted",
+                    Some(json!({"upstream_status": status_code})),
+                ),
+                StatusCode::NOT_FOUND => ErrorData::invalid_request(
+                    "Agent API resource was not found",
+                    Some(json!({"upstream_status": status_code})),
+                ),
+                _ if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() => {
+                    ErrorData::internal_error(
+                        "Agent API temporarily unavailable",
+                        Some(json!({"upstream_status": status_code})),
+                    )
+                }
+                _ => ErrorData::internal_error(
+                    "Agent API request was not successful",
+                    Some(json!({"upstream_status": status_code})),
+                ),
+            });
         }
         Ok(body.into())
+    }
+
+    async fn get_incident_context(&self) -> Result<Value, ErrorData> {
+        let incidents = self
+            .get_incident(
+                "/api/v1/incidents",
+                &[("page_size".to_string(), "100".to_string())],
+            )
+            .await?;
+        incident_overview(&incidents.data)
     }
 
     async fn get_network_overview(&self, args: NetworkArgs) -> Result<ToolResponse, ErrorData> {
@@ -400,7 +505,18 @@ impl McpServer {
         &self,
         Parameters(_args): Parameters<EmptyArgs>,
     ) -> Result<Json<ToolResponse>, ErrorData> {
-        Ok(Json(self.get(SCOPE_SYSTEM, "/api/v1/status", &[]).await?))
+        self.require_scope(SCOPE_SYSTEM)?;
+        self.require_incident_scope()?;
+        let (status, incidents) = tokio::join!(
+            self.get(SCOPE_SYSTEM, "/api/v1/status", &[]),
+            self.get_incident_context(),
+        );
+        let mut response = status?;
+        let overview = incidents?;
+        if let Some(object) = response.data.as_object_mut() {
+            object.insert("incidents".to_string(), overview);
+        }
+        Ok(Json(response))
     }
 
     #[tool(name = "list_events", description = "List normalized Clawforge events")]
@@ -420,10 +536,42 @@ impl McpServer {
         Parameters(args): Parameters<IncidentArgs>,
     ) -> Result<Json<ToolResponse>, ErrorData> {
         let query = incident_query(&args);
-        Ok(Json(
-            self.get(SCOPE_INCIDENTS, "/api/v1/incidents", &query)
-                .await?,
-        ))
+        Ok(Json(self.get_incident("/api/v1/incidents", &query).await?))
+    }
+
+    #[tool(name = "get_incident", description = "Read one Clawforge incident")]
+    async fn get_incident_tool(
+        &self,
+        Parameters(args): Parameters<IncidentIdArgs>,
+    ) -> Result<Json<ToolResponse>, ErrorData> {
+        let path = incident_path(&args.id, "")?;
+        Ok(Json(self.get_incident(&path, &[]).await?))
+    }
+
+    #[tool(
+        name = "get_incident_timeline",
+        description = "Read a redacted, paginated Clawforge incident timeline"
+    )]
+    async fn get_incident_timeline(
+        &self,
+        Parameters(args): Parameters<IncidentTimelineArgs>,
+    ) -> Result<Json<ToolResponse>, ErrorData> {
+        let path = incident_path(&args.id, "/timeline")?;
+        let query = incident_timeline_query(&args);
+        Ok(Json(self.get_incident(&path, &query).await?))
+    }
+
+    #[tool(
+        name = "get_incident_relations",
+        description = "Read normalized, paginated relations for a Clawforge incident"
+    )]
+    async fn get_incident_relations(
+        &self,
+        Parameters(args): Parameters<IncidentRelationsArgs>,
+    ) -> Result<Json<ToolResponse>, ErrorData> {
+        let path = incident_path(&args.id, "/relations")?;
+        let query = incident_relations_query(&args);
+        Ok(Json(self.get_incident(&path, &query).await?))
     }
 
     #[tool(
@@ -434,10 +582,17 @@ impl McpServer {
         &self,
         Parameters(_args): Parameters<EmptyArgs>,
     ) -> Result<Json<ToolResponse>, ErrorData> {
-        Ok(Json(
-            self.get(SCOPE_SECURITY, "/api/v1/security/overview", &[])
-                .await?,
-        ))
+        self.require_scope(SCOPE_SECURITY)?;
+        self.require_incident_scope()?;
+        let (security, incidents) = tokio::join!(
+            self.get(SCOPE_SECURITY, "/api/v1/security/overview", &[]),
+            self.get_incident_context(),
+        );
+        let mut response = security?;
+        if let Some(object) = response.data.as_object_mut() {
+            object.insert("incidents".to_string(), incidents?);
+        }
+        Ok(Json(response))
     }
 
     #[tool(
@@ -525,6 +680,87 @@ fn incident_query(args: &IncidentArgs) -> Vec<(String, String)> {
         ("from".into(), args.from.clone()),
         ("to".into(), args.to.clone()),
     ])
+}
+
+fn incident_path(id: &str, suffix: &str) -> Result<String, ErrorData> {
+    let id = Uuid::parse_str(id).map_err(|_| {
+        ErrorData::invalid_params("incident id must be a UUID", Some(json!({"field": "id"})))
+    })?;
+    Ok(format!("/api/v1/incidents/{id}{suffix}"))
+}
+
+fn incident_timeline_query(args: &IncidentTimelineArgs) -> Vec<(String, String)> {
+    pairs([
+        ("page".into(), args.page.map(|v| v.to_string())),
+        (
+            "page_size".into(),
+            args.page_size.map(|v| v.clamp(1, 100).to_string()),
+        ),
+        ("status".into(), args.status.clone()),
+        ("severity".into(), args.severity.clone()),
+        ("from".into(), args.from.clone()),
+        ("to".into(), args.to.clone()),
+    ])
+}
+
+fn incident_relations_query(args: &IncidentRelationsArgs) -> Vec<(String, String)> {
+    pairs([
+        ("page".into(), args.page.map(|v| v.to_string())),
+        (
+            "page_size".into(),
+            args.page_size.map(|v| v.clamp(1, 100).to_string()),
+        ),
+        ("relation_type".into(), args.relation_type.clone()),
+        ("severity".into(), args.severity.clone()),
+        ("from".into(), args.from.clone()),
+        ("to".into(), args.to.clone()),
+    ])
+}
+
+fn incident_overview(data: &Value) -> Result<Value, ErrorData> {
+    let incidents = data
+        .as_array()
+        .ok_or_else(|| ErrorData::internal_error("Agent API incident response invalid", None))?;
+    let mut by_status = serde_json::Map::new();
+    let mut by_severity = serde_json::Map::new();
+    let mut active_count = 0_u64;
+    let mut highest_severity = None;
+    let mut highest_rank = 0_u8;
+    for incident in incidents {
+        if let Some(status) = incident.get("status").and_then(Value::as_str) {
+            let count = by_status
+                .entry(status.to_string())
+                .or_insert_with(|| Value::from(0_u64));
+            *count = Value::from(count.as_u64().unwrap_or(0) + 1);
+            if !matches!(status, "resolved" | "closed") {
+                active_count += 1;
+            }
+        }
+        if let Some(severity) = incident.get("severity").and_then(Value::as_str) {
+            let count = by_severity
+                .entry(severity.to_string())
+                .or_insert_with(|| Value::from(0_u64));
+            *count = Value::from(count.as_u64().unwrap_or(0) + 1);
+            let rank = match severity {
+                "critical" => 5,
+                "high" => 4,
+                "medium" => 3,
+                "low" => 2,
+                _ => 1,
+            };
+            if rank > highest_rank {
+                highest_rank = rank;
+                highest_severity = Some(severity);
+            }
+        }
+    }
+    Ok(json!({
+        "total": incidents.len(),
+        "active": active_count,
+        "highest_severity": highest_severity,
+        "by_status": by_status,
+        "by_severity": by_severity
+    }))
 }
 
 fn finding_query(args: &FindingArgs) -> Vec<(String, String)> {
@@ -661,6 +897,9 @@ mod tests {
         assert_eq!(
             names,
             vec![
+                "get_incident",
+                "get_incident_relations",
+                "get_incident_timeline",
                 "get_network_overview",
                 "get_security_overview",
                 "get_status",
@@ -670,6 +909,37 @@ mod tests {
                 "list_security_findings",
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn incident_scope_accepts_canonical_and_legacy_names() {
+        let canonical = McpServer::new(test_config(&[SCOPE_INCIDENT]));
+        assert!(canonical.require_incident_scope().is_ok());
+        let legacy = McpServer::new(test_config(&[SCOPE_INCIDENTS_LEGACY]));
+        assert!(legacy.require_incident_scope().is_ok());
+        let unrelated = McpServer::new(test_config(&[SCOPE_SECURITY]));
+        assert!(unrelated.require_incident_scope().is_err());
+        let result = unrelated
+            .get_incident_tool(Parameters(IncidentIdArgs {
+                id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into(),
+            }))
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn incident_paths_and_overview_are_bounded() {
+        assert!(incident_path("not-a-uuid", "").is_err());
+        let overview = incident_overview(&json!([
+            {"status":"detected","severity":"high"},
+            {"status":"closed","severity":"critical"},
+            {"status":"investigating","severity":"low"}
+        ]))
+        .unwrap();
+        assert_eq!(overview["total"], 3);
+        assert_eq!(overview["active"], 2);
+        assert_eq!(overview["highest_severity"], "critical");
+        assert!(incident_overview(&json!({"unexpected":true})).is_err());
     }
 
     #[tokio::test]
@@ -747,8 +1017,111 @@ mod tests {
         );
         let client = ClientInfo::default().serve(transport).await.unwrap();
         let tools = client.list_tools(None).await.unwrap();
-        assert_eq!(tools.tools.len(), 7);
+        assert_eq!(tools.tools.len(), 10);
         client.cancel().await.unwrap();
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn rmcp_client_can_call_incident_tools_and_context() {
+        use rmcp::model::{CallToolRequestParams, ClientInfo};
+        use rmcp::transport::{
+            streamable_http_client::StreamableHttpClientTransportConfig,
+            StreamableHttpClientTransport,
+        };
+        use rmcp::ServiceExt;
+
+        let incident_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let agent_app = Router::new().fallback(move |request: Request<Body>| async move {
+            let path = request.uri().path();
+            let data = match path {
+                "/api/v1/status" => json!({"service":"clawforge","status":"ok"}),
+                "/api/v1/security/overview" => json!({"findings_total":1,"active_findings":1}),
+                "/api/v1/incidents" => json!([
+                    {"id":incident_id,"status":"detected","severity":"high","confidence":88,"risk_score":70,"summary":"test incident","raw_payload":{"secret":"removed"}}
+                ]),
+                path if path == format!("/api/v1/incidents/{incident_id}") => json!({
+                    "id":incident_id,"status":"detected","severity":"high","confidence":88,
+                    "risk_score":70,"summary":"test incident","raw_payload":{"secret":"removed"}
+                }),
+                path if path == format!("/api/v1/incidents/{incident_id}/timeline") => json!([
+                    {"kind":"status","timestamp":"2026-01-01T00:00:00Z","data":{"status":"detected"}},
+                    {"kind":"note","timestamp":"2026-01-01T00:01:00Z","data":{"body":"private"}}
+                ]),
+                path if path == format!("/api/v1/incidents/{incident_id}/relations") => json!([
+                    {"kind":"relation","timestamp":"2026-01-01T00:02:00Z","data":{"relation_type":"event","event_type":"threat.indicator","severity":"high","raw_payload":{"secret":"removed"}}}
+                ]),
+                _ => json!([]),
+            };
+            axum::Json(json!({
+                "status":"ok",
+                "data":data,
+                "timestamp":"2026-01-01T00:00:00Z",
+                "pagination":null,
+                "errors":[]
+            }))
+        });
+        let agent_listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let agent_address = agent_listener.local_addr().unwrap();
+        let agent_server = tokio::spawn(async move {
+            axum::serve(agent_listener, agent_app).await.unwrap();
+        });
+
+        let config = Arc::new(Config {
+            agent_api_url: Url::parse(&format!("http://{agent_address}")).unwrap(),
+            agent_api_token: "agent-secret".into(),
+            mcp_auth_token: "mcp-secret".into(),
+            mcp_scopes: [SCOPE_ALL.to_string()].into_iter().collect(),
+            timeout: Duration::from_secs(2),
+        });
+        let app = build_app(config);
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let transport = StreamableHttpClientTransport::from_config(
+            StreamableHttpClientTransportConfig::with_uri(format!("http://{address}/mcp"))
+                .auth_header("mcp-secret"),
+        );
+        let client = ClientInfo::default().serve(transport).await.unwrap();
+
+        let mut id_arguments = serde_json::Map::new();
+        id_arguments.insert("id".to_string(), json!(incident_id));
+        for tool in [
+            "list_incidents",
+            "get_incident",
+            "get_incident_timeline",
+            "get_incident_relations",
+            "get_status",
+            "get_security_overview",
+        ] {
+            let params = if tool == "list_incidents" {
+                CallToolRequestParams::new(tool)
+            } else if matches!(
+                tool,
+                "get_incident" | "get_incident_timeline" | "get_incident_relations"
+            ) {
+                CallToolRequestParams::new(tool).with_arguments(id_arguments.clone())
+            } else {
+                CallToolRequestParams::new(tool)
+            };
+            let result = client.call_tool(params).await.unwrap();
+            assert_ne!(result.is_error, Some(true), "tool={tool}");
+            let serialized = serde_json::to_string(&result).unwrap();
+            assert!(!serialized.contains("raw_payload"));
+            assert!(!serialized.contains("private"));
+            if matches!(tool, "get_status" | "get_security_overview") {
+                assert!(serialized.contains("\"incidents\""));
+            }
+        }
+
+        client.cancel().await.unwrap();
+        server.abort();
+        agent_server.abort();
     }
 }
