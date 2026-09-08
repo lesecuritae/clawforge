@@ -1063,6 +1063,7 @@ struct AgentQuery {
     active: Option<bool>,
     asn: Option<String>,
     prefix: Option<String>,
+    network_type: Option<String>,
     rpki_status: Option<String>,
     from: Option<String>,
     to: Option<String>,
@@ -1612,6 +1613,58 @@ async fn agent_rpki(
         &state,
         &principal,
         "/api/v1/network/rpki",
+        AGENT_SCOPE_NETWORK_READ,
+    )
+    .await;
+    Ok(envelope(data, Some(pagination)))
+}
+
+async fn agent_trust(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AgentQuery>,
+) -> ApiResult<Json<ApiEnvelope<Vec<serde_json::Value>>>> {
+    let principal = authenticate_agent(&state, &headers).await?;
+    require_agent_scope(&principal, AGENT_SCOPE_NETWORK_READ)?;
+    let mut values = agent_network_values(&state, "trust").await?;
+    values.retain(|value| {
+        query.status.as_deref().is_none_or(|status| {
+            value.get("status").and_then(serde_json::Value::as_str) == Some(status)
+        }) && query.network_type.as_deref().is_none_or(|network_type| {
+            value.get("type").and_then(serde_json::Value::as_str) == Some(network_type)
+        }) && agent_time_matches(value, &query)
+    });
+    let values = values
+        .iter()
+        // Trust registry internals (node identities, device tags, groups and
+        // raw network lists) stay inside the API/storage boundary.
+        .map(|value| {
+            agent_network_view(
+                value,
+                &[
+                    "id",
+                    "name",
+                    "type",
+                    "identifier",
+                    "source",
+                    "status",
+                    "created_at",
+                    "verified_at",
+                    "timestamp",
+                    "age_seconds",
+                    "confidence",
+                    "trust_score",
+                    "assessment",
+                ],
+            )
+        })
+        .collect::<Vec<_>>();
+    let (page, page_size) = agent_page(&query, 50);
+    let (data, pagination) = paged_values(values, page, page_size);
+    audit_agent_read(
+        &state,
+        &principal,
+        "/api/v1/network/trust",
         AGENT_SCOPE_NETWORK_READ,
     )
     .await;
@@ -3683,7 +3736,8 @@ async fn main() -> anyhow::Result<()> {
                 .route("/network/asn", get(agent_asn))
                 .route("/network/prefixes", get(agent_prefixes))
                 .route("/network/bgp", get(agent_bgp))
-                .route("/network/rpki", get(agent_rpki)),
+                .route("/network/rpki", get(agent_rpki))
+                .route("/network/trust", get(agent_trust)),
         )
         .layer(middleware::from_fn_with_state(
             app_state.clone(),
@@ -3915,6 +3969,44 @@ mod tests {
         }));
         assert_eq!(finding["severity"], "high");
         assert!(finding.get("metadata").is_none());
+    }
+
+    #[test]
+    fn agent_trust_view_excludes_registry_internals() {
+        let trust = agent_network_view(
+            &serde_json::json!({
+                "id": "network-1",
+                "name": "Homelab Tailnet",
+                "type": "Tailscale",
+                "identifier": "tailnet-id",
+                "source": "trusted_registry",
+                "status": "Verified",
+                "networks": ["192.168.10.0/24"],
+                "node_identities": ["node-secret"],
+                "device_tags": ["tag:prod"],
+                "groups": ["admins"],
+                "timestamp": "2026-09-08T00:00:00Z",
+                "confidence": 100,
+                "trust_score": -40
+            }),
+            &[
+                "id",
+                "name",
+                "type",
+                "identifier",
+                "source",
+                "status",
+                "timestamp",
+                "confidence",
+                "trust_score",
+            ],
+        );
+        assert_eq!(trust["status"], "Verified");
+        assert_eq!(trust["trust_score"], -40);
+        assert!(trust.get("networks").is_none());
+        assert!(trust.get("node_identities").is_none());
+        assert!(trust.get("device_tags").is_none());
+        assert!(trust.get("groups").is_none());
     }
 
     #[test]

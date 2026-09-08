@@ -163,6 +163,41 @@ services:
       retries: 5
     restart: unless-stopped
 
+  clawforge-mcp:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    command: ["/usr/local/bin/clawforge-mcp"]
+    environment:
+      CLAWFORGE_AGENT_API_URL: ${CLAWFORGE_AGENT_API_URL:-http://clawforge-api:8080}
+      CLAWFORGE_MCP_BIND: 0.0.0.0:8090
+      CLAWFORGE_MCP_AGENT_TOKEN_FILE: /run/secrets/mcp_agent_api_token
+      CLAWFORGE_MCP_AUTH_TOKEN_FILE: /run/secrets/mcp_auth_token
+      CLAWFORGE_MCP_SCOPES: ${CLAWFORGE_MCP_SCOPES:-agent:read}
+      CLAWFORGE_MCP_UPSTREAM_TIMEOUT_SECONDS: ${CLAWFORGE_MCP_UPSTREAM_TIMEOUT_SECONDS:-10}
+      RUST_LOG: ${RUST_LOG:-info}
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=32m
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    depends_on:
+      clawforge-api:
+        condition: service_healthy
+    secrets:
+      - mcp_agent_api_token
+      - mcp_auth_token
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8090/health >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
   clawforge-frontend:
     build:
       context: ./frontend
@@ -322,3 +357,7 @@ secrets:
     file: ${CLAWFORGE_NOTIFIER_SECRET_FILE:-./secrets/notifier_token.example}
   events_token:
     file: ${CLAWFORGE_EVENTS_SECRET_FILE:-./secrets/events_token.example}
+  mcp_agent_api_token:
+    file: ${CLAWFORGE_MCP_AGENT_TOKEN_FILE:-./secrets/mcp_agent_api_token.example}
+  mcp_auth_token:
+    file: ${CLAWFORGE_MCP_AUTH_TOKEN_FILE:-./secrets/mcp_auth_token.example}

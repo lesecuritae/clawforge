@@ -82,6 +82,23 @@ components:
         age_seconds: { type: number, nullable: true }
         status: { type: string, enum: [active, expired] }
         assessed_at: { type: string, format: date-time, nullable: true }
+    AgentTrustNetwork:
+      type: object
+      required: [id, name, type, identifier, status, timestamp, confidence, trust_score]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        type: { type: string }
+        identifier: { type: string }
+        source: { type: string, example: trusted_registry }
+        status: { type: string, enum: [Pending, Verified, Revoked] }
+        created_at: { type: string, format: date-time }
+        verified_at: { type: string, format: date-time, nullable: true }
+        timestamp: { type: string, format: date-time }
+        age_seconds: { type: number, nullable: true }
+        confidence: { type: integer, minimum: 0, maximum: 100 }
+        trust_score: { type: integer, minimum: -100, maximum: 0 }
+        assessment: { type: object, additionalProperties: true }
   responses:
     RateLimited:
       description: Endpoint or global rate limit exceeded.
@@ -285,6 +302,23 @@ paths:
         '403': { description: Required agent scope missing }
         '429': { $ref: '#/components/responses/RateLimited' }
         '503': { description: RPKI storage unavailable }
+  /api/v1/network/trust:
+    get:
+      security: [{ agentBearerAuth: [] }]
+      description: Read-only trusted infrastructure status with registry internals removed.
+      parameters:
+        - { in: query, name: page, schema: { type: integer, minimum: 1, default: 1 } }
+        - { in: query, name: page_size, schema: { type: integer, minimum: 1, maximum: 100, default: 50 } }
+        - { in: query, name: status, schema: { type: string, enum: [Pending, Verified, Revoked] } }
+        - { in: query, name: network_type, schema: { type: string } }
+        - { in: query, name: from, schema: { type: string, format: date-time } }
+        - { in: query, name: to, schema: { type: string, format: date-time } }
+      responses:
+        '200': { description: Paginated trusted infrastructure envelope }
+        '401': { description: Agent token missing or invalid }
+        '403': { description: Required agent scope missing }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { description: Trust registry unavailable }
   /health:
     get:
       responses:

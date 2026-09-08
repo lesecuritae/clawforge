@@ -1,5 +1,5 @@
 [workspace]
-members = ["api", "worker", "intelligence", "risk", "policy", "storage", "analyzer", "notifier", "events"]
+members = ["api", "worker", "intelligence", "risk", "policy", "storage", "analyzer", "notifier", "events", "mcp"]
 resolver = "2"
 
 [workspace.package]

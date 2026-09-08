@@ -115,9 +115,10 @@ rollenbasierte Exportfunktionen. Zeitangaben sind UTC in RFC-3339-Format.
 | `GET /api/v1/network/prefixes` | Prefix-Kontext | Prefix, ASN, Netzwerktyp, Zeit und Quelle | `agent:network:read` |
 | `GET /api/v1/network/bgp` | Routing-Ereignisse | Prefix, vorherige/neue ASN, Status, Quelle, Zeit, Confidence | `agent:network:read` |
 | `GET /api/v1/network/rpki` | ROA-Bewertung | Prefix, ASN, Valid/Invalid/Unknown, Quelle, Zeit, Trust-Hinweis | `agent:network:read` |
+| `GET /api/v1/network/trust` | Trusted Infrastructure | Name, Typ, Identifier, Status, Zeit, Confidence und gespeicherter Trust-Wert ohne Registry-Interna | `agent:network:read` |
 
-Die Detailrouten für einzelne Events und Incidents sowie Trust-, Provider-
-und Capabilities-Ressourcen bleiben für Phase 2 vorgesehen.
+Die Detailrouten für einzelne Events und Incidents sowie Provider- und
+Capabilities-Ressourcen bleiben für Phase 2 vorgesehen.
 
 Die Ressourcen sind ausschließlich `GET`. Es gibt unter `/api/v1` keine
 Provider-Aktivierung, manuelle Synchronisation, Trust-Änderung,
@@ -239,7 +240,9 @@ Er darf keine nicht dokumentierten Felder voraussetzen.
 3. **Erledigt:** Agent-Token-Scopes, Ablauf, Widerruf und Audit-Prüfung
    ergänzen.
 4. **Erledigt:** OpenAPI-Schemas, Filter und Fehlercodes dokumentieren.
-5. **Offen:** OpenClaw/MCP erst als separaten, read-only Client anbinden.
+5. **Erledigt:** Versionierten Trust-Read-Endpunkt mit Registry-Redaktion
+   ergänzen.
+6. **Offen:** OpenClaw/MCP erst als separaten, read-only Client anbinden.
 
 Die Migration `0012_agent_tokens.sql` legt die dedizierte Credential-Tabelle
 für die Fassade an. Sie wird beim normalen Start über den bestehenden
