@@ -53,7 +53,7 @@ services:
       - backend
       - frontend
     ports:
-      - "${CLAWFORGE_API_PORT:-8080}:8080"
+      - "${CLAWFORGE_API_HOST:-127.0.0.1}:${CLAWFORGE_API_PORT:-8080}:8080"
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/ready >/dev/null"]
       interval: 10s
@@ -279,7 +279,7 @@ services:
       - frontend
       - backend
     ports:
-      - "${CLAWFORGE_FRONTEND_PORT:-3000}:8080"
+      - "${CLAWFORGE_FRONTEND_HOST:-127.0.0.1}:${CLAWFORGE_FRONTEND_PORT:-3000}:8080"
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/"]
       interval: 10s

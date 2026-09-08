@@ -5,7 +5,10 @@
 | `DATABASE_URL` | unset | PostgreSQL connection URL; takes precedence over the file form |
 | `DATABASE_URL_FILE` | unset | Secret-file alternative used by API and worker |
 | `CLAWFORGE_API_BIND` | `0.0.0.0:8080` | API listen address |
+| `CLAWFORGE_API_HOST` | `127.0.0.1` | Host bind address in Compose; set explicitly before exposing the API |
 | `CLAWFORGE_API_PORT` | `8080` | Host port in Compose |
+| `CLAWFORGE_FRONTEND_HOST` | `127.0.0.1` | Frontend host bind address in Compose |
+| `CLAWFORGE_FRONTEND_PORT` | `3000` | Frontend host port in Compose |
 | `CLAWFORGE_WORKER_POLL_SECONDS` | `60` | Scheduler tick interval, with a five-second minimum |
 | `CLAWFORGE_ENABLE_FEEDS` | `false` | Enables the prepared phase‑1 feed jobs |
 | `CLAWFORGE_ENABLE_NETWORK` | `false` | Enables ASN, BGP, and RPKI network-provider jobs |

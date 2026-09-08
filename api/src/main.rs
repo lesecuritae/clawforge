@@ -14,6 +14,7 @@ use argon2::{
     Argon2,
 };
 use axum::{
+    body::{to_bytes, Body},
     extract::{ConnectInfo, Path, Query, Request, State},
     http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     middleware::{self, Next},
@@ -529,7 +530,18 @@ struct IndicatorQuery {
 
 async fn intelligence_providers(
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> ApiResult<Json<ApiEnvelope<Vec<serde_json::Value>>>> {
+    let principal = authenticate(&state, &headers).await?;
+    require_role(&principal, &["Administrator", "Operator", "Viewer"])?;
+    audit(
+        &state,
+        &principal,
+        "provider_status_read",
+        "intelligence/providers",
+        serde_json::json!({}),
+    )
+    .await;
     state
         .store
         .list_provider_views()
@@ -540,14 +552,26 @@ async fn intelligence_providers(
 
 async fn intelligence_status(
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> ApiResult<Json<ApiEnvelope<Vec<serde_json::Value>>>> {
-    intelligence_providers(State(state)).await
+    intelligence_providers(State(state), headers).await
 }
 
 async fn intelligence_indicators(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(query): Query<IndicatorQuery>,
 ) -> ApiResult<Json<ApiEnvelope<Vec<serde_json::Value>>>> {
+    let principal = authenticate(&state, &headers).await?;
+    require_role(&principal, &["Administrator", "Operator", "Viewer"])?;
+    audit(
+        &state,
+        &principal,
+        "intelligence_indicators_read",
+        "intelligence/indicators",
+        serde_json::json!({}),
+    )
+    .await;
     let mut values = state.store.list_indicator_views(1000).await.map_err(|_| {
         api_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -999,8 +1023,19 @@ async fn visualization_trust(
 
 async fn network_asn(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(query): Query<NetworkQuery>,
 ) -> ApiResult<Json<ApiEnvelope<Vec<serde_json::Value>>>> {
+    let principal = authenticate(&state, &headers).await?;
+    require_role(&principal, &["Administrator", "Operator", "Viewer"])?;
+    audit(
+        &state,
+        &principal,
+        "network_asn_read",
+        "network/asn",
+        serde_json::json!({}),
+    )
+    .await;
     let mut values = network_view(State(state), "asn")
         .await
         .map_err(|_| api_error(StatusCode::SERVICE_UNAVAILABLE, "ASN list unavailable"))?;
@@ -1026,8 +1061,19 @@ async fn network_asn(
 
 async fn network_bgp(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(query): Query<NetworkQuery>,
 ) -> ApiResult<Json<ApiEnvelope<Vec<serde_json::Value>>>> {
+    let principal = authenticate(&state, &headers).await?;
+    require_role(&principal, &["Administrator", "Operator", "Viewer"])?;
+    audit(
+        &state,
+        &principal,
+        "network_bgp_read",
+        "network/bgp",
+        serde_json::json!({}),
+    )
+    .await;
     let mut values = network_view(State(state), "bgp")
         .await
         .map_err(|_| api_error(StatusCode::SERVICE_UNAVAILABLE, "BGP list unavailable"))?;
@@ -1057,7 +1103,18 @@ async fn network_bgp(
 
 async fn network_rpki(
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> ApiResult<Json<ApiEnvelope<Vec<serde_json::Value>>>> {
+    let principal = authenticate(&state, &headers).await?;
+    require_role(&principal, &["Administrator", "Operator", "Viewer"])?;
+    audit(
+        &state,
+        &principal,
+        "network_rpki_read",
+        "network/rpki",
+        serde_json::json!({}),
+    )
+    .await;
     let values = network_view(State(state), "rpki")
         .await
         .map_err(|_| api_error(StatusCode::SERVICE_UNAVAILABLE, "RPKI list unavailable"))?;
@@ -1067,7 +1124,18 @@ async fn network_rpki(
 
 async fn network_trust(
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> ApiResult<Json<ApiEnvelope<Vec<serde_json::Value>>>> {
+    let principal = authenticate(&state, &headers).await?;
+    require_role(&principal, &["Administrator", "Operator", "Viewer"])?;
+    audit(
+        &state,
+        &principal,
+        "network_trust_read",
+        "network/trust",
+        serde_json::json!({}),
+    )
+    .await;
     let values = network_view(State(state), "trust")
         .await
         .map_err(|_| api_error(StatusCode::SERVICE_UNAVAILABLE, "trust list unavailable"))?;
@@ -5218,6 +5286,35 @@ async fn shutdown_signal() {
     }
 }
 
+/// Replace framework extractor diagnostics with the stable API error contract.
+/// Axum's default path/query rejection includes parser details and echoed input
+/// values, which are useful for debugging but can disclose implementation
+/// details to unauthenticated callers.
+async fn sanitize_framework_errors(request: Request, next: Next) -> Response {
+    let response = next.run(request).await;
+    if response.status() != StatusCode::BAD_REQUEST {
+        return response;
+    }
+    let (parts, body) = response.into_parts();
+    let bytes = match to_bytes(body, 64 * 1024).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return api_error(StatusCode::BAD_REQUEST, "invalid request").into_response();
+        }
+    };
+    let text = String::from_utf8_lossy(&bytes);
+    if is_framework_rejection(&text) {
+        return api_error(StatusCode::BAD_REQUEST, "invalid request").into_response();
+    }
+    Response::from_parts(parts, Body::from(bytes))
+}
+
+fn is_framework_rejection(message: &str) -> bool {
+    message.starts_with("Invalid URL:")
+        || message.starts_with("Failed to deserialize")
+        || message.starts_with("Failed to parse")
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -5376,6 +5473,7 @@ async fn main() -> anyhow::Result<()> {
             app_state.clone(),
             rate_limit_middleware,
         ))
+        .layer(middleware::from_fn(sanitize_framework_errors))
         .with_state(app_state);
     tracing::info!(%address, "Clawforge API listening");
     axum::serve(
@@ -5441,6 +5539,17 @@ mod tests {
     fn bootstrap_password_policy_rejects_short_values() {
         assert!("short".len() < 12);
         assert!("a-long-enough-password".len() >= 12);
+    }
+
+    #[test]
+    fn framework_rejection_messages_are_identified_without_echoing_input() {
+        assert!(is_framework_rejection(
+            "Invalid URL: Cannot parse `id` with value secret"
+        ));
+        assert!(is_framework_rejection(
+            "Failed to deserialize query string: page: number too large"
+        ));
+        assert!(!is_framework_rejection("invalid incident identifier"));
     }
 
     #[test]

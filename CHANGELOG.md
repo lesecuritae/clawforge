@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+- Completed the application security audit for v1 readiness: protected all
+  legacy intelligence/network read routes with authentication, role checks,
+  and audit records, added a 256 KiB MCP request-size limit, and normalized
+  framework parser failures to generic errors. Added active authorization,
+  input-validation, redaction, container, frontend, and read-only MCP
+  regression coverage. Compose host ports now bind to loopback by default.
 - Added the controlled security-audit report and hardened Agent API incident
   identifier validation so malformed IDs return generic authenticated errors.
 - Fixed PostgreSQL alert aggregation so the Operations Summary remains

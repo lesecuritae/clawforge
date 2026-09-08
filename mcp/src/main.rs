@@ -32,6 +32,7 @@ use rmcp::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use tower_http::limit::RequestBodyLimitLayer;
 use uuid::Uuid;
 
 const SCOPE_SYSTEM: &str = "agent:system:read";
@@ -46,6 +47,7 @@ const SCOPE_SECURITY: &str = "agent:security:read";
 const SCOPE_NETWORK: &str = "agent:network:read";
 const SCOPE_ALL: &str = "agent:read";
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+const MAX_REQUEST_BYTES: usize = 256 * 1024;
 static MCP_UPSTREAM_REQUESTS: AtomicU64 = AtomicU64::new(0);
 static MCP_UPSTREAM_ERRORS: AtomicU64 = AtomicU64::new(0);
 static MCP_AUTH_FAILURES: AtomicU64 = AtomicU64::new(0);
@@ -1035,6 +1037,7 @@ fn build_app(config: Arc<Config>) -> Router {
     );
     let protected = Router::new()
         .fallback_service(service)
+        .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BYTES))
         .layer(middleware::from_fn_with_state(state.clone(), mcp_auth));
     Router::new()
         .route("/health", get(health))
@@ -1294,6 +1297,29 @@ mod tests {
         assert!(status.is_success(), "status={status} body={response_body}");
         let body: Value = serde_json::from_str(&response_body).unwrap();
         assert_eq!(body["result"]["serverInfo"]["name"], "rmcp");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn streamable_http_rejects_oversized_authenticated_requests() {
+        let app = build_app(test_config(&[SCOPE_ALL]));
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let payload = "x".repeat(MAX_REQUEST_BYTES + 1);
+        let response = reqwest::Client::new()
+            .post(format!("http://{address}/mcp"))
+            .bearer_auth("mcp-secret")
+            .header("content-type", "application/json")
+            .body(payload)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
         server.abort();
     }
 

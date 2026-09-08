@@ -3,6 +3,19 @@
 Historical Operations Intelligence release with controlled security-audit
 hardening.
 
+## Application security audit update
+
+- Protected the unversioned legacy intelligence and network read routes with
+  bearer authentication, read-role authorization, and audit events.
+- Added a 256 KiB request-body limit to the Streamable HTTP MCP adapter while
+  retaining the existing response-size and redaction guards.
+- Normalized malformed path and query extractor failures to generic `400`
+  responses so parser details and echoed input are not disclosed.
+- Changed Compose API and frontend host-port defaults to loopback-only binds;
+  external exposure now requires explicit host bind configuration.
+- Re-ran authorization, scope-escalation, malformed-input, rate-limit,
+  read-only MCP, secret-scan, frontend, container, and Compose checks.
+
 ## Highlights
 
 - Operations snapshots, history filtering, trend direction, reason, and
