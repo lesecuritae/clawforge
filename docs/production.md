@@ -30,6 +30,7 @@ Secrets. Der Standardzugang ist minimal read-only:
 ```text
 agent:operations:read
 agent:operations:briefing
+agent:operations:recommend
 agent:context:read
 agent:decision:read
 agent:incident:read

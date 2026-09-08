@@ -44,6 +44,7 @@ const SCOPE_DECISION: &str = "agent:decision:read";
 const SCOPE_PROVIDER: &str = "agent:provider:read";
 const SCOPE_OPERATIONS: &str = "agent:operations:read";
 const SCOPE_OPERATIONS_BRIEFING: &str = "agent:operations:briefing";
+const SCOPE_OPERATIONS_RECOMMEND: &str = "agent:operations:recommend";
 const SCOPE_SECURITY: &str = "agent:security:read";
 const SCOPE_KNOWLEDGE: &str = "agent:knowledge:read";
 const SCOPE_NETWORK: &str = "agent:network:read";
@@ -136,6 +137,20 @@ struct HistoryArgs {
     to: Option<String>,
     #[schemars(description = "Aggregation interval: hour, day, or week")]
     interval: Option<String>,
+    #[schemars(description = "1-based page number")]
+    page: Option<i64>,
+    #[schemars(description = "Page size, capped at 100")]
+    page_size: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+struct DecisionArgs {
+    #[schemars(
+        description = "Decision status: open, acknowledged, dismissed, resolved, or expired"
+    )]
+    status: Option<String>,
+    #[schemars(description = "Decision category filter")]
+    category: Option<String>,
     #[schemars(description = "1-based page number")]
     page: Option<i64>,
     #[schemars(description = "Page size, capped at 100")]
@@ -329,6 +344,7 @@ fn parse_scopes(value: &str) -> Result<HashSet<String>> {
         SCOPE_PROVIDER,
         SCOPE_OPERATIONS,
         SCOPE_OPERATIONS_BRIEFING,
+        SCOPE_OPERATIONS_RECOMMEND,
         SCOPE_SECURITY,
         SCOPE_KNOWLEDGE,
         SCOPE_NETWORK,
@@ -768,6 +784,44 @@ impl McpServer {
     }
 
     #[tool(
+        name = "get_operations_recommendations",
+        description = "Read explainable, persisted operations recommendations and their confidence; no actions are executed; requires agent:operations:recommend"
+    )]
+    async fn get_operations_recommendations(
+        &self,
+        Parameters(args): Parameters<DecisionArgs>,
+    ) -> Result<Json<ToolResponse>, ErrorData> {
+        let query = decision_query(&args);
+        Ok(Json(
+            self.get(
+                SCOPE_OPERATIONS_RECOMMEND,
+                "/api/v1/operations/recommendations",
+                &query,
+            )
+            .await?,
+        ))
+    }
+
+    #[tool(
+        name = "get_decision_history",
+        description = "Read the historical record of persisted decisions and recommendations; read-only and requires agent:operations:recommend"
+    )]
+    async fn get_decision_history(
+        &self,
+        Parameters(args): Parameters<DecisionArgs>,
+    ) -> Result<Json<ToolResponse>, ErrorData> {
+        let query = decision_query(&args);
+        Ok(Json(
+            self.get(
+                SCOPE_OPERATIONS_RECOMMEND,
+                "/api/v1/decisions/history",
+                &query,
+            )
+            .await?,
+        ))
+    }
+
+    #[tool(
         name = "get_health_overview",
         description = "Read current operations health together with historical risk and provider trends; no actions are performed; requires agent:operations:read"
     )]
@@ -1012,6 +1066,18 @@ fn pairs(values: impl IntoIterator<Item = (String, Option<String>)>) -> Vec<(Str
         .into_iter()
         .filter_map(|(key, value)| value.map(|value| (key, value)))
         .collect()
+}
+
+fn decision_query(args: &DecisionArgs) -> Vec<(String, String)> {
+    pairs([
+        ("status".into(), args.status.clone()),
+        ("category".into(), args.category.clone()),
+        ("page".into(), args.page.map(|value| value.to_string())),
+        (
+            "page_size".into(),
+            args.page_size.map(|value| value.clamp(1, 100).to_string()),
+        ),
+    ])
 }
 
 fn event_query(args: &EventArgs) -> Vec<(String, String)> {
@@ -1270,6 +1336,11 @@ mod tests {
         let operations = McpServer::new(test_config(&[SCOPE_OPERATIONS]));
         assert!(operations.require_scope(SCOPE_OPERATIONS).is_ok());
         assert!(operations.require_scope(SCOPE_PROVIDER).is_err());
+        let recommendations = McpServer::new(test_config(&[SCOPE_OPERATIONS_RECOMMEND]));
+        assert!(recommendations
+            .require_scope(SCOPE_OPERATIONS_RECOMMEND)
+            .is_ok());
+        assert!(recommendations.require_scope(SCOPE_OPERATIONS).is_err());
         let briefing = McpServer::new(test_config(&[SCOPE_OPERATIONS_BRIEFING]));
         assert!(briefing.require_scope(SCOPE_OPERATIONS_BRIEFING).is_ok());
         assert!(briefing.require_scope(SCOPE_OPERATIONS).is_err());
@@ -1364,6 +1435,7 @@ mod tests {
                 "get_agent_context",
                 "get_agent_status",
                 "get_daily_operations_briefing",
+                "get_decision_history",
                 "get_decisions",
                 "get_health_overview",
                 "get_incident",
@@ -1373,6 +1445,7 @@ mod tests {
                 "get_knowledge_context",
                 "get_network_overview",
                 "get_operations_history",
+                "get_operations_recommendations",
                 "get_operations_summary",
                 "get_provider_status",
                 "get_security_briefing",
@@ -1517,11 +1590,13 @@ mod tests {
         );
         let client = ClientInfo::default().serve(transport).await.unwrap();
         let tools = client.list_tools(None).await.unwrap();
-        assert_eq!(tools.tools.len(), 23);
+        assert_eq!(tools.tools.len(), 25);
         let expected = [
             "get_status",
             "get_agent_status",
             "get_daily_operations_briefing",
+            "get_operations_recommendations",
+            "get_decision_history",
             "list_events",
             "list_incidents",
             "get_incident",
@@ -1599,6 +1674,9 @@ mod tests {
                     "attention_points":[],
                     "recommended_checks":[]
                 }),
+                "/api/v1/operations/recommendations" | "/api/v1/decisions/history" => json!([
+                    {"id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","severity":"high","category":"provider_health","title":"Provider outage","reason":"timeout","recommendation":"Review fallback","confidence":0.91,"status":"open"}
+                ]),
                 "/api/v1/security/overview" => json!({"findings_total":1,"active_findings":1}),
                 "/api/v1/incidents" => json!([
                     {"id":incident_id,"status":"detected","severity":"high","confidence":88,"risk_score":70,"summary":"test incident","raw_payload":{"secret":"removed"}}
@@ -1669,6 +1747,8 @@ mod tests {
             "get_decisions",
             "get_provider_status",
             "get_operations_summary",
+            "get_operations_recommendations",
+            "get_decision_history",
             "get_operations_history",
             "get_status",
             "get_security_overview",
@@ -1710,6 +1790,12 @@ mod tests {
             }
             if tool == "get_operations_summary" {
                 assert!(serialized.contains("\"provider_health\""));
+            }
+            if matches!(
+                tool,
+                "get_operations_recommendations" | "get_decision_history"
+            ) {
+                assert!(serialized.contains("\"recommendation\""));
             }
         }
 

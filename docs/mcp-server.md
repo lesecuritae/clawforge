@@ -2,7 +2,7 @@
 
 Status: Read-only MCP-Adapter produktionsbereit. Der MCP-Dienst ist ein
 isolierter Rust-Service und wurde mit OpenClaw Discovery sowie den
-Operations-Leseabfragen geprüft. Die aktuelle Tool-Liste umfasst 23 Tools.
+Operations-Leseabfragen geprüft. Die aktuelle Tool-Liste umfasst 25 Tools.
 
 Dieses Dokument beschreibt einen separaten, read-only MCP-Dienst für
 OpenClaw. Die Agent API v1 bleibt die einzige Datenquelle. Der MCP-Dienst
@@ -51,6 +51,8 @@ als MCP-Upstream verwendet.
 | `get_provider_status` | `GET /api/v1/providers` | `agent:provider:read` | direkt nutzbar |
 | `get_operations_summary` | `GET /api/v1/operations/summary` | `agent:operations:read` | direkt nutzbar |
 | `get_daily_operations_briefing` | `GET /api/v1/operations/briefing` | `agent:operations:briefing` | Tageslagebild |
+| `get_operations_recommendations` | `GET /api/v1/operations/recommendations` | `agent:operations:recommend` | Offene Decision-Empfehlungen |
+| `get_decision_history` | `GET /api/v1/decisions/history` | `agent:operations:recommend` | Decision-Historie |
 | `get_health_overview` | `GET /api/v1/operations/summary` | `agent:operations:read` | Trend- und Health-Ansicht |
 | `get_operations_history` | `GET /api/v1/history/summary` | `agent:history:read` | historische Trends und Anomalien |
 | `list_events` | `GET /api/v1/events` | `agent:events:read` | direkt nutzbar |
@@ -153,6 +155,23 @@ und im Tool-Vertrag versioniert.
   Alerts, wichtige Ereignisse, Provider-Health, gespeicherte Veränderungen,
   Attention Points und Recommended Checks
 - Ausschließlich read-only; keine neue Bewertung oder Aktion
+
+### `get_operations_recommendations`
+
+- Eingabe: `status`, `category`, `page`, `page_size`
+- Upstream: `/api/v1/operations/recommendations`
+- Scope: `agent:operations:recommend`
+- Ausgabe: persistierte Empfehlungen mit Severity, Grund, Empfehlung und
+  Confidence
+- Keine automatische Aktion, keine Regel-Skriptausführung und kein Schreibzugriff
+
+### `get_decision_history`
+
+- Eingabe: `status`, `category`, `page`, `page_size`
+- Upstream: `/api/v1/decisions/history`
+- Scope: `agent:operations:recommend`
+- Ausgabe: frühere Entscheidungen einschließlich abgeschlossener und
+  abgelaufener Einträge
 
 ### `list_events`
 

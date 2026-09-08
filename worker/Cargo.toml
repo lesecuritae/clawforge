@@ -11,6 +11,7 @@ clawforge-intelligence = { path = "../intelligence" }
 clawforge-policy = { path = "../policy" }
 clawforge-risk = { path = "../risk" }
 clawforge-storage = { path = "../storage" }
+clawforge-decision = { path = "../decision" }
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

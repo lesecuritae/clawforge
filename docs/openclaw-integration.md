@@ -19,6 +19,7 @@ Für ein read-only Agent-Profil werden nur die benötigten Scopes vergeben:
 
 - `agent:operations:read`
 - `agent:operations:briefing`
+- `agent:operations:recommend`
 - `agent:context:read`
 - `agent:decision:read`
 - `agent:incident:read`
@@ -40,9 +41,10 @@ bewusst breit lesendes Profil verwendet werden. Für `get_status`,
 
 1. MCP-Container und API im isolierten Compose-Netz starten.
 2. MCP-Token und Agent-Token getrennt rotieren und als Secrets laden.
-3. Tool-Liste abrufen und die 23 read-only Tools erkennen.
+3. Tool-Liste abrufen und die 25 read-only Tools erkennen.
 4. `get_status`, `get_agent_context`, `get_decisions`,
    `get_operations_summary`, `get_daily_operations_briefing`,
+   `get_operations_recommendations`, `get_decision_history`,
    `get_operations_history`, `get_knowledge_context`,
    `get_security_briefing` und `get_system_graph` aufrufen.
 5. Incident-Replay sowie Incident-, Security-, Trust-, Network-, Provider- und Event-Tools mit den

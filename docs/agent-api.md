@@ -113,6 +113,8 @@ rollenbasierte Exportfunktionen. Zeitangaben sind UTC in RFC-3339-Format.
 | `GET /api/v1/providers` | Provider-Health | Quelle, Status, letzter Erfolg/Fehler, Datenalter, Qualität und Indicator-Anzahl ohne Rohfeeds | `agent:provider:read` |
 | `GET /api/v1/operations/summary` | Operations-Einstiegspunkt | Status, Risk-Level, aktive Incidents, kritische Events, Provider-Health, Attention Points und Recommended Checks | `agent:operations:read` |
 | `GET /api/v1/operations/briefing` | tägliches Lagebild | Aktueller Status, aktive Incidents/Alerts, Ereignisse, Provider-Health, Änderungen und Prüfempfehlungen | `agent:operations:briefing` |
+| `GET /api/v1/operations/recommendations` | Decision Engine Empfehlungen | Persistierte, erklärbare Empfehlungen mit Schweregrad, Grund, Empfehlung und Confidence | `agent:operations:recommend` |
+| `GET /api/v1/decisions/history` | Decision Historie | Frühere Entscheidungen einschließlich resolved/expired ohne automatische Aktionen | `agent:operations:recommend` |
 | `GET /api/v1/knowledge` | historische Erkenntnisse | Redigierte Lessons Learned, Incident-Zusammenfassungen und Muster | `agent:knowledge:read` |
 | `GET /api/v1/providers/{id}/history` | Provider-Verlauf | Status, Datenalter, Qualität und Synchronisationsverlauf ohne Feed-Inhalte | `agent:provider:read` |
 | `GET /api/v1/history` | historische Lagebilder | Operations-Snapshots mit Zeitbereich, Intervall und Trendvergleich | `agent:operations:read` |
@@ -164,6 +166,7 @@ Scopes sind:
 | `agent:provider:read` | `/api/v1/providers` |
 | `agent:operations:read` | `/api/v1/operations/summary`, `/api/v1/history` |
 | `agent:operations:briefing` | `/api/v1/operations/briefing` |
+| `agent:operations:recommend` | `/api/v1/operations/recommendations`, `/api/v1/decisions/history` |
 | `agent:knowledge:read` | `/api/v1/knowledge` |
 | `agent:history:read` | `/api/v1/history/summary` |
 | `agent:incident:replay` | `/api/v1/incidents/{id}/replay` |
@@ -406,6 +409,18 @@ nicht exportiert. Abgeschlossene oder gelöste Incidents können als
 und Synchronisationsereignisse. Der Verlauf enthält Status, Datenalter,
 Indicator-Anzahl, Laufzeit und Fehlertext, aber keine Zugangsdaten oder
 Feedinhalte.
+
+## Decision Intelligence v0.6
+
+`GET /api/v1/operations/recommendations` liefert die offenen, persistierten
+Empfehlungen der Decision Engine. Jede Empfehlung enthält einen Grund, eine
+nachvollziehbare Confidence und eine reine Prüfempfehlung. Der Endpunkt führt
+keine Aktion aus und verändert weder Risk-, Trust- noch Policy-Daten.
+
+`GET /api/v1/decisions/history` stellt die gespeicherte Historie einschließlich
+`acknowledged`, `dismissed`, `resolved` und `expired` bereit. Beide Endpunkte
+verwenden `agent:operations:recommend`; Rohpayloads, Secrets und interne
+Regelzustände werden nicht exportiert.
 
 ## OpenAPI-Vertrag
 

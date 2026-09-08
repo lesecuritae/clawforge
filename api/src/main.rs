@@ -86,6 +86,7 @@ const AGENT_SCOPE_DECISION_READ: &str = "agent:decision:read";
 const AGENT_SCOPE_PROVIDER_READ: &str = "agent:provider:read";
 const AGENT_SCOPE_OPERATIONS_READ: &str = "agent:operations:read";
 const AGENT_SCOPE_OPERATIONS_BRIEFING: &str = "agent:operations:briefing";
+const AGENT_SCOPE_OPERATIONS_RECOMMEND: &str = "agent:operations:recommend";
 const AGENT_SCOPE_SECURITY_READ: &str = "agent:security:read";
 const AGENT_SCOPE_KNOWLEDGE_READ: &str = "agent:knowledge:read";
 const AGENT_SCOPE_NETWORK_READ: &str = "agent:network:read";
@@ -105,6 +106,7 @@ const AGENT_SCOPES: &[&str] = &[
     AGENT_SCOPE_PROVIDER_READ,
     AGENT_SCOPE_OPERATIONS_READ,
     AGENT_SCOPE_OPERATIONS_BRIEFING,
+    AGENT_SCOPE_OPERATIONS_RECOMMEND,
     AGENT_SCOPE_SECURITY_READ,
     AGENT_SCOPE_KNOWLEDGE_READ,
     AGENT_SCOPE_NETWORK_READ,
@@ -1186,6 +1188,7 @@ struct AgentQuery {
     from: Option<String>,
     to: Option<String>,
     interval: Option<String>,
+    category: Option<String>,
 }
 
 fn agent_page(query: &AgentQuery, default: i64) -> (i64, i64) {
@@ -3165,6 +3168,147 @@ fn valid_provider_identifier(value: &str) -> bool {
         && value.chars().all(|character| {
             character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | ':')
         })
+}
+
+fn agent_decision_view(value: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "id": value.get("id"),
+        "created_at": value.get("created_at"),
+        "updated_at": value.get("updated_at"),
+        "severity": value.get("severity"),
+        "category": value.get("category"),
+        "source": value.get("source"),
+        "title": value.get("title"),
+        "description": value.get("description"),
+        "reason": value.get("reason"),
+        "recommendation": value.get("recommendation"),
+        "confidence": value.get("confidence"),
+        "status": value.get("status"),
+        "related_incident_id": value.get("related_incident_id")
+    })
+}
+
+fn validate_decision_query(query: &AgentQuery) -> ApiResult<()> {
+    if let Some(status) = query.status.as_deref() {
+        if !matches!(
+            status,
+            "open" | "acknowledged" | "dismissed" | "resolved" | "expired"
+        ) {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid decision status",
+            ));
+        }
+    }
+    if let Some(category) = query.category.as_deref() {
+        if category.is_empty()
+            || category.len() > 128
+            || !category
+                .chars()
+                .all(|value| value.is_ascii_alphanumeric() || matches!(value, '-' | '_' | '.'))
+        {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid decision category",
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn admin_operations_recommendations(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AgentQuery>,
+) -> ApiResult<Json<ApiEnvelope<Vec<serde_json::Value>>>> {
+    let principal = authenticate(&state, &headers).await?;
+    require_role(&principal, &["Administrator", "Operator", "Viewer"])?;
+    validate_decision_query(&query)?;
+    let values = state
+        .store
+        .list_decisions(query.status.as_deref(), query.category.as_deref(), 500)
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "recommendations unavailable",
+            )
+        })?;
+    let values = values.iter().map(agent_decision_view).collect::<Vec<_>>();
+    let (page, page_size) = agent_page(&query, 50);
+    let (data, pagination) = paged_values(values, page, page_size);
+    audit(
+        &state,
+        &principal,
+        "operations_recommendations_read",
+        "operations/recommendations",
+        serde_json::json!({"category": query.category, "status": query.status}),
+    )
+    .await;
+    Ok(envelope(data, Some(pagination)))
+}
+
+async fn agent_operations_recommendations(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AgentQuery>,
+) -> ApiResult<Json<ApiEnvelope<Vec<serde_json::Value>>>> {
+    let principal = authenticate_agent(&state, &headers).await?;
+    require_agent_scope(&principal, AGENT_SCOPE_OPERATIONS_RECOMMEND)?;
+    validate_decision_query(&query)?;
+    let status = query.status.as_deref().or(Some("open"));
+    let values = state
+        .store
+        .list_decisions(status, query.category.as_deref(), 500)
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "recommendations unavailable",
+            )
+        })?;
+    let values = values.iter().map(agent_decision_view).collect::<Vec<_>>();
+    let (page, page_size) = agent_page(&query, 50);
+    let (data, pagination) = paged_values(values, page, page_size);
+    audit_agent_read(
+        &state,
+        &principal,
+        "/api/v1/operations/recommendations",
+        AGENT_SCOPE_OPERATIONS_RECOMMEND,
+    )
+    .await;
+    Ok(envelope(data, Some(pagination)))
+}
+
+async fn agent_decision_history(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AgentQuery>,
+) -> ApiResult<Json<ApiEnvelope<Vec<serde_json::Value>>>> {
+    let principal = authenticate_agent(&state, &headers).await?;
+    require_agent_scope(&principal, AGENT_SCOPE_OPERATIONS_RECOMMEND)?;
+    validate_decision_query(&query)?;
+    let values = state
+        .store
+        .list_decisions(query.status.as_deref(), query.category.as_deref(), 500)
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "decision history unavailable",
+            )
+        })?;
+    let values = values.iter().map(agent_decision_view).collect::<Vec<_>>();
+    let (page, page_size) = agent_page(&query, 50);
+    let (data, pagination) = paged_values(values, page, page_size);
+    audit_agent_read(
+        &state,
+        &principal,
+        "/api/v1/decisions/history",
+        AGENT_SCOPE_OPERATIONS_RECOMMEND,
+    )
+    .await;
+    Ok(envelope(data, Some(pagination)))
 }
 
 async fn admin_operations_summary(
@@ -6094,6 +6238,14 @@ async fn main() -> anyhow::Result<()> {
         .route("/admin/providers/{id}", post(admin_update_provider))
         .route("/admin/providers/{id}/sync", post(admin_sync_provider))
         .route("/operations/summary", get(admin_operations_summary))
+        .route(
+            "/operations/recommendations",
+            get(admin_operations_recommendations),
+        )
+        .route(
+            "/operations/decisions/history",
+            get(admin_operations_recommendations),
+        )
         .route("/security/briefing", get(admin_security_briefing))
         .route("/system/graph", get(admin_system_graph))
         .route("/admin/alerts", get(admin_alerts))
@@ -6169,6 +6321,11 @@ async fn main() -> anyhow::Result<()> {
                 .route("/providers/{id}/history", get(agent_provider_history))
                 .route("/operations/summary", get(agent_operations_summary))
                 .route("/operations/briefing", get(agent_operations_briefing))
+                .route(
+                    "/operations/recommendations",
+                    get(agent_operations_recommendations),
+                )
+                .route("/decisions/history", get(agent_decision_history))
                 .route("/history", get(agent_history))
                 .route("/history/summary", get(agent_history_summary))
                 .route("/knowledge", get(agent_knowledge))
@@ -6784,5 +6941,32 @@ mod tests {
         assert!(!serialized.contains("private"));
         assert!(!serialized.contains("candidate_id"));
         assert!(!serialized.contains("correlation_key"));
+    }
+
+    #[test]
+    fn decision_views_are_explainable_and_do_not_export_metadata() {
+        let value = serde_json::json!({
+            "id": Uuid::new_v4(), "severity":"high", "category":"provider_health",
+            "source":"decision_engine", "title":"Provider outage", "description":"sync failed",
+            "reason":"timeout", "recommendation":"review fallback", "confidence":0.91,
+            "status":"open", "metadata":{"provider_id":"secret-internal"}
+        });
+        let view = agent_decision_view(&value);
+        assert_eq!(view["confidence"], 0.91);
+        assert!(view.get("metadata").is_none());
+        assert!(view["recommendation"].as_str().is_some());
+    }
+
+    #[test]
+    fn recommendation_scope_is_explicitly_read_only() {
+        assert!(validate_agent_scopes(&[
+            AGENT_SCOPE_OPERATIONS_RECOMMEND.into()
+        ]));
+        assert!(!validate_agent_scopes(&["agent:operations:write".into()]));
+        let invalid = AgentQuery {
+            status: Some("execute".into()),
+            ..AgentQuery::default()
+        };
+        assert!(validate_decision_query(&invalid).is_err());
     }
 }

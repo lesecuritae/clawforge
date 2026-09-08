@@ -1,3 +1,16 @@
+# Clawforge v0.6.0 Decision Intelligence
+
+## Decision Intelligence
+
+- Persisted explainable decisions and read-only Operations Recommendations API.
+- Declarative rules and rule execution history without script execution.
+- Approval foundation for future workflows; no action is executed in v0.6.
+- MCP tools `get_operations_recommendations` and `get_decision_history`.
+- Operations Center view for current recommendations and decision history.
+
+The Decision Engine is strictly advisory. It does not change Risk, Trust,
+Policy, providers, or system configuration.
+
 # Clawforge v0.5.0
 
 ## Operations Intelligence expansion

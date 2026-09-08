@@ -4,6 +4,14 @@
 
 Weitere Änderungen für die nächste Version werden hier gesammelt.
 
+## [0.6.0] - 2026-09-08
+
+- Added the read-only Decision Intelligence layer with persisted recommendations,
+  declarative rule evaluation, decision history, and approval foundations.
+- Added `get_operations_recommendations` and `get_decision_history` to MCP
+  with the `agent:operations:recommend` scope.
+- Added Operations Center presentation and Decision Engine documentation.
+
 ## [0.5.0] - 2026-09-08
 
 - Added the v0.5 Operations Intelligence layer: daily operations briefing,
@@ -72,7 +80,8 @@ Weitere Änderungen für die nächste Version werden hier gesammelt.
 - Production backup, restore, update, migration, and container-hardening workflows.
 - Role-aware global and endpoint-specific API rate limits with 429 retry headers and audit events.
 
-[Unreleased]: https://github.com/lesecuritae/clawforge/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/lesecuritae/clawforge/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/lesecuritae/clawforge/releases/tag/v0.6.0
 [0.5.0]: https://github.com/lesecuritae/clawforge/releases/tag/v0.5.0
 [0.4.0]: https://github.com/lesecuritae/clawforge/releases/tag/v0.4.0
 [0.3.0]: https://github.com/lesecuritae/clawforge/releases/tag/v0.3.0

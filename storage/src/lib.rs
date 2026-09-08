@@ -21,6 +21,20 @@ pub struct PostgresStore {
     pool: PgPool,
 }
 
+#[derive(Debug, Clone)]
+pub struct DecisionInput {
+    pub severity: String,
+    pub category: String,
+    pub source: String,
+    pub title: String,
+    pub description: String,
+    pub reason: String,
+    pub recommendation: String,
+    pub confidence: f64,
+    pub related_incident_id: Option<Uuid>,
+    pub metadata: serde_json::Value,
+}
+
 impl PostgresStore {
     pub async fn connect(database_url: &str) -> Result<Self> {
         let pool = PgPoolOptions::new()
@@ -1987,6 +2001,109 @@ impl PostgresStore {
                 })
             })
             .collect())
+    }
+
+    /// Return bounded decision records. The API applies the final read-only
+    /// projection; this view contains only explanation fields and sanitized
+    /// metadata persisted by the decision engine.
+    pub async fn list_decisions(
+        &self,
+        status: Option<&str>,
+        category: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<serde_json::Value>> {
+        let rows = sqlx::query("SELECT id,created_at,updated_at,severity,category,source,title,description,reason,recommendation,confidence,status,related_incident_id,metadata FROM decisions WHERE ($1::text IS NULL OR status=$1) AND ($2::text IS NULL OR category=$2) ORDER BY updated_at DESC LIMIT $3")
+            .bind(status)
+            .bind(category)
+            .bind(limit.clamp(1, 500))
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                serde_json::json!({
+                    "id": row.get::<Uuid,_>("id"),
+                    "created_at": row.get::<chrono::DateTime<chrono::Utc>,_>("created_at"),
+                    "updated_at": row.get::<chrono::DateTime<chrono::Utc>,_>("updated_at"),
+                    "severity": row.get::<String,_>("severity"),
+                    "category": row.get::<String,_>("category"),
+                    "source": row.get::<String,_>("source"),
+                    "title": row.get::<String,_>("title"),
+                    "description": row.get::<String,_>("description"),
+                    "reason": row.get::<String,_>("reason"),
+                    "recommendation": row.get::<String,_>("recommendation"),
+                    "confidence": row.get::<f64,_>("confidence"),
+                    "status": row.get::<String,_>("status"),
+                    "related_incident_id": row.get::<Option<Uuid>,_>("related_incident_id"),
+                    "metadata": row.get::<serde_json::Value,_>("metadata")
+                })
+            })
+            .collect())
+    }
+
+    pub async fn upsert_decision(&self, input: &DecisionInput) -> Result<Uuid> {
+        if !matches!(
+            input.severity.as_str(),
+            "info" | "low" | "medium" | "high" | "critical"
+        ) || input.category.trim().is_empty()
+            || input.source.trim().is_empty()
+            || input.title.trim().is_empty()
+            || input.title.len() > 240
+            || input.description.trim().is_empty()
+            || input.reason.trim().is_empty()
+            || input.recommendation.trim().is_empty()
+            || !(0.0..=1.0).contains(&input.confidence)
+        {
+            anyhow::bail!("invalid decision");
+        }
+        let existing = sqlx::query_scalar::<_, Uuid>("SELECT id FROM decisions WHERE status='open' AND category=$1 AND source=$2 AND title=$3 AND related_incident_id IS NOT DISTINCT FROM $4 ORDER BY updated_at DESC LIMIT 1")
+            .bind(input.category.trim()).bind(input.source.trim()).bind(input.title.trim()).bind(input.related_incident_id)
+            .fetch_optional(&self.pool).await?;
+        if let Some(id) = existing {
+            sqlx::query("UPDATE decisions SET severity=$2,description=$3,reason=$4,recommendation=$5,confidence=$6,metadata=$7,updated_at=NOW() WHERE id=$1")
+                .bind(id).bind(&input.severity).bind(input.description.trim()).bind(input.reason.trim()).bind(input.recommendation.trim()).bind(input.confidence).bind(&input.metadata)
+                .execute(&self.pool).await?;
+            return Ok(id);
+        }
+        let id = Uuid::new_v4();
+        sqlx::query("INSERT INTO decisions (id,severity,category,source,title,description,reason,recommendation,confidence,related_incident_id,metadata) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)")
+            .bind(id).bind(&input.severity).bind(input.category.trim()).bind(input.source.trim()).bind(input.title.trim()).bind(input.description.trim()).bind(input.reason.trim()).bind(input.recommendation.trim()).bind(input.confidence).bind(input.related_incident_id).bind(&input.metadata)
+            .execute(&self.pool).await?;
+        Ok(id)
+    }
+
+    pub async fn list_rules(
+        &self,
+        enabled: Option<bool>,
+        limit: i64,
+    ) -> Result<Vec<serde_json::Value>> {
+        let rows = sqlx::query("SELECT id,name,description,enabled,severity,condition,created_at FROM rules WHERE ($1::bool IS NULL OR enabled=$1) ORDER BY created_at ASC LIMIT $2")
+            .bind(enabled).bind(limit.clamp(1, 500)).fetch_all(&self.pool).await?;
+        Ok(rows.into_iter().map(|row| serde_json::json!({
+            "id": row.get::<Uuid,_>("id"), "name": row.get::<String,_>("name"),
+            "description": row.get::<String,_>("description"), "enabled": row.get::<bool,_>("enabled"),
+            "severity": row.get::<String,_>("severity"), "condition": row.get::<serde_json::Value,_>("condition"),
+            "created_at": row.get::<chrono::DateTime<chrono::Utc>,_>("created_at")
+        })).collect())
+    }
+
+    pub async fn record_rule_execution(
+        &self,
+        rule_id: Uuid,
+        event_id: Option<Uuid>,
+        result: &serde_json::Value,
+        decision_id: Option<Uuid>,
+    ) -> Result<Uuid> {
+        let id = Uuid::new_v4();
+        sqlx::query("INSERT INTO rule_executions (id,rule_id,event_id,result,decision_id) VALUES ($1,$2,$3,$4,$5)")
+            .bind(id).bind(rule_id).bind(event_id).bind(result).bind(decision_id).execute(&self.pool).await?;
+        Ok(id)
+    }
+
+    pub async fn expire_decisions(&self) -> Result<u64> {
+        let result = sqlx::query("UPDATE decisions SET status='expired',updated_at=NOW() WHERE status='open' AND updated_at < NOW()-INTERVAL '30 days'")
+            .execute(&self.pool).await?;
+        Ok(result.rows_affected())
     }
 
     pub async fn create_knowledge_entry(

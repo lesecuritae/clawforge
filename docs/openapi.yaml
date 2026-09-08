@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: Clawforge API
-  version: 0.5.0
+  version: 0.6.0
   description: Backend-only intelligence, incident, and administration API.
   x-rate-limit-contract: Responses may include X-RateLimit-Limit and X-RateLimit-Remaining; 429 responses include Retry-After.
   x-response-contract: Every JSON endpoint returns status, data, timestamp, pagination, and errors.
@@ -46,7 +46,7 @@ components:
       required: [service, version, status, migrations, runtime, events, providers]
       properties:
         service: { type: string, example: clawforge }
-        version: { type: string, example: 0.5.0 }
+        version: { type: string, example: 0.6.0 }
         status: { type: string, enum: [ok] }
         migrations: { type: object, additionalProperties: true }
         runtime: { type: array, items: { type: object, additionalProperties: true } }
@@ -126,6 +126,23 @@ components:
         security_changes: { type: object, additionalProperties: true }
         attention_points: { type: array, items: { type: object, additionalProperties: true } }
         recommended_checks: { type: array, items: { type: object, additionalProperties: true } }
+    DecisionRecommendation:
+      type: object
+      required: [id, severity, category, source, title, reason, recommendation, confidence, status]
+      properties:
+        id: { type: string, format: uuid }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        severity: { type: string, enum: [info, low, medium, high, critical] }
+        category: { type: string }
+        source: { type: string }
+        title: { type: string }
+        description: { type: string }
+        reason: { type: string }
+        recommendation: { type: string }
+        confidence: { type: number, minimum: 0, maximum: 1 }
+        status: { type: string, enum: [open, acknowledged, dismissed, resolved, expired] }
+        related_incident_id: { type: string, format: uuid, nullable: true }
     SecurityPosture:
       type: object
       required: [risk_level, incident_count, alert_count, provider_status, policy_status, trust_summary, trend]
@@ -420,6 +437,54 @@ paths:
         '403': { description: agent:knowledge:read scope missing }
         '429': { $ref: '#/components/responses/RateLimited' }
         '503': { description: Knowledge storage unavailable }
+  /api/v1/operations/recommendations:
+    get:
+      security: [{ agentBearerAuth: [] }]
+      description: Read-only persisted recommendations from the Decision Engine. No automatic action is performed. Requires agent:operations:recommend.
+      parameters:
+        - { in: query, name: status, schema: { type: string, enum: [open, acknowledged, dismissed, resolved, expired], default: open } }
+        - { in: query, name: category, schema: { type: string } }
+        - { in: query, name: page, schema: { type: integer, minimum: 1, default: 1 } }
+        - { in: query, name: page_size, schema: { type: integer, minimum: 1, maximum: 100, default: 50 } }
+      responses:
+        '200':
+          description: Operations recommendations envelope
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiEnvelope'
+                  - type: object
+                    properties:
+                      data: { type: array, items: { $ref: '#/components/schemas/DecisionRecommendation' } }
+        '401': { description: Agent token missing or invalid }
+        '403': { description: agent:operations:recommend scope missing }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { description: Decision storage unavailable }
+  /api/v1/decisions/history:
+    get:
+      security: [{ agentBearerAuth: [] }]
+      description: Read-only history of persisted decisions, including resolved and expired entries. Requires agent:operations:recommend.
+      parameters:
+        - { in: query, name: status, schema: { type: string, enum: [open, acknowledged, dismissed, resolved, expired] } }
+        - { in: query, name: category, schema: { type: string } }
+        - { in: query, name: page, schema: { type: integer, minimum: 1, default: 1 } }
+        - { in: query, name: page_size, schema: { type: integer, minimum: 1, maximum: 100, default: 50 } }
+      responses:
+        '200':
+          description: Decision history envelope
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiEnvelope'
+                  - type: object
+                    properties:
+                      data: { type: array, items: { $ref: '#/components/schemas/DecisionRecommendation' } }
+        '401': { description: Agent token missing or invalid }
+        '403': { description: agent:operations:recommend scope missing }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { description: Decision history unavailable }
   /api/v1/history:
     get:
       security: [{ agentBearerAuth: [] }]
