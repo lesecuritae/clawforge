@@ -1,3 +1,20 @@
+# Clawforge v0.5.0
+
+## Operations Intelligence expansion
+
+- Daily Operations Briefing through Agent API v1 with existing incidents,
+  alerts, events, provider health, trends, and recommended checks.
+- Expanded Security Posture response with incident, alert, provider, policy,
+  trust, and trend context.
+- Redacted Knowledge Context API and MCP tool for resolved-incident summaries,
+  lessons learned, and recurring patterns.
+- Provider synchronization and quality history persisted in PostgreSQL and
+  exposed read-only through Agent API v1.
+- API governance, scopes, OpenAPI contracts, and MCP documentation updated.
+
+The v0.5 release remains read-only for agents and MCP. No new provider feed,
+automatic remediation, or direct MCP database access was added.
+
 # Clawforge v0.4.0
 
 ## Production operations update

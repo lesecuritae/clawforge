@@ -85,7 +85,9 @@ const AGENT_SCOPE_CONTEXT_READ: &str = "agent:context:read";
 const AGENT_SCOPE_DECISION_READ: &str = "agent:decision:read";
 const AGENT_SCOPE_PROVIDER_READ: &str = "agent:provider:read";
 const AGENT_SCOPE_OPERATIONS_READ: &str = "agent:operations:read";
+const AGENT_SCOPE_OPERATIONS_BRIEFING: &str = "agent:operations:briefing";
 const AGENT_SCOPE_SECURITY_READ: &str = "agent:security:read";
+const AGENT_SCOPE_KNOWLEDGE_READ: &str = "agent:knowledge:read";
 const AGENT_SCOPE_NETWORK_READ: &str = "agent:network:read";
 const AGENT_SCOPE_INCIDENT_REPLAY: &str = "agent:incident:replay";
 const AGENT_SCOPE_HISTORY_READ: &str = "agent:history:read";
@@ -102,7 +104,9 @@ const AGENT_SCOPES: &[&str] = &[
     AGENT_SCOPE_DECISION_READ,
     AGENT_SCOPE_PROVIDER_READ,
     AGENT_SCOPE_OPERATIONS_READ,
+    AGENT_SCOPE_OPERATIONS_BRIEFING,
     AGENT_SCOPE_SECURITY_READ,
+    AGENT_SCOPE_KNOWLEDGE_READ,
     AGENT_SCOPE_NETWORK_READ,
     AGENT_SCOPE_INCIDENT_REPLAY,
     AGENT_SCOPE_HISTORY_READ,
@@ -2956,18 +2960,25 @@ async fn agent_security_posture(
         .iter()
         .filter_map(|value| value.get("source").and_then(serde_json::Value::as_str))
         .collect::<std::collections::BTreeSet<_>>();
-    let snapshots = state
-        .store
-        .list_operations_snapshots(None, None, 2)
-        .await
-        .map_err(|_| {
-            api_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "security posture history unavailable",
-            )
-        })?;
-    let current = serde_json::json!({"risk_level": risk_severity(highest_risk), "active_incidents": 0, "alerts": {"open": 0}, "provider_health": {"failed": 0}});
-    let trend = operations_trend(&current, &snapshots);
+    let summary = load_operations_summary(&state).await?;
+    let incidents = state.store.list_incidents(None, 500).await.map_err(|_| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "security posture unavailable",
+        )
+    })?;
+    let providers = state.store.list_provider_views().await.map_err(|_| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "security posture unavailable",
+        )
+    })?;
+    let trust = agent_network_values(&state, "trust").await?;
+    let trend = summary.get("trend").cloned().unwrap_or_default();
+    let active_incidents = incidents
+        .iter()
+        .filter(|value| context_is_active_incident(value))
+        .count();
     audit_agent_read(
         &state,
         &principal,
@@ -2980,6 +2991,12 @@ async fn agent_security_posture(
             "findings_total": values.len(),
             "active_findings": active,
             "highest_risk_score": highest_risk,
+            "risk_level": summary.get("risk_level").cloned().unwrap_or_else(|| serde_json::Value::from(risk_severity(highest_risk))),
+            "incident_count": active_incidents,
+            "alert_count": summary.get("alerts").and_then(|value| value.get("open")).cloned().unwrap_or_else(|| serde_json::Value::from(0)),
+            "provider_status": providers.iter().map(agent_provider_view).collect::<Vec<_>>(),
+            "policy_status": {"status": "enforced", "source": "policy_engine"},
+            "trust_summary": context_trust_data(&trust),
             "by_severity": by_severity,
             "affected_components": components,
             "trend": trend.get("risk_level").cloned().unwrap_or_default()
@@ -3003,6 +3020,151 @@ async fn agent_operations_summary(
     )
     .await;
     Ok(envelope(summary, None))
+}
+
+/// Compact, read-only daily briefing assembled from the existing operations
+/// summary and normalized event/provider views. No additional scoring or
+/// action is performed here.
+async fn agent_operations_briefing(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<ApiEnvelope<serde_json::Value>>> {
+    let principal = authenticate_agent(&state, &headers).await?;
+    require_agent_scope(&principal, AGENT_SCOPE_OPERATIONS_BRIEFING)?;
+    let summary = load_operations_summary(&state).await?;
+    let incidents = state.store.list_incidents(None, 500).await.map_err(|_| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "operations briefing unavailable",
+        )
+    })?;
+    let events = state.store.list_events(None, 100).await.map_err(|_| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "operations briefing unavailable",
+        )
+    })?;
+    let active_incidents = incidents
+        .iter()
+        .filter(|value| context_is_active_incident(value))
+        .map(agent_incident_view)
+        .take(20)
+        .collect::<Vec<_>>();
+    let active_incident_count = incidents
+        .iter()
+        .filter(|value| context_is_active_incident(value))
+        .count();
+    let recent_events = events
+        .iter()
+        .map(agent_event_view)
+        .rev()
+        .take(20)
+        .collect::<Vec<_>>();
+    audit_agent_read(
+        &state,
+        &principal,
+        "/api/v1/operations/briefing",
+        AGENT_SCOPE_OPERATIONS_BRIEFING,
+    )
+    .await;
+    Ok(envelope(
+        serde_json::json!({
+            "timestamp": Utc::now(),
+            "overall_status": summary.get("overall_status"),
+            "risk_level": summary.get("risk_level"),
+            "active_incidents": {"count": active_incident_count, "items": active_incidents},
+            "active_alerts": summary.get("alerts"),
+            "recent_events": recent_events,
+            "provider_health": summary.get("provider_health"),
+            "security_changes": summary.get("trend"),
+            "attention_points": summary.get("attention_points"),
+            "recommended_checks": summary.get("recommended_checks")
+        }),
+        None,
+    ))
+}
+
+async fn agent_knowledge(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AgentQuery>,
+) -> ApiResult<Json<ApiEnvelope<Vec<serde_json::Value>>>> {
+    let principal = authenticate_agent(&state, &headers).await?;
+    require_agent_scope(&principal, AGENT_SCOPE_KNOWLEDGE_READ)?;
+    let values = state
+        .store
+        .list_knowledge_entries(500)
+        .await
+        .map_err(|_| api_error(StatusCode::SERVICE_UNAVAILABLE, "knowledge unavailable"))?;
+    let values = values
+        .into_iter()
+        .filter(|value| agent_time_matches(value, &query))
+        .map(|mut value| {
+            if let Some(object) = value.as_object_mut() {
+                object.remove("related_incident");
+                object.remove("tags");
+            }
+            value
+        })
+        .collect::<Vec<_>>();
+    let (page, page_size) = agent_page(&query, 50);
+    let (data, pagination) = paged_values(values, page, page_size);
+    audit_agent_read(
+        &state,
+        &principal,
+        "/api/v1/knowledge",
+        AGENT_SCOPE_KNOWLEDGE_READ,
+    )
+    .await;
+    Ok(envelope(data, Some(pagination)))
+}
+
+async fn agent_provider_history(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(provider_id): Path<String>,
+    Query(query): Query<AgentQuery>,
+) -> ApiResult<Json<ApiEnvelope<Vec<serde_json::Value>>>> {
+    let principal = authenticate_agent(&state, &headers).await?;
+    require_agent_scope(&principal, AGENT_SCOPE_PROVIDER_READ)?;
+    if !valid_provider_identifier(&provider_id) {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid provider identifier",
+        ));
+    }
+    let values = state
+        .store
+        .list_provider_history(&provider_id, 500)
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "provider history unavailable",
+            )
+        })?;
+    let values = values
+        .into_iter()
+        .filter(|value| agent_time_matches(value, &query))
+        .collect::<Vec<_>>();
+    let (page, page_size) = agent_page(&query, 50);
+    let (data, pagination) = paged_values(values, page, page_size);
+    audit_agent_read(
+        &state,
+        &principal,
+        &format!("/api/v1/providers/{provider_id}/history"),
+        AGENT_SCOPE_PROVIDER_READ,
+    )
+    .await;
+    Ok(envelope(data, Some(pagination)))
+}
+
+fn valid_provider_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | ':')
+        })
 }
 
 async fn admin_operations_summary(
@@ -4560,10 +4722,21 @@ struct AuditQuery {
     user: Option<String>,
     action: Option<String>,
     result: Option<String>,
+    scope: Option<String>,
     limit: Option<i64>,
     page: Option<i64>,
     page_size: Option<i64>,
     format: Option<String>,
+}
+
+fn audit_scope_matches(value: &serde_json::Value, scope: Option<&str>) -> bool {
+    scope.is_none_or(|wanted| {
+        value
+            .get("details")
+            .and_then(|details| details.get("scope"))
+            .and_then(serde_json::Value::as_str)
+            == Some(wanted)
+    })
 }
 
 async fn audit_events(
@@ -4597,6 +4770,10 @@ async fn audit_events(
         )
         .await
         .map_err(|_| api_error(StatusCode::SERVICE_UNAVAILABLE, "audit events unavailable"))?;
+    let values = values
+        .into_iter()
+        .filter(|value| audit_scope_matches(value, query.scope.as_deref()))
+        .collect::<Vec<_>>();
     let (data, pagination) = paged_values(
         values,
         query.page.unwrap_or(1),
@@ -4795,6 +4972,10 @@ async fn export_audit_events(
         )
         .await
         .map_err(|_| api_error(StatusCode::SERVICE_UNAVAILABLE, "audit export unavailable"))?;
+    let values = values
+        .into_iter()
+        .filter(|value| audit_scope_matches(value, query.scope.as_deref()))
+        .collect::<Vec<_>>();
     if query.format.as_deref() == Some("csv") {
         return csv_response(
             values_as_csv(
@@ -5985,9 +6166,12 @@ async fn main() -> anyhow::Result<()> {
                 .route("/context", get(agent_context))
                 .route("/decisions", get(agent_decisions))
                 .route("/providers", get(agent_provider_status))
+                .route("/providers/{id}/history", get(agent_provider_history))
                 .route("/operations/summary", get(agent_operations_summary))
+                .route("/operations/briefing", get(agent_operations_briefing))
                 .route("/history", get(agent_history))
                 .route("/history/summary", get(agent_history_summary))
+                .route("/knowledge", get(agent_knowledge))
                 .route("/events", get(agent_events))
                 .route("/incidents", get(agent_incidents))
                 .route("/incidents/{id}", get(agent_incident_detail))
@@ -6246,6 +6430,10 @@ mod tests {
         assert!(validate_agent_scopes(&[
             AGENT_SCOPE_PROVIDER_READ.to_string(),
             AGENT_SCOPE_OPERATIONS_READ.to_string()
+        ]));
+        assert!(validate_agent_scopes(&[
+            AGENT_SCOPE_OPERATIONS_BRIEFING.to_string(),
+            AGENT_SCOPE_KNOWLEDGE_READ.to_string()
         ]));
         assert!(validate_agent_scopes(&[AGENT_SCOPE_ALL_READ.to_string()]));
         assert!(!validate_agent_scopes(&["agent:admin:write".to_string()]));
@@ -6552,6 +6740,30 @@ mod tests {
             parse_agent_uuid("not-a-uuid").expect_err("invalid id must be rejected");
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body.0.errors, vec!["invalid incident identifier"]);
+    }
+
+    #[test]
+    fn audit_scope_filter_matches_only_explicit_agent_scope() {
+        let event = serde_json::json!({"details": {"scope": "agent:operations:briefing"}});
+        assert!(audit_scope_matches(&event, None));
+        assert!(audit_scope_matches(
+            &event,
+            Some("agent:operations:briefing")
+        ));
+        assert!(!audit_scope_matches(&event, Some("agent:knowledge:read")));
+        assert!(!audit_scope_matches(
+            &serde_json::json!({"details": {}}),
+            Some("agent:events:read")
+        ));
+    }
+
+    #[test]
+    fn provider_history_identifiers_are_bounded() {
+        assert!(valid_provider_identifier("threatfox"));
+        assert!(valid_provider_identifier("asn:ripestat"));
+        assert!(!valid_provider_identifier(""));
+        assert!(!valid_provider_identifier("provider/history"));
+        assert!(!valid_provider_identifier(&"x".repeat(129)));
     }
 
     #[test]

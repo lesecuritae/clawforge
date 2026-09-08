@@ -2,7 +2,7 @@
 
 Status: Read-only MCP-Adapter produktionsbereit. Der MCP-Dienst ist ein
 isolierter Rust-Service und wurde mit OpenClaw Discovery sowie den
-Operations-Leseabfragen geprüft. Die aktuelle Tool-Liste umfasst 21 Tools.
+Operations-Leseabfragen geprüft. Die aktuelle Tool-Liste umfasst 23 Tools.
 
 Dieses Dokument beschreibt einen separaten, read-only MCP-Dienst für
 OpenClaw. Die Agent API v1 bleibt die einzige Datenquelle. Der MCP-Dienst
@@ -50,6 +50,7 @@ als MCP-Upstream verwendet.
 | `get_decisions` | `GET /api/v1/decisions` | `agent:decision:read` | direkt nutzbar |
 | `get_provider_status` | `GET /api/v1/providers` | `agent:provider:read` | direkt nutzbar |
 | `get_operations_summary` | `GET /api/v1/operations/summary` | `agent:operations:read` | direkt nutzbar |
+| `get_daily_operations_briefing` | `GET /api/v1/operations/briefing` | `agent:operations:briefing` | Tageslagebild |
 | `get_health_overview` | `GET /api/v1/operations/summary` | `agent:operations:read` | Trend- und Health-Ansicht |
 | `get_operations_history` | `GET /api/v1/history/summary` | `agent:history:read` | historische Trends und Anomalien |
 | `list_events` | `GET /api/v1/events` | `agent:events:read` | direkt nutzbar |
@@ -61,6 +62,7 @@ als MCP-Upstream verwendet.
 | `get_security_overview` | `GET /api/v1/security/overview` + Incident-Liste | `agent:security:read` + `agent:incident:read` | direkt nutzbar |
 | `list_security_findings` | `GET /api/v1/security/findings` | `agent:security:read` | direkt nutzbar |
 | `get_security_posture` | `GET /api/v1/security/posture` | `agent:security:read` | Trend- und Komponentenansicht |
+| `get_knowledge_context` | `GET /api/v1/knowledge` | `agent:knowledge:read` | Lessons Learned und Muster |
 | `get_security_briefing` | `GET /api/v1/security/briefing` | `agent:security:briefing` | kompakte Lagebewertung |
 | `get_trust_status` | `GET /api/v1/network/trust` | `agent:network:read` | direkt nutzbar |
 | `get_network_overview` | `GET /api/v1/network/asn`, `/prefixes`, `/bgp`, `/rpki` | `agent:network:read` | deterministische Zusammenführung im Adapter |
@@ -142,6 +144,16 @@ und im Tool-Vertrag versioniert.
 - Der MCP-Server führt keine Remediation oder Schreiboperation aus und bildet
   keine neue Risk- oder Trust-Bewertung
 
+### `get_daily_operations_briefing`
+
+- Eingabe: keine
+- Upstream: `/api/v1/operations/briefing`
+- Scope: `agent:operations:briefing`
+- Ausgabe: Tageszeitpunkt, Gesamtstatus, Risk-Level, aktive Incidents und
+  Alerts, wichtige Ereignisse, Provider-Health, gespeicherte Veränderungen,
+  Attention Points und Recommended Checks
+- Ausschließlich read-only; keine neue Bewertung oder Aktion
+
 ### `list_events`
 
 - Eingabe: `page`, `page_size` (maximal 100), `event_type`, `source`,
@@ -202,6 +214,16 @@ und im Tool-Vertrag versioniert.
 - Scope: `agent:security:briefing`
 - Ausgabe: Status, Risiko, priorisierte Incidents, neue Findings,
   Provider-Probleme und Unsicherheiten ohne Aktionen
+
+### `get_knowledge_context`
+
+- Eingabe: keine
+- Upstream: `/api/v1/knowledge`
+- Scope: `agent:knowledge:read`
+- Ausgabe: freigegebene Incident-Zusammenfassungen, Lessons Learned und
+  wiederkehrende Muster
+- Notiztexte, Rohpayloads, Tags mit internen Details und Registry-Interna
+  werden nicht weitergereicht
 
 ### `get_system_graph`
 

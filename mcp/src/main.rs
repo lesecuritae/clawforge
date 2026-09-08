@@ -43,7 +43,9 @@ const SCOPE_CONTEXT: &str = "agent:context:read";
 const SCOPE_DECISION: &str = "agent:decision:read";
 const SCOPE_PROVIDER: &str = "agent:provider:read";
 const SCOPE_OPERATIONS: &str = "agent:operations:read";
+const SCOPE_OPERATIONS_BRIEFING: &str = "agent:operations:briefing";
 const SCOPE_SECURITY: &str = "agent:security:read";
+const SCOPE_KNOWLEDGE: &str = "agent:knowledge:read";
 const SCOPE_NETWORK: &str = "agent:network:read";
 const SCOPE_INCIDENT_REPLAY: &str = "agent:incident:replay";
 const SCOPE_HISTORY: &str = "agent:history:read";
@@ -326,7 +328,9 @@ fn parse_scopes(value: &str) -> Result<HashSet<String>> {
         SCOPE_DECISION,
         SCOPE_PROVIDER,
         SCOPE_OPERATIONS,
+        SCOPE_OPERATIONS_BRIEFING,
         SCOPE_SECURITY,
+        SCOPE_KNOWLEDGE,
         SCOPE_NETWORK,
         SCOPE_INCIDENT_REPLAY,
         SCOPE_HISTORY,
@@ -746,6 +750,24 @@ impl McpServer {
     }
 
     #[tool(
+        name = "get_daily_operations_briefing",
+        description = "Read the current sanitized daily operations briefing with incidents, alerts, provider health, changes, and recommended checks; no actions are performed; requires agent:operations:briefing"
+    )]
+    async fn get_daily_operations_briefing(
+        &self,
+        Parameters(_args): Parameters<EmptyArgs>,
+    ) -> Result<Json<ToolResponse>, ErrorData> {
+        Ok(Json(
+            self.get(
+                SCOPE_OPERATIONS_BRIEFING,
+                "/api/v1/operations/briefing",
+                &[],
+            )
+            .await?,
+        ))
+    }
+
+    #[tool(
         name = "get_health_overview",
         description = "Read current operations health together with historical risk and provider trends; no actions are performed; requires agent:operations:read"
     )]
@@ -855,6 +877,19 @@ impl McpServer {
         Ok(Json(
             self.get(SCOPE_SECURITY, "/api/v1/security/posture", &[])
                 .await?,
+        ))
+    }
+
+    #[tool(
+        name = "get_knowledge_context",
+        description = "Read summarized historical knowledge entries and lessons learned; raw incident notes and internal relations are excluded; requires agent:knowledge:read"
+    )]
+    async fn get_knowledge_context(
+        &self,
+        Parameters(_args): Parameters<EmptyArgs>,
+    ) -> Result<Json<ToolResponse>, ErrorData> {
+        Ok(Json(
+            self.get(SCOPE_KNOWLEDGE, "/api/v1/knowledge", &[]).await?,
         ))
     }
 
@@ -1235,6 +1270,12 @@ mod tests {
         let operations = McpServer::new(test_config(&[SCOPE_OPERATIONS]));
         assert!(operations.require_scope(SCOPE_OPERATIONS).is_ok());
         assert!(operations.require_scope(SCOPE_PROVIDER).is_err());
+        let briefing = McpServer::new(test_config(&[SCOPE_OPERATIONS_BRIEFING]));
+        assert!(briefing.require_scope(SCOPE_OPERATIONS_BRIEFING).is_ok());
+        assert!(briefing.require_scope(SCOPE_OPERATIONS).is_err());
+        let knowledge = McpServer::new(test_config(&[SCOPE_KNOWLEDGE]));
+        assert!(knowledge.require_scope(SCOPE_KNOWLEDGE).is_ok());
+        assert!(knowledge.require_scope(SCOPE_SECURITY).is_err());
     }
 
     #[tokio::test]
@@ -1322,12 +1363,14 @@ mod tests {
             vec![
                 "get_agent_context",
                 "get_agent_status",
+                "get_daily_operations_briefing",
                 "get_decisions",
                 "get_health_overview",
                 "get_incident",
                 "get_incident_relations",
                 "get_incident_replay",
                 "get_incident_timeline",
+                "get_knowledge_context",
                 "get_network_overview",
                 "get_operations_history",
                 "get_operations_summary",
@@ -1474,10 +1517,11 @@ mod tests {
         );
         let client = ClientInfo::default().serve(transport).await.unwrap();
         let tools = client.list_tools(None).await.unwrap();
-        assert_eq!(tools.tools.len(), 21);
+        assert_eq!(tools.tools.len(), 23);
         let expected = [
             "get_status",
             "get_agent_status",
+            "get_daily_operations_briefing",
             "list_events",
             "list_incidents",
             "get_incident",
@@ -1497,6 +1541,7 @@ mod tests {
             "get_security_briefing",
             "get_security_posture",
             "get_system_graph",
+            "get_knowledge_context",
         ];
         for name in expected {
             let tool = tools

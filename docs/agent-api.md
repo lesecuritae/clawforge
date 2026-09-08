@@ -112,6 +112,9 @@ rollenbasierte Exportfunktionen. Zeitangaben sind UTC in RFC-3339-Format.
 | `GET /api/v1/decisions` | priorisierte read-only Lageeinschätzung | Gesamtstatus, bestehende Risikowerte, Aufmerksamkeitspunkte, empfohlene Prüfungen und Context-Zusammenfassung | `agent:decision:read` |
 | `GET /api/v1/providers` | Provider-Health | Quelle, Status, letzter Erfolg/Fehler, Datenalter, Qualität und Indicator-Anzahl ohne Rohfeeds | `agent:provider:read` |
 | `GET /api/v1/operations/summary` | Operations-Einstiegspunkt | Status, Risk-Level, aktive Incidents, kritische Events, Provider-Health, Attention Points und Recommended Checks | `agent:operations:read` |
+| `GET /api/v1/operations/briefing` | tägliches Lagebild | Aktueller Status, aktive Incidents/Alerts, Ereignisse, Provider-Health, Änderungen und Prüfempfehlungen | `agent:operations:briefing` |
+| `GET /api/v1/knowledge` | historische Erkenntnisse | Redigierte Lessons Learned, Incident-Zusammenfassungen und Muster | `agent:knowledge:read` |
+| `GET /api/v1/providers/{id}/history` | Provider-Verlauf | Status, Datenalter, Qualität und Synchronisationsverlauf ohne Feed-Inhalte | `agent:provider:read` |
 | `GET /api/v1/history` | historische Lagebilder | Operations-Snapshots mit Zeitbereich, Intervall und Trendvergleich | `agent:operations:read` |
 | `GET /api/v1/history/summary` | historische Intelligence | Trends, Veränderungen und Auffälligkeiten nach Stunde/Tag/Woche | `agent:history:read` |
 | `GET /api/v1/events` | aktuelle kanonische Events | Typ, Quelle, Severity, Zeit, Korrelation, begründete Zusammenfassung | `agent:events:read` |
@@ -131,9 +134,10 @@ rollenbasierte Exportfunktionen. Zeitangaben sind UTC in RFC-3339-Format.
 | `GET /api/v1/network/trust` | Trusted Infrastructure | Name, Typ, Identifier, Status, Zeit, Confidence und gespeicherter Trust-Wert ohne Registry-Interna | `agent:network:read` |
 | `GET /api/v1/system/graph` | Systemgraph | sichere Service-, Datenbank- und Provider-Abhängigkeiten | `agent:system:graph:read` |
 
-Die Agent-Incident-Detail-, Timeline- und Relationsrouten sind read-only. Die
-übrigen Detailrouten für einzelne Events sowie Provider- und
-Capabilities-Ressourcen bleiben für Phase 2 vorgesehen.
+Die Agent-Incident-Detail-, Timeline- und Relationsrouten sind read-only. Für
+einzelne Events wird weiterhin nur die normalisierte Event-Liste exportiert;
+Provider-Health und Provider-Historie sind bereits Bestandteil dieses
+Vertrags. Interne Capabilities-Ressourcen bleiben außerhalb von `/api/v1`.
 
 ## Eingefrorener v1-Vertrag
 
@@ -159,6 +163,8 @@ Scopes sind:
 | `agent:decision:read` | `/api/v1/decisions` |
 | `agent:provider:read` | `/api/v1/providers` |
 | `agent:operations:read` | `/api/v1/operations/summary`, `/api/v1/history` |
+| `agent:operations:briefing` | `/api/v1/operations/briefing` |
+| `agent:knowledge:read` | `/api/v1/knowledge` |
 | `agent:history:read` | `/api/v1/history/summary` |
 | `agent:incident:replay` | `/api/v1/incidents/{id}/replay` |
 | `agent:security:briefing` | `/api/v1/security/briefing` |
@@ -379,6 +385,27 @@ ihre Teilbereiche erweitern keine granularen Resource-Scopes.
 `404` unbekannte Ressourcen, `429` überschrittenes Limit und `503` nicht
 verfügbare PostgreSQL-/Migrationsabhängigkeit. Die bestehenden
 `Retry-After`- und `X-RateLimit-*`-Header gelten auch für `/api/v1`.
+
+## Operations Intelligence v0.5
+
+`GET /api/v1/operations/briefing` ist der kompakte read-only Einstiegspunkt
+für Tagesberichte. Er verwendet ausschließlich bereits gespeicherte
+Operations Summary-, Incident-, Alert-, Event- und Provider-Daten. Die
+Antwort enthält keine Rohpayloads und führt keine neue Risikoberechnung aus.
+
+`GET /api/v1/security/posture` bündelt den aktuellen Risk-Level, aktive
+Incident- und Alert-Zahlen, Provider-Zustände, den vorhandenen Policy-Status,
+Trust-Zusammenfassung und den gespeicherten Trend.
+
+`GET /api/v1/knowledge` liefert nur freigegebene Zusammenfassungen. Freie
+Incident-Notizen, Rohfeeds, Korrelation-Schlüssel und Registry-Interna werden
+nicht exportiert. Abgeschlossene oder gelöste Incidents können als
+`incident`-Einträge persistiert werden.
+
+`GET /api/v1/providers/{id}/history` zeigt die normalisierte Providerqualität
+und Synchronisationsereignisse. Der Verlauf enthält Status, Datenalter,
+Indicator-Anzahl, Laufzeit und Fehlertext, aber keine Zugangsdaten oder
+Feedinhalte.
 
 ## OpenAPI-Vertrag
 

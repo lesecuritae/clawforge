@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: Clawforge API
-  version: 0.1.0
+  version: 0.5.0
   description: Backend-only intelligence, incident, and administration API.
   x-rate-limit-contract: Responses may include X-RateLimit-Limit and X-RateLimit-Remaining; 429 responses include Retry-After.
   x-response-contract: Every JSON endpoint returns status, data, timestamp, pagination, and errors.
@@ -46,7 +46,7 @@ components:
       required: [service, version, status, migrations, runtime, events, providers]
       properties:
         service: { type: string, example: clawforge }
-        version: { type: string, example: 0.1.0 }
+        version: { type: string, example: 0.5.0 }
         status: { type: string, enum: [ok] }
         migrations: { type: object, additionalProperties: true }
         runtime: { type: array, items: { type: object, additionalProperties: true } }
@@ -112,6 +112,54 @@ components:
         trust: { type: object, additionalProperties: true }
         alerts: { type: object, additionalProperties: { type: integer, minimum: 0 } }
         system_status: { type: string, enum: [ok, degraded, unavailable] }
+    OperationsBriefing:
+      type: object
+      required: [timestamp, overall_status, risk_level, active_incidents, active_alerts, recent_events, provider_health, security_changes, attention_points, recommended_checks]
+      properties:
+        timestamp: { type: string, format: date-time }
+        overall_status: { type: string }
+        risk_level: { type: string }
+        active_incidents: { type: object, additionalProperties: true }
+        active_alerts: { type: object, additionalProperties: true }
+        recent_events: { type: array, items: { $ref: '#/components/schemas/AgentEvent' } }
+        provider_health: { type: object, additionalProperties: true }
+        security_changes: { type: object, additionalProperties: true }
+        attention_points: { type: array, items: { type: object, additionalProperties: true } }
+        recommended_checks: { type: array, items: { type: object, additionalProperties: true } }
+    SecurityPosture:
+      type: object
+      required: [risk_level, incident_count, alert_count, provider_status, policy_status, trust_summary, trend]
+      properties:
+        risk_level: { type: string }
+        incident_count: { type: integer, minimum: 0 }
+        alert_count: { type: integer, minimum: 0 }
+        provider_status: { type: array, items: { $ref: '#/components/schemas/AgentProviderStatus' } }
+        policy_status: { type: object, additionalProperties: true }
+        trust_summary: { type: object, additionalProperties: true }
+        trend: { type: object, additionalProperties: true }
+    KnowledgeEntry:
+      type: object
+      required: [id, type, title, summary, source, created_at]
+      properties:
+        id: { type: integer }
+        type: { type: string, enum: [incident, lesson_learned, pattern] }
+        title: { type: string }
+        summary: { type: string }
+        source: { type: string }
+        created_at: { type: string, format: date-time }
+    ProviderHistory:
+      type: object
+      required: [id, provider_id, status, timestamp, quality_score, indicator_count, sync_duration_ms]
+      properties:
+        id: { type: integer }
+        provider_id: { type: string }
+        status: { type: string }
+        timestamp: { type: string, format: date-time }
+        last_error: { type: string, nullable: true }
+        quality_score: { type: integer, minimum: 0, maximum: 100 }
+        data_age_seconds: { type: number, nullable: true }
+        indicator_count: { type: integer, minimum: 0 }
+        sync_duration_ms: { type: integer, minimum: 0 }
     Alert:
       type: object
       required: [id, source, severity, status, created_at, delivery_status, summary]
@@ -265,6 +313,32 @@ paths:
         '403': { description: agent:provider:read scope missing }
         '429': { $ref: '#/components/responses/RateLimited' }
         '503': { description: Provider status unavailable }
+  /api/v1/providers/{id}/history:
+    get:
+      security: [{ agentBearerAuth: [] }]
+      description: Read-only normalized provider quality and synchronization history. Raw feeds and credentials are never returned. Requires agent:provider:read.
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string } }
+        - { in: query, name: page, schema: { type: integer, minimum: 1, default: 1 } }
+        - { in: query, name: page_size, schema: { type: integer, minimum: 1, maximum: 100, default: 50 } }
+        - { in: query, name: from, schema: { type: string, format: date-time } }
+        - { in: query, name: to, schema: { type: string, format: date-time } }
+      responses:
+        '200':
+          description: Provider history envelope
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiEnvelope'
+                  - type: object
+                    properties:
+                      data: { type: array, items: { $ref: '#/components/schemas/ProviderHistory' } }
+        '400': { description: Invalid provider identifier }
+        '401': { description: Agent token missing or invalid }
+        '403': { description: agent:provider:read scope missing }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { description: Provider history unavailable }
   /api/v1/decisions:
     get:
       security: [{ agentBearerAuth: [] }]
@@ -303,6 +377,49 @@ paths:
         '403': { description: agent:operations:read scope missing }
         '429': { $ref: '#/components/responses/RateLimited' }
         '503': { description: Operations summary unavailable }
+  /api/v1/operations/briefing:
+    get:
+      security: [{ agentBearerAuth: [] }]
+      description: Daily read-only operations briefing assembled from existing summaries, incidents, alerts, events, and provider health. Requires agent:operations:briefing.
+      responses:
+        '200':
+          description: Operations briefing envelope
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiEnvelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/OperationsBriefing' }
+        '401': { description: Agent token missing or invalid }
+        '403': { description: agent:operations:briefing scope missing }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { description: Operations briefing unavailable }
+  /api/v1/knowledge:
+    get:
+      security: [{ agentBearerAuth: [] }]
+      description: Read-only historical knowledge summaries. Incident notes, raw payloads, and internal relations are excluded. Requires agent:knowledge:read.
+      parameters:
+        - { in: query, name: page, schema: { type: integer, minimum: 1, default: 1 } }
+        - { in: query, name: page_size, schema: { type: integer, minimum: 1, maximum: 100, default: 50 } }
+        - { in: query, name: from, schema: { type: string, format: date-time } }
+        - { in: query, name: to, schema: { type: string, format: date-time } }
+      responses:
+        '200':
+          description: Knowledge context envelope
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiEnvelope'
+                  - type: object
+                    properties:
+                      data: { type: array, items: { $ref: '#/components/schemas/KnowledgeEntry' } }
+        '401': { description: Agent token missing or invalid }
+        '403': { description: agent:knowledge:read scope missing }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { description: Knowledge storage unavailable }
   /api/v1/history:
     get:
       security: [{ agentBearerAuth: [] }]
@@ -898,9 +1015,12 @@ paths:
   /audit/events:
     get:
       security: [{ bearerAuth: [] }]
-      description: Viewer, Operator, or Administrator with source, severity, user, action, result, and time filters. Result searches redacted audit details.
+      description: Viewer, Operator, or Administrator with source, severity, user, agent/scope, action, result, and time filters. Result searches redacted audit details.
       parameters:
+        - { in: query, name: source, schema: { type: string } }
+        - { in: query, name: severity, schema: { type: string } }
         - { in: query, name: user, schema: { type: string } }
+        - { in: query, name: scope, schema: { type: string } }
         - { in: query, name: action, schema: { type: string } }
         - { in: query, name: result, schema: { type: string } }
         - { in: query, name: from, schema: { type: string, format: date-time } }
@@ -925,6 +1045,17 @@ paths:
   /audit/events/export:
     get:
       security: [{ bearerAuth: [] }]
+      description: Export immutable audit events as JSON or CSV with the same user, agent/scope, action, result, source, severity, and time filters as the explorer.
+      parameters:
+        - { in: query, name: format, schema: { type: string, enum: [json, csv], default: json } }
+        - { in: query, name: source, schema: { type: string } }
+        - { in: query, name: severity, schema: { type: string } }
+        - { in: query, name: user, schema: { type: string } }
+        - { in: query, name: scope, schema: { type: string } }
+        - { in: query, name: action, schema: { type: string } }
+        - { in: query, name: result, schema: { type: string } }
+        - { in: query, name: from, schema: { type: string, format: date-time } }
+        - { in: query, name: to, schema: { type: string, format: date-time } }
       responses:
         '200': { description: Audit export }
         '429': { $ref: '#/components/responses/RateLimited' }

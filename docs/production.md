@@ -29,11 +29,13 @@ Secrets. Der Standardzugang ist minimal read-only:
 
 ```text
 agent:operations:read
+agent:operations:briefing
 agent:context:read
 agent:decision:read
 agent:incident:read
 agent:provider:read
 agent:security:read
+agent:knowledge:read
 ```
 
 Für Netzwerk-, Trust-, Event- oder Systemtools müssen die entsprechenden

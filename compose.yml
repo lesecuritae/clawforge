@@ -278,7 +278,7 @@ services:
       CLAWFORGE_MCP_BIND: 0.0.0.0:8090
       CLAWFORGE_MCP_AGENT_TOKEN_FILE: /run/secrets/mcp_agent_api_token
       CLAWFORGE_MCP_AUTH_TOKEN_FILE: /run/secrets/mcp_auth_token
-      CLAWFORGE_MCP_SCOPES: ${CLAWFORGE_MCP_SCOPES:-agent:operations:read,agent:context:read,agent:decision:read,agent:incident:read,agent:provider:read,agent:security:read}
+      CLAWFORGE_MCP_SCOPES: ${CLAWFORGE_MCP_SCOPES:-agent:operations:read,agent:operations:briefing,agent:context:read,agent:decision:read,agent:incident:read,agent:provider:read,agent:security:read,agent:knowledge:read}
       CLAWFORGE_MCP_UPSTREAM_TIMEOUT_SECONDS: ${CLAWFORGE_MCP_UPSTREAM_TIMEOUT_SECONDS:-10}
       RUST_LOG: ${RUST_LOG:-info}
     read_only: true

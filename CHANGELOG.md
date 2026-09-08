@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+Weitere Änderungen für die nächste Version werden hier gesammelt.
+
+## [0.5.0] - 2026-09-08
+
+- Added the v0.5 Operations Intelligence layer: daily operations briefing,
+  expanded Security Posture, redacted Knowledge API, and provider health
+  history with dedicated read-only Agent API scopes.
+- Added `get_daily_operations_briefing` and `get_knowledge_context` to the
+  MCP adapter and documented the API governance and v0.5 contracts.
+- Added PostgreSQL persistence for sanitized knowledge entries and provider
+  synchronization history; resolved incidents can contribute a summary entry.
+
 
 - Added v0.4 Incident Reconstruction API/MCP read-only replay, including stored correlation chains, status history, provider origins, and alert grouping without raw payloads.
 - Added historical intelligence summary, Security Briefing, and safe service dependency graph endpoints with dedicated agent scopes and MCP tools.
@@ -60,6 +72,7 @@
 - Production backup, restore, update, migration, and container-hardening workflows.
 - Role-aware global and endpoint-specific API rate limits with 429 retry headers and audit events.
 
-[Unreleased]: https://github.com/lesecuritae/clawforge/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/lesecuritae/clawforge/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/lesecuritae/clawforge/releases/tag/v0.5.0
 [0.4.0]: https://github.com/lesecuritae/clawforge/releases/tag/v0.4.0
 [0.3.0]: https://github.com/lesecuritae/clawforge/releases/tag/v0.3.0

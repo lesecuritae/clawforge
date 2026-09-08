@@ -1166,6 +1166,29 @@ impl PostgresStore {
                 )
                 .await;
         }
+        if matches!(status, "resolved" | "closed") {
+            if let Ok(Some(incident)) = self.get_incident(id).await {
+                let title = format!("Resolved incident {}", id);
+                let summary = incident
+                    .get("summary")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("Incident resolved")
+                    .to_string();
+                let _ = self
+                    .create_knowledge_entry(
+                        "incident",
+                        &title,
+                        &summary,
+                        "incident_management",
+                        Some(id),
+                        &serde_json::json!([
+                            "resolved",
+                            incident.get("severity").cloned().unwrap_or_default()
+                        ]),
+                    )
+                    .await;
+            }
+        }
         Ok(())
     }
 
@@ -1575,6 +1598,37 @@ impl PostgresStore {
                 }).collect()
     }
 
+    /// Return bounded provider health history. Only normalized operational
+    /// metadata is exposed; feed contents and credentials never enter this
+    /// table.
+    pub async fn list_provider_history(
+        &self,
+        provider_id: &str,
+        limit: i64,
+    ) -> Result<Vec<serde_json::Value>> {
+        let rows = sqlx::query("SELECT id,provider_id,state,recorded_at,last_error,quality_score,data_age_seconds,indicator_count,sync_duration_ms FROM provider_history WHERE provider_id=$1 ORDER BY recorded_at DESC LIMIT $2")
+            .bind(provider_id)
+            .bind(limit.clamp(1, 500))
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                serde_json::json!({
+                    "id": row.get::<i64,_>("id"),
+                    "provider_id": row.get::<String,_>("provider_id"),
+                    "status": row.get::<String,_>("state"),
+                    "timestamp": row.get::<chrono::DateTime<chrono::Utc>,_>("recorded_at"),
+                    "last_error": row.try_get::<String,_>("last_error").ok(),
+                    "quality_score": row.get::<i16,_>("quality_score"),
+                    "data_age_seconds": row.try_get::<f64,_>("data_age_seconds").ok(),
+                    "indicator_count": row.get::<i32,_>("indicator_count"),
+                    "sync_duration_ms": row.get::<i64,_>("sync_duration_ms")
+                })
+            })
+            .collect())
+    }
+
     pub async fn list_indicator_views(&self, limit: i64) -> Result<Vec<serde_json::Value>> {
         let rows = sqlx::query("SELECT i.id, i.value, i.indicator_type, i.categories, i.confidence, i.source, i.first_seen, i.last_seen, i.expires_at, i.metadata, EXTRACT(EPOCH FROM (NOW() - i.last_seen)) AS age_seconds, r.risk_score, r.trust_score, r.reason, r.recorded_at FROM indicators i LEFT JOIN LATERAL (SELECT risk_score, trust_score, reason, recorded_at FROM risk_history WHERE indicator_id = i.id ORDER BY recorded_at DESC LIMIT 1) r ON TRUE ORDER BY i.last_seen DESC LIMIT $1")
             .bind(limit.clamp(1, 1000)).fetch_all(&self.pool).await?;
@@ -1872,6 +1926,8 @@ impl PostgresStore {
     pub async fn provider_started(&self, provider_id: &str) -> Result<()> {
         sqlx::query("INSERT INTO provider_status (provider_id, state, last_started_at, updated_at) VALUES ($1,'running',NOW(),NOW()) ON CONFLICT (provider_id) DO UPDATE SET state='running', last_started_at=NOW(), updated_at=NOW()")
             .bind(provider_id).execute(&self.pool).await?;
+        sqlx::query("INSERT INTO provider_history (provider_id,state,quality_score,data_age_seconds,indicator_count,sync_duration_ms) SELECT $1,'running',p.quality_score,EXTRACT(EPOCH FROM (NOW()-s.last_data_at)),COALESCE(s.indicator_count,0),COALESCE(s.sync_duration_ms,0) FROM providers p LEFT JOIN provider_status s ON s.provider_id=p.id WHERE p.id=$1")
+            .bind(provider_id).execute(&self.pool).await?;
         Ok(())
     }
 
@@ -1889,6 +1945,8 @@ impl PostgresStore {
             .bind(provider_id)
             .execute(&self.pool)
             .await?;
+        sqlx::query("INSERT INTO provider_history (provider_id,state,quality_score,data_age_seconds,indicator_count,sync_duration_ms) SELECT $1,'ok',p.quality_score,EXTRACT(EPOCH FROM (NOW()-s.last_data_at)),s.indicator_count,s.sync_duration_ms FROM providers p JOIN provider_status s ON s.provider_id=p.id WHERE p.id=$1")
+            .bind(provider_id).execute(&self.pool).await?;
         Ok(())
     }
 
@@ -1906,7 +1964,54 @@ impl PostgresStore {
             .bind(provider_id)
             .execute(&self.pool)
             .await?;
+        sqlx::query("INSERT INTO provider_history (provider_id,state,last_error,quality_score,data_age_seconds,indicator_count,sync_duration_ms) SELECT $1,'error',$2,p.quality_score,EXTRACT(EPOCH FROM (NOW()-s.last_data_at)),s.indicator_count,s.sync_duration_ms FROM providers p JOIN provider_status s ON s.provider_id=p.id WHERE p.id=$1")
+            .bind(provider_id).bind(error).execute(&self.pool).await?;
         Ok(())
+    }
+
+    pub async fn list_knowledge_entries(&self, limit: i64) -> Result<Vec<serde_json::Value>> {
+        let rows = sqlx::query("SELECT id,entry_type,title,summary,source,created_at,related_incident,tags FROM knowledge_entries ORDER BY created_at DESC LIMIT $1")
+            .bind(limit.clamp(1, 500)).fetch_all(&self.pool).await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                serde_json::json!({
+                    "id": row.get::<i64,_>("id"),
+                    "type": row.get::<String,_>("entry_type"),
+                    "title": row.get::<String,_>("title"),
+                    "summary": row.get::<String,_>("summary"),
+                    "source": row.get::<String,_>("source"),
+                    "created_at": row.get::<chrono::DateTime<chrono::Utc>,_>("created_at"),
+                    "related_incident": row.try_get::<Uuid,_>("related_incident").ok(),
+                    "tags": row.get::<serde_json::Value,_>("tags")
+                })
+            })
+            .collect())
+    }
+
+    pub async fn create_knowledge_entry(
+        &self,
+        entry_type: &str,
+        title: &str,
+        summary: &str,
+        source: &str,
+        related_incident: Option<Uuid>,
+        tags: &serde_json::Value,
+    ) -> Result<i64> {
+        if !matches!(entry_type, "incident" | "lesson_learned" | "pattern") {
+            anyhow::bail!("invalid knowledge entry type");
+        }
+        if title.trim().is_empty()
+            || title.len() > 240
+            || summary.trim().is_empty()
+            || summary.len() > 10_000
+        {
+            anyhow::bail!("invalid knowledge entry text");
+        }
+        let id = sqlx::query_scalar::<_, i64>("INSERT INTO knowledge_entries (entry_type,title,summary,source,related_incident,tags) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (entry_type,related_incident) DO UPDATE SET title=EXCLUDED.title,summary=EXCLUDED.summary,source=EXCLUDED.source,tags=EXCLUDED.tags RETURNING id")
+            .bind(entry_type).bind(title.trim()).bind(summary.trim()).bind(source).bind(related_incident).bind(tags)
+            .fetch_one(&self.pool).await?;
+        Ok(id)
     }
 
     pub async fn expire_indicators(&self, now: chrono::DateTime<chrono::Utc>) -> Result<u64> {
