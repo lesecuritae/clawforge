@@ -73,6 +73,8 @@ struct RateDecision {
 
 const AGENT_SCOPE_SYSTEM_READ: &str = "agent:system:read";
 const AGENT_SCOPE_EVENTS_READ: &str = "agent:events:read";
+const AGENT_SCOPE_INCIDENT_READ: &str = "agent:incident:read";
+const AGENT_SCOPE_INCIDENTS_READ_LEGACY: &str = "agent:incidents:read";
 const AGENT_SCOPE_INCIDENTS_READ: &str = "agent:incidents:read";
 const AGENT_SCOPE_SECURITY_READ: &str = "agent:security:read";
 const AGENT_SCOPE_NETWORK_READ: &str = "agent:network:read";
@@ -81,6 +83,7 @@ const AGENT_SCOPE_ALL_READ: &str = "agent:read";
 const AGENT_SCOPES: &[&str] = &[
     AGENT_SCOPE_SYSTEM_READ,
     AGENT_SCOPE_EVENTS_READ,
+    AGENT_SCOPE_INCIDENT_READ,
     AGENT_SCOPE_INCIDENTS_READ,
     AGENT_SCOPE_SECURITY_READ,
     AGENT_SCOPE_NETWORK_READ,
@@ -1063,6 +1066,7 @@ struct AgentQuery {
     active: Option<bool>,
     asn: Option<String>,
     prefix: Option<String>,
+    relation_type: Option<String>,
     network_type: Option<String>,
     rpki_status: Option<String>,
     from: Option<String>,
@@ -1146,13 +1150,63 @@ fn agent_incident_view(value: &serde_json::Value) -> serde_json::Value {
         "id": value.get("id"),
         "status": value.get("status"),
         "severity": value.get("severity"),
+        "confidence": value.get("confidence"),
         "risk_score": value.get("risk_score"),
         "summary": value.get("summary"),
-        "correlation_key": value.get("correlation_key"),
         "event_count": value.get("event_count"),
         "created_at": value.get("created_at"),
         "updated_at": value.get("updated_at")
     })
+}
+
+fn require_agent_incident_scope(principal: &AgentPrincipal) -> ApiResult<()> {
+    // Keep accepting the plural scope issued by the first Agent API release;
+    // new integrations should request the singular, canonical scope.
+    require_agent_scope_any(
+        principal,
+        &[AGENT_SCOPE_INCIDENT_READ, AGENT_SCOPE_INCIDENTS_READ_LEGACY],
+    )
+}
+
+fn agent_incident_timeline_view(value: &serde_json::Value) -> serde_json::Value {
+    let kind = value.get("kind").and_then(serde_json::Value::as_str);
+    let data = value.get("data").unwrap_or(&serde_json::Value::Null);
+    match kind {
+        Some("status") => serde_json::json!({
+            "kind": "status",
+            "timestamp": value.get("timestamp"),
+            "status": data.get("status"),
+            "previous_status": data.get("previous_status"),
+            "reason": data.get("reason")
+        }),
+        Some("relation") => serde_json::json!({
+            "kind": "relation",
+            "timestamp": value.get("timestamp"),
+            "relation_type": data.get("relation_type"),
+            "event_id": data.get("event_id"),
+            "related_event_id": data.get("related_event_id"),
+            "related_incident_id": data.get("related_incident_id"),
+            "event_type": data.get("event_type"),
+            "source": data.get("source"),
+            "severity": data.get("severity"),
+            "occurred_at": data.get("occurred_at"),
+            "correlation_id": data.get("correlation_id"),
+            "indicator": data.get("indicator"),
+            "confidence": data.get("confidence"),
+            "reason": data.get("reason")
+        }),
+        // Operator note bodies are deliberately not exposed to external
+        // agents because they are free-form internal investigation content.
+        Some("note") => serde_json::json!({
+            "kind": "note",
+            "timestamp": value.get("timestamp"),
+            "recorded": true
+        }),
+        _ => serde_json::json!({
+            "kind": "unknown",
+            "timestamp": value.get("timestamp")
+        }),
+    }
 }
 
 fn agent_network_view(value: &serde_json::Value, fields: &[&str]) -> serde_json::Value {
@@ -1274,7 +1328,7 @@ async fn agent_incidents(
     Query(query): Query<AgentQuery>,
 ) -> ApiResult<Json<ApiEnvelope<Vec<serde_json::Value>>>> {
     let principal = authenticate_agent(&state, &headers).await?;
-    require_agent_scope(&principal, AGENT_SCOPE_INCIDENTS_READ)?;
+    require_agent_incident_scope(&principal)?;
     let status =
         match query.status.as_deref() {
             Some(value) => Some(canonical_incident_status(value).ok_or_else(|| {
@@ -1299,7 +1353,133 @@ async fn agent_incidents(
         &state,
         &principal,
         "/api/v1/incidents",
-        AGENT_SCOPE_INCIDENTS_READ,
+        AGENT_SCOPE_INCIDENT_READ,
+    )
+    .await;
+    Ok(envelope(data, Some(pagination)))
+}
+
+async fn agent_incident_detail(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<ApiEnvelope<serde_json::Value>>> {
+    let principal = authenticate_agent(&state, &headers).await?;
+    require_agent_incident_scope(&principal)?;
+    let value = state
+        .store
+        .get_incident(id)
+        .await
+        .map_err(|_| api_error(StatusCode::SERVICE_UNAVAILABLE, "incident unavailable"))?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "incident not found"))?;
+    audit_agent_read(
+        &state,
+        &principal,
+        &format!("/api/v1/incidents/{id}"),
+        AGENT_SCOPE_INCIDENT_READ,
+    )
+    .await;
+    Ok(envelope(agent_incident_view(&value), None))
+}
+
+async fn agent_incident_timeline(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Query(query): Query<AgentQuery>,
+) -> ApiResult<Json<ApiEnvelope<Vec<serde_json::Value>>>> {
+    let principal = authenticate_agent(&state, &headers).await?;
+    require_agent_incident_scope(&principal)?;
+    let timeline = state
+        .store
+        .incident_timeline(id)
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "incident timeline unavailable",
+            )
+        })?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "incident not found"))?;
+    let mut values = timeline
+        .iter()
+        .filter(|value| {
+            query.status.as_deref().is_none_or(|status| {
+                value
+                    .get("data")
+                    .and_then(|data| data.get("status"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some(status)
+            }) && query.severity.as_deref().is_none_or(|severity| {
+                value
+                    .get("data")
+                    .and_then(|data| data.get("severity"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some(severity)
+            }) && agent_time_matches(value, &query)
+        })
+        .map(agent_incident_timeline_view)
+        .collect::<Vec<_>>();
+    let (page, page_size) = agent_page(&query, 50);
+    let (data, pagination) = paged_values(std::mem::take(&mut values), page, page_size);
+    audit_agent_read(
+        &state,
+        &principal,
+        &format!("/api/v1/incidents/{id}/timeline"),
+        AGENT_SCOPE_INCIDENT_READ,
+    )
+    .await;
+    Ok(envelope(data, Some(pagination)))
+}
+
+async fn agent_incident_relations(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Query(query): Query<AgentQuery>,
+) -> ApiResult<Json<ApiEnvelope<Vec<serde_json::Value>>>> {
+    let principal = authenticate_agent(&state, &headers).await?;
+    require_agent_incident_scope(&principal)?;
+    let timeline = state
+        .store
+        .incident_timeline(id)
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "incident relations unavailable",
+            )
+        })?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "incident not found"))?;
+    let values = timeline
+        .iter()
+        .filter(|value| {
+            value.get("kind").and_then(serde_json::Value::as_str) == Some("relation")
+                && query.relation_type.as_deref().is_none_or(|relation_type| {
+                    value
+                        .get("data")
+                        .and_then(|data| data.get("relation_type"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some(relation_type)
+                })
+                && query.severity.as_deref().is_none_or(|severity| {
+                    value
+                        .get("data")
+                        .and_then(|data| data.get("severity"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some(severity)
+                })
+                && agent_time_matches(value, &query)
+        })
+        .map(agent_incident_timeline_view)
+        .collect::<Vec<_>>();
+    let (page, page_size) = agent_page(&query, 50);
+    let (data, pagination) = paged_values(values, page, page_size);
+    audit_agent_read(
+        &state,
+        &principal,
+        &format!("/api/v1/incidents/{id}/relations"),
+        AGENT_SCOPE_INCIDENT_READ,
     )
     .await;
     Ok(envelope(data, Some(pagination)))
@@ -1821,6 +2001,21 @@ fn require_agent_scope(principal: &AgentPrincipal, scope: &str) -> ApiResult<()>
         .scopes
         .iter()
         .any(|value| value == scope || value == AGENT_SCOPE_ALL_READ)
+    {
+        Ok(())
+    } else {
+        Err(api_error(
+            StatusCode::FORBIDDEN,
+            "agent scope is not granted",
+        ))
+    }
+}
+
+fn require_agent_scope_any(principal: &AgentPrincipal, scopes: &[&str]) -> ApiResult<()> {
+    if principal
+        .scopes
+        .iter()
+        .any(|value| value == AGENT_SCOPE_ALL_READ || scopes.iter().any(|scope| value == scope))
     {
         Ok(())
     } else {
@@ -3893,6 +4088,9 @@ async fn main() -> anyhow::Result<()> {
                 .route("/status", get(agent_status))
                 .route("/events", get(agent_events))
                 .route("/incidents", get(agent_incidents))
+                .route("/incidents/{id}", get(agent_incident_detail))
+                .route("/incidents/{id}/timeline", get(agent_incident_timeline))
+                .route("/incidents/{id}/relations", get(agent_incident_relations))
                 .route("/security/findings", get(agent_findings))
                 .route("/security/overview", get(agent_security_overview))
                 .route("/network/asn", get(agent_asn))
@@ -4118,6 +4316,9 @@ mod tests {
         assert!(validate_agent_scopes(
             &[AGENT_SCOPE_EVENTS_READ.to_string()]
         ));
+        assert!(validate_agent_scopes(&[
+            AGENT_SCOPE_INCIDENT_READ.to_string()
+        ]));
         assert!(validate_agent_scopes(&[AGENT_SCOPE_ALL_READ.to_string()]));
         assert!(!validate_agent_scopes(&["agent:admin:write".to_string()]));
         let principal = AgentPrincipal {
@@ -4126,6 +4327,54 @@ mod tests {
             scopes: vec![AGENT_SCOPE_ALL_READ.into()],
         };
         assert!(require_agent_scope(&principal, AGENT_SCOPE_NETWORK_READ).is_ok());
+    }
+
+    #[test]
+    fn agent_incident_views_are_redacted_and_scope_compatible() {
+        let incident = agent_incident_view(&serde_json::json!({
+            "id": "incident-1",
+            "status": "detected",
+            "severity": "high",
+            "confidence": 88,
+            "risk_score": 72,
+            "summary": "Correlated threat",
+            "correlation_key": "internal:198.51.100.10",
+            "candidate_id": "candidate-1",
+            "raw_payload": {"token": "must-not-leak"},
+            "event_count": 2,
+            "created_at": "2026-09-08T00:00:00Z",
+            "updated_at": "2026-09-08T00:01:00Z"
+        }));
+        assert_eq!(incident["confidence"], 88);
+        assert!(incident.get("correlation_key").is_none());
+        assert!(incident.get("candidate_id").is_none());
+        assert!(incident.get("raw_payload").is_none());
+
+        let timeline = agent_incident_timeline_view(&serde_json::json!({
+            "kind": "note",
+            "timestamp": "2026-09-08T00:02:00Z",
+            "data": {"body": "password=must-not-leak", "author": "operator"}
+        }));
+        assert_eq!(timeline["recorded"], true);
+        assert!(timeline.get("body").is_none());
+        assert!(timeline.get("author").is_none());
+
+        let principal = AgentPrincipal {
+            id: Uuid::new_v4(),
+            name: "incident-agent".into(),
+            scopes: vec![AGENT_SCOPE_INCIDENT_READ.into()],
+        };
+        assert!(require_agent_incident_scope(&principal).is_ok());
+        let legacy = AgentPrincipal {
+            scopes: vec![AGENT_SCOPE_INCIDENTS_READ_LEGACY.into()],
+            ..principal.clone()
+        };
+        assert!(require_agent_incident_scope(&legacy).is_ok());
+        let wrong = AgentPrincipal {
+            scopes: vec![AGENT_SCOPE_SECURITY_READ.into()],
+            ..principal
+        };
+        assert!(require_agent_incident_scope(&wrong).is_err());
     }
 
     #[test]

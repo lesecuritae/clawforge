@@ -148,7 +148,7 @@ paths:
                   minItems: 1
                   items:
                     type: string
-                    enum: [agent:system:read, agent:events:read, agent:incidents:read, agent:security:read, agent:network:read, agent:read]
+                    enum: [agent:system:read, agent:events:read, agent:incident:read, agent:incidents:read, agent:security:read, agent:network:read, agent:read]
                 expires_in_hours: { type: integer, minimum: 1, maximum: 8760, default: 720 }
       responses:
         '200': { description: Token envelope; the secret is not persisted and is shown once }
@@ -190,7 +190,7 @@ paths:
   /api/v1/incidents:
     get:
       security: [{ agentBearerAuth: [] }]
-      description: Read-only incident list.
+      description: Read-only incident list. Requires agent:incident:read; the legacy agent:incidents:read scope remains accepted for existing tokens.
       parameters:
         - { in: query, name: page, schema: { type: integer, minimum: 1, default: 1 } }
         - { in: query, name: page_size, schema: { type: integer, minimum: 1, maximum: 100, default: 50 } }
@@ -202,6 +202,57 @@ paths:
         '200': { description: Paginated agent incident envelope }
         '401': { description: Agent token missing or invalid }
         '403': { description: Required agent scope missing }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { description: Incident storage unavailable }
+  /api/v1/incidents/{id}:
+    get:
+      security: [{ agentBearerAuth: [] }]
+      description: Read-only incident detail without candidate provenance, correlation keys, notes, or raw payloads. Requires agent:incident:read.
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200': { description: Agent incident detail envelope }
+        '401': { description: Agent token missing or invalid }
+        '403': { description: Required agent scope missing }
+        '404': { description: Incident not found }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { description: Incident storage unavailable }
+  /api/v1/incidents/{id}/timeline:
+    get:
+      security: [{ agentBearerAuth: [] }]
+      description: Paginated, redacted incident timeline. Free-form operator note bodies are omitted. Requires agent:incident:read.
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string, format: uuid } }
+        - { in: query, name: page, schema: { type: integer, minimum: 1, default: 1 } }
+        - { in: query, name: page_size, schema: { type: integer, minimum: 1, maximum: 100, default: 50 } }
+        - { in: query, name: status, schema: { type: string, enum: [detected, investigating, confirmed, mitigated, resolved, closed] } }
+        - { in: query, name: severity, schema: { type: string } }
+        - { in: query, name: from, schema: { type: string, format: date-time } }
+        - { in: query, name: to, schema: { type: string, format: date-time } }
+      responses:
+        '200': { description: Paginated agent incident timeline envelope }
+        '401': { description: Agent token missing or invalid }
+        '403': { description: Required agent scope missing }
+        '404': { description: Incident not found }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { description: Incident storage unavailable }
+  /api/v1/incidents/{id}/relations:
+    get:
+      security: [{ agentBearerAuth: [] }]
+      description: Paginated incident relations with normalized event and indicator context, never raw payloads. Requires agent:incident:read.
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string, format: uuid } }
+        - { in: query, name: page, schema: { type: integer, minimum: 1, default: 1 } }
+        - { in: query, name: page_size, schema: { type: integer, minimum: 1, maximum: 100, default: 50 } }
+        - { in: query, name: relation_type, schema: { type: string, enum: [event, indicator, event_relationship, incident] } }
+        - { in: query, name: severity, schema: { type: string } }
+        - { in: query, name: from, schema: { type: string, format: date-time } }
+        - { in: query, name: to, schema: { type: string, format: date-time } }
+      responses:
+        '200': { description: Paginated agent incident relations envelope }
+        '401': { description: Agent token missing or invalid }
+        '403': { description: Required agent scope missing }
+        '404': { description: Incident not found }
         '429': { $ref: '#/components/responses/RateLimited' }
         '503': { description: Incident storage unavailable }
   /api/v1/security/findings:

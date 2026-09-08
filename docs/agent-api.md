@@ -108,7 +108,10 @@ rollenbasierte Exportfunktionen. Zeitangaben sind UTC in RFC-3339-Format.
 | --- | --- | --- | --- |
 | `GET /api/v1/status` | Betriebszustand | API, Worker, PostgreSQL, Migrationen, Event-Consumer, Provider-Zusammenfassung, Versionsstand | `agent:system:read` |
 | `GET /api/v1/events` | aktuelle kanonische Events | Typ, Quelle, Severity, Zeit, Korrelation, begründete Zusammenfassung | `agent:events:read` |
-| `GET /api/v1/incidents` | Incident-Liste | Status, Severity, Risiko, Summary, Zeit, Event-Anzahl | `agent:incidents:read` |
+| `GET /api/v1/incidents` | Incident-Liste | Status, Severity, Confidence, Risiko, Summary, Zeit, Event-Anzahl | `agent:incident:read` |
+| `GET /api/v1/incidents/{id}` | Incident-Details | Status, Severity, Confidence, Risiko, Summary und Zeit | `agent:incident:read` |
+| `GET /api/v1/incidents/{id}/timeline` | Incident-Timeline | Status- und Relationsereignisse, paginiert und redigiert | `agent:incident:read` |
+| `GET /api/v1/incidents/{id}/relations` | Incident-Relationen | Events, Indicators und Incident-Beziehungen ohne Rohpayload | `agent:incident:read` |
 | `GET /api/v1/security/findings` | Security Findings | Indicator-Finding, Quelle, Confidence, Alter, Ablauf, Risk-/Trust-Werte, Reason | `agent:security:read` |
 | `GET /api/v1/security/overview` | Security-Zusammenfassung | Finding-Anzahl, aktive Findings, Severity-Verteilung, höchste gespeicherte Bewertung | `agent:security:read` |
 | `GET /api/v1/network/asn` | ASN-Kontext | ASN, Organisation, Provider, Land, Prefixe, Netzwerktyp, Reputation, Alter | `agent:network:read` |
@@ -117,7 +120,8 @@ rollenbasierte Exportfunktionen. Zeitangaben sind UTC in RFC-3339-Format.
 | `GET /api/v1/network/rpki` | ROA-Bewertung | Prefix, ASN, Valid/Invalid/Unknown, Quelle, Zeit, Trust-Hinweis | `agent:network:read` |
 | `GET /api/v1/network/trust` | Trusted Infrastructure | Name, Typ, Identifier, Status, Zeit, Confidence und gespeicherter Trust-Wert ohne Registry-Interna | `agent:network:read` |
 
-Die Detailrouten für einzelne Events und Incidents sowie Provider- und
+Die Agent-Incident-Detail-, Timeline- und Relationsrouten sind read-only. Die
+übrigen Detailrouten für einzelne Events sowie Provider- und
 Capabilities-Ressourcen bleiben für Phase 2 vorgesehen.
 
 Die Ressourcen sind ausschließlich `GET`. Es gibt unter `/api/v1` keine
@@ -128,10 +132,11 @@ Incident-Statusänderung, Policy- oder Blockaktion.
 
 Listen unterstützen, soweit fachlich sinnvoll:
 
-- `page`, `page_size`
+- `page`, `page_size` für alle Listen und Incident-Unterressourcen
 - `from`, `to`
 - `severity`, `source`, `status`
 - `event_type` und `correlation_id` für Events
+- `relation_type` für Incident-Relationen
 - `asn`, `prefix` und `rpki_status` für Netzwerkdaten
 - `confidence_min` und `active` für Findings
 
@@ -186,6 +191,27 @@ Ein Finding liefert die bereits gespeicherte Bewertung und ihre Herkunft:
 }
 ```
 
+Ein Agent-Incident enthält nur den stabilen, bereits bewerteten Kontext:
+
+```json
+{
+  "id": "incident-uuid",
+  "status": "investigating",
+  "severity": "high",
+  "confidence": 88,
+  "risk_score": 72,
+  "summary": "Correlated threat",
+  "event_count": 2,
+  "created_at": "2026-09-08T00:00:00Z",
+  "updated_at": "2026-09-08T00:05:00Z"
+}
+```
+
+`correlation_key`, `candidate_id`, Notiztexte, Rohpayloads und interne
+Datenbankfelder werden nicht ausgegeben. Timeline- und Relationsantworten
+verwenden dieselbe Hülle und Pagination; freie Operator-Notizen werden nur als
+`recorded: true` signalisiert.
+
 Ein Netzwerkdatensatz enthält stets Quelle, Zeitpunkt, Alter und vorhandene
 Bewertung. Die API berechnet dabei keinen neuen Score; sie gibt die vom
 bestehenden Network-/Risk-Layer gespeicherten Werte aus.
@@ -203,7 +229,10 @@ Die Autorisierung wird an der Fassade zentral geprüft:
 
 Die geplanten Agent-Scopes sind absichtlich feiner als die bestehenden
 UI-Rollen. Ein Operator- oder Administrator-Benutzer kann später einen
-separaten Agent-Token mit einer Teilmenge seiner Leserechte ausstellen. Ein
+separaten Agent-Token mit einer Teilmenge seiner Leserechte ausstellen. Für
+Incidents ist `agent:incident:read` der kanonische Scope. Der frühere
+`agent:incidents:read` wird für bereits ausgestellte Tokens aus
+Kompatibilitätsgründen weiterhin akzeptiert. Ein
 Agent-Token erhält niemals Schreibrechte. Tokenwerte, IPs und Rohpayloads
 werden weder geloggt noch in Audit-Details abgelegt.
 
