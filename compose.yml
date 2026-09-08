@@ -163,6 +163,37 @@ services:
       retries: 5
     restart: unless-stopped
 
+  clawforge-correlation:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    command: ["/usr/local/bin/clawforge-correlation"]
+    environment:
+      DATABASE_URL_FILE: /run/secrets/database_url
+      CLAWFORGE_CORRELATION_POLL_SECONDS: ${CLAWFORGE_CORRELATION_POLL_SECONDS:-5}
+      CLAWFORGE_CORRELATION_WINDOW_SECONDS: ${CLAWFORGE_CORRELATION_WINDOW_SECONDS:-900}
+      RUST_LOG: ${RUST_LOG:-info}
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=32m
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    depends_on:
+      postgres:
+        condition: service_healthy
+    secrets:
+      - database_url
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "kill -0 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
   clawforge-mcp:
     build:
       context: .

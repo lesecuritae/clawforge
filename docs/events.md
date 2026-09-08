@@ -1,5 +1,9 @@
 # Event backbone
 
+The event backbone remains the canonical append-only event and delivery layer.
+The separate correlation consumer reads its deliveries and stores analysis
+relationships in `event_relationships`; it does not alter this event model.
+
 The event backbone uses migration `0011_events.sql` and keeps canonical events
 separate from delivery state. `events` stores the immutable event envelope;
 `event_consumers` tracks service heartbeats; `event_delivery` tracks retries,

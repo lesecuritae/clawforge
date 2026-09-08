@@ -278,6 +278,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "clawforge-correlation"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clawforge-storage",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "clawforge-events"
 version = "0.1.0"
 dependencies = [

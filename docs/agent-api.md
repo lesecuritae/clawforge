@@ -155,7 +155,7 @@ Ein Systemstatus enthält Komponentenstatus statt interner Prozessdetails:
     "service": "clawforge",
     "version": "0.1.0",
     "status": "ok",
-    "migrations": { "current": true, "applied": 12, "expected": 12 },
+    "migrations": { "current": true, "applied": 13, "expected": 13 },
     "runtime": [],
     "events": { "pending": 0, "failed": 0 },
     "providers": { "total": 0, "enabled": 0 }

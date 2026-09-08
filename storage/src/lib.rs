@@ -499,6 +499,109 @@ impl PostgresStore {
         Ok(result)
     }
 
+    /// Return the bounded event context used by the correlation analysis
+    /// layer. The event backbone remains the source of truth; this method only
+    /// exposes a time-windowed read view to the separate correlation worker.
+    pub async fn list_correlation_events(
+        &self,
+        occurred_at: chrono::DateTime<chrono::Utc>,
+        window: chrono::Duration,
+        exclude: Uuid,
+    ) -> Result<Vec<CorrelationEvent>> {
+        let from = occurred_at - window;
+        let to = occurred_at + window;
+        let rows = sqlx::query("SELECT event_id,event_type,source,severity,occurred_at,correlation_id,payload FROM events WHERE event_id <> $1 AND occurred_at BETWEEN $2 AND $3 ORDER BY occurred_at DESC LIMIT 500")
+            .bind(exclude)
+            .bind(from)
+            .bind(to)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| CorrelationEvent {
+                event_id: row.get("event_id"),
+                event_type: row.get("event_type"),
+                source: row.get("source"),
+                severity: row.get("severity"),
+                occurred_at: row.get("occurred_at"),
+                correlation_id: row.get("correlation_id"),
+                payload: row.get("payload"),
+            })
+            .collect())
+    }
+
+    /// Store relationships and the corresponding candidate atomically. This
+    /// never republishes events and does not promote a candidate into an
+    /// actionable incident.
+    pub async fn persist_correlation(&self, request: CorrelationPersistence<'_>) -> Result<Uuid> {
+        let candidate_from = request.first_seen - request.window;
+        let mut tx = self.pool.begin().await?;
+        let existing = sqlx::query("SELECT id,severity FROM incident_candidates WHERE correlation_key=$1 AND status='open' AND last_seen >= $2 ORDER BY last_seen DESC LIMIT 1 FOR UPDATE")
+            .bind(request.correlation_key)
+            .bind(candidate_from)
+            .fetch_optional(&mut *tx)
+            .await?;
+        let candidate_id = if let Some(row) = existing {
+            let id: Uuid = row.get("id");
+            let current_severity: String = row.get("severity");
+            let next_severity = max_incident_severity(&current_severity, request.severity);
+            sqlx::query("UPDATE incident_candidates SET confidence=GREATEST(confidence,$2), severity=$3, first_seen=LEAST(first_seen,$4), last_seen=GREATEST(last_seen,$5), summary=$6, updated_at=NOW() WHERE id=$1")
+                .bind(id)
+                .bind(request.confidence.clamp(0, 100))
+                .bind(next_severity)
+                .bind(request.first_seen)
+                .bind(request.last_seen)
+                .bind(request.summary)
+                .execute(&mut *tx)
+                .await?;
+            id
+        } else {
+            let id = Uuid::new_v4();
+            sqlx::query("INSERT INTO incident_candidates (id,correlation_key,confidence,severity,first_seen,last_seen,summary) VALUES ($1,$2,$3,$4,$5,$6,$7)")
+                .bind(id)
+                .bind(request.correlation_key)
+                .bind(request.confidence.clamp(0, 100))
+                .bind(request.severity)
+                .bind(request.first_seen)
+                .bind(request.last_seen)
+                .bind(request.summary)
+                .execute(&mut *tx)
+                .await?;
+            id
+        };
+        for event_id in request.event_ids {
+            sqlx::query("INSERT INTO incident_candidate_events (candidate_id,event_id) VALUES ($1,$2) ON CONFLICT DO NOTHING")
+                .bind(candidate_id)
+                .bind(event_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        sqlx::query("UPDATE incident_candidates SET event_count=(SELECT COUNT(*) FROM incident_candidate_events WHERE candidate_id=$1), updated_at=NOW() WHERE id=$1")
+            .bind(candidate_id)
+            .execute(&mut *tx)
+            .await?;
+        for relationship in request.relationships {
+            let (event_id, related_event_id) =
+                if relationship.event_id.to_string() <= relationship.related_event_id.to_string() {
+                    (relationship.event_id, relationship.related_event_id)
+                } else {
+                    (relationship.related_event_id, relationship.event_id)
+                };
+            sqlx::query("INSERT INTO event_relationships (id,event_id,related_event_id,candidate_id,relation_type,confidence,reason) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (event_id,related_event_id,relation_type) DO UPDATE SET candidate_id=COALESCE(event_relationships.candidate_id,EXCLUDED.candidate_id),confidence=GREATEST(event_relationships.confidence,EXCLUDED.confidence),reason=EXCLUDED.reason")
+                .bind(Uuid::new_v4())
+                .bind(event_id)
+                .bind(related_event_id)
+                .bind(candidate_id)
+                .bind(&relationship.relation_type)
+                .bind(relationship.confidence.clamp(0, 100))
+                .bind(&relationship.reason)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(candidate_id)
+    }
+
     pub async fn complete_event_delivery(
         &self,
         delivery_id: Uuid,
@@ -1622,6 +1725,38 @@ pub struct AgentPrincipal {
 pub struct ProviderSyncRequest {
     pub id: Uuid,
     pub provider_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct CorrelationEvent {
+    pub event_id: Uuid,
+    pub event_type: String,
+    pub source: String,
+    pub severity: String,
+    pub occurred_at: chrono::DateTime<chrono::Utc>,
+    pub correlation_id: Option<String>,
+    pub payload: serde_json::Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct EventRelationship {
+    pub event_id: Uuid,
+    pub related_event_id: Uuid,
+    pub relation_type: String,
+    pub confidence: i16,
+    pub reason: String,
+}
+
+pub struct CorrelationPersistence<'a> {
+    pub correlation_key: &'a str,
+    pub confidence: i16,
+    pub severity: &'a str,
+    pub summary: &'a str,
+    pub first_seen: chrono::DateTime<chrono::Utc>,
+    pub last_seen: chrono::DateTime<chrono::Utc>,
+    pub window: chrono::Duration,
+    pub event_ids: &'a [Uuid],
+    pub relationships: &'a [EventRelationship],
 }
 
 fn normalize_incident_severity(value: &str) -> String {
