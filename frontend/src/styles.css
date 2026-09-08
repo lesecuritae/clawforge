@@ -83,5 +83,7 @@ td { border-top: 1px solid #16283d; padding: 14px 21px; color: #c5d1df; white-sp
 .graph-wrap { overflow: auto; padding: 18px 21px 25px; background: #091523; }
 .graph-svg { display: block; min-width: 760px; width: 100%; height: auto; min-height: 300px; }
 .graph-nodes text { pointer-events: none; }
+.check-list { list-style: none; display: grid; gap: 10px; padding: 16px 21px 20px; margin: 0; }
+.check-list li { display: flex; align-items: center; gap: 10px; color: #c5d1df; font-size: 12px; }
 @media (max-width: 720px) { .trust-summary { gap: 6px; padding: 12px; }.trust-summary .metric { padding: 10px; }.trust-summary .eyebrow { font-size: 8px; }.monitor-grid { grid-template-columns: 1fr 1fr; padding: 12px; }.event-filters label { width: 100%; }.event-filters label input, .event-filters label select { width: 100%; } }
 @media (max-width: 720px) { .toolbar { align-items: stretch; }.toolbar label, .search-label, .search-label input { width: 100%; }.toolbar input, .toolbar select { width: 100%; }.status-actions { align-items: flex-end; flex-direction: column; } }

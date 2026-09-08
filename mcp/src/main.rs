@@ -31,6 +31,8 @@ const SCOPE_INCIDENT: &str = "agent:incident:read";
 const SCOPE_INCIDENTS_LEGACY: &str = "agent:incidents:read";
 const SCOPE_CONTEXT: &str = "agent:context:read";
 const SCOPE_DECISION: &str = "agent:decision:read";
+const SCOPE_PROVIDER: &str = "agent:provider:read";
+const SCOPE_OPERATIONS: &str = "agent:operations:read";
 const SCOPE_SECURITY: &str = "agent:security:read";
 const SCOPE_NETWORK: &str = "agent:network:read";
 const SCOPE_ALL: &str = "agent:read";
@@ -227,6 +229,8 @@ fn parse_scopes(value: &str) -> Result<HashSet<String>> {
         SCOPE_INCIDENTS_LEGACY,
         SCOPE_CONTEXT,
         SCOPE_DECISION,
+        SCOPE_PROVIDER,
+        SCOPE_OPERATIONS,
         SCOPE_SECURITY,
         SCOPE_NETWORK,
         SCOPE_ALL,
@@ -544,6 +548,33 @@ impl McpServer {
     ) -> Result<Json<ToolResponse>, ErrorData> {
         Ok(Json(
             self.get(SCOPE_DECISION, "/api/v1/decisions", &[]).await?,
+        ))
+    }
+
+    #[tool(
+        name = "get_provider_status",
+        description = "Read normalized Clawforge provider health and synchronization status"
+    )]
+    async fn get_provider_status(
+        &self,
+        Parameters(_args): Parameters<EmptyArgs>,
+    ) -> Result<Json<ToolResponse>, ErrorData> {
+        Ok(Json(
+            self.get(SCOPE_PROVIDER, "/api/v1/providers", &[]).await?,
+        ))
+    }
+
+    #[tool(
+        name = "get_operations_summary",
+        description = "Read the high-level, read-only Clawforge operations summary"
+    )]
+    async fn get_operations_summary(
+        &self,
+        Parameters(_args): Parameters<EmptyArgs>,
+    ) -> Result<Json<ToolResponse>, ErrorData> {
+        Ok(Json(
+            self.get(SCOPE_OPERATIONS, "/api/v1/operations/summary", &[])
+                .await?,
         ))
     }
 
@@ -910,6 +941,14 @@ mod tests {
             .get_decisions(Parameters(EmptyArgs::default()))
             .await
             .is_err());
+        assert!(server
+            .get_provider_status(Parameters(EmptyArgs::default()))
+            .await
+            .is_err());
+        assert!(server
+            .get_operations_summary(Parameters(EmptyArgs::default()))
+            .await
+            .is_err());
     }
 
     #[test]
@@ -920,6 +959,12 @@ mod tests {
         let decision = McpServer::new(test_config(&[SCOPE_DECISION]));
         assert!(decision.require_scope(SCOPE_DECISION).is_ok());
         assert!(decision.require_scope(SCOPE_CONTEXT).is_err());
+        let provider = McpServer::new(test_config(&[SCOPE_PROVIDER]));
+        assert!(provider.require_scope(SCOPE_PROVIDER).is_ok());
+        assert!(provider.require_scope(SCOPE_OPERATIONS).is_err());
+        let operations = McpServer::new(test_config(&[SCOPE_OPERATIONS]));
+        assert!(operations.require_scope(SCOPE_OPERATIONS).is_ok());
+        assert!(operations.require_scope(SCOPE_PROVIDER).is_err());
     }
 
     #[tokio::test]
@@ -998,6 +1043,8 @@ mod tests {
                 "get_incident_relations",
                 "get_incident_timeline",
                 "get_network_overview",
+                "get_operations_summary",
+                "get_provider_status",
                 "get_security_overview",
                 "get_status",
                 "get_trust_status",
@@ -1114,7 +1161,7 @@ mod tests {
         );
         let client = ClientInfo::default().serve(transport).await.unwrap();
         let tools = client.list_tools(None).await.unwrap();
-        assert_eq!(tools.tools.len(), 12);
+        assert_eq!(tools.tools.len(), 14);
         client.cancel().await.unwrap();
         server.abort();
     }
@@ -1147,6 +1194,18 @@ mod tests {
                     "attention_points":[{"payload":{"secret":"removed"},"correlation_key":"removed"}],
                     "recommended_checks":[{"check":"incident_timelines"}],
                     "context":{"candidate_id":"removed"}
+                }),
+                "/api/v1/providers" => json!([
+                    {"id":"threatfox","name":"ThreatFox","status":"ok","quality_score":90,"last_error":"none","raw_payload":{"secret":"removed"}}
+                ]),
+                "/api/v1/operations/summary" => json!({
+                    "overall_status":"high",
+                    "risk_level":"high",
+                    "active_incidents":1,
+                    "critical_events":0,
+                    "provider_health":{"total":1,"items":[{"raw_payload":{"secret":"removed"}}]},
+                    "attention_points":[],
+                    "recommended_checks":[]
                 }),
                 "/api/v1/security/overview" => json!({"findings_total":1,"active_findings":1}),
                 "/api/v1/incidents" => json!([
@@ -1211,6 +1270,8 @@ mod tests {
             "get_incident_relations",
             "get_agent_context",
             "get_decisions",
+            "get_provider_status",
+            "get_operations_summary",
             "get_status",
             "get_security_overview",
         ] {
@@ -1240,6 +1301,12 @@ mod tests {
             }
             if tool == "get_decisions" {
                 assert!(serialized.contains("\"overall_status\""));
+            }
+            if tool == "get_provider_status" {
+                assert!(serialized.contains("\"quality_score\""));
+            }
+            if tool == "get_operations_summary" {
+                assert!(serialized.contains("\"provider_health\""));
             }
         }
 

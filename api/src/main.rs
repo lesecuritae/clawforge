@@ -21,7 +21,8 @@ use axum::{
 use chrono::{Duration, Utc};
 use clawforge_intelligence::{NetworkType, TrustedNetwork, VerificationStatus};
 use clawforge_storage::{
-    database_url_from_env, AdminPrincipal, AgentPrincipal, MigrationStatus, PostgresStore,
+    database_url_from_env, AdminPrincipal, AgentPrincipal, AuditEventFilter, MigrationStatus,
+    PostgresStore,
 };
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
@@ -78,6 +79,8 @@ const AGENT_SCOPE_INCIDENTS_READ_LEGACY: &str = "agent:incidents:read";
 const AGENT_SCOPE_INCIDENTS_READ: &str = "agent:incidents:read";
 const AGENT_SCOPE_CONTEXT_READ: &str = "agent:context:read";
 const AGENT_SCOPE_DECISION_READ: &str = "agent:decision:read";
+const AGENT_SCOPE_PROVIDER_READ: &str = "agent:provider:read";
+const AGENT_SCOPE_OPERATIONS_READ: &str = "agent:operations:read";
 const AGENT_SCOPE_SECURITY_READ: &str = "agent:security:read";
 const AGENT_SCOPE_NETWORK_READ: &str = "agent:network:read";
 const AGENT_SCOPE_ALL_READ: &str = "agent:read";
@@ -89,6 +92,8 @@ const AGENT_SCOPES: &[&str] = &[
     AGENT_SCOPE_INCIDENTS_READ,
     AGENT_SCOPE_CONTEXT_READ,
     AGENT_SCOPE_DECISION_READ,
+    AGENT_SCOPE_PROVIDER_READ,
+    AGENT_SCOPE_OPERATIONS_READ,
     AGENT_SCOPE_SECURITY_READ,
     AGENT_SCOPE_NETWORK_READ,
     AGENT_SCOPE_ALL_READ,
@@ -1154,6 +1159,7 @@ fn agent_incident_view(value: &serde_json::Value) -> serde_json::Value {
         "id": value.get("id"),
         "status": value.get("status"),
         "severity": value.get("severity"),
+        "source": value.get("source"),
         "confidence": value.get("confidence"),
         "risk_score": value.get("risk_score"),
         "summary": value.get("summary"),
@@ -1584,6 +1590,116 @@ fn decision_risk_assessment(
     })
 }
 
+fn agent_provider_view(value: &serde_json::Value) -> serde_json::Value {
+    let status = value
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            if value
+                .get("enabled")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            {
+                "unknown".to_string()
+            } else {
+                "disabled".to_string()
+            }
+        });
+    serde_json::json!({
+        "id": value.get("id"),
+        "name": value.get("name"),
+        "type": value.get("source"),
+        "source": value.get("source"),
+        "status": status,
+        "enabled": value.get("enabled"),
+        "last_success": value.get("last_success_at"),
+        "last_failure": value.get("last_failure_at"),
+        "last_error": value.get("last_error"),
+        "data_age": value.get("age_seconds"),
+        "data_age_seconds": value.get("age_seconds"),
+        "quality_score": value.get("quality_score").or_else(|| value.get("confidence")),
+        "indicator_count": value.get("indicator_count"),
+        "sync_duration_ms": value.get("sync_duration_ms"),
+        "timestamp": value.get("timestamp")
+    })
+}
+
+fn operations_provider_health(values: &[serde_json::Value]) -> serde_json::Value {
+    let healthy = values
+        .iter()
+        .filter(|value| value.get("status").and_then(serde_json::Value::as_str) == Some("ok"))
+        .count();
+    let failed = values
+        .iter()
+        .filter(|value| value.get("status").and_then(serde_json::Value::as_str) == Some("error"))
+        .count();
+    let enabled = values
+        .iter()
+        .filter(|value| value.get("enabled").and_then(serde_json::Value::as_bool) == Some(true))
+        .count();
+    let quality_sum = values
+        .iter()
+        .filter_map(|value| {
+            value
+                .get("quality_score")
+                .or_else(|| value.get("confidence"))
+                .and_then(serde_json::Value::as_i64)
+        })
+        .sum::<i64>();
+    let quality_count = values
+        .iter()
+        .filter(|value| {
+            value
+                .get("quality_score")
+                .or_else(|| value.get("confidence"))
+                .and_then(serde_json::Value::as_i64)
+                .is_some()
+        })
+        .count();
+    serde_json::json!({
+        "total": values.len(),
+        "enabled": enabled,
+        "healthy": healthy,
+        "failed": failed,
+        "average_quality_score": if quality_count == 0 { 0 } else { quality_sum / quality_count as i64 },
+        "items": values.iter().map(agent_provider_view).collect::<Vec<_>>()
+    })
+}
+
+fn operations_summary_data(
+    incidents: &[serde_json::Value],
+    indicators: &[serde_json::Value],
+    trust: &[serde_json::Value],
+    events: &[serde_json::Value],
+    providers: &[serde_json::Value],
+) -> serde_json::Value {
+    let risk_assessment = decision_risk_assessment(incidents, indicators);
+    let active_incidents = incidents
+        .iter()
+        .filter(|value| context_is_active_incident(value))
+        .count();
+    let critical_events = events
+        .iter()
+        .filter(|value| {
+            value.get("severity").and_then(serde_json::Value::as_str) == Some("critical")
+        })
+        .count();
+    let attention_points = decision_attention_points(incidents, indicators, events);
+    let recommended_checks = decision_recommended_checks(incidents, indicators, trust, events);
+    serde_json::json!({
+        "overall_status": risk_assessment.get("overall_status"),
+        "risk_level": risk_assessment.get("risk_level"),
+        "active_incidents": active_incidents,
+        "critical_events": critical_events,
+        "provider_health": operations_provider_health(providers),
+        "attention_points": attention_points,
+        "recommended_checks": recommended_checks,
+        "correlation_confidence": risk_assessment.get("correlation_confidence"),
+        "trust": context_trust_data(trust)
+    })
+}
+
 async fn agent_status(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1865,6 +1981,154 @@ async fn agent_decisions(
         }),
         None,
     ))
+}
+
+async fn agent_provider_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AgentQuery>,
+) -> ApiResult<Json<ApiEnvelope<Vec<serde_json::Value>>>> {
+    let principal = authenticate_agent(&state, &headers).await?;
+    require_agent_scope(&principal, AGENT_SCOPE_PROVIDER_READ)?;
+    let mut values = state.store.list_provider_views().await.map_err(|_| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "provider status unavailable",
+        )
+    })?;
+    values.retain(|value| {
+        query.source.as_deref().is_none_or(|source| {
+            value.get("source").and_then(serde_json::Value::as_str) == Some(source)
+        }) && query.status.as_deref().is_none_or(|status| {
+            value.get("status").and_then(serde_json::Value::as_str) == Some(status)
+        })
+    });
+    let values = values.iter().map(agent_provider_view).collect::<Vec<_>>();
+    let (page, page_size) = agent_page(&query, 50);
+    let (data, pagination) = paged_values(values, page, page_size);
+    audit_agent_read(
+        &state,
+        &principal,
+        "/api/v1/providers",
+        AGENT_SCOPE_PROVIDER_READ,
+    )
+    .await;
+    Ok(envelope(data, Some(pagination)))
+}
+
+async fn load_operations_summary(state: &AppState) -> ApiResult<serde_json::Value> {
+    let migration = state
+        .store
+        .readiness()
+        .await
+        .map_err(|_| api_error(StatusCode::SERVICE_UNAVAILABLE, "operations unavailable"))?;
+    let migration_response: MigrationResponse = migration.into();
+    let runtime = state.store.runtime_status_views().await.map_err(|_| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "operations runtime unavailable",
+        )
+    })?;
+    let event_status = state.store.event_status().await.map_err(|_| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "operations events unavailable",
+        )
+    })?;
+    let providers = state.store.list_provider_views().await.map_err(|_| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "operations providers unavailable",
+        )
+    })?;
+    let incidents = state.store.list_incidents(None, 500).await.map_err(|_| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "operations incidents unavailable",
+        )
+    })?;
+    let indicators = state.store.list_indicator_views(1000).await.map_err(|_| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "operations risk data unavailable",
+        )
+    })?;
+    let trust = agent_network_values(state, "trust").await?;
+    let events = state.store.list_events(None, 100).await.map_err(|_| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "operations event data unavailable",
+        )
+    })?;
+    let mut summary = operations_summary_data(&incidents, &indicators, &trust, &events, &providers);
+    let provider_health = summary
+        .get("provider_health")
+        .and_then(|value| value.get("failed"))
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+    let runtime_degraded = runtime
+        .iter()
+        .any(|value| value.get("state").and_then(serde_json::Value::as_str) == Some("error"));
+    let system_status = if migration_response.current && !runtime_degraded {
+        if provider_health > 0 {
+            "degraded"
+        } else {
+            "ok"
+        }
+    } else {
+        "unavailable"
+    };
+    if let Some(object) = summary.as_object_mut() {
+        object.insert(
+            "system_status".into(),
+            serde_json::Value::from(system_status),
+        );
+        object.insert(
+            "system".into(),
+            serde_json::json!({
+                "status": system_status,
+                "migrations": migration_response,
+                "runtime": runtime,
+                "events": event_status
+            }),
+        );
+    }
+    Ok(summary)
+}
+
+async fn agent_operations_summary(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<ApiEnvelope<serde_json::Value>>> {
+    let principal = authenticate_agent(&state, &headers).await?;
+    require_agent_scope(&principal, AGENT_SCOPE_OPERATIONS_READ)?;
+    let summary = load_operations_summary(&state).await?;
+    audit_agent_read(
+        &state,
+        &principal,
+        "/api/v1/operations/summary",
+        AGENT_SCOPE_OPERATIONS_READ,
+    )
+    .await;
+    Ok(envelope(summary, None))
+}
+
+async fn admin_operations_summary(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<ApiEnvelope<serde_json::Value>>> {
+    let principal = authenticate(&state, &headers).await?;
+    require_role(&principal, &["Administrator", "Operator", "Viewer"])?;
+    let summary = load_operations_summary(&state).await?;
+    audit(
+        &state,
+        &principal,
+        "operations_summary_read",
+        "operations",
+        serde_json::json!({}),
+    )
+    .await;
+    Ok(envelope(summary, None))
 }
 
 async fn agent_events(
@@ -3295,6 +3559,7 @@ struct AuditQuery {
     source: Option<String>,
     severity: Option<String>,
     user: Option<String>,
+    action: Option<String>,
     limit: Option<i64>,
     page: Option<i64>,
     page_size: Option<i64>,
@@ -3319,11 +3584,14 @@ async fn audit_events(
     let values = state
         .store
         .list_audit_events(
-            query.from,
-            query.to,
-            query.source.as_deref(),
-            query.severity.as_deref(),
-            query.user.as_deref(),
+            AuditEventFilter {
+                from: query.from,
+                to: query.to,
+                source: query.source.as_deref(),
+                severity: query.severity.as_deref(),
+                actor: query.user.as_deref(),
+                action: query.action.as_deref(),
+            },
             500,
         )
         .await
@@ -3513,11 +3781,14 @@ async fn export_audit_events(
     let values = state
         .store
         .list_audit_events(
-            query.from,
-            query.to,
-            query.source.as_deref(),
-            query.severity.as_deref(),
-            query.user.as_deref(),
+            AuditEventFilter {
+                from: query.from,
+                to: query.to,
+                source: query.source.as_deref(),
+                severity: query.severity.as_deref(),
+                actor: query.user.as_deref(),
+                action: query.action.as_deref(),
+            },
             500,
         )
         .await
@@ -3604,6 +3875,7 @@ struct IncidentQuery {
     page: Option<i64>,
     page_size: Option<i64>,
     severity: Option<String>,
+    source: Option<String>,
     from: Option<String>,
     to: Option<String>,
     format: Option<String>,
@@ -3643,6 +3915,11 @@ async fn incidents(
             .unwrap_or_default();
         query.severity.as_deref().is_none_or(|severity| {
             value.get("severity").and_then(serde_json::Value::as_str) == Some(severity)
+        }) && query.source.as_deref().is_none_or(|source| {
+            value
+                .get("source")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|sources| sources.split(", ").any(|candidate| candidate == source))
         }) && query.from.as_deref().is_none_or(|from| timestamp >= from)
             && query.to.as_deref().is_none_or(|to| timestamp <= to)
     });
@@ -4604,6 +4881,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/admin/providers", get(admin_providers))
         .route("/admin/providers/{id}", post(admin_update_provider))
         .route("/admin/providers/{id}/sync", post(admin_sync_provider))
+        .route("/operations/summary", get(admin_operations_summary))
         .route(
             "/admin/notifications/channels",
             get(admin_notification_channels).post(admin_create_notification_channel),
@@ -4670,6 +4948,8 @@ async fn main() -> anyhow::Result<()> {
                 .route("/status", get(agent_status))
                 .route("/context", get(agent_context))
                 .route("/decisions", get(agent_decisions))
+                .route("/providers", get(agent_provider_status))
+                .route("/operations/summary", get(agent_operations_summary))
                 .route("/events", get(agent_events))
                 .route("/incidents", get(agent_incidents))
                 .route("/incidents/{id}", get(agent_incident_detail))
@@ -4909,6 +5189,10 @@ mod tests {
         assert!(validate_agent_scopes(&[
             AGENT_SCOPE_DECISION_READ.to_string()
         ]));
+        assert!(validate_agent_scopes(&[
+            AGENT_SCOPE_PROVIDER_READ.to_string(),
+            AGENT_SCOPE_OPERATIONS_READ.to_string()
+        ]));
         assert!(validate_agent_scopes(&[AGENT_SCOPE_ALL_READ.to_string()]));
         assert!(!validate_agent_scopes(&["agent:admin:write".to_string()]));
         let principal = AgentPrincipal {
@@ -4917,6 +5201,46 @@ mod tests {
             scopes: vec![AGENT_SCOPE_ALL_READ.into()],
         };
         assert!(require_agent_scope(&principal, AGENT_SCOPE_NETWORK_READ).is_ok());
+    }
+
+    #[test]
+    fn provider_and_operations_views_are_safe_and_action_free() {
+        let provider = agent_provider_view(&serde_json::json!({
+            "id": "threatfox",
+            "name": "ThreatFox",
+            "source": "abuse.ch",
+            "enabled": true,
+            "status": "ok",
+            "quality_score": 94,
+            "age_seconds": 120,
+            "indicator_count": 12,
+            "sync_duration_ms": 450,
+            "payload": {"api_key": "must-not-leak"},
+            "credentials": "must-not-leak"
+        }));
+        assert_eq!(provider["quality_score"], 94);
+        assert_eq!(provider["data_age_seconds"], 120);
+        assert!(provider.get("payload").is_none());
+        assert!(provider.get("credentials").is_none());
+
+        let summary = operations_summary_data(
+            &[serde_json::json!({
+                "id": "incident-1", "status": "detected", "severity": "high",
+                "risk_score": 82, "confidence": 88, "summary": "review"
+            })],
+            &[serde_json::json!({"risk_score": 72, "confidence": 90})],
+            &[serde_json::json!({"status": "Verified", "trust_score": -20})],
+            &[serde_json::json!({"severity": "critical", "event_type": "rpki.invalid"})],
+            &[serde_json::json!({
+                "id": "threatfox", "name": "ThreatFox", "source": "abuse.ch",
+                "enabled": true, "status": "ok", "quality_score": 94
+            })],
+        );
+        assert_eq!(summary["active_incidents"], 1);
+        assert_eq!(summary["critical_events"], 1);
+        assert_eq!(summary["provider_health"]["healthy"], 1);
+        assert!(summary.get("payload").is_none());
+        assert!(summary.get("action").is_none());
     }
 
     #[test]

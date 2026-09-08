@@ -7,6 +7,8 @@
 - Added optional event consumption for the notifier and analyzer services.
 - Added read-only visualization APIs and an SVG-based frontend view for event timelines, network relationships, incident correlations, and trusted infrastructure.
 - Expanded the frontend into an operations dashboard with runtime cards, Prometheus monitoring values, filtered event streaming, incident relationship details, and richer ASN/BGP/RPKI tables.
+- Added provider quality and failure metadata, the read-only provider status and operations summary APIs, and matching MCP tools.
+- Added an Operations Summary dashboard view, source/time incident filters, audit explorer filters, and retention documentation.
 
 ## [0.1.0] - 2026-09-07
 

@@ -72,6 +72,38 @@ components:
         attention_points: { type: array, items: { type: object, additionalProperties: true } }
         recommended_checks: { type: array, items: { type: object, additionalProperties: true } }
         context: { $ref: '#/components/schemas/AgentContext' }
+    AgentProviderStatus:
+      type: object
+      required: [id, name, type, status, quality_score]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        type: { type: string }
+        source: { type: string }
+        status: { type: string, enum: [ok, error, running, disabled, unknown] }
+        enabled: { type: boolean }
+        last_success: { type: string, format: date-time, nullable: true }
+        last_failure: { type: string, format: date-time, nullable: true }
+        last_error: { type: string, nullable: true }
+        data_age: { type: number, nullable: true }
+        data_age_seconds: { type: number, nullable: true }
+        quality_score: { type: integer, minimum: 0, maximum: 100 }
+        indicator_count: { type: integer, minimum: 0 }
+        sync_duration_ms: { type: integer, minimum: 0 }
+    OperationsSummary:
+      type: object
+      required: [overall_status, risk_level, active_incidents, critical_events, provider_health, attention_points, recommended_checks]
+      properties:
+        overall_status: { type: string, enum: [info, low, medium, high, critical] }
+        risk_level: { type: string, enum: [info, low, medium, high, critical] }
+        active_incidents: { type: integer, minimum: 0 }
+        critical_events: { type: integer, minimum: 0 }
+        provider_health: { type: object, additionalProperties: true }
+        attention_points: { type: array, items: { type: object, additionalProperties: true } }
+        recommended_checks: { type: array, items: { type: object, additionalProperties: true } }
+        correlation_confidence: { type: object, additionalProperties: true }
+        trust: { type: object, additionalProperties: true }
+        system_status: { type: string, enum: [ok, degraded, unavailable] }
     AgentEvent:
       type: object
       required: [event_id, event_type, source, severity, timestamp]
@@ -169,6 +201,30 @@ paths:
         '403': { description: agent:context:read scope missing }
         '429': { $ref: '#/components/responses/RateLimited' }
         '503': { description: PostgreSQL or context dependency unavailable }
+  /api/v1/providers:
+    get:
+      security: [{ agentBearerAuth: [] }]
+      description: Paginated, normalized provider health without raw feed data. Requires agent:provider:read.
+      parameters:
+        - { in: query, name: page, schema: { type: integer, minimum: 1, default: 1 } }
+        - { in: query, name: page_size, schema: { type: integer, minimum: 1, maximum: 100, default: 50 } }
+        - { in: query, name: source, schema: { type: string } }
+        - { in: query, name: status, schema: { type: string } }
+      responses:
+        '200':
+          description: Provider status envelope
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiEnvelope'
+                  - type: object
+                    properties:
+                      data: { type: array, items: { $ref: '#/components/schemas/AgentProviderStatus' } }
+        '401': { description: Agent token missing or invalid }
+        '403': { description: agent:provider:read scope missing }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { description: Provider status unavailable }
   /api/v1/decisions:
     get:
       security: [{ agentBearerAuth: [] }]
@@ -188,6 +244,35 @@ paths:
         '403': { description: agent:decision:read scope missing }
         '429': { $ref: '#/components/responses/RateLimited' }
         '503': { description: PostgreSQL or decision dependency unavailable }
+  /api/v1/operations/summary:
+    get:
+      security: [{ agentBearerAuth: [] }]
+      description: High-level read-only operations summary derived from existing context, incidents, risk, trust, events, and provider views. Requires agent:operations:read. No action is performed.
+      responses:
+        '200':
+          description: Operations summary envelope
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiEnvelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/OperationsSummary' }
+        '401': { description: Agent token missing or invalid }
+        '403': { description: agent:operations:read scope missing }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { description: Operations summary unavailable }
+  /operations/summary:
+    get:
+      security: [{ bearerAuth: [] }]
+      description: Role-protected operations summary used by the administrative dashboard. This route is read-only and reuses the same aggregation as the agent API.
+      responses:
+        '200': { description: Operations summary envelope }
+        '401': { description: Session or API token missing or invalid }
+        '403': { description: Viewer, Operator, or Administrator role required }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { description: Operations summary unavailable }
   /admin/auth/agent-tokens:
     post:
       security: [{ bearerAuth: [] }]
@@ -206,7 +291,7 @@ paths:
                   minItems: 1
                   items:
                     type: string
-                    enum: [agent:system:read, agent:events:read, agent:incident:read, agent:incidents:read, agent:context:read, agent:decision:read, agent:security:read, agent:network:read, agent:read]
+                    enum: [agent:system:read, agent:events:read, agent:incident:read, agent:incidents:read, agent:context:read, agent:decision:read, agent:provider:read, agent:operations:read, agent:security:read, agent:network:read, agent:read]
                 expires_in_hours: { type: integer, minimum: 1, maximum: 8760, default: 720 }
       responses:
         '200': { description: Token envelope; the secret is not persisted and is shown once }
@@ -254,6 +339,7 @@ paths:
         - { in: query, name: page_size, schema: { type: integer, minimum: 1, maximum: 100, default: 50 } }
         - { in: query, name: status, schema: { type: string, enum: [detected, investigating, confirmed, mitigated, resolved, closed] } }
         - { in: query, name: severity, schema: { type: string } }
+        - { in: query, name: source, schema: { type: string } }
         - { in: query, name: from, schema: { type: string, format: date-time } }
         - { in: query, name: to, schema: { type: string, format: date-time } }
       responses:

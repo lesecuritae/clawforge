@@ -1,6 +1,6 @@
 # Clawforge MCP Server
 
-Status: Phase 1 implementiert. Der MCP-Dienst ist ein isolierter, read-only
+Status: Read-only MCP-Adapter implementiert. Der MCP-Dienst ist ein isolierter
 Rust-Service. OpenClaw ist noch nicht angebunden.
 
 Dieses Dokument beschreibt einen separaten, read-only MCP-Dienst für
@@ -30,7 +30,7 @@ MCP-Tool-Aufrufe in dokumentierte `GET`-Aufrufe der Agent API und gibt deren
 bereits bereinigte Antwort weiter. Er berechnet keine Scores, korreliert keine
 neuen Events und führt keine Aktionen aus.
 
-Die bestehende Agent API bleibt unverändert. Insbesondere werden die alten,
+Die Agent API bleibt der einzige Upstream-Vertrag. Insbesondere werden die alten,
 unversionierten `/intelligence/*`, `/network/*` und `/internal/*`-Routen nicht
 als MCP-Upstream verwendet.
 
@@ -41,6 +41,8 @@ als MCP-Upstream verwendet.
 | `get_status` | `GET /api/v1/status` + Incident-Liste | `agent:system:read` + `agent:incident:read` | direkt nutzbar |
 | `get_agent_context` | `GET /api/v1/context` | `agent:context:read` | direkt nutzbar |
 | `get_decisions` | `GET /api/v1/decisions` | `agent:decision:read` | direkt nutzbar |
+| `get_provider_status` | `GET /api/v1/providers` | `agent:provider:read` | direkt nutzbar |
+| `get_operations_summary` | `GET /api/v1/operations/summary` | `agent:operations:read` | direkt nutzbar |
 | `list_events` | `GET /api/v1/events` | `agent:events:read` | direkt nutzbar |
 | `list_incidents` | `GET /api/v1/incidents` | `agent:incident:read` | direkt nutzbar |
 | `get_incident` | `GET /api/v1/incidents/{id}` | `agent:incident:read` | direkt nutzbar |
@@ -99,6 +101,25 @@ und im Tool-Vertrag versioniert.
 - Der MCP-Dienst berechnet keine neue Bewertung und löst keine Aktion aus; er
   reicht ausschließlich die read-only Agent-API-Antwort weiter
 - Keine Rohpayloads, Secrets, Candidate-IDs oder Korrelationsschlüssel
+
+### `get_provider_status`
+
+- Eingabe: keine
+- Upstream: `/api/v1/providers`
+- Scope: `agent:provider:read`
+- Ausgabe: Provider-Typ und Quelle, Status, letzter Erfolg/Fehler, Datenalter,
+  Qualität, Synchronisationsdauer und Indicator-Anzahl
+- Feed-Inhalte, Credentials und Rohdaten werden nicht weitergereicht
+
+### `get_operations_summary`
+
+- Eingabe: keine
+- Upstream: `/api/v1/operations/summary`
+- Scope: `agent:operations:read`
+- Ausgabe: Gesamtstatus, Risk-Level, aktive Incidents, kritische Events,
+  Provider-Health, Attention Points und Recommended Checks
+- Der MCP-Server führt keine Remediation oder Schreiboperation aus und bildet
+  keine neue Risk- oder Trust-Bewertung
 
 ### `list_events`
 

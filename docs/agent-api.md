@@ -1,8 +1,8 @@
 # Agent API Design
 
-Status: Phase 1 implementiert. Dieses Dokument beschreibt die externe
-Read-only-API-Schicht für OpenClaw- und spätere MCP-Anbindungen. Ein MCP-
-Server ist weiterhin nicht implementiert.
+Status: Agent API v1 und Operations-Erweiterung implementiert. Dieses Dokument
+beschreibt die externe Read-only-API-Schicht für OpenClaw- und MCP-Anbindungen.
+Der separate MCP-Adapter verwendet diese API als einzige Datenquelle.
 
 ## Ziele und Grenzen
 
@@ -109,6 +109,8 @@ rollenbasierte Exportfunktionen. Zeitangaben sind UTC in RFC-3339-Format.
 | `GET /api/v1/status` | Betriebszustand | API, Worker, PostgreSQL, Migrationen, Event-Consumer, Provider-Zusammenfassung, Versionsstand | `agent:system:read` |
 | `GET /api/v1/context` | konsolidierte Lageabfrage | Systemstatus, aktive Incidents, Severity, Risk-Scores, Trust-Status, wichtige Events und Correlation-Zusammenfassungen | `agent:context:read` |
 | `GET /api/v1/decisions` | priorisierte read-only Lageeinschätzung | Gesamtstatus, bestehende Risikowerte, Aufmerksamkeitspunkte, empfohlene Prüfungen und Context-Zusammenfassung | `agent:decision:read` |
+| `GET /api/v1/providers` | Provider-Health | Quelle, Status, letzter Erfolg/Fehler, Datenalter, Qualität und Indicator-Anzahl ohne Rohfeeds | `agent:provider:read` |
+| `GET /api/v1/operations/summary` | Operations-Einstiegspunkt | Status, Risk-Level, aktive Incidents, kritische Events, Provider-Health, Attention Points und Recommended Checks | `agent:operations:read` |
 | `GET /api/v1/events` | aktuelle kanonische Events | Typ, Quelle, Severity, Zeit, Korrelation, begründete Zusammenfassung | `agent:events:read` |
 | `GET /api/v1/incidents` | Incident-Liste | Status, Severity, Confidence, Risiko, Summary, Zeit, Event-Anzahl | `agent:incident:read` |
 | `GET /api/v1/incidents/{id}` | Incident-Details | Status, Severity, Confidence, Risiko, Summary und Zeit | `agent:incident:read` |
@@ -162,7 +164,7 @@ Ein Systemstatus enthält Komponentenstatus statt interner Prozessdetails:
     "service": "clawforge",
     "version": "0.1.0",
     "status": "ok",
-    "migrations": { "current": true, "applied": 14, "expected": 14 },
+    "migrations": { "current": true, "applied": 15, "expected": 15 },
     "runtime": [],
     "events": { "pending": 0, "failed": 0 },
     "providers": { "total": 0, "enabled": 0 }
@@ -231,6 +233,19 @@ Beispiel:
 Die Decision-Antwort enthält weder Rohpayloads, Secrets, Candidate-IDs noch
 Korrelationsschlüssel. Sie verwendet ausschließlich die bestehenden sicheren
 Agent-Views und ist vollständig read-only.
+
+`GET /api/v1/providers` liefert den normalisierten Zustand der registrierten
+Provider und internen Intelligence-Worker. `quality_score`, `data_age`,
+Datenalter in Sekunden,
+Synchronisationsdauer und Indicator-Anzahl stammen aus den bestehenden
+Provider-Statusdaten; Feed-Inhalte und Credentials werden nie ausgegeben.
+
+`GET /api/v1/operations/summary` ist ein kompakter Einstiegspunkt für Agents.
+Er kombiniert die vorhandenen Incident-, Risk-, Trust-, Event- und
+Provider-Views. Die enthaltenen `attention_points` und
+`recommended_checks` sind Hinweise für weitere Leseprüfungen. Sie lösen keine
+Policy-, Trust-, Provider- oder Blockaktion aus. Beide Endpunkte sind
+vollständig read-only und werden pro Abruf auditiert.
 
 Ein Finding liefert die bereits gespeicherte Bewertung und ihre Herkunft:
 

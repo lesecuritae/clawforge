@@ -764,7 +764,7 @@ impl PostgresStore {
         status: Option<&str>,
         limit: i64,
     ) -> Result<Vec<serde_json::Value>> {
-        let rows = sqlx::query("SELECT i.id,i.status,i.severity,i.confidence,i.candidate_id,i.created_at,i.updated_at,i.risk_score,i.summary,i.correlation_key,(COUNT(DISTINCT ie.event_id)+COUNT(DISTINCT ir.event_id)) AS event_count FROM incidents i LEFT JOIN incident_events ie ON ie.incident_id=i.id LEFT JOIN incident_relations ir ON ir.incident_id=i.id AND ir.relation_type='event' WHERE ($1::text IS NULL OR i.status=$1) GROUP BY i.id ORDER BY i.updated_at DESC LIMIT $2")
+        let rows = sqlx::query("SELECT i.id,i.status,i.severity,i.confidence,i.candidate_id,i.created_at,i.updated_at,i.risk_score,i.summary,i.correlation_key,(SELECT string_agg(DISTINCT e.source, ', ' ORDER BY e.source) FROM incident_relations source_relation JOIN events e ON e.event_id=source_relation.event_id WHERE source_relation.incident_id=i.id) AS source,(COUNT(DISTINCT ie.event_id)+COUNT(DISTINCT ir.event_id)) AS event_count FROM incidents i LEFT JOIN incident_events ie ON ie.incident_id=i.id LEFT JOIN incident_relations ir ON ir.incident_id=i.id AND ir.relation_type='event' WHERE ($1::text IS NULL OR i.status=$1) GROUP BY i.id ORDER BY i.updated_at DESC LIMIT $2")
             .bind(status).bind(limit.clamp(1, 500)).fetch_all(&self.pool).await?;
         Ok(rows
             .into_iter()
@@ -780,6 +780,7 @@ impl PostgresStore {
                     "risk_score": row.get::<i16,_>("risk_score"),
                     "summary": row.get::<String,_>("summary"),
                     "correlation_key": row.get::<String,_>("correlation_key"),
+                    "source": row.get::<Option<String>,_>("source"),
                     "event_count": row.get::<i64,_>("event_count")
                 })
             })
@@ -1291,7 +1292,7 @@ impl PostgresStore {
     }
 
     pub async fn list_provider_views(&self) -> Result<Vec<serde_json::Value>> {
-        let rows = sqlx::query("SELECT p.id, p.name, p.source, p.interval_seconds, p.confidence, p.enabled, s.state, s.last_started_at, s.last_success_at, s.next_run_at, s.consecutive_failures, s.last_error, s.indicator_count, s.sync_duration_ms, s.last_data_at, EXTRACT(EPOCH FROM (NOW() - s.last_data_at)) AS age_seconds FROM providers p LEFT JOIN provider_status s ON s.provider_id = p.id ORDER BY p.id")
+        let rows = sqlx::query("SELECT p.id, p.name, p.source, p.interval_seconds, p.confidence, p.quality_score, p.enabled, s.state, s.last_started_at, s.last_success_at, s.last_failure_at, s.next_run_at, s.consecutive_failures, s.last_error, s.indicator_count, s.sync_duration_ms, s.last_data_at, EXTRACT(EPOCH FROM (NOW() - s.last_data_at)) AS age_seconds FROM providers p LEFT JOIN provider_status s ON s.provider_id = p.id ORDER BY p.id")
             .fetch_all(&self.pool).await?;
         rows.into_iter().map(|row| {
                     let status = row.try_get::<String, _>("state").ok();
@@ -1302,10 +1303,12 @@ impl PostgresStore {
                         "source": row.get::<String, _>("source"),
                         "interval_seconds": row.get::<i64, _>("interval_seconds"),
                         "confidence": row.get::<i16, _>("confidence"),
+                        "quality_score": row.get::<i16, _>("quality_score"),
                         "enabled": row.get::<bool, _>("enabled"),
                         "status": status,
                 "last_started_at": row.try_get::<chrono::DateTime<chrono::Utc>, _>("last_started_at").ok(),
-                        "last_success_at": last_success_at,
+                "last_success_at": last_success_at,
+                "last_failure_at": row.try_get::<chrono::DateTime<chrono::Utc>, _>("last_failure_at").ok(),
                 "next_run_at": row.try_get::<chrono::DateTime<chrono::Utc>, _>("next_run_at").ok(),
                         "last_error": row.try_get::<String, _>("last_error").ok(),
                         "retry_count": row.try_get::<i32, _>("consecutive_failures").unwrap_or(0),
@@ -1528,7 +1531,7 @@ impl PostgresStore {
     }
 
     pub async fn upsert_provider(&self, provider: &Provider) -> Result<()> {
-        sqlx::query("INSERT INTO providers (id, name, source, interval_seconds, confidence, enabled) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name, source=EXCLUDED.source, confidence=EXCLUDED.confidence, updated_at=NOW()")
+        sqlx::query("INSERT INTO providers (id, name, source, interval_seconds, confidence, quality_score, enabled) VALUES ($1,$2,$3,$4,$5,$5,$6) ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name, source=EXCLUDED.source, confidence=EXCLUDED.confidence, quality_score=EXCLUDED.quality_score, updated_at=NOW()")
             .bind(&provider.id).bind(&provider.name).bind(&provider.source)
             .bind(provider.interval_seconds).bind(provider.confidence as i16).bind(provider.enabled)
             .execute(&self.pool).await?;
@@ -1581,7 +1584,7 @@ impl PostgresStore {
         indicator_count: i32,
         sync_duration_ms: i64,
     ) -> Result<()> {
-        sqlx::query("INSERT INTO provider_status (provider_id, state, next_run_at, consecutive_failures, last_error, indicator_count, sync_duration_ms, updated_at) VALUES ($1,'error',$2,1,$3,$4,$5,NOW()) ON CONFLICT (provider_id) DO UPDATE SET state='error', next_run_at=$2, consecutive_failures=provider_status.consecutive_failures+1, last_error=$3, indicator_count=$4, sync_duration_ms=$5, updated_at=NOW()")
+        sqlx::query("INSERT INTO provider_status (provider_id, state, last_failure_at, next_run_at, consecutive_failures, last_error, indicator_count, sync_duration_ms, updated_at) VALUES ($1,'error',NOW(),$2,1,$3,$4,$5,NOW()) ON CONFLICT (provider_id) DO UPDATE SET state='error', last_failure_at=NOW(), next_run_at=$2, consecutive_failures=provider_status.consecutive_failures+1, last_error=$3, indicator_count=$4, sync_duration_ms=$5, updated_at=NOW()")
             .bind(provider_id).bind(next_run).bind(error).bind(indicator_count).bind(sync_duration_ms).execute(&self.pool).await?;
         Ok(())
     }
@@ -1872,15 +1875,11 @@ impl PostgresStore {
 
     pub async fn list_audit_events(
         &self,
-        from: Option<chrono::DateTime<chrono::Utc>>,
-        to: Option<chrono::DateTime<chrono::Utc>>,
-        source: Option<&str>,
-        severity: Option<&str>,
-        actor: Option<&str>,
+        filter: AuditEventFilter<'_>,
         limit: i64,
     ) -> Result<Vec<serde_json::Value>> {
-        let rows = sqlx::query("SELECT id, actor, action, resource, details, event_type, source, severity, reason, recorded_at FROM audit_events WHERE ($1::timestamptz IS NULL OR recorded_at >= $1) AND ($2::timestamptz IS NULL OR recorded_at <= $2) AND ($3::text IS NULL OR source=$3) AND ($4::text IS NULL OR severity=$4) AND ($5::text IS NULL OR actor=$5) ORDER BY recorded_at DESC LIMIT $6")
-            .bind(from).bind(to).bind(source).bind(severity).bind(actor).bind(limit.clamp(1, 1000)).fetch_all(&self.pool).await?;
+        let rows = sqlx::query("SELECT id, actor, action, resource, details, event_type, source, severity, reason, recorded_at FROM audit_events WHERE ($1::timestamptz IS NULL OR recorded_at >= $1) AND ($2::timestamptz IS NULL OR recorded_at <= $2) AND ($3::text IS NULL OR source=$3) AND ($4::text IS NULL OR severity=$4) AND ($5::text IS NULL OR actor=$5) AND ($6::text IS NULL OR action=$6) ORDER BY recorded_at DESC LIMIT $7")
+            .bind(filter.from).bind(filter.to).bind(filter.source).bind(filter.severity).bind(filter.actor).bind(filter.action).bind(limit.clamp(1, 1000)).fetch_all(&self.pool).await?;
         Ok(rows.into_iter().map(|r| serde_json::json!({
             "id": r.get::<i64,_>("id"), "actor": r.get::<String,_>("actor"), "action": r.get::<String,_>("action"),
             "resource": r.get::<String,_>("resource"), "details": r.get::<serde_json::Value,_>("details"),
@@ -2170,6 +2169,16 @@ pub struct MigrationStatus {
     pub latest: i64,
     pub expected_latest: i64,
     pub current: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AuditEventFilter<'a> {
+    pub from: Option<chrono::DateTime<chrono::Utc>>,
+    pub to: Option<chrono::DateTime<chrono::Utc>>,
+    pub source: Option<&'a str>,
+    pub severity: Option<&'a str>,
+    pub actor: Option<&'a str>,
+    pub action: Option<&'a str>,
 }
 
 pub fn database_url_from_env() -> Result<String> {
