@@ -8,7 +8,7 @@
 
 ![Clawforge Security Platform](assets/branding/rebranding-announcement.png)
 
-Clawforge is an independent Rust security-intelligence service. It combines threat feeds, network intelligence, risk and trust scoring, PostgreSQL persistence, and a policy boundary. The current implementation is a backend foundation with an Axum API and Tokio worker; no provider result can block traffic directly.
+Clawforge is an independent Rust security-intelligence service. It combines threat feeds, network intelligence, risk and trust scoring, PostgreSQL persistence, incidents, alerts, a read-only Agent API v1, and a Rust MCP adapter for OpenClaw. The production stack includes health/readiness checks, daily backup/restore procedures, scoped agent access, audit logging, and no provider result can block traffic directly.
 
 ## Quick start
 
@@ -20,3 +20,4 @@ curl http://127.0.0.1:8080/ready
 ```
 
 Read the [German documentation](README.de.md) or [English documentation](README.en.md) for configuration, providers, deployment, and security details.
+See [production.md](docs/production.md) and [openclaw-integration.md](docs/openclaw-integration.md) for production operation and the OpenClaw MCP contract.

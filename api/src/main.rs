@@ -2,7 +2,10 @@ use std::{
     collections::{HashMap, HashSet},
     env, fs,
     net::SocketAddr,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration as StdDuration, Instant},
 };
 
@@ -98,6 +101,10 @@ const AGENT_SCOPES: &[&str] = &[
     AGENT_SCOPE_NETWORK_READ,
     AGENT_SCOPE_ALL_READ,
 ];
+
+static API_REQUESTS: AtomicU64 = AtomicU64::new(0);
+static API_ERRORS: AtomicU64 = AtomicU64::new(0);
+static API_RATE_LIMITED: AtomicU64 = AtomicU64::new(0);
 
 impl Default for RateLimiter {
     fn default() -> Self {
@@ -233,6 +240,7 @@ async fn rate_limit_middleware(
     request: Request,
     next: Next,
 ) -> Response {
+    API_REQUESTS.fetch_add(1, Ordering::Relaxed);
     let path = request.uri().path().to_string();
     let Some(_) = policy_for(&path, request.method(), None) else {
         return next.run(request).await;
@@ -269,6 +277,8 @@ async fn rate_limit_middleware(
         policy.window,
     );
     if !global.allowed || !endpoint.allowed {
+        API_RATE_LIMITED.fetch_add(1, Ordering::Relaxed);
+        API_ERRORS.fetch_add(1, Ordering::Relaxed);
         let retry_after = if global.retry_after > endpoint.retry_after {
             global.retry_after
         } else {
@@ -296,6 +306,9 @@ async fn rate_limit_middleware(
     }
     let remaining = global.remaining.min(endpoint.remaining);
     let mut response = next.run(request).await;
+    if response.status().is_client_error() || response.status().is_server_error() {
+        API_ERRORS.fetch_add(1, Ordering::Relaxed);
+    }
     response.headers_mut().insert(
         "X-RateLimit-Limit",
         HeaderValue::from_str(&policy.limit.to_string()).expect("valid limit value"),
@@ -2798,11 +2811,16 @@ async fn agent_trust(
 }
 
 async fn metrics(State(state): State<AppState>) -> Result<Response, StatusCode> {
-    let body = state
-        .store
-        .metrics_text()
-        .await
-        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let mut body = state.store.metrics_text().await.map_err(|error| {
+        tracing::error!(%error, "metrics collection failed");
+        StatusCode::SERVICE_UNAVAILABLE
+    })?;
+    body.push_str(&format!(
+        "# TYPE clawforge_api_requests_total counter\nclawforge_api_requests_total {}\n# TYPE clawforge_api_errors_total counter\nclawforge_api_errors_total {}\n# TYPE clawforge_api_rate_limited_total counter\nclawforge_api_rate_limited_total {}\n",
+        API_REQUESTS.load(Ordering::Relaxed),
+        API_ERRORS.load(Ordering::Relaxed),
+        API_RATE_LIMITED.load(Ordering::Relaxed),
+    ));
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/plain; version=0.0.4")

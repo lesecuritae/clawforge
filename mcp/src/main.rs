@@ -1,4 +1,13 @@
-use std::{collections::HashSet, net::SocketAddr, path::Path, sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    net::SocketAddr,
+    path::Path,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use anyhow::{anyhow, Context, Result};
 use axum::{
@@ -36,6 +45,10 @@ const SCOPE_OPERATIONS: &str = "agent:operations:read";
 const SCOPE_SECURITY: &str = "agent:security:read";
 const SCOPE_NETWORK: &str = "agent:network:read";
 const SCOPE_ALL: &str = "agent:read";
+const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+static MCP_UPSTREAM_REQUESTS: AtomicU64 = AtomicU64::new(0);
+static MCP_UPSTREAM_ERRORS: AtomicU64 = AtomicU64::new(0);
+static MCP_AUTH_FAILURES: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone)]
 struct AppState {
@@ -67,21 +80,33 @@ struct EventArgs {
     page: Option<i64>,
     #[schemars(description = "Page size, capped at 100")]
     page_size: Option<i64>,
+    #[schemars(description = "Filter by normalized event type")]
     event_type: Option<String>,
+    #[schemars(description = "Filter by event source")]
     source: Option<String>,
+    #[schemars(description = "Filter by severity")]
     severity: Option<String>,
+    #[schemars(description = "Filter by correlation reference")]
     correlation_id: Option<String>,
+    #[schemars(description = "RFC-3339 start timestamp")]
     from: Option<String>,
+    #[schemars(description = "RFC-3339 end timestamp")]
     to: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 struct IncidentArgs {
+    #[schemars(description = "1-based page number")]
     page: Option<i64>,
+    #[schemars(description = "Page size, capped at 100")]
     page_size: Option<i64>,
+    #[schemars(description = "Incident lifecycle status")]
     status: Option<String>,
+    #[schemars(description = "Incident severity")]
     severity: Option<String>,
+    #[schemars(description = "RFC-3339 start timestamp")]
     from: Option<String>,
+    #[schemars(description = "RFC-3339 end timestamp")]
     to: Option<String>,
 }
 
@@ -95,11 +120,17 @@ struct IncidentIdArgs {
 struct IncidentTimelineArgs {
     #[schemars(description = "Incident UUID")]
     id: String,
+    #[schemars(description = "1-based page number")]
     page: Option<i64>,
+    #[schemars(description = "Page size, capped at 100")]
     page_size: Option<i64>,
+    #[schemars(description = "Filter timeline status")]
     status: Option<String>,
+    #[schemars(description = "Filter timeline severity")]
     severity: Option<String>,
+    #[schemars(description = "RFC-3339 start timestamp")]
     from: Option<String>,
+    #[schemars(description = "RFC-3339 end timestamp")]
     to: Option<String>,
 }
 
@@ -107,43 +138,69 @@ struct IncidentTimelineArgs {
 struct IncidentRelationsArgs {
     #[schemars(description = "Incident UUID")]
     id: String,
+    #[schemars(description = "1-based page number")]
     page: Option<i64>,
+    #[schemars(description = "Page size, capped at 100")]
     page_size: Option<i64>,
+    #[schemars(description = "Relation type filter")]
     relation_type: Option<String>,
+    #[schemars(description = "Relation severity filter")]
     severity: Option<String>,
+    #[schemars(description = "RFC-3339 start timestamp")]
     from: Option<String>,
+    #[schemars(description = "RFC-3339 end timestamp")]
     to: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 struct FindingArgs {
+    #[schemars(description = "1-based page number")]
     page: Option<i64>,
+    #[schemars(description = "Page size, capped at 100")]
     page_size: Option<i64>,
+    #[schemars(description = "Indicator source")]
     source: Option<String>,
+    #[schemars(description = "Finding severity")]
     severity: Option<String>,
+    #[schemars(description = "Minimum confidence from 0 to 100")]
     confidence_min: Option<u8>,
+    #[schemars(description = "Only active findings when true")]
     active: Option<bool>,
+    #[schemars(description = "RFC-3339 start timestamp")]
     from: Option<String>,
+    #[schemars(description = "RFC-3339 end timestamp")]
     to: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 struct TrustArgs {
+    #[schemars(description = "1-based page number")]
     page: Option<i64>,
+    #[schemars(description = "Page size, capped at 100")]
     page_size: Option<i64>,
+    #[schemars(description = "Pending, Verified, or Revoked")]
     status: Option<String>,
+    #[schemars(description = "Tailscale, NetBird, VLAN, VPN, ASN, or prefix")]
     network_type: Option<String>,
+    #[schemars(description = "RFC-3339 start timestamp")]
     from: Option<String>,
+    #[schemars(description = "RFC-3339 end timestamp")]
     to: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 struct NetworkArgs {
+    #[schemars(description = "ASN filter")]
     asn: Option<String>,
+    #[schemars(description = "CIDR prefix filter")]
     prefix: Option<String>,
+    #[schemars(description = "RPKI status filter")]
     rpki_status: Option<String>,
+    #[schemars(description = "RFC-3339 start timestamp")]
     from: Option<String>,
+    #[schemars(description = "RFC-3339 end timestamp")]
     to: Option<String>,
+    #[schemars(description = "Page size, capped at 100")]
     page_size: Option<i64>,
 }
 
@@ -175,6 +232,20 @@ impl From<ApiEnvelope> for ToolResponse {
             errors: value.errors,
         }
     }
+}
+
+fn ensure_response_size(response: ToolResponse) -> Result<ToolResponse, ErrorData> {
+    let size = serde_json::to_vec(&response)
+        .map(|bytes| bytes.len())
+        .unwrap_or(MAX_RESPONSE_BYTES + 1);
+    if size > MAX_RESPONSE_BYTES {
+        MCP_UPSTREAM_ERRORS.fetch_add(1, Ordering::Relaxed);
+        return Err(ErrorData::internal_error(
+            "MCP response exceeds the configured size limit",
+            Some(json!({"max_bytes": MAX_RESPONSE_BYTES})),
+        ));
+    }
+    Ok(response)
 }
 
 impl Config {
@@ -310,9 +381,11 @@ async fn mcp_auth(
     next: Next,
 ) -> Response {
     let Some(token) = bearer(&headers) else {
+        MCP_AUTH_FAILURES.fetch_add(1, Ordering::Relaxed);
         return auth_error("MCP bearer token required");
     };
     if token != state.config.mcp_auth_token {
+        MCP_AUTH_FAILURES.fetch_add(1, Ordering::Relaxed);
         return auth_error("invalid MCP bearer token");
     }
     next.run(request).await
@@ -330,6 +403,18 @@ async fn health() -> impl IntoResponse {
     (
         StatusCode::OK,
         axum::Json(json!({"service":"clawforge-mcp","status":"ok"})),
+    )
+}
+
+async fn metrics() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        format!(
+            "# TYPE clawforge_mcp_upstream_requests_total counter\nclawforge_mcp_upstream_requests_total {}\n# TYPE clawforge_mcp_upstream_errors_total counter\nclawforge_mcp_upstream_errors_total {}\n# TYPE clawforge_mcp_auth_failures_total counter\nclawforge_mcp_auth_failures_total {}\n",
+            MCP_UPSTREAM_REQUESTS.load(Ordering::Relaxed),
+            MCP_UPSTREAM_ERRORS.load(Ordering::Relaxed),
+            MCP_AUTH_FAILURES.load(Ordering::Relaxed),
+        ),
     )
 }
 
@@ -404,6 +489,7 @@ impl McpServer {
                 .iter()
                 .map(|(key, value)| (key.as_str(), value.as_str())),
         );
+        MCP_UPSTREAM_REQUESTS.fetch_add(1, Ordering::Relaxed);
         let response = self
             .client
             .get(url)
@@ -411,13 +497,28 @@ impl McpServer {
             .timeout(self.config.timeout)
             .send()
             .await
-            .map_err(|_| ErrorData::internal_error("Agent API request failed", None))?;
+            .map_err(|_| {
+                MCP_UPSTREAM_ERRORS.fetch_add(1, Ordering::Relaxed);
+                ErrorData::internal_error("Agent API request failed", None)
+            })?;
         let status = response.status();
-        let body = response
-            .json::<ApiEnvelope>()
-            .await
-            .map_err(|_| ErrorData::internal_error("Agent API response invalid", None))?;
+        let bytes = response.bytes().await.map_err(|_| {
+            MCP_UPSTREAM_ERRORS.fetch_add(1, Ordering::Relaxed);
+            ErrorData::internal_error("Agent API response invalid", None)
+        })?;
+        if bytes.len() > MAX_RESPONSE_BYTES {
+            MCP_UPSTREAM_ERRORS.fetch_add(1, Ordering::Relaxed);
+            return Err(ErrorData::internal_error(
+                "Agent API response exceeds the MCP size limit",
+                Some(json!({"max_bytes": MAX_RESPONSE_BYTES})),
+            ));
+        }
+        let body = serde_json::from_slice::<ApiEnvelope>(&bytes).map_err(|_| {
+            MCP_UPSTREAM_ERRORS.fetch_add(1, Ordering::Relaxed);
+            ErrorData::internal_error("Agent API response invalid", None)
+        })?;
         if !status.is_success() || body.status != "ok" {
+            MCP_UPSTREAM_ERRORS.fetch_add(1, Ordering::Relaxed);
             let status_code = status.as_u16();
             return Err(match status {
                 StatusCode::UNAUTHORIZED => ErrorData::invalid_request(
@@ -444,7 +545,8 @@ impl McpServer {
                 ),
             });
         }
-        Ok(body.into())
+        let response: ToolResponse = body.into();
+        ensure_response_size(response)
     }
 
     async fn get_incident_context(&self) -> Result<Value, ErrorData> {
@@ -496,7 +598,7 @@ impl McpServer {
             "bgp": redact(bgp.expect("checked above").data),
             "rpki": redact(rpki.expect("checked above").data)
         });
-        Ok(ToolResponse {
+        ensure_response_size(ToolResponse {
             status: "ok".to_string(),
             data,
             timestamp: chrono::Utc::now().to_rfc3339(),
@@ -508,7 +610,10 @@ impl McpServer {
 
 #[tool_router]
 impl McpServer {
-    #[tool(name = "get_status", description = "Read Clawforge system status")]
+    #[tool(
+        name = "get_status",
+        description = "Read-only system, migration, runtime, provider, and incident status; requires agent:system:read and agent:incident:read"
+    )]
     async fn get_status(
         &self,
         Parameters(_args): Parameters<EmptyArgs>,
@@ -529,7 +634,7 @@ impl McpServer {
 
     #[tool(
         name = "get_agent_context",
-        description = "Read the consolidated, redacted Clawforge agent context"
+        description = "Read the consolidated, redacted Clawforge context without raw payloads or actions; requires agent:context:read"
     )]
     async fn get_agent_context(
         &self,
@@ -540,7 +645,7 @@ impl McpServer {
 
     #[tool(
         name = "get_decisions",
-        description = "Read the prioritized, read-only Clawforge operations decision summary"
+        description = "Read existing prioritized operations decisions and recommended checks; no actions are performed; requires agent:decision:read"
     )]
     async fn get_decisions(
         &self,
@@ -553,7 +658,7 @@ impl McpServer {
 
     #[tool(
         name = "get_provider_status",
-        description = "Read normalized Clawforge provider health and synchronization status"
+        description = "Read normalized provider health, data age, quality, and synchronization status; requires agent:provider:read"
     )]
     async fn get_provider_status(
         &self,
@@ -566,7 +671,7 @@ impl McpServer {
 
     #[tool(
         name = "get_operations_summary",
-        description = "Read the high-level, read-only Clawforge operations summary"
+        description = "Read the high-level operations summary, attention points, and checks; no remediation is performed; requires agent:operations:read"
     )]
     async fn get_operations_summary(
         &self,
@@ -578,7 +683,10 @@ impl McpServer {
         ))
     }
 
-    #[tool(name = "list_events", description = "List normalized Clawforge events")]
+    #[tool(
+        name = "list_events",
+        description = "List paginated normalized events with optional source, severity, type, correlation, and time filters; requires agent:events:read"
+    )]
     async fn list_events(
         &self,
         Parameters(args): Parameters<EventArgs>,
@@ -589,7 +697,10 @@ impl McpServer {
         ))
     }
 
-    #[tool(name = "list_incidents", description = "List Clawforge incidents")]
+    #[tool(
+        name = "list_incidents",
+        description = "List paginated incidents with lifecycle, severity, and time filters; read-only and requires agent:incident:read"
+    )]
     async fn list_incidents(
         &self,
         Parameters(args): Parameters<IncidentArgs>,
@@ -598,7 +709,10 @@ impl McpServer {
         Ok(Json(self.get_incident("/api/v1/incidents", &query).await?))
     }
 
-    #[tool(name = "get_incident", description = "Read one Clawforge incident")]
+    #[tool(
+        name = "get_incident",
+        description = "Read one redacted incident by UUID; no notes, raw payloads, or status changes; requires agent:incident:read"
+    )]
     async fn get_incident_tool(
         &self,
         Parameters(args): Parameters<IncidentIdArgs>,
@@ -609,7 +723,7 @@ impl McpServer {
 
     #[tool(
         name = "get_incident_timeline",
-        description = "Read a redacted, paginated Clawforge incident timeline"
+        description = "Read a redacted paginated incident timeline by UUID with status, severity, and time filters; requires agent:incident:read"
     )]
     async fn get_incident_timeline(
         &self,
@@ -622,7 +736,7 @@ impl McpServer {
 
     #[tool(
         name = "get_incident_relations",
-        description = "Read normalized, paginated relations for a Clawforge incident"
+        description = "Read normalized paginated incident relations without raw payloads; requires agent:incident:read"
     )]
     async fn get_incident_relations(
         &self,
@@ -635,7 +749,7 @@ impl McpServer {
 
     #[tool(
         name = "get_security_overview",
-        description = "Read the stored Clawforge security overview"
+        description = "Read the stored security overview and safe incident context; no new scoring or actions; requires agent:security:read and agent:incident:read"
     )]
     async fn get_security_overview(
         &self,
@@ -656,7 +770,7 @@ impl McpServer {
 
     #[tool(
         name = "list_security_findings",
-        description = "List normalized Clawforge security findings"
+        description = "List paginated normalized findings with source, confidence, age, and severity filters; requires agent:security:read"
     )]
     async fn list_security_findings(
         &self,
@@ -671,7 +785,7 @@ impl McpServer {
 
     #[tool(
         name = "get_trust_status",
-        description = "Read verified, pending, and revoked Clawforge trust networks"
+        description = "Read verified, pending, and revoked trusted networks; MCP cannot change trust; requires agent:network:read"
     )]
     async fn get_trust_status(
         &self,
@@ -686,7 +800,7 @@ impl McpServer {
 
     #[tool(
         name = "get_network_overview",
-        description = "Read ASN, prefix, BGP, and RPKI intelligence"
+        description = "Read grouped ASN, prefix, BGP, and RPKI intelligence with optional filters; no new assessment; requires agent:network:read"
     )]
     async fn get_network_overview_tool(
         &self,
@@ -896,6 +1010,7 @@ fn build_app(config: Arc<Config>) -> Router {
         .layer(middleware::from_fn_with_state(state.clone(), mcp_auth));
     Router::new()
         .route("/health", get(health))
+        .route("/metrics", get(metrics))
         .nest("/mcp", protected)
 }
 
@@ -1022,6 +1137,19 @@ mod tests {
             json!({"payload":{"token":"secret"},"metadata":{"raw_feed":"x"},"node_identities":["node"],"status":"Verified"}),
         );
         assert_eq!(value, json!({"status":"Verified"}));
+    }
+
+    #[test]
+    fn tool_responses_are_size_bounded() {
+        let response = ToolResponse {
+            status: "ok".into(),
+            data: json!({"large": "x".repeat(MAX_RESPONSE_BYTES) }),
+            timestamp: "2026-01-01T00:00:00Z".into(),
+            pagination: None,
+            errors: Vec::new(),
+        };
+        let error = ensure_response_size(response).expect_err("oversized response must fail");
+        assert!(format!("{error:?}").contains("size limit"));
     }
 
     #[test]

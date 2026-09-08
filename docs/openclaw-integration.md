@@ -21,13 +21,14 @@ Für ein read-only Agent-Profil werden nur die benötigten Scopes vergeben:
 - `agent:context:read`
 - `agent:decision:read`
 - `agent:incident:read`
-- `agent:security:read`
-- `agent:network:read`
 - `agent:provider:read`
+- `agent:security:read`
 
 `agent:read` kann diese Einzelrechte zusammenfassen, sollte aber nur für ein
-bewusst breit lesendes Profil verwendet werden. Es existieren keine MCP-
-Schreibwerkzeuge.
+bewusst breit lesendes Profil verwendet werden. Für `get_status`,
+`list_events`, `get_trust_status` und `get_network_overview` werden zusätzlich
+`agent:system:read`, `agent:events:read` beziehungsweise
+`agent:network:read` benötigt. Es existieren keine MCP-Schreibwerkzeuge.
 
 ## Abnahmetest
 
@@ -43,6 +44,8 @@ Schreibwerkzeuge.
    Berechtigungsfehler liefern.
 7. Upstream-Timeout, `401`, `429` und `5xx` prüfen. Antworten dürfen keine
    Rohpayloads, Secrets, Candidate-IDs oder Korrelationsschlüssel enthalten.
+8. `/metrics` auf MCP-Aufruf- und Fehlerzähler prüfen, ohne Tokenwerte zu
+   loggen.
 
 Die OpenAPI-Spezifikation unter `docs/openapi.yaml` und
 `docs/agent-api.md` bleiben der Vertrag für den Upstream. OpenClaw darf keine

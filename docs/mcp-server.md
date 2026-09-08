@@ -229,6 +229,40 @@ OpenClaw-Konfigurationsdateien werden in dieser Phase nicht geändert. Eine
 spätere Verbindung muss den MCP-Token rotieren können, ohne das
 Agent-API-Credential zu ändern.
 
+### Response- und Fehlervertrag
+
+Der Upstream-Body und die redigierte MCP-Antwort sind jeweils auf 1 MiB
+begrenzt. Größere Antworten werden als temporärer MCP-Fehler abgewiesen.
+Listen müssen deshalb über die vorgesehenen `page`-/`page_size`-Parameter
+abgefragt werden; `page_size` wird auf 100 begrenzt. Ein Upstream-Timeout,
+ungültiges JSON, `401`, `403`, `404`, `429` oder `5xx` wird in eine
+verständliche MCP-Fehlermeldung mit Statuskontext übersetzt, ohne Body,
+Token oder Stacktrace weiterzugeben.
+
+Beispiel einer erfolgreichen Tool-Antwort:
+
+```json
+{
+  "status": "ok",
+  "data": {
+    "overall_status": "degraded",
+    "risk_level": "medium",
+    "active_incidents": 1,
+    "attention_points": [],
+    "recommended_checks": []
+  },
+  "timestamp": "2026-09-08T00:00:00Z",
+  "pagination": null,
+  "errors": []
+}
+```
+
+Der MCP-Dienst stellt zusätzlich `/metrics` für
+`clawforge_mcp_upstream_requests_total`,
+`clawforge_mcp_upstream_errors_total` und
+`clawforge_mcp_auth_failures_total` bereit. Diese Zähler enthalten keine
+Tokenwerte oder Request-Payloads.
+
 ## Sprache und SDK
 
 Der MCP-Dienst ist in Rust als eigenes Workspace-Mitglied umgesetzt. Das passt
@@ -368,7 +402,7 @@ fachliche Zugriffsspur.
 ## Implementierung und Betrieb
 
 1. Das Crate `mcp/` nutzt `rmcp` mit Streamable HTTP und registriert genau die
-   zehn read-only Tools.
+   vierzehn read-only Tools.
 2. Der Upstream-Client liest getrennte Agent-API- und MCP-Credentials aus
    Docker Secrets, validiert die Agent-API-Envelope und setzt Timeouts.
 3. Die Compose-Datei startet `clawforge-mcp` intern auf Port 8090. Der Dienst
@@ -382,7 +416,7 @@ fachliche Zugriffsspur.
 
 ## Tests
 
-- `tools/list` enthält genau die zehn read-only Tools.
+- `tools/list` enthält genau die vierzehn read-only Tools.
 - Incident-Tools rufen ausschließlich die vier versionierten Incident-
   Endpunkte der Agent API auf und akzeptieren den kanonischen Scope
   `agent:incident:read` (der alte Plural bleibt kompatibel).

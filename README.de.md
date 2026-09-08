@@ -8,7 +8,7 @@
 
 ![Clawforge Security Platform](assets/branding/rebranding-announcement.png)
 
-Clawforge ist eine eigenständige Rust-Plattform für Security Intelligence. Sie verbindet Threat-Intelligence-Feeds, Netzwerkdaten, Risiko- und Vertrauensbewertung, PostgreSQL-Persistenz und eine Policy-Grenze. Die aktuelle Version besteht aus einer Axum-API und einem Tokio-Worker. Kein einzelner Feed darf direkt eine Sperre auslösen.
+Clawforge ist eine eigenständige Rust-Plattform für Security Intelligence. Sie verbindet Threat-Intelligence-Feeds, Netzwerkdaten, Risiko- und Vertrauensbewertung, Incidents, Alerts, PostgreSQL-Persistenz, Agent API v1 und einen read-only MCP-Adapter für OpenClaw. Kein einzelner Feed darf direkt eine Sperre auslösen.
 
 ## Enthalten
 
@@ -18,6 +18,7 @@ Clawforge ist eine eigenständige Rust-Plattform für Security Intelligence. Sie
 - PostgreSQL mit sqlx-Migrationen, Providerstatus und Risk-History
 - Trusted Infrastructure als explizit registriertes Vertrauenssignal
 - API-Endpunkte für Health/Readiness, Intelligence, Netzwerk, Trust und Prometheus-Metriken sowie Graceful Shutdown
+- Read-only Agent API v1 und MCP-Tools mit Scopes, Redaction, Timeouts und OpenClaw-Vertrag
 
 ## Schnellstart
 
@@ -29,7 +30,7 @@ curl http://127.0.0.1:8080/ready
 curl http://127.0.0.1:8080/version
 ```
 
-Feed-Synchronisation bleibt standardmäßig deaktiviert. Für Provider mit Authentifizierung werden private Docker-Secret-Dateien benötigt. Details stehen in [docs/configuration.md](docs/configuration.md), [docs/providers.md](docs/providers.md) und [docs/deployment.md](docs/deployment.md).
+Feed-Synchronisation bleibt standardmäßig deaktiviert. Für Provider mit Authentifizierung werden private Docker-Secret-Dateien benötigt. Details stehen in [docs/configuration.md](docs/configuration.md), [docs/providers.md](docs/providers.md), [docs/production.md](docs/production.md) und [docs/openclaw-integration.md](docs/openclaw-integration.md).
 
 ## Struktur
 

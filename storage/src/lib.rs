@@ -1596,6 +1596,14 @@ impl PostgresStore {
             sqlx::query_scalar("SELECT COUNT(*) FROM audit_events WHERE event_type = 'bgp_change'")
                 .fetch_one(&self.pool)
                 .await?;
+        let incidents: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM incidents WHERE status NOT IN ('resolved','closed')",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        let alerts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM alerts WHERE status='open'")
+            .fetch_one(&self.pool)
+            .await?;
         let worker_up: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runtime_status WHERE component = 'worker' AND state = 'running' AND last_heartbeat_at > NOW() - INTERVAL '2 minutes'")
             .fetch_one(&self.pool).await?;
         let events_created: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events")
@@ -1615,7 +1623,7 @@ impl PostgresStore {
         )
         .fetch_one(&self.pool)
         .await?;
-        let event_processing_seconds: f64 = sqlx::query_scalar("SELECT COALESCE(AVG(EXTRACT(EPOCH FROM (processed_at - processing_started_at))), 0) FROM event_delivery WHERE status='processed' AND processed_at IS NOT NULL AND processing_started_at IS NOT NULL")
+        let event_processing_seconds: f64 = sqlx::query_scalar("SELECT COALESCE(AVG(EXTRACT(EPOCH FROM (processed_at - processing_started_at))), 0)::float8 FROM event_delivery WHERE status='processed' AND processed_at IS NOT NULL AND processing_started_at IS NOT NULL")
             .fetch_one(&self.pool).await?;
         let provider_rows = sqlx::query("SELECT p.id, COALESCE(s.state, 'never') AS state FROM providers p LEFT JOIN provider_status s ON s.provider_id = p.id ORDER BY p.id")
             .fetch_all(&self.pool).await?;
@@ -1653,7 +1661,7 @@ impl PostgresStore {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        Ok(format!("# TYPE clawforge_provider_sync_total counter\nclawforge_provider_sync_total {providers}\n# TYPE clawforge_provider_errors_total counter\nclawforge_provider_errors_total {errors}\n# TYPE clawforge_indicators_total gauge\nclawforge_indicators_total {indicators}\n# TYPE clawforge_risk_events_total counter\nclawforge_risk_events_total {risks}\n# TYPE clawforge_bgp_changes_total counter\nclawforge_bgp_changes_total {bgp}\n# TYPE clawforge_events_created_total counter\nclawforge_events_created_total {events_created}\n# TYPE clawforge_events_processed_total counter\nclawforge_events_processed_total {events_processed}\n# TYPE clawforge_events_failed_total counter\nclawforge_events_failed_total {events_failed}\n# TYPE clawforge_event_queue_size gauge\nclawforge_event_queue_size {event_queue}\n# TYPE clawforge_event_processing_duration_seconds gauge\nclawforge_event_processing_duration_seconds {event_processing_seconds}\n# TYPE clawforge_worker_up gauge\nclawforge_worker_up {worker_up}\n# TYPE clawforge_database_up gauge\nclawforge_database_up 1\n# TYPE clawforge_provider_sync_status gauge\n{provider_status}\n# TYPE clawforge_event_consumer_up gauge\n{consumer_status}\n"))
+        Ok(format!("# TYPE clawforge_provider_sync_total counter\nclawforge_provider_sync_total {providers}\n# TYPE clawforge_provider_errors_total counter\nclawforge_provider_errors_total {errors}\n# TYPE clawforge_indicators_total gauge\nclawforge_indicators_total {indicators}\n# TYPE clawforge_risk_events_total counter\nclawforge_risk_events_total {risks}\n# TYPE clawforge_bgp_changes_total counter\nclawforge_bgp_changes_total {bgp}\n# TYPE clawforge_incidents_active gauge\nclawforge_incidents_active {incidents}\n# TYPE clawforge_alerts_open gauge\nclawforge_alerts_open {alerts}\n# TYPE clawforge_events_created_total counter\nclawforge_events_created_total {events_created}\n# TYPE clawforge_events_processed_total counter\nclawforge_events_processed_total {events_processed}\n# TYPE clawforge_events_failed_total counter\nclawforge_events_failed_total {events_failed}\n# TYPE clawforge_event_queue_size gauge\nclawforge_event_queue_size {event_queue}\n# TYPE clawforge_event_processing_duration_seconds gauge\nclawforge_event_processing_duration_seconds {event_processing_seconds}\n# TYPE clawforge_worker_up gauge\nclawforge_worker_up {worker_up}\n# TYPE clawforge_database_up gauge\nclawforge_database_up 1\n# TYPE clawforge_provider_sync_status gauge\n{provider_status}\n# TYPE clawforge_event_consumer_up gauge\n{consumer_status}\n"))
     }
 
     pub async fn set_runtime_status(
