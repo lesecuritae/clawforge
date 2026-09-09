@@ -1,4 +1,4 @@
-# Production Operations v0.10
+# Production Operations v0.10 and v0.11
 
 The production maturity layer makes controlled operation state visible while
 keeping external execution disabled. Execution requests are persisted behind
@@ -43,6 +43,10 @@ relationships. Apply it through the normal migration runner. Include the new
 tables in PostgreSQL backups and verify a fresh migration plus restore before
 enabling production operations. The dry-run flag must remain enabled until a
 separate reviewed release activates a specific connector action.
+
+Migration `0026_platform_hardening.sql` adds worker registration, leases,
+execution metrics, explicit RBAC permission mappings, and disabled connector
+action metadata. See [production-hardening-v0.11.md](production-hardening-v0.11.md).
 
 ## Dependency validation
 

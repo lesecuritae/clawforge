@@ -101,6 +101,7 @@ const AGENT_SCOPE_CONNECTOR_READ: &str = "agent:connector:read";
 const AGENT_SCOPE_ACTION_READ: &str = "agent:action:read";
 const AGENT_SCOPE_EXECUTION_READ: &str = "agent:execution:read";
 const AGENT_SCOPE_OPERATIONS_STATE: &str = "agent:operations:state";
+const AGENT_SCOPE_METRICS_READ: &str = "agent:metrics:read";
 const AGENT_SCOPE_ALL_READ: &str = "agent:read";
 
 const AGENT_SCOPES: &[&str] = &[
@@ -127,6 +128,7 @@ const AGENT_SCOPES: &[&str] = &[
     AGENT_SCOPE_ACTION_READ,
     AGENT_SCOPE_EXECUTION_READ,
     AGENT_SCOPE_OPERATIONS_STATE,
+    AGENT_SCOPE_METRICS_READ,
     AGENT_SCOPE_ALL_READ,
 ];
 
@@ -194,6 +196,7 @@ fn role_multiplier(role: Option<&str>) -> u32 {
     match role {
         Some("Administrator") => 200,
         Some("Operator") => 150,
+        Some("Approver") => 125,
         Some("Viewer") => 100,
         _ => 50,
     }
@@ -3427,7 +3430,7 @@ async fn admin_approve_workflow(
     Json(request): Json<ApproveWorkflowRequest>,
 ) -> ApiResult<Json<ApiEnvelope<serde_json::Value>>> {
     let principal = authenticate(&state, &headers).await?;
-    require_role(&principal, &["Administrator"])?;
+    require_role(&principal, &["Administrator", "Approver"])?;
     if request
         .comment
         .as_deref()
@@ -4118,7 +4121,12 @@ async fn admin_execution_transition(
     status: &'static str,
 ) -> ApiResult<Json<ApiEnvelope<serde_json::Value>>> {
     let principal = authenticate(&state, &headers).await?;
-    require_role(&principal, &["Administrator", "Operator"])?;
+    let allowed_roles = if status == "approved" {
+        &["Administrator", "Approver"][..]
+    } else {
+        &["Administrator", "Operator"][..]
+    };
+    require_role(&principal, allowed_roles)?;
     state
         .store
         .update_execution_status(id, status, &principal.username, None, None)
@@ -5013,6 +5021,21 @@ async fn metrics(State(state): State<AppState>) -> Result<Response, StatusCode> 
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
+async fn agent_metrics(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Response> {
+    let principal = authenticate_agent(&state, &headers).await?;
+    require_agent_scope(&principal, AGENT_SCOPE_METRICS_READ)?;
+    audit_agent_read(
+        &state,
+        &principal,
+        "/api/v1/metrics",
+        AGENT_SCOPE_METRICS_READ,
+    )
+    .await;
+    metrics(State(state))
+        .await
+        .map_err(|_| api_error(StatusCode::SERVICE_UNAVAILABLE, "metrics unavailable"))
+}
+
 #[derive(Serialize)]
 struct ApiError {
     status: &'static str,
@@ -5200,7 +5223,9 @@ async fn audit_agent_read(
 }
 
 fn require_role(principal: &AdminPrincipal, roles: &[&str]) -> ApiResult<()> {
-    if roles.iter().any(|role| *role == principal.role) {
+    if roles.iter().any(|role| *role == principal.role)
+        || (principal.role == "Approver" && roles.contains(&"Viewer"))
+    {
         Ok(())
     } else {
         Err(api_error(StatusCode::FORBIDDEN, "insufficient permission"))
@@ -5420,7 +5445,7 @@ async fn admin_create_user(
     require_role(&principal, &["Administrator"])?;
     if !matches!(
         request.role.as_str(),
-        "Administrator" | "Operator" | "Viewer"
+        "Administrator" | "Operator" | "Approver" | "Viewer"
     ) {
         return Err(api_error(StatusCode::BAD_REQUEST, "unsupported role"));
     }
@@ -7373,6 +7398,7 @@ async fn main() -> anyhow::Result<()> {
                 .route("/executions/{id}", get(agent_execution_detail))
                 .route("/history", get(agent_history))
                 .route("/history/summary", get(agent_history_summary))
+                .route("/metrics", get(agent_metrics))
                 .route("/knowledge", get(agent_knowledge))
                 .route("/events", get(agent_events))
                 .route("/incidents", get(agent_incidents))

@@ -4,6 +4,17 @@
 
 Weitere Änderungen für die nächste Version werden hier gesammelt.
 
+## [0.11.0] - 2026-09-09
+
+- Added production execution worker registration, heartbeats, bounded leases,
+  recovery metadata, and execution metrics. The executor remains dry-run only.
+- Extended Docker, GitHub, and Proxmox connector metadata with safe read
+  capabilities and disabled action registrations for future policy-gated work.
+- Added explicit Viewer, Operator, Approver, and Administrator permission
+  mappings plus the authenticated read-only `/api/v1/metrics` endpoint.
+- Added Prometheus action, duration, worker-health, and policy-denial metrics;
+  migration `0026_platform_hardening.sql`; and production hardening guidance.
+
 ## [0.10.0] - 2026-09-09
 
 - Added the production operations maturity layer with execution queue state,

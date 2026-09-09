@@ -1827,6 +1827,23 @@ impl PostgresStore {
         .await?;
         let worker_up: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runtime_status WHERE component = 'worker' AND state = 'running' AND last_heartbeat_at > NOW() - INTERVAL '2 minutes'")
             .fetch_one(&self.pool).await?;
+        let execution_workers: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM execution_workers WHERE status IN ('healthy','degraded') AND last_heartbeat_at > NOW() - INTERVAL '2 minutes'")
+            .fetch_one(&self.pool).await?;
+        let actions_total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM execution_metrics")
+            .fetch_one(&self.pool)
+            .await?;
+        let actions_failed: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM execution_metrics WHERE status IN ('failed','timeout')",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        let action_duration: f64 = sqlx::query_scalar(
+            "SELECT COALESCE(AVG(duration_ms),0)::float8 FROM execution_metrics",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        let policy_denials: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_events WHERE action LIKE '%denied%' AND (resource LIKE '%action%' OR resource LIKE '%execution%')")
+            .fetch_one(&self.pool).await?;
         let events_created: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events")
             .fetch_one(&self.pool)
             .await?;
@@ -1899,7 +1916,7 @@ impl PostgresStore {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        Ok(format!("# TYPE clawforge_provider_sync_total counter\nclawforge_provider_sync_total {providers}\n# TYPE clawforge_provider_errors_total counter\nclawforge_provider_errors_total {errors}\n# TYPE clawforge_indicators_total gauge\nclawforge_indicators_total {indicators}\n# TYPE clawforge_risk_events_total counter\nclawforge_risk_events_total {risks}\n# TYPE clawforge_bgp_changes_total counter\nclawforge_bgp_changes_total {bgp}\n# TYPE clawforge_incidents_active gauge\nclawforge_incidents_active {incidents}\n# TYPE clawforge_alerts_open gauge\nclawforge_alerts_open {alerts}\n# TYPE clawforge_correlations_total gauge\nclawforge_correlations_total {correlations}\n# TYPE clawforge_provider_quality_average gauge\nclawforge_provider_quality_average {provider_quality}\n# TYPE clawforge_agent_api_access_total counter\nclawforge_agent_api_access_total {agent_access}\n# TYPE clawforge_events_created_total counter\nclawforge_events_created_total {events_created}\n# TYPE clawforge_events_processed_total counter\nclawforge_events_processed_total {events_processed}\n# TYPE clawforge_events_failed_total counter\nclawforge_events_failed_total {events_failed}\n# TYPE clawforge_event_queue_size gauge\nclawforge_event_queue_size {event_queue}\n# TYPE clawforge_event_processing_duration_seconds gauge\nclawforge_event_processing_duration_seconds {event_processing_seconds}\n# TYPE clawforge_worker_up gauge\nclawforge_worker_up {worker_up}\n# TYPE clawforge_database_up gauge\nclawforge_database_up 1\n# TYPE clawforge_provider_sync_status gauge\n{provider_status}\n# TYPE clawforge_event_consumer_up gauge\n{consumer_status}\n# TYPE clawforge_component_up gauge\n{component_status}\n"))
+        Ok(format!("# TYPE clawforge_provider_sync_total counter\nclawforge_provider_sync_total {providers}\n# TYPE clawforge_provider_errors_total counter\nclawforge_provider_errors_total {errors}\n# TYPE clawforge_indicators_total gauge\nclawforge_indicators_total {indicators}\n# TYPE clawforge_risk_events_total counter\nclawforge_risk_events_total {risks}\n# TYPE clawforge_bgp_changes_total counter\nclawforge_bgp_changes_total {bgp}\n# TYPE clawforge_incidents_active gauge\nclawforge_incidents_active {incidents}\n# TYPE clawforge_alerts_open gauge\nclawforge_alerts_open {alerts}\n# TYPE clawforge_correlations_total gauge\nclawforge_correlations_total {correlations}\n# TYPE clawforge_provider_quality_average gauge\nclawforge_provider_quality_average {provider_quality}\n# TYPE clawforge_agent_api_access_total counter\nclawforge_agent_api_access_total {agent_access}\n# TYPE clawforge_events_created_total counter\nclawforge_events_created_total {events_created}\n# TYPE clawforge_events_processed_total counter\nclawforge_events_processed_total {events_processed}\n# TYPE clawforge_events_failed_total counter\nclawforge_events_failed_total {events_failed}\n# TYPE clawforge_event_queue_size gauge\nclawforge_event_queue_size {event_queue}\n# TYPE clawforge_event_processing_duration_seconds gauge\nclawforge_event_processing_duration_seconds {event_processing_seconds}\n# TYPE clawforge_worker_up gauge\nclawforge_worker_up {worker_up}\n# TYPE clawforge_execution_workers_healthy gauge\nclawforge_execution_workers_healthy {execution_workers}\n# TYPE clawforge_actions_total counter\nclawforge_actions_total {actions_total}\n# TYPE clawforge_action_errors_total counter\nclawforge_action_errors_total {actions_failed}\n# TYPE clawforge_execution_duration gauge\nclawforge_execution_duration {action_duration}\n# TYPE clawforge_policy_denials_total counter\nclawforge_policy_denials_total {policy_denials}\n# TYPE clawforge_database_up gauge\nclawforge_database_up 1\n# TYPE clawforge_provider_sync_status gauge\n{provider_status}\n# TYPE clawforge_event_consumer_up gauge\n{consumer_status}\n# TYPE clawforge_component_up gauge\n{component_status}\n"))
     }
 
     pub async fn set_runtime_status(
@@ -2337,15 +2354,130 @@ impl PostgresStore {
         let approvals = self.list_pending_approvals(500).await?;
         let connectors = self.list_connectors(None).await?;
         let providers = self.list_provider_views().await?;
+        let workers = self.list_execution_workers().await?;
+        let execution_metrics = self.execution_metrics_summary().await?;
         Ok(serde_json::json!({
             "pending_approvals": approvals.len(), "pending_execution_approvals": pending.len(), "running_executions": running.len(), "queued_executions": queue.len(),
             "connector_health": connectors.iter().map(|v| serde_json::json!({"id":v.get("id"),"name":v.get("name"),"status":v.get("status"),"health":v.get("health"),"last_check":v.get("last_check")})).collect::<Vec<_>>(),
             "provider_health": providers.iter().map(|v| serde_json::json!({"id":v.get("id"),"name":v.get("name"),"status":v.get("status"),"quality_score":v.get("quality_score"),"data_age_seconds":v.get("data_age_seconds")})).collect::<Vec<_>>(),
-            "execution_mode": "dry_run"
+            "execution_mode": "dry_run",
+            "execution_workers": workers,
+            "execution_metrics": execution_metrics,
+            "recovery_status": {"mode": "manual_restore_tested", "external_actions_enabled": false}
+        }))
+    }
+
+    /// Register a long-running execution worker without storing credentials.
+    /// Registration is idempotent so container restarts do not create stale
+    /// worker rows.
+    pub async fn register_execution_worker(&self, name: &str, capacity: i32) -> Result<Uuid> {
+        let id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO execution_workers (id,name,status,capacity,last_heartbeat_at,updated_at)
+             VALUES ($1,$2,'healthy',$3,NOW(),NOW())
+             ON CONFLICT (name) DO UPDATE SET status='healthy',capacity=$3,last_heartbeat_at=NOW(),updated_at=NOW()
+             RETURNING id",
+        )
+        .bind(Uuid::new_v4())
+        .bind(name.trim())
+        .bind(capacity.clamp(1, 64))
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(id)
+    }
+
+    pub async fn heartbeat_execution_worker(
+        &self,
+        worker_id: Uuid,
+        status: &str,
+        current_jobs: i32,
+        error: Option<&str>,
+    ) -> Result<()> {
+        if !matches!(
+            status,
+            "healthy" | "degraded" | "draining" | "stopped" | "failed"
+        ) {
+            anyhow::bail!("invalid execution worker status");
+        }
+        sqlx::query(
+            "UPDATE execution_workers SET status=$2,current_jobs=$3,last_heartbeat_at=NOW(),last_error=$4,updated_at=NOW() WHERE id=$1",
+        )
+        .bind(worker_id)
+        .bind(status)
+        .bind(current_jobs.max(0))
+        .bind(error.map(|value| value.chars().take(2_000).collect::<String>()))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_execution_workers(&self) -> Result<Vec<serde_json::Value>> {
+        let rows = sqlx::query(
+            "SELECT id,name,status,capacity,current_jobs,last_heartbeat_at,last_error,created_at,updated_at FROM execution_workers ORDER BY name",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| serde_json::json!({
+                "id": row.get::<Uuid,_>("id"),
+                "name": row.get::<String,_>("name"),
+                "status": row.get::<String,_>("status"),
+                "capacity": row.get::<i32,_>("capacity"),
+                "current_jobs": row.get::<i32,_>("current_jobs"),
+                "last_heartbeat_at": row.try_get::<chrono::DateTime<chrono::Utc>,_>("last_heartbeat_at").ok(),
+                "last_error": row.try_get::<String,_>("last_error").ok()
+            }))
+            .collect())
+    }
+
+    pub async fn record_execution_metric(
+        &self,
+        execution_id: Option<Uuid>,
+        worker_id: Option<Uuid>,
+        status: &str,
+        duration_ms: Option<i64>,
+        retry_count: i32,
+    ) -> Result<()> {
+        if !matches!(
+            status,
+            "success" | "failed" | "timeout" | "cancelled" | "dry_run"
+        ) {
+            anyhow::bail!("invalid execution metric status");
+        }
+        sqlx::query("INSERT INTO execution_metrics (execution_id,worker_id,status,duration_ms,retry_count) VALUES ($1,$2,$3,$4,$5)")
+            .bind(execution_id).bind(worker_id).bind(status).bind(duration_ms).bind(retry_count.max(0))
+            .execute(&self.pool).await?;
+        Ok(())
+    }
+
+    pub async fn execution_metrics_summary(&self) -> Result<serde_json::Value> {
+        let row = sqlx::query("SELECT COUNT(*)::bigint AS total, COUNT(*) FILTER (WHERE status='success')::bigint AS successful, COUNT(*) FILTER (WHERE status IN ('failed','timeout'))::bigint AS failed, COALESCE(AVG(duration_ms),0)::float8 AS average_duration_ms FROM execution_metrics")
+            .fetch_one(&self.pool).await?;
+        Ok(serde_json::json!({
+            "total": row.get::<i64,_>("total"),
+            "successful": row.get::<i64,_>("successful"),
+            "failed": row.get::<i64,_>("failed"),
+            "average_duration_ms": row.get::<f64,_>("average_duration_ms")
         }))
     }
 
     pub async fn process_one_dry_run(&self) -> Result<()> {
+        self.process_one_dry_run_for_worker(None).await
+    }
+
+    /// Process at most one request in dry-run mode. A lease is created before
+    /// the state transition, which makes worker recovery and duplicate
+    /// prevention observable without permitting external connector actions.
+    pub async fn process_one_dry_run_for_worker(&self, worker_id: Option<Uuid>) -> Result<()> {
+        let started = std::time::Instant::now();
+        // Reclaim leases from workers that stopped heartbeating. The request
+        // is queued again only when it was still in a non-terminal state.
+        sqlx::query("UPDATE execution_leases SET status='expired',updated_at=NOW() WHERE status='active' AND expires_at<=NOW()")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("UPDATE execution_requests SET status='queued',started_at=NULL,next_retry_at=NULL,error_summary='worker lease expired; request reclaimed' WHERE id IN (SELECT execution_id FROM execution_leases WHERE status='expired') AND status IN ('starting','running')")
+            .execute(&self.pool)
+            .await?;
         let timed_out: Vec<Uuid> = sqlx::query_scalar("UPDATE execution_requests SET status='timeout',finished_at=NOW(),error_summary='dry-run execution timeout' WHERE status IN ('starting','running') AND started_at IS NOT NULL AND started_at < NOW() - (timeout_seconds * INTERVAL '1 second') RETURNING id")
             .fetch_all(&self.pool)
             .await?;
@@ -2372,6 +2504,10 @@ impl PostgresStore {
         }
         let id: Option<Uuid> = sqlx::query_scalar("UPDATE execution_requests SET status='starting',started_at=NOW() WHERE id=(SELECT id FROM execution_requests WHERE status IN ('approved','pending','queued') ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1) RETURNING id").fetch_optional(&self.pool).await?;
         if let Some(id) = id {
+            if let Some(worker_id) = worker_id {
+                sqlx::query("INSERT INTO execution_leases (id,execution_id,worker_id,expires_at) VALUES ($1,$2,$3,NOW()+INTERVAL '2 minutes') ON CONFLICT (execution_id) DO UPDATE SET worker_id=$3,status='active',expires_at=NOW()+INTERVAL '2 minutes',updated_at=NOW()")
+                    .bind(Uuid::new_v4()).bind(id).bind(worker_id).execute(&self.pool).await?;
+            }
             self.record_audit_event(
                 "executor",
                 "execution_request_starting",
@@ -2389,6 +2525,18 @@ impl PostgresStore {
                 None,
             )
             .await?;
+            if let Some(worker_id) = worker_id {
+                sqlx::query("UPDATE execution_leases SET status='released',updated_at=NOW() WHERE execution_id=$1")
+                    .bind(id).execute(&self.pool).await?;
+                self.record_execution_metric(
+                    Some(id),
+                    Some(worker_id),
+                    "dry_run",
+                    Some(started.elapsed().as_millis() as i64),
+                    0,
+                )
+                .await?;
+            }
         }
         Ok(())
     }

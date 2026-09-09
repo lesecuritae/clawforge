@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: Clawforge API
-  version: 0.10.0
+  version: 0.11.0
   description: Backend-only intelligence, incident, and administration API.
   x-rate-limit-contract: Responses may include X-RateLimit-Limit and X-RateLimit-Remaining; 429 responses include Retry-After.
   x-response-contract: Every JSON endpoint returns status, data, timestamp, pagination, and errors.
@@ -46,7 +46,7 @@ components:
       required: [service, version, status, migrations, runtime, events, providers]
       properties:
         service: { type: string, example: clawforge }
-        version: { type: string, example: 0.10.0 }
+        version: { type: string, example: 0.11.0 }
         status: { type: string, enum: [ok] }
         migrations: { type: object, additionalProperties: true }
         runtime: { type: array, items: { type: object, additionalProperties: true } }
@@ -335,6 +335,20 @@ paths:
         '403': { description: Required agent scope missing }
         '429': { $ref: '#/components/responses/RateLimited' }
         '503': { description: PostgreSQL or migration status unavailable }
+  /api/v1/metrics:
+    get:
+      security: [{ agentBearerAuth: [] }]
+      description: Bounded Prometheus-compatible operational metrics. Requires agent:metrics:read; no secrets or raw payloads are returned.
+      responses:
+        '200':
+          description: Prometheus text exposition
+          content:
+            text/plain:
+              schema: { type: string }
+        '401': { description: Agent token missing or invalid }
+        '403': { description: agent:metrics:read scope missing }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { description: Metrics unavailable }
   /api/v1/agents/status:
     get:
       security: [{ agentBearerAuth: [] }]

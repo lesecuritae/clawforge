@@ -21,11 +21,20 @@ pub const CAPABILITIES: &[&str] = &[
     "container.health",
     "container.image_version",
     "container.restart_count",
+    "container.images",
+    "container.networks",
+    "container.volumes",
     "repository.status",
     "repository.commits",
     "repository.security_alerts",
     "repository.workflow_status",
+    "repository.issues",
+    "repository.actions",
+    "repository.releases",
     "platform.health",
+    "platform.nodes",
+    "platform.vms",
+    "platform.storage",
     "container.restart",
     "container.pull",
     "repository.workflow_retry",
@@ -152,10 +161,10 @@ impl ReadOnlyConnector for DockerConnector {
         ConnectorMetadata {
             id: "docker".into(),
             name: "Docker Connector".into(),
-            version: "0.8.0".into(),
+            version: env!("CARGO_PKG_VERSION").into(),
             connector_type: "docker".into(),
             status: "configured".into(),
-            capabilities: CAPABILITIES[..5].iter().map(|v| (*v).into()).collect(),
+            capabilities: CAPABILITIES[..8].iter().map(|v| (*v).into()).collect(),
         }
     }
 
@@ -211,10 +220,10 @@ impl ReadOnlyConnector for GitHubConnector {
         ConnectorMetadata {
             id: "github".into(),
             name: "GitHub Connector".into(),
-            version: "0.8.0".into(),
+            version: env!("CARGO_PKG_VERSION").into(),
             connector_type: "github".into(),
             status: "configured".into(),
-            capabilities: CAPABILITIES[5..9].iter().map(|v| (*v).into()).collect(),
+            capabilities: CAPABILITIES[8..15].iter().map(|v| (*v).into()).collect(),
         }
     }
 
@@ -252,10 +261,15 @@ impl ReadOnlyConnector for ProxmoxConnector {
         ConnectorMetadata {
             id: "proxmox".into(),
             name: "Proxmox Connector Foundation".into(),
-            version: "0.8.0".into(),
+            version: env!("CARGO_PKG_VERSION").into(),
             connector_type: "proxmox".into(),
             status: "configured".into(),
-            capabilities: vec!["platform.health".into()],
+            capabilities: vec![
+                "platform.health".into(),
+                "platform.nodes".into(),
+                "platform.vms".into(),
+                "platform.storage".into(),
+            ],
         }
     }
 

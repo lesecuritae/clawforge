@@ -366,6 +366,10 @@ async fn migrations_and_restart_persist() -> anyhow::Result<()> {
         "approval_policies",
         "execution_recovery",
         "entity_relationships",
+        "execution_workers",
+        "execution_leases",
+        "execution_metrics",
+        "role_permissions",
     ] {
         let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
             .bind(format!("public.{table}"))
@@ -390,6 +394,21 @@ async fn migrations_and_restart_persist() -> anyhow::Result<()> {
     assert_eq!(high_policy.2, "two_operators");
     let operations_state = restarted.operations_state().await?;
     assert_eq!(operations_state["execution_mode"], "dry_run");
+    let worker_id = restarted
+        .register_execution_worker("integration-worker", 2)
+        .await?;
+    restarted
+        .heartbeat_execution_worker(worker_id, "healthy", 0, None)
+        .await?;
+    restarted
+        .record_execution_metric(None, Some(worker_id), "dry_run", Some(5), 0)
+        .await?;
+    assert_eq!(restarted.list_execution_workers().await?.len(), 1);
+    assert_eq!(restarted.execution_metrics_summary().await?["total"], 1);
+    sqlx::query("DELETE FROM execution_workers WHERE id=$1")
+        .bind(worker_id)
+        .execute(restarted.pool())
+        .await?;
     let connector_id: uuid::Uuid =
         sqlx::query_scalar("SELECT id FROM connector_registry ORDER BY name LIMIT 1")
             .fetch_one(restarted.pool())

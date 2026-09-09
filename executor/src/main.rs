@@ -18,6 +18,16 @@ async fn main() -> anyhow::Result<()> {
         );
     }
     let store = PostgresStore::connect(&database_url_from_env()?).await?;
+    let worker_name = env::var("CLAWFORGE_EXECUTOR_WORKER_NAME")
+        .unwrap_or_else(|_| format!("executor-{}", std::process::id()));
+    let worker_capacity = env::var("CLAWFORGE_EXECUTOR_WORKER_CAPACITY")
+        .ok()
+        .and_then(|value| value.parse::<i32>().ok())
+        .unwrap_or(1)
+        .clamp(1, 64);
+    let worker_id = store
+        .register_execution_worker(&worker_name, worker_capacity)
+        .await?;
     store
         .set_runtime_status("executor", "running", None)
         .await?;
@@ -32,9 +42,13 @@ async fn main() -> anyhow::Result<()> {
         tokio::select! {
             _ = ticks.tick() => {
                 if let Err(error) = store.set_runtime_status("executor", "running", None).await { tracing::warn!(%error, "executor heartbeat failed"); }
-                if let Err(error) = store.process_one_dry_run().await { tracing::warn!(%error, "dry-run request processing failed"); }
+                if let Err(error) = store.heartbeat_execution_worker(worker_id, "healthy", 0, None).await { tracing::warn!(%error, "executor worker heartbeat failed"); }
+                if let Err(error) = store.process_one_dry_run_for_worker(Some(worker_id)).await {
+                    tracing::warn!(%error, "dry-run request processing failed");
+                    let _ = store.heartbeat_execution_worker(worker_id, "degraded", 0, Some(&error.to_string())).await;
+                }
             }
-            _ = shutdown_signal() => { let _ = store.set_runtime_status("executor", "stopped", None).await; break; }
+            _ = shutdown_signal() => { let _ = store.heartbeat_execution_worker(worker_id, "stopped", 0, None).await; let _ = store.set_runtime_status("executor", "stopped", None).await; break; }
         }
     }
     Ok(())

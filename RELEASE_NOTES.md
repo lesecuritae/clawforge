@@ -195,3 +195,16 @@ execution is intentionally unavailable in this release.
 
 The executor remains dry-run only. No shell commands, connector mutations, or
 automatic remediation are enabled in this release.
+
+# Clawforge v0.11.0 Production Hardening
+
+- Execution worker registration, heartbeat and lease recovery metadata
+- Prometheus action, duration, worker and policy-denial metrics
+- Expanded safe read-only Docker, GitHub and Proxmox connector projections
+- Explicit Viewer/Operator/Approver/Administrator permission registry
+- Authenticated read-only Agent API metrics at `/api/v1/metrics`
+
+Productive connector actions remain disabled. The executor requires
+`CLAWFORGE_EXECUTOR_DRY_RUN=true`; no shell commands or automatic remediation
+are available. Apply migration `0026_platform_hardening.sql` through the
+standard startup migration path and run the documented backup/restore check.

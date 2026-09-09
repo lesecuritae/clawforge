@@ -124,6 +124,7 @@ rollenbasierte Exportfunktionen. Zeitangaben sind UTC in RFC-3339-Format.
 | `GET /api/v1/connectors/{id}/capabilities` | Connector-Fähigkeiten | Allowlisted read-only Fähigkeiten | `agent:connector:read` |
 | `GET /api/v1/knowledge` | historische Erkenntnisse | Redigierte Lessons Learned, Incident-Zusammenfassungen und Muster | `agent:knowledge:read` |
 | `GET /api/v1/providers/{id}/history` | Provider-Verlauf | Status, Datenalter, Qualität und Synchronisationsverlauf ohne Feed-Inhalte | `agent:provider:read` |
+| `GET /api/v1/metrics` | Betriebsmetriken | Prometheus-kompatible Action-, Worker-, Laufzeit-, Provider- und Policy-Metriken ohne Secrets | `agent:metrics:read` |
 | `GET /api/v1/history` | historische Lagebilder | Operations-Snapshots mit Zeitbereich, Intervall und Trendvergleich | `agent:operations:read` |
 | `GET /api/v1/history/summary` | historische Intelligence | Trends, Veränderungen und Auffälligkeiten nach Stunde/Tag/Woche | `agent:history:read` |
 | `GET /api/v1/events` | aktuelle kanonische Events | Typ, Quelle, Severity, Zeit, Korrelation, begründete Zusammenfassung | `agent:events:read` |
@@ -180,6 +181,7 @@ Scopes sind:
 | `agent:connector:read` | `/api/v1/connectors` und Connector-Detail-, Health- und Capability-Routen; nur Lesedaten |
 | `agent:action:read` | `/api/v1/actions` und Action-Details; registrierte Aktionen ohne Ausführung |
 | `agent:execution:read` | `/api/v1/executions` und Execution-Details; Status und begrenzte Ergebniszusammenfassung |
+| `agent:metrics:read` | `/api/v1/metrics`; Prometheus-kompatible Betriebsmetriken ohne Secrets oder Rohpayloads |
 | `agent:knowledge:read` | `/api/v1/knowledge` |
 | `agent:history:read` | `/api/v1/history/summary` |
 | `agent:incident:replay` | `/api/v1/incidents/{id}/replay` |
@@ -545,7 +547,7 @@ Bearer-Authentifizierung laufen, alle Antworten OpenAPI-konform sind,
 Agent-Tokens auf Read-Scopes begrenzt sind und die Regressionstests für
 Event Backbone, Risk/Policy/Trust, Provider und Frontend erfolgreich sind.
 
-## Production Operations v0.10
+## Production Operations v0.10/v0.11
 
 `GET /api/v1/operations/state` liefert die read-only Lage der kontrollierten
 Operations-Schicht: Warteschlange, offene Freigaben, laufende Executions sowie
