@@ -118,6 +118,10 @@ rollenbasierte Exportfunktionen. Zeitangaben sind UTC in RFC-3339-Format.
 | `GET /api/v1/workflows` | Workflow-Definitionen | Aktivierte deklarative Schritte und Approval-Anforderungen | `agent:workflow:read` |
 | `GET /api/v1/workflows/{id}` | Workflow-Details | Schritte, vorbereitete Runs und redigierte Audit-Historie | `agent:workflow:read` |
 | `GET /api/v1/workflow-runs` | Workflow-Historie | Vorbereitete Runs, Status und Decision-Referenzen | `agent:workflow:read` |
+| `GET /api/v1/connectors` | Connector Registry | Read-only externe Infrastruktur-Connectoren und Fähigkeiten | `agent:connector:read` |
+| `GET /api/v1/connectors/{id}` | Connector-Details | Sanitized Metadaten ohne Credentials | `agent:connector:read` |
+| `GET /api/v1/connectors/{id}/health` | Connector Health | Status, letzter Check und Latenz | `agent:connector:read` |
+| `GET /api/v1/connectors/{id}/capabilities` | Connector-Fähigkeiten | Allowlisted read-only Fähigkeiten | `agent:connector:read` |
 | `GET /api/v1/knowledge` | historische Erkenntnisse | Redigierte Lessons Learned, Incident-Zusammenfassungen und Muster | `agent:knowledge:read` |
 | `GET /api/v1/providers/{id}/history` | Provider-Verlauf | Status, Datenalter, Qualität und Synchronisationsverlauf ohne Feed-Inhalte | `agent:provider:read` |
 | `GET /api/v1/history` | historische Lagebilder | Operations-Snapshots mit Zeitbereich, Intervall und Trendvergleich | `agent:operations:read` |
@@ -172,6 +176,7 @@ Scopes sind:
 | `agent:operations:recommend` | `/api/v1/operations/recommendations`, `/api/v1/decisions/history` |
 | `agent:workflow:read` | `/api/v1/workflows`, `/api/v1/workflows/{id}`, `/api/v1/workflow-runs` |
 | `agent:workflow:approve` | Für spätere, separat geschützte Freigabeflüsse reserviert; OpenClaw erhält keine Schreibroute |
+| `agent:connector:read` | `/api/v1/connectors` und Connector-Detail-, Health- und Capability-Routen; nur Lesedaten |
 | `agent:knowledge:read` | `/api/v1/knowledge` |
 | `agent:history:read` | `/api/v1/history/summary` |
 | `agent:incident:replay` | `/api/v1/incidents/{id}/replay` |
@@ -206,6 +211,13 @@ Vertrag nicht umgehen.
 Die Ressourcen sind ausschließlich `GET`. Es gibt unter `/api/v1` keine
 Provider-Aktivierung, manuelle Synchronisation, Trust-Änderung,
 Incident-Statusänderung, Policy- oder Blockaktion.
+
+## Connector Framework v0.8
+
+Die Connector-Ressourcen liefern ausschließlich sanitisiertes Registry-,
+Health- und Capability-Material. Docker, GitHub und die Proxmox-Foundation
+bleiben read-only; Credentials, Secret-Referenzen und Rohdaten werden nicht
+ausgegeben. Zugriffe werden auditiert und benötigen `agent:connector:read`.
 
 ## Workflow Governance v0.7
 

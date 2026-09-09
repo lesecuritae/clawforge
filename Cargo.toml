@@ -1,11 +1,11 @@
 [workspace]
-members = ["api", "worker", "intelligence", "risk", "policy", "storage", "decision", "workflow", "analyzer", "notifier", "events", "mcp", "correlation", "incidents"]
+members = ["api", "worker", "intelligence", "risk", "policy", "storage", "decision", "workflow", "connector", "analyzer", "notifier", "events", "mcp", "correlation", "incidents"]
 resolver = "2"
 
 [workspace.package]
 edition = "2021"
 license = "Apache-2.0"
-version = "0.7.0"
+version = "0.8.0"
 
 [workspace.dependencies]
 anyhow = "1"

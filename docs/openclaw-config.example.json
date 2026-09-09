@@ -26,7 +26,10 @@
             "get_provider_status",
             "get_operations_summary",
             "get_health_overview",
-            "get_security_posture"
+            "get_security_posture",
+            "list_connectors",
+            "get_connector_status",
+            "get_connector_capabilities"
           ]
         }
       }

@@ -2116,6 +2116,106 @@ impl PostgresStore {
         Ok(result.rows_affected())
     }
 
+    /// Return connector metadata and capability summaries without exposing
+    /// connector configuration or secret references.
+    pub async fn list_connectors(
+        &self,
+        connector_id: Option<Uuid>,
+    ) -> Result<Vec<serde_json::Value>> {
+        let rows = sqlx::query(
+            "SELECT r.id,r.name,r.version,r.connector_type,r.status,r.last_check,r.health,
+                    r.created_at,r.updated_at,h.status AS health_status,h.checked_at,h.latency_ms,h.error,
+                    COALESCE((SELECT jsonb_agg(jsonb_build_object('name',c.capability,'read_only',c.read_only) ORDER BY c.capability)
+                              FROM connector_capabilities c WHERE c.connector_id=r.id), '[]'::jsonb) AS capabilities,
+                    m.description,m.read_only
+             FROM connector_registry r
+             LEFT JOIN connector_metadata m ON m.connector_id=r.id
+             LEFT JOIN connector_health h ON h.connector_id=r.id
+             WHERE ($1::uuid IS NULL OR r.id=$1)
+             ORDER BY r.name",
+        )
+        .bind(connector_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                serde_json::json!({
+                    "id": row.get::<Uuid,_>("id"),
+                    "name": row.get::<String,_>("name"),
+                    "version": row.get::<String,_>("version"),
+                    "type": row.get::<String,_>("connector_type"),
+                    "status": row.get::<String,_>("status"),
+                    "last_check": row.get::<Option<chrono::DateTime<chrono::Utc>>,_>("last_check"),
+                    "health": row.get::<Option<String>,_>("health_status").or_else(|| row.get::<Option<String>,_>("health")).unwrap_or_else(|| "unknown".into()),
+                    "health_checked_at": row.get::<Option<chrono::DateTime<chrono::Utc>>,_>("checked_at"),
+                    "latency_ms": row.get::<Option<i32>,_>("latency_ms"),
+                    "health_error": row.get::<Option<String>,_>("error"),
+                    "description": row.get::<Option<String>,_>("description").unwrap_or_default(),
+                    "read_only": row.get::<Option<bool>,_>("read_only").unwrap_or(true),
+                    "capabilities": row.get::<serde_json::Value,_>("capabilities"),
+                    "created_at": row.get::<chrono::DateTime<chrono::Utc>,_>("created_at"),
+                    "updated_at": row.get::<chrono::DateTime<chrono::Utc>,_>("updated_at")
+                })
+            })
+            .collect())
+    }
+
+    pub async fn list_connector_capabilities(
+        &self,
+        connector_id: Uuid,
+    ) -> Result<Vec<serde_json::Value>> {
+        let rows = sqlx::query(
+            "SELECT capability,read_only,created_at FROM connector_capabilities WHERE connector_id=$1 ORDER BY capability",
+        )
+        .bind(connector_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                serde_json::json!({
+                    "capability": row.get::<String,_>("capability"),
+                    "read_only": row.get::<bool,_>("read_only"),
+                    "created_at": row.get::<chrono::DateTime<chrono::Utc>,_>("created_at")
+                })
+            })
+            .collect())
+    }
+
+    pub async fn record_connector_health(
+        &self,
+        connector_id: Uuid,
+        status: &str,
+        latency_ms: Option<i32>,
+        error: Option<&str>,
+    ) -> Result<()> {
+        if !matches!(status, "unknown" | "healthy" | "degraded" | "unavailable") {
+            anyhow::bail!("invalid connector health status");
+        }
+        let sanitized_error = error.map(|value| value.chars().take(2_000).collect::<String>());
+        sqlx::query(
+            "INSERT INTO connector_health (connector_id,status,checked_at,latency_ms,error,updated_at)
+             VALUES ($1,$2,NOW(),$3,$4,NOW())
+             ON CONFLICT (connector_id) DO UPDATE SET status=$2,checked_at=NOW(),latency_ms=$3,error=$4,updated_at=NOW()",
+        )
+        .bind(connector_id)
+        .bind(status)
+        .bind(latency_ms)
+        .bind(sanitized_error)
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "UPDATE connector_registry SET status=CASE WHEN $2='healthy' THEN 'healthy' WHEN $2='disabled' THEN 'disabled' ELSE $2 END,
+                    health=$2,last_check=NOW(),updated_at=NOW() WHERE id=$1",
+        )
+        .bind(connector_id)
+        .bind(status)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Return bounded workflow metadata and step summaries. Step
     /// configuration is deliberately kept out of this view.
     pub async fn list_workflows(

@@ -2,7 +2,7 @@
 
 Status: Read-only MCP-Adapter produktionsbereit. Der MCP-Dienst ist ein
 isolierter Rust-Service und wurde mit OpenClaw Discovery sowie den
-Operations-Leseabfragen geprüft. Die aktuelle Tool-Liste umfasst 28 Tools.
+Operations-Leseabfragen geprüft. Die aktuelle Tool-Liste umfasst 31 Tools.
 
 Dieses Dokument beschreibt einen separaten, read-only MCP-Dienst für
 OpenClaw. Die Agent API v1 bleibt die einzige Datenquelle. Der MCP-Dienst
@@ -72,6 +72,9 @@ als MCP-Upstream verwendet.
 | `list_workflows` | `GET /api/v1/workflows` | `agent:workflow:read` | deklarative Workflow-Definitionen |
 | `get_workflow_status` | `GET /api/v1/workflows/{id}` | `agent:workflow:read` | Schritte, Runs und Auditstatus |
 | `get_workflow_history` | `GET /api/v1/workflow-runs` | `agent:workflow:read` | vorbereitete Runs und Approvalstatus |
+| `list_connectors` | `GET /api/v1/connectors` | `agent:connector:read` | Connector Registry und read-only Fähigkeiten |
+| `get_connector_status` | `GET /api/v1/connectors/{id}/health` | `agent:connector:read` | Health und letzter Check |
+| `get_connector_capabilities` | `GET /api/v1/connectors/{id}/capabilities` | `agent:connector:read` | Allowlisted Fähigkeiten |
 
 `get_trust_status` verwendet ausschließlich den versionierten
 `/api/v1/network/trust`-Vertrag. Die historische Route `/network/trust` bleibt
@@ -175,6 +178,14 @@ und im Tool-Vertrag versioniert.
 - Scope: `agent:operations:recommend`
 - Ausgabe: frühere Entscheidungen einschließlich abgeschlossener und
   abgelaufener Einträge
+
+### Connector-Tools
+
+`list_connectors`, `get_connector_status` und `get_connector_capabilities` lesen
+nur die sanitisierten Connector-Metadaten. Credentials, Secret-Referenzen und
+externe Rohdaten werden nicht weitergegeben. Alle drei Tools benötigen
+`agent:connector:read`; Schreibaktionen, Container-Restarts und Repository-
+Änderungen sind nicht verfügbar.
 
 ### Workflow-Tools
 
@@ -303,7 +314,7 @@ Aktivierung, Policy-Änderungen, Incident-Statusänderungen oder Blockaktionen.
 
 ## Produktionsvertrag und OpenClaw-Vorbereitung
 
-Der MCP-Server ist ein stateless read-only Adapter. Alle 28 Tools verwenden
+Der MCP-Server ist ein stateless read-only Adapter. Alle 31 Tools verwenden
 die versionierte Agent API v1 als einzige Datenquelle; es gibt keine direkte
 PostgreSQL-, Event-Backbone- oder Worker-Verbindung. Upstream-Aufrufe haben
 ein konfigurierbares Timeout (`CLAWFORGE_MCP_UPSTREAM_TIMEOUT_SECONDS`,
@@ -508,7 +519,7 @@ fachliche Zugriffsspur.
 ## Implementierung und Betrieb
 
 1. Das Crate `mcp/` nutzt `rmcp` mit Streamable HTTP und registriert genau die
-   28 read-only Tools.
+   31 read-only Tools.
 2. Der Upstream-Client liest getrennte Agent-API- und MCP-Credentials aus
    Docker Secrets, validiert die Agent-API-Envelope und setzt Timeouts.
 3. Die Compose-Datei startet `clawforge-mcp` intern auf Port 8090. Der Dienst
@@ -522,7 +533,7 @@ fachliche Zugriffsspur.
 
 ## Tests
 
-- `tools/list` enthält genau die 28 read-only Tools einschließlich der drei
+- `tools/list` enthält genau die 31 read-only Tools einschließlich der drei
   Workflow-Tools.
 - Incident-Tools rufen ausschließlich die vier versionierten Incident-
   Endpunkte der Agent API auf und akzeptieren den kanonischen Scope

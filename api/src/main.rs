@@ -96,6 +96,7 @@ const AGENT_SCOPE_SECURITY_BRIEFING: &str = "agent:security:briefing";
 const AGENT_SCOPE_SYSTEM_GRAPH: &str = "agent:system:graph:read";
 const AGENT_SCOPE_WORKFLOW_READ: &str = "agent:workflow:read";
 const AGENT_SCOPE_WORKFLOW_APPROVE: &str = "agent:workflow:approve";
+const AGENT_SCOPE_CONNECTOR_READ: &str = "agent:connector:read";
 const AGENT_SCOPE_ALL_READ: &str = "agent:read";
 
 const AGENT_SCOPES: &[&str] = &[
@@ -118,6 +119,7 @@ const AGENT_SCOPES: &[&str] = &[
     AGENT_SCOPE_SYSTEM_GRAPH,
     AGENT_SCOPE_WORKFLOW_READ,
     AGENT_SCOPE_WORKFLOW_APPROVE,
+    AGENT_SCOPE_CONNECTOR_READ,
     AGENT_SCOPE_ALL_READ,
 ];
 
@@ -3515,6 +3517,265 @@ async fn agent_workflow_runs(
     Ok(envelope(data, Some(pagination)))
 }
 
+fn connector_view(value: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "id": value.get("id"),
+        "name": value.get("name"),
+        "version": value.get("version"),
+        "type": value.get("type"),
+        "status": value.get("status"),
+        "health": value.get("health"),
+        "last_check": value.get("last_check"),
+        "health_checked_at": value.get("health_checked_at"),
+        "latency_ms": value.get("latency_ms"),
+        "description": value.get("description"),
+        "read_only": true,
+        "capabilities": value.get("capabilities")
+    })
+}
+
+fn connector_health_view(value: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "id": value.get("id"),
+        "name": value.get("name"),
+        "type": value.get("type"),
+        "status": value.get("health"),
+        "last_check": value.get("health_checked_at").or_else(|| value.get("last_check")),
+        "latency_ms": value.get("latency_ms"),
+        "read_only": true
+    })
+}
+
+async fn admin_connectors(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<ApiEnvelope<Vec<serde_json::Value>>>> {
+    let principal = authenticate(&state, &headers).await?;
+    require_role(&principal, &["Administrator", "Operator", "Viewer"])?;
+    let values = state.store.list_connectors(None).await.map_err(|_| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "connector registry unavailable",
+        )
+    })?;
+    audit(
+        &state,
+        &principal,
+        "connectors_read",
+        "connectors",
+        serde_json::json!({}),
+    )
+    .await;
+    Ok(envelope(values.iter().map(connector_view).collect(), None))
+}
+
+async fn admin_connector_detail(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<ApiEnvelope<serde_json::Value>>> {
+    let principal = authenticate(&state, &headers).await?;
+    require_role(&principal, &["Administrator", "Operator", "Viewer"])?;
+    let value = state
+        .store
+        .list_connectors(Some(id))
+        .await
+        .map_err(|_| api_error(StatusCode::SERVICE_UNAVAILABLE, "connector unavailable"))?
+        .into_iter()
+        .next()
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "connector not found"))?;
+    audit(
+        &state,
+        &principal,
+        "connector_read",
+        &id.to_string(),
+        serde_json::json!({}),
+    )
+    .await;
+    Ok(envelope(connector_view(&value), None))
+}
+
+async fn admin_connector_health(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<ApiEnvelope<serde_json::Value>>> {
+    let principal = authenticate(&state, &headers).await?;
+    require_role(&principal, &["Administrator", "Operator", "Viewer"])?;
+    let value = state
+        .store
+        .list_connectors(Some(id))
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "connector health unavailable",
+            )
+        })?
+        .into_iter()
+        .next()
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "connector not found"))?;
+    audit(
+        &state,
+        &principal,
+        "connector_health_read",
+        &id.to_string(),
+        serde_json::json!({}),
+    )
+    .await;
+    Ok(envelope(connector_health_view(&value), None))
+}
+
+async fn admin_connector_capabilities(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<ApiEnvelope<Vec<serde_json::Value>>>> {
+    let principal = authenticate(&state, &headers).await?;
+    require_role(&principal, &["Administrator", "Operator", "Viewer"])?;
+    if state
+        .store
+        .list_connectors(Some(id))
+        .await
+        .map_err(|_| api_error(StatusCode::SERVICE_UNAVAILABLE, "connector unavailable"))?
+        .is_empty()
+    {
+        return Err(api_error(StatusCode::NOT_FOUND, "connector not found"));
+    }
+    let values = state
+        .store
+        .list_connector_capabilities(id)
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "connector capabilities unavailable",
+            )
+        })?;
+    audit(
+        &state,
+        &principal,
+        "connector_capabilities_read",
+        &id.to_string(),
+        serde_json::json!({}),
+    )
+    .await;
+    Ok(envelope(values, None))
+}
+
+async fn agent_connectors(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<ApiEnvelope<Vec<serde_json::Value>>>> {
+    let principal = authenticate_agent(&state, &headers).await?;
+    require_agent_scope(&principal, AGENT_SCOPE_CONNECTOR_READ)?;
+    let values = state.store.list_connectors(None).await.map_err(|_| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "connector registry unavailable",
+        )
+    })?;
+    audit_agent_read(
+        &state,
+        &principal,
+        "/api/v1/connectors",
+        AGENT_SCOPE_CONNECTOR_READ,
+    )
+    .await;
+    Ok(envelope(values.iter().map(connector_view).collect(), None))
+}
+
+async fn agent_connector_detail(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<ApiEnvelope<serde_json::Value>>> {
+    let principal = authenticate_agent(&state, &headers).await?;
+    require_agent_scope(&principal, AGENT_SCOPE_CONNECTOR_READ)?;
+    let value = state
+        .store
+        .list_connectors(Some(id))
+        .await
+        .map_err(|_| api_error(StatusCode::SERVICE_UNAVAILABLE, "connector unavailable"))?
+        .into_iter()
+        .next()
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "connector not found"))?;
+    audit_agent_read(
+        &state,
+        &principal,
+        "/api/v1/connectors/{id}",
+        AGENT_SCOPE_CONNECTOR_READ,
+    )
+    .await;
+    Ok(envelope(connector_view(&value), None))
+}
+
+async fn agent_connector_health(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<ApiEnvelope<serde_json::Value>>> {
+    let principal = authenticate_agent(&state, &headers).await?;
+    require_agent_scope(&principal, AGENT_SCOPE_CONNECTOR_READ)?;
+    let value = state
+        .store
+        .list_connectors(Some(id))
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "connector health unavailable",
+            )
+        })?
+        .into_iter()
+        .next()
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "connector not found"))?;
+    audit_agent_read(
+        &state,
+        &principal,
+        "/api/v1/connectors/{id}/health",
+        AGENT_SCOPE_CONNECTOR_READ,
+    )
+    .await;
+    Ok(envelope(connector_health_view(&value), None))
+}
+
+async fn agent_connector_capabilities(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<ApiEnvelope<Vec<serde_json::Value>>>> {
+    let principal = authenticate_agent(&state, &headers).await?;
+    require_agent_scope(&principal, AGENT_SCOPE_CONNECTOR_READ)?;
+    if state
+        .store
+        .list_connectors(Some(id))
+        .await
+        .map_err(|_| api_error(StatusCode::SERVICE_UNAVAILABLE, "connector unavailable"))?
+        .is_empty()
+    {
+        return Err(api_error(StatusCode::NOT_FOUND, "connector not found"));
+    }
+    let values = state
+        .store
+        .list_connector_capabilities(id)
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "connector capabilities unavailable",
+            )
+        })?;
+    audit_agent_read(
+        &state,
+        &principal,
+        "/api/v1/connectors/{id}/capabilities",
+        AGENT_SCOPE_CONNECTOR_READ,
+    )
+    .await;
+    Ok(envelope(values, None))
+}
+
 fn validate_decision_query(query: &AgentQuery) -> ApiResult<()> {
     if let Some(status) = query.status.as_deref() {
         if !matches!(
@@ -6577,6 +6838,13 @@ async fn main() -> anyhow::Result<()> {
         .route("/workflows/{id}", get(admin_workflow_detail))
         .route("/workflow-runs", get(admin_workflow_runs))
         .route("/workflows/{id}/approve", post(admin_approve_workflow))
+        .route("/connectors", get(admin_connectors))
+        .route("/connectors/{id}", get(admin_connector_detail))
+        .route("/connectors/{id}/health", get(admin_connector_health))
+        .route(
+            "/connectors/{id}/capabilities",
+            get(admin_connector_capabilities),
+        )
         .route(
             "/api/v1/workflows/{id}/approve",
             post(admin_approve_workflow),
@@ -6664,6 +6932,13 @@ async fn main() -> anyhow::Result<()> {
                 .route("/workflows", get(agent_workflows))
                 .route("/workflows/{id}", get(agent_workflow_detail))
                 .route("/workflow-runs", get(agent_workflow_runs))
+                .route("/connectors", get(agent_connectors))
+                .route("/connectors/{id}", get(agent_connector_detail))
+                .route("/connectors/{id}/health", get(agent_connector_health))
+                .route(
+                    "/connectors/{id}/capabilities",
+                    get(agent_connector_capabilities),
+                )
                 .route("/history", get(agent_history))
                 .route("/history/summary", get(agent_history_summary))
                 .route("/knowledge", get(agent_knowledge))
@@ -7344,5 +7619,22 @@ mod tests {
             ..AgentQuery::default()
         };
         assert!(validate_workflow_query(&query).is_err());
+    }
+
+    #[test]
+    fn connector_views_are_read_only_and_redacted() {
+        let value = serde_json::json!({
+            "id": Uuid::new_v4(), "name": "Docker Connector", "version": "0.8.0",
+            "type": "docker", "status": "configured", "health": "unknown",
+            "description": "container status", "health_error": "secret socket path",
+            "secret_ref": "docker_token", "capabilities": [{"name":"container.list","read_only":true}]
+        });
+        let view = connector_view(&value);
+        let serialized = serde_json::to_string(&view).unwrap();
+        assert!(serialized.contains("container.list"));
+        assert!(serialized.contains("read_only"));
+        assert!(!serialized.contains("secret socket"));
+        assert!(!serialized.contains("secret_ref"));
+        assert!(validate_agent_scopes(&[AGENT_SCOPE_CONNECTOR_READ.into()]));
     }
 }

@@ -54,6 +54,7 @@ const SCOPE_SECURITY_BRIEFING: &str = "agent:security:briefing";
 const SCOPE_SYSTEM_GRAPH: &str = "agent:system:graph:read";
 const SCOPE_WORKFLOW: &str = "agent:workflow:read";
 const SCOPE_WORKFLOW_APPROVE: &str = "agent:workflow:approve";
+const SCOPE_CONNECTOR: &str = "agent:connector:read";
 const SCOPE_ALL: &str = "agent:read";
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_REQUEST_BYTES: usize = 256 * 1024;
@@ -162,6 +163,12 @@ struct DecisionArgs {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 struct WorkflowIdArgs {
     #[schemars(description = "Workflow UUID")]
+    id: String,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+struct ConnectorIdArgs {
+    #[schemars(description = "Connector UUID")]
     id: String,
 }
 
@@ -376,6 +383,7 @@ fn parse_scopes(value: &str) -> Result<HashSet<String>> {
         SCOPE_SYSTEM_GRAPH,
         SCOPE_WORKFLOW,
         SCOPE_WORKFLOW_APPROVE,
+        SCOPE_CONNECTOR,
         SCOPE_ALL,
     ];
     if scopes.is_empty()
@@ -1139,6 +1147,61 @@ impl McpServer {
                 .await?,
         ))
     }
+
+    #[tool(
+        name = "list_connectors",
+        description = "List configured external infrastructure connectors and their sanitized read-only capabilities; no connector action is available; requires agent:connector:read"
+    )]
+    async fn list_connectors(
+        &self,
+        Parameters(_args): Parameters<EmptyArgs>,
+    ) -> Result<Json<ToolResponse>, ErrorData> {
+        Ok(Json(
+            self.get(SCOPE_CONNECTOR, "/api/v1/connectors", &[]).await?,
+        ))
+    }
+
+    #[tool(
+        name = "get_connector_status",
+        description = "Read one connector health and status record without credentials or configuration; requires agent:connector:read"
+    )]
+    async fn get_connector_status(
+        &self,
+        Parameters(args): Parameters<ConnectorIdArgs>,
+    ) -> Result<Json<ToolResponse>, ErrorData> {
+        let id = Uuid::parse_str(&args.id).map_err(|_| {
+            ErrorData::invalid_params("connector id must be a UUID", Some(json!({"field":"id"})))
+        })?;
+        Ok(Json(
+            self.get(
+                SCOPE_CONNECTOR,
+                &format!("/api/v1/connectors/{id}/health"),
+                &[],
+            )
+            .await?,
+        ))
+    }
+
+    #[tool(
+        name = "get_connector_capabilities",
+        description = "Read the allowlisted capabilities of one connector; all capabilities are read-only and no external action is performed; requires agent:connector:read"
+    )]
+    async fn get_connector_capabilities(
+        &self,
+        Parameters(args): Parameters<ConnectorIdArgs>,
+    ) -> Result<Json<ToolResponse>, ErrorData> {
+        let id = Uuid::parse_str(&args.id).map_err(|_| {
+            ErrorData::invalid_params("connector id must be a UUID", Some(json!({"field":"id"})))
+        })?;
+        Ok(Json(
+            self.get(
+                SCOPE_CONNECTOR,
+                &format!("/api/v1/connectors/{id}/capabilities"),
+                &[],
+            )
+            .await?,
+        ))
+    }
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -1522,6 +1585,8 @@ mod tests {
             vec![
                 "get_agent_context",
                 "get_agent_status",
+                "get_connector_capabilities",
+                "get_connector_status",
                 "get_daily_operations_briefing",
                 "get_decision_history",
                 "get_decisions",
@@ -1544,6 +1609,7 @@ mod tests {
                 "get_trust_status",
                 "get_workflow_history",
                 "get_workflow_status",
+                "list_connectors",
                 "list_events",
                 "list_incidents",
                 "list_security_findings",
@@ -1681,8 +1747,11 @@ mod tests {
         );
         let client = ClientInfo::default().serve(transport).await.unwrap();
         let tools = client.list_tools(None).await.unwrap();
-        assert_eq!(tools.tools.len(), 28);
+        assert_eq!(tools.tools.len(), 31);
         let expected = [
+            "list_connectors",
+            "get_connector_status",
+            "get_connector_capabilities",
             "get_status",
             "get_agent_status",
             "get_daily_operations_briefing",
@@ -1777,6 +1846,11 @@ mod tests {
                 "/api/v1/workflow-runs" => json!([]),
                 "/api/v1/workflows/00000000-0000-4000-8000-000000000030" => json!({"id":"00000000-0000-4000-8000-000000000030","name":"Security Incident Workflow","category":"incident","enabled":true,"steps":[],"runs":[],"audit":[]}),
                 "/api/v1/security/overview" => json!({"findings_total":1,"active_findings":1}),
+                "/api/v1/connectors" => json!([
+                    {"id":"00000000-0000-4000-8000-000000000050","name":"Docker Connector","type":"docker","status":"configured","health":"unknown","capabilities":[{"name":"container.list","read_only":true}]}
+                ]),
+                "/api/v1/connectors/00000000-0000-4000-8000-000000000050/health" => json!({"id":"00000000-0000-4000-8000-000000000050","status":"unknown","read_only":true}),
+                "/api/v1/connectors/00000000-0000-4000-8000-000000000050/capabilities" => json!([{"capability":"container.list","read_only":true}]),
                 "/api/v1/incidents" => json!([
                     {"id":incident_id,"status":"detected","severity":"high","confidence":88,"risk_score":70,"summary":"test incident","raw_payload":{"secret":"removed"}}
                 ]),
@@ -1856,6 +1930,9 @@ mod tests {
             "list_workflows",
             "get_workflow_status",
             "get_workflow_history",
+            "list_connectors",
+            "get_connector_status",
+            "get_connector_capabilities",
         ] {
             let params = if tool == "list_incidents" {
                 CallToolRequestParams::new(tool)
@@ -1867,11 +1944,18 @@ mod tests {
                     | "get_incident_relations"
             ) {
                 CallToolRequestParams::new(tool).with_arguments(id_arguments.clone())
-            } else if tool == "get_workflow_status" {
+            } else if matches!(
+                tool,
+                "get_workflow_status" | "get_connector_status" | "get_connector_capabilities"
+            ) {
                 let mut workflow_arguments = serde_json::Map::new();
                 workflow_arguments.insert(
                     "id".to_string(),
-                    json!("00000000-0000-4000-8000-000000000030"),
+                    json!(if tool.starts_with("get_connector") {
+                        "00000000-0000-4000-8000-000000000050"
+                    } else {
+                        "00000000-0000-4000-8000-000000000030"
+                    }),
                 );
                 CallToolRequestParams::new(tool).with_arguments(workflow_arguments)
             } else {
@@ -1908,6 +1992,9 @@ mod tests {
             }
             if tool == "list_workflows" {
                 assert!(serialized.contains("Security Incident Workflow"));
+            }
+            if tool == "list_connectors" {
+                assert!(serialized.contains("Docker Connector"));
             }
         }
 

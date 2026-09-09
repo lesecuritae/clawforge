@@ -1,3 +1,19 @@
+# Clawforge v0.8.0 Connector Framework
+
+## Read-only infrastructure connectors
+
+- Connector registry with metadata, health, capabilities, and audit events.
+- Docker connector capabilities for container status, health, image versions,
+  and restart counts.
+- GitHub repository and Proxmox health connector foundations.
+- Agent API v1 resources and MCP tools `list_connectors`,
+  `get_connector_status`, and `get_connector_capabilities`.
+- Operations Center Connectors view.
+
+Connector credentials remain outside the repository and are injected through
+secret files. No restart, write, policy, workflow, or external mutation is
+implemented.
+
 # Clawforge v0.7.0 Workflow Governance
 
 ## Controlled workflow layer

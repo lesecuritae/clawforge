@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: Clawforge API
-  version: 0.7.0
+  version: 0.8.0
   description: Backend-only intelligence, incident, and administration API.
   x-rate-limit-contract: Responses may include X-RateLimit-Limit and X-RateLimit-Remaining; 429 responses include Retry-After.
   x-response-contract: Every JSON endpoint returns status, data, timestamp, pagination, and errors.
@@ -46,7 +46,7 @@ components:
       required: [service, version, status, migrations, runtime, events, providers]
       properties:
         service: { type: string, example: clawforge }
-        version: { type: string, example: 0.7.0 }
+        version: { type: string, example: 0.8.0 }
         status: { type: string, enum: [ok] }
         migrations: { type: object, additionalProperties: true }
         runtime: { type: array, items: { type: object, additionalProperties: true } }
@@ -188,6 +188,28 @@ components:
         actor: { type: string }
         action: { type: string }
         timestamp: { type: string, format: date-time }
+    ConnectorCapability:
+      type: object
+      required: [name, read_only]
+      properties:
+        name: { type: string }
+        read_only: { type: boolean, example: true }
+    Connector:
+      type: object
+      required: [id, name, version, type, status, health, read_only, capabilities]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        version: { type: string }
+        type: { type: string, enum: [docker, github, proxmox] }
+        status: { type: string, enum: [configured, healthy, degraded, unavailable, disabled] }
+        health: { type: string, enum: [unknown, healthy, degraded, unavailable] }
+        last_check: { type: string, format: date-time, nullable: true }
+        health_checked_at: { type: string, format: date-time, nullable: true }
+        latency_ms: { type: integer, nullable: true }
+        description: { type: string }
+        read_only: { type: boolean, example: true }
+        capabilities: { type: array, items: { $ref: '#/components/schemas/ConnectorCapability' } }
     SecurityPosture:
       type: object
       required: [risk_level, incident_count, alert_count, provider_status, policy_status, trust_summary, trend]
@@ -592,6 +614,58 @@ paths:
         '403': { description: agent:workflow:read scope missing }
         '400': { description: Invalid workflow id or status }
         '429': { $ref: '#/components/responses/RateLimited' }
+  /api/v1/connectors:
+    get:
+      security: [{ agentBearerAuth: [] }]
+      description: Read-only connector registry. Credentials and connector configuration are never returned. Requires agent:connector:read.
+      responses:
+        '200':
+          description: Connector registry
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiEnvelope'
+                  - type: object
+                    properties:
+                      data: { type: array, items: { $ref: '#/components/schemas/Connector' } }
+        '401': { description: Agent token missing or invalid }
+        '403': { description: agent:connector:read scope missing }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /api/v1/connectors/{id}:
+    get:
+      security: [{ agentBearerAuth: [] }]
+      description: Read one sanitized connector definition. Requires agent:connector:read.
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200': { description: Connector detail }
+        '400': { description: Invalid connector identifier }
+        '401': { description: Agent token missing or invalid }
+        '403': { description: agent:connector:read scope missing }
+        '404': { description: Connector not found }
+  /api/v1/connectors/{id}/health:
+    get:
+      security: [{ agentBearerAuth: [] }]
+      description: Read connector health, check time, and latency. Requires agent:connector:read.
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200': { description: Connector health }
+        '401': { description: Agent token missing or invalid }
+        '403': { description: agent:connector:read scope missing }
+        '404': { description: Connector not found }
+  /api/v1/connectors/{id}/capabilities:
+    get:
+      security: [{ agentBearerAuth: [] }]
+      description: Read allowlisted read-only connector capabilities. Requires agent:connector:read.
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200': { description: Connector capabilities }
+        '401': { description: Agent token missing or invalid }
+        '403': { description: agent:connector:read scope missing }
+        '404': { description: Connector not found }
   /api/v1/history:
     get:
       security: [{ agentBearerAuth: [] }]
