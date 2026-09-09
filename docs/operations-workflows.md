@@ -16,6 +16,12 @@ Provider aktivieren, Policies ändern, Trust vergeben oder Approvals auslösen.
 Die Operations-Center-Ansicht zeigt aktuelle Empfehlungen und die Historie
 über die bestehenden administrativen Read-Routen.
 
+Ab v0.7 können passende offene Decisions zusätzlich als Workflow-Run
+vorbereitet werden. Ein Run mit auswirkungsrelevantem Schritt wartet auf eine
+Administratorfreigabe. Die Freigabe protokolliert nur den Governance-Zustand;
+es gibt weiterhin keinen Executor und keine automatische Aktion. Details und
+Zustandsübergänge stehen in `docs/workflows.md`.
+
 Bei einem Provider-Ausfall lautet die Ausgabe beispielsweise, die Provider-
 Historie und Fallback-Konfiguration zu prüfen. Das System aktiviert keinen
 Fallback automatisch.

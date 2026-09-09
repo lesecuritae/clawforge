@@ -1,7 +1,7 @@
 use std::{env, time::Duration};
 
 use clawforge_decision::DecisionEngine;
-use clawforge_storage::{database_url_from_env, DecisionInput, PostgresStore};
+use clawforge_storage::{database_url_from_env, DecisionInput, PostgresStore, WorkflowRunInput};
 use clawforge_worker::Scheduler;
 use tokio::time::{interval, MissedTickBehavior};
 use tracing_subscriber::EnvFilter;
@@ -62,6 +62,9 @@ async fn main() -> anyhow::Result<()> {
                     }
                     if let Err(error) = evaluate_decisions(&store).await {
                         tracing::warn!(%error, "decision evaluation failed");
+                    }
+                    if let Err(error) = prepare_workflow_runs(&store).await {
+                        tracing::warn!(%error, "workflow preparation failed");
                     }
                 }
             }
@@ -141,5 +144,61 @@ async fn evaluate_decisions(store: &PostgresStore) -> anyhow::Result<()> {
         }
     }
     store.expire_decisions().await?;
+    Ok(())
+}
+
+async fn prepare_workflow_runs(store: &PostgresStore) -> anyhow::Result<()> {
+    let decisions = store.list_decisions(Some("open"), None, 500).await?;
+    let workflows = store.list_workflows(None, Some(true), 100).await?;
+    for decision in decisions {
+        let Some(category) = decision.get("category").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let Some(workflow) = workflows.iter().find(|workflow| {
+            workflow.get("category").and_then(serde_json::Value::as_str) == Some(category)
+        }) else {
+            continue;
+        };
+        let Some(workflow_id) = workflow
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| uuid::Uuid::parse_str(value).ok())
+        else {
+            continue;
+        };
+        let requires_approval = workflow
+            .get("steps")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|steps| {
+                steps.iter().any(|step| {
+                    step.get("required_approval")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true)
+                })
+            });
+        let decision_id = decision
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| uuid::Uuid::parse_str(value).ok());
+        store
+            .prepare_workflow_run(&WorkflowRunInput {
+                workflow_id,
+                decision_id,
+                status: if requires_approval {
+                    "waiting_approval"
+                } else {
+                    "pending"
+                }
+                .into(),
+                result: serde_json::json!({
+                    "prepared": true,
+                    "reason": decision.get("reason"),
+                    "automatic_actions": false
+                }),
+                actor: "workflow_engine".into(),
+                audit_action: "run_prepared".into(),
+            })
+            .await?;
+    }
     Ok(())
 }

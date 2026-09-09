@@ -94,6 +94,8 @@ const AGENT_SCOPE_INCIDENT_REPLAY: &str = "agent:incident:replay";
 const AGENT_SCOPE_HISTORY_READ: &str = "agent:history:read";
 const AGENT_SCOPE_SECURITY_BRIEFING: &str = "agent:security:briefing";
 const AGENT_SCOPE_SYSTEM_GRAPH: &str = "agent:system:graph:read";
+const AGENT_SCOPE_WORKFLOW_READ: &str = "agent:workflow:read";
+const AGENT_SCOPE_WORKFLOW_APPROVE: &str = "agent:workflow:approve";
 const AGENT_SCOPE_ALL_READ: &str = "agent:read";
 
 const AGENT_SCOPES: &[&str] = &[
@@ -114,6 +116,8 @@ const AGENT_SCOPES: &[&str] = &[
     AGENT_SCOPE_HISTORY_READ,
     AGENT_SCOPE_SECURITY_BRIEFING,
     AGENT_SCOPE_SYSTEM_GRAPH,
+    AGENT_SCOPE_WORKFLOW_READ,
+    AGENT_SCOPE_WORKFLOW_APPROVE,
     AGENT_SCOPE_ALL_READ,
 ];
 
@@ -1189,6 +1193,7 @@ struct AgentQuery {
     to: Option<String>,
     interval: Option<String>,
     category: Option<String>,
+    workflow_id: Option<String>,
 }
 
 fn agent_page(query: &AgentQuery, default: i64) -> (i64, i64) {
@@ -3186,6 +3191,328 @@ fn agent_decision_view(value: &serde_json::Value) -> serde_json::Value {
         "status": value.get("status"),
         "related_incident_id": value.get("related_incident_id")
     })
+}
+
+fn workflow_view(value: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "id": value.get("id"),
+        "name": value.get("name"),
+        "description": value.get("description"),
+        "category": value.get("category"),
+        "enabled": value.get("enabled"),
+        "created_at": value.get("created_at"),
+        "updated_at": value.get("updated_at"),
+        "steps": value.get("steps").and_then(|steps| steps.as_array().map(|items| items.iter().map(|step| serde_json::json!({
+            "id": step.get("id"), "name": step.get("name"), "step_order": step.get("step_order"),
+            "type": step.get("type"), "required_approval": step.get("required_approval"),
+            "created_at": step.get("created_at")
+        })).collect::<Vec<_>>()))
+    })
+}
+
+fn workflow_run_view(value: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "id": value.get("id"), "workflow_id": value.get("workflow_id"),
+        "workflow_name": value.get("workflow_name"), "category": value.get("category"),
+        "decision_id": value.get("decision_id"), "status": value.get("status"),
+        "started_at": value.get("started_at"), "finished_at": value.get("finished_at")
+    })
+}
+
+fn validate_workflow_query(query: &AgentQuery) -> ApiResult<Option<Uuid>> {
+    if let Some(status) = query.status.as_deref() {
+        if !matches!(
+            status,
+            "pending" | "running" | "waiting_approval" | "completed" | "failed" | "cancelled"
+        ) {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid workflow run status",
+            ));
+        }
+    }
+    query
+        .workflow_id
+        .as_deref()
+        .map(|value| {
+            Uuid::parse_str(value)
+                .map_err(|_| api_error(StatusCode::BAD_REQUEST, "invalid workflow id"))
+        })
+        .transpose()
+}
+
+async fn admin_workflows(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<ApiEnvelope<Vec<serde_json::Value>>>> {
+    let principal = authenticate(&state, &headers).await?;
+    require_role(&principal, &["Administrator", "Operator", "Viewer"])?;
+    let values = state
+        .store
+        .list_workflows(None, None, 100)
+        .await
+        .map_err(|_| api_error(StatusCode::SERVICE_UNAVAILABLE, "workflow list unavailable"))?;
+    let values = values.iter().map(workflow_view).collect::<Vec<_>>();
+    audit(
+        &state,
+        &principal,
+        "workflows_read",
+        "workflows",
+        serde_json::json!({}),
+    )
+    .await;
+    Ok(envelope(values, None))
+}
+
+async fn admin_workflow_detail(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<ApiEnvelope<serde_json::Value>>> {
+    let principal = authenticate(&state, &headers).await?;
+    require_role(&principal, &["Administrator", "Operator", "Viewer"])?;
+    let workflow = state
+        .store
+        .list_workflows(Some(id), None, 1)
+        .await
+        .map_err(|_| api_error(StatusCode::SERVICE_UNAVAILABLE, "workflow unavailable"))?
+        .into_iter()
+        .next()
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "workflow not found"))?;
+    let mut value = workflow_view(&workflow);
+    let runs = state
+        .store
+        .list_workflow_runs(Some(id), None, 100)
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "workflow history unavailable",
+            )
+        })?;
+    let audit_log = state
+        .store
+        .list_workflow_audit(id, 100)
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "workflow audit unavailable",
+            )
+        })?;
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "runs".into(),
+            serde_json::Value::Array(runs.iter().map(workflow_run_view).collect()),
+        );
+        object.insert("audit".into(), serde_json::Value::Array(audit_log));
+    }
+    audit(
+        &state,
+        &principal,
+        "workflow_read",
+        &id.to_string(),
+        serde_json::json!({}),
+    )
+    .await;
+    Ok(envelope(value, None))
+}
+
+async fn admin_workflow_runs(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AgentQuery>,
+) -> ApiResult<Json<ApiEnvelope<Vec<serde_json::Value>>>> {
+    let principal = authenticate(&state, &headers).await?;
+    require_role(&principal, &["Administrator", "Operator", "Viewer"])?;
+    let workflow_id = validate_workflow_query(&query)?;
+    let values = state
+        .store
+        .list_workflow_runs(workflow_id, query.status.as_deref(), 500)
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "workflow history unavailable",
+            )
+        })?;
+    let values = values.iter().map(workflow_run_view).collect::<Vec<_>>();
+    let (page, page_size) = agent_page(&query, 50);
+    let (data, pagination) = paged_values(values, page, page_size);
+    audit(
+        &state,
+        &principal,
+        "workflow_runs_read",
+        "workflow-runs",
+        serde_json::json!({"status":query.status,"workflow_id":workflow_id}),
+    )
+    .await;
+    Ok(envelope(data, Some(pagination)))
+}
+
+#[derive(Deserialize)]
+struct ApproveWorkflowRequest {
+    run_id: Uuid,
+    comment: Option<String>,
+    decision_reason: Option<String>,
+}
+
+async fn admin_approve_workflow(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(workflow_id): Path<Uuid>,
+    Json(request): Json<ApproveWorkflowRequest>,
+) -> ApiResult<Json<ApiEnvelope<serde_json::Value>>> {
+    let principal = authenticate(&state, &headers).await?;
+    require_role(&principal, &["Administrator"])?;
+    if request
+        .comment
+        .as_deref()
+        .is_some_and(|value| value.len() > 10_000)
+        || request
+            .decision_reason
+            .as_deref()
+            .is_some_and(|value| value.len() > 10_000)
+    {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "approval text is too long",
+        ));
+    }
+    let value = state
+        .store
+        .approve_workflow_run(
+            workflow_id,
+            request.run_id,
+            principal.id,
+            &principal.username,
+            request.comment.as_deref(),
+            request.decision_reason.as_deref(),
+        )
+        .await
+        .map_err(|error| {
+            let message = error.to_string();
+            if message.contains("not found") {
+                api_error(StatusCode::NOT_FOUND, "workflow run not found")
+            } else {
+                api_error(StatusCode::CONFLICT, "workflow approval is not available")
+            }
+        })?;
+    audit(
+        &state,
+        &principal,
+        "workflow_approved",
+        &workflow_id.to_string(),
+        serde_json::json!({"run_id":request.run_id}),
+    )
+    .await;
+    Ok(envelope(value, None))
+}
+
+async fn agent_workflows(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<ApiEnvelope<Vec<serde_json::Value>>>> {
+    let principal = authenticate_agent(&state, &headers).await?;
+    require_agent_scope(&principal, AGENT_SCOPE_WORKFLOW_READ)?;
+    let values = state
+        .store
+        .list_workflows(None, Some(true), 100)
+        .await
+        .map_err(|_| api_error(StatusCode::SERVICE_UNAVAILABLE, "workflow list unavailable"))?;
+    let values = values.iter().map(workflow_view).collect::<Vec<_>>();
+    audit_agent_read(
+        &state,
+        &principal,
+        "/api/v1/workflows",
+        AGENT_SCOPE_WORKFLOW_READ,
+    )
+    .await;
+    Ok(envelope(values, None))
+}
+
+async fn agent_workflow_detail(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<ApiEnvelope<serde_json::Value>>> {
+    let principal = authenticate_agent(&state, &headers).await?;
+    require_agent_scope(&principal, AGENT_SCOPE_WORKFLOW_READ)?;
+    let workflow = state
+        .store
+        .list_workflows(Some(id), Some(true), 1)
+        .await
+        .map_err(|_| api_error(StatusCode::SERVICE_UNAVAILABLE, "workflow unavailable"))?
+        .into_iter()
+        .next()
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "workflow not found"))?;
+    let mut value = workflow_view(&workflow);
+    let runs = state
+        .store
+        .list_workflow_runs(Some(id), None, 100)
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "workflow history unavailable",
+            )
+        })?;
+    let audit_log = state
+        .store
+        .list_workflow_audit(id, 100)
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "workflow audit unavailable",
+            )
+        })?;
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "runs".into(),
+            serde_json::Value::Array(runs.iter().map(workflow_run_view).collect()),
+        );
+        object.insert("audit".into(), serde_json::Value::Array(audit_log));
+    }
+    audit_agent_read(
+        &state,
+        &principal,
+        "/api/v1/workflows/{id}",
+        AGENT_SCOPE_WORKFLOW_READ,
+    )
+    .await;
+    Ok(envelope(value, None))
+}
+
+async fn agent_workflow_runs(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AgentQuery>,
+) -> ApiResult<Json<ApiEnvelope<Vec<serde_json::Value>>>> {
+    let principal = authenticate_agent(&state, &headers).await?;
+    require_agent_scope(&principal, AGENT_SCOPE_WORKFLOW_READ)?;
+    let workflow_id = validate_workflow_query(&query)?;
+    let values = state
+        .store
+        .list_workflow_runs(workflow_id, query.status.as_deref(), 500)
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "workflow history unavailable",
+            )
+        })?;
+    let values = values.iter().map(workflow_run_view).collect::<Vec<_>>();
+    let (page, page_size) = agent_page(&query, 50);
+    let (data, pagination) = paged_values(values, page, page_size);
+    audit_agent_read(
+        &state,
+        &principal,
+        "/api/v1/workflow-runs",
+        AGENT_SCOPE_WORKFLOW_READ,
+    )
+    .await;
+    Ok(envelope(data, Some(pagination)))
 }
 
 fn validate_decision_query(query: &AgentQuery) -> ApiResult<()> {
@@ -6246,6 +6573,14 @@ async fn main() -> anyhow::Result<()> {
             "/operations/decisions/history",
             get(admin_operations_recommendations),
         )
+        .route("/workflows", get(admin_workflows))
+        .route("/workflows/{id}", get(admin_workflow_detail))
+        .route("/workflow-runs", get(admin_workflow_runs))
+        .route("/workflows/{id}/approve", post(admin_approve_workflow))
+        .route(
+            "/api/v1/workflows/{id}/approve",
+            post(admin_approve_workflow),
+        )
         .route("/security/briefing", get(admin_security_briefing))
         .route("/system/graph", get(admin_system_graph))
         .route("/admin/alerts", get(admin_alerts))
@@ -6326,6 +6661,9 @@ async fn main() -> anyhow::Result<()> {
                     get(agent_operations_recommendations),
                 )
                 .route("/decisions/history", get(agent_decision_history))
+                .route("/workflows", get(agent_workflows))
+                .route("/workflows/{id}", get(agent_workflow_detail))
+                .route("/workflow-runs", get(agent_workflow_runs))
                 .route("/history", get(agent_history))
                 .route("/history/summary", get(agent_history_summary))
                 .route("/knowledge", get(agent_knowledge))
@@ -6968,5 +7306,43 @@ mod tests {
             ..AgentQuery::default()
         };
         assert!(validate_decision_query(&invalid).is_err());
+    }
+
+    #[test]
+    fn workflow_views_exclude_configuration_and_metadata() {
+        let value = serde_json::json!({
+            "id": Uuid::new_v4(), "name": "Security Incident Workflow",
+            "description": "approval path", "category": "incident", "enabled": true,
+            "metadata": {"secret": "removed"},
+            "steps": [{"id": Uuid::new_v4(), "name": "Approve", "step_order": 1,
+                "type": "approval", "required_approval": true,
+                "configuration": {"token": "removed"}}]
+        });
+        let view = workflow_view(&value);
+        let serialized = serde_json::to_string(&view).unwrap();
+        assert!(serialized.contains("Security Incident Workflow"));
+        assert!(serialized.contains("required_approval"));
+        assert!(!serialized.contains("metadata"));
+        assert!(!serialized.contains("configuration"));
+        assert!(!serialized.contains("secret"));
+    }
+
+    #[test]
+    fn workflow_scope_and_filters_are_read_only_and_bounded() {
+        assert!(validate_agent_scopes(&[AGENT_SCOPE_WORKFLOW_READ.into()]));
+        assert!(validate_agent_scopes(
+            &[AGENT_SCOPE_WORKFLOW_APPROVE.into()]
+        ));
+        assert!(!validate_agent_scopes(&["agent:workflow:execute".into()]));
+        let query = AgentQuery {
+            workflow_id: Some("not-a-uuid".into()),
+            ..AgentQuery::default()
+        };
+        assert!(validate_workflow_query(&query).is_err());
+        let query = AgentQuery {
+            status: Some("execute".into()),
+            ..AgentQuery::default()
+        };
+        assert!(validate_workflow_query(&query).is_err());
     }
 }

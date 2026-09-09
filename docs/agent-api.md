@@ -115,6 +115,9 @@ rollenbasierte Exportfunktionen. Zeitangaben sind UTC in RFC-3339-Format.
 | `GET /api/v1/operations/briefing` | tägliches Lagebild | Aktueller Status, aktive Incidents/Alerts, Ereignisse, Provider-Health, Änderungen und Prüfempfehlungen | `agent:operations:briefing` |
 | `GET /api/v1/operations/recommendations` | Decision Engine Empfehlungen | Persistierte, erklärbare Empfehlungen mit Schweregrad, Grund, Empfehlung und Confidence | `agent:operations:recommend` |
 | `GET /api/v1/decisions/history` | Decision Historie | Frühere Entscheidungen einschließlich resolved/expired ohne automatische Aktionen | `agent:operations:recommend` |
+| `GET /api/v1/workflows` | Workflow-Definitionen | Aktivierte deklarative Schritte und Approval-Anforderungen | `agent:workflow:read` |
+| `GET /api/v1/workflows/{id}` | Workflow-Details | Schritte, vorbereitete Runs und redigierte Audit-Historie | `agent:workflow:read` |
+| `GET /api/v1/workflow-runs` | Workflow-Historie | Vorbereitete Runs, Status und Decision-Referenzen | `agent:workflow:read` |
 | `GET /api/v1/knowledge` | historische Erkenntnisse | Redigierte Lessons Learned, Incident-Zusammenfassungen und Muster | `agent:knowledge:read` |
 | `GET /api/v1/providers/{id}/history` | Provider-Verlauf | Status, Datenalter, Qualität und Synchronisationsverlauf ohne Feed-Inhalte | `agent:provider:read` |
 | `GET /api/v1/history` | historische Lagebilder | Operations-Snapshots mit Zeitbereich, Intervall und Trendvergleich | `agent:operations:read` |
@@ -167,6 +170,8 @@ Scopes sind:
 | `agent:operations:read` | `/api/v1/operations/summary`, `/api/v1/history` |
 | `agent:operations:briefing` | `/api/v1/operations/briefing` |
 | `agent:operations:recommend` | `/api/v1/operations/recommendations`, `/api/v1/decisions/history` |
+| `agent:workflow:read` | `/api/v1/workflows`, `/api/v1/workflows/{id}`, `/api/v1/workflow-runs` |
+| `agent:workflow:approve` | Für spätere, separat geschützte Freigabeflüsse reserviert; OpenClaw erhält keine Schreibroute |
 | `agent:knowledge:read` | `/api/v1/knowledge` |
 | `agent:history:read` | `/api/v1/history/summary` |
 | `agent:incident:replay` | `/api/v1/incidents/{id}/replay` |
@@ -201,6 +206,20 @@ Vertrag nicht umgehen.
 Die Ressourcen sind ausschließlich `GET`. Es gibt unter `/api/v1` keine
 Provider-Aktivierung, manuelle Synchronisation, Trust-Änderung,
 Incident-Statusänderung, Policy- oder Blockaktion.
+
+## Workflow Governance v0.7
+
+Workflows bereiten ausschließlich nachvollziehbare Schritte vor. Erlaubte
+Schritttypen sind `notification`, `analysis`, `approval`, `external_check` und
+`manual`; Shell-Ausführung und automatische externe Änderungen sind nicht
+zulässig. Ein vorbereiteter Run kann auf `waiting_approval` stehen. Eine
+Freigabe wird ausschließlich über eine intern geschützte
+Administrationsroute protokolliert und setzt den Run zurück auf `pending`; sie
+startet keine Ausführung.
+
+Die administrativ geschützte Route `POST /api/v1/workflows/{id}/approve` benötigt eine
+Administrator-Session oder einen Administrator-API-Token und einen `run_id`.
+Agenten und MCP erhalten nur die oben genannten Read-only-Ressourcen.
 
 ### Filter und Abfragen
 

@@ -37,6 +37,7 @@ agent:incident:read
 agent:provider:read
 agent:security:read
 agent:knowledge:read
+agent:workflow:read
 ```
 
 Für Netzwerk-, Trust-, Event- oder Systemtools müssen die entsprechenden

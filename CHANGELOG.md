@@ -4,6 +4,14 @@
 
 Weitere Änderungen für die nächste Version werden hier gesammelt.
 
+## [0.7.0] - 2026-09-08
+
+- Added controlled Workflow Governance with declarative workflow definitions,
+  steps, prepared runs, approvals, and immutable workflow audit records.
+- Added read-only Agent API workflow resources and three MCP workflow tools.
+- Added Operations Center workflow overview and documentation for approval
+  boundaries. No workflow step or external system action is executed.
+
 ## [0.6.0] - 2026-09-08
 
 - Added the read-only Decision Intelligence layer with persisted recommendations,
@@ -80,7 +88,8 @@ Weitere Änderungen für die nächste Version werden hier gesammelt.
 - Production backup, restore, update, migration, and container-hardening workflows.
 - Role-aware global and endpoint-specific API rate limits with 429 retry headers and audit events.
 
-[Unreleased]: https://github.com/lesecuritae/clawforge/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/lesecuritae/clawforge/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/lesecuritae/clawforge/releases/tag/v0.7.0
 [0.6.0]: https://github.com/lesecuritae/clawforge/releases/tag/v0.6.0
 [0.5.0]: https://github.com/lesecuritae/clawforge/releases/tag/v0.5.0
 [0.4.0]: https://github.com/lesecuritae/clawforge/releases/tag/v0.4.0

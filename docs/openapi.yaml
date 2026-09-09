@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: Clawforge API
-  version: 0.6.0
+  version: 0.7.0
   description: Backend-only intelligence, incident, and administration API.
   x-rate-limit-contract: Responses may include X-RateLimit-Limit and X-RateLimit-Remaining; 429 responses include Retry-After.
   x-response-contract: Every JSON endpoint returns status, data, timestamp, pagination, and errors.
@@ -46,7 +46,7 @@ components:
       required: [service, version, status, migrations, runtime, events, providers]
       properties:
         service: { type: string, example: clawforge }
-        version: { type: string, example: 0.6.0 }
+        version: { type: string, example: 0.7.0 }
         status: { type: string, enum: [ok] }
         migrations: { type: object, additionalProperties: true }
         runtime: { type: array, items: { type: object, additionalProperties: true } }
@@ -143,6 +143,51 @@ components:
         confidence: { type: number, minimum: 0, maximum: 1 }
         status: { type: string, enum: [open, acknowledged, dismissed, resolved, expired] }
         related_incident_id: { type: string, format: uuid, nullable: true }
+    WorkflowStep:
+      type: object
+      required: [id, name, step_order, type, required_approval]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        step_order: { type: integer, minimum: 1 }
+        type: { type: string, enum: [notification, analysis, approval, external_check, manual] }
+        required_approval: { type: boolean }
+        created_at: { type: string, format: date-time }
+    Workflow:
+      type: object
+      required: [id, name, description, category, enabled, steps]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        description: { type: string }
+        category: { type: string }
+        enabled: { type: boolean }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        steps: { type: array, items: { $ref: '#/components/schemas/WorkflowStep' } }
+        runs: { type: array, items: { $ref: '#/components/schemas/WorkflowRun' } }
+        audit: { type: array, items: { $ref: '#/components/schemas/WorkflowAudit' } }
+    WorkflowRun:
+      type: object
+      required: [id, workflow_id, status, started_at]
+      properties:
+        id: { type: string, format: uuid }
+        workflow_id: { type: string, format: uuid }
+        workflow_name: { type: string }
+        category: { type: string }
+        decision_id: { type: string, format: uuid, nullable: true }
+        status: { type: string, enum: [pending, running, waiting_approval, completed, failed, cancelled] }
+        started_at: { type: string, format: date-time }
+        finished_at: { type: string, format: date-time, nullable: true }
+    WorkflowAudit:
+      type: object
+      required: [id, workflow_id, actor, action, timestamp]
+      properties:
+        id: { type: string, format: uuid }
+        workflow_id: { type: string, format: uuid }
+        actor: { type: string }
+        action: { type: string }
+        timestamp: { type: string, format: date-time }
     SecurityPosture:
       type: object
       required: [risk_level, incident_count, alert_count, provider_status, policy_status, trust_summary, trend]
@@ -485,6 +530,68 @@ paths:
         '403': { description: agent:operations:recommend scope missing }
         '429': { $ref: '#/components/responses/RateLimited' }
         '503': { description: Decision history unavailable }
+  /api/v1/workflows:
+    get:
+      security: [{ agentBearerAuth: [] }]
+      description: Read-only enabled declarative workflows and their steps. No step is executed. Requires agent:workflow:read.
+      responses:
+        '200':
+          description: Workflow definitions
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiEnvelope'
+                  - type: object
+                    properties:
+                      data: { type: array, items: { $ref: '#/components/schemas/Workflow' } }
+        '401': { description: Agent token missing or invalid }
+        '403': { description: agent:workflow:read scope missing }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /api/v1/workflows/{id}:
+    get:
+      security: [{ agentBearerAuth: [] }]
+      description: Read-only workflow details, prepared runs, and sanitized audit history. Requires agent:workflow:read.
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Workflow detail
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiEnvelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/Workflow' }
+        '401': { description: Agent token missing or invalid }
+        '403': { description: agent:workflow:read scope missing }
+        '404': { description: Workflow not found }
+  /api/v1/workflow-runs:
+    get:
+      security: [{ agentBearerAuth: [] }]
+      description: Read-only prepared workflow runs and approval state. Requires agent:workflow:read.
+      parameters:
+        - { in: query, name: workflow_id, schema: { type: string, format: uuid } }
+        - { in: query, name: status, schema: { type: string, enum: [pending, running, waiting_approval, completed, failed, cancelled] } }
+        - { in: query, name: page, schema: { type: integer, minimum: 1, default: 1 } }
+        - { in: query, name: page_size, schema: { type: integer, minimum: 1, maximum: 100, default: 50 } }
+      responses:
+        '200':
+          description: Workflow run history
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiEnvelope'
+                  - type: object
+                    properties:
+                      data: { type: array, items: { $ref: '#/components/schemas/WorkflowRun' } }
+        '401': { description: Agent token missing or invalid }
+        '403': { description: agent:workflow:read scope missing }
+        '400': { description: Invalid workflow id or status }
+        '429': { $ref: '#/components/responses/RateLimited' }
   /api/v1/history:
     get:
       security: [{ agentBearerAuth: [] }]
@@ -529,6 +636,30 @@ paths:
         '403': { description: Viewer, Operator, or Administrator role required }
         '429': { $ref: '#/components/responses/RateLimited' }
         '503': { description: Operations summary unavailable }
+  /api/v1/workflows/{id}/approve:
+    post:
+      security: [{ bearerAuth: [] }]
+      description: Internal Administrator-only approval recording. It never executes a workflow step or external action.
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [run_id]
+              properties:
+                run_id: { type: string, format: uuid }
+                comment: { type: string, maxLength: 10000 }
+                decision_reason: { type: string, maxLength: 10000 }
+      responses:
+        '200': { description: Approval recorded; run remains pending and unexecuted }
+        '401': { description: Missing administrator authentication }
+        '403': { description: Administrator role required }
+        '404': { description: Workflow run not found }
+        '409': { description: Run is not awaiting approval }
+        '429': { $ref: '#/components/responses/RateLimited' }
   /admin/alerts:
     get:
       security: [{ bearerAuth: [] }]

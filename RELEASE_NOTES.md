@@ -1,3 +1,19 @@
+# Clawforge v0.7.0 Workflow Governance
+
+## Controlled workflow layer
+
+- Declarative workflows and allowlisted steps (`notification`, `analysis`,
+  `approval`, `external_check`, `manual`).
+- Prepared workflow runs linked to Decision Engine recommendations.
+- Approval state, comments, reasons, and workflow audit history.
+- Agent API read-only workflow resources and MCP tools:
+  `list_workflows`, `get_workflow_status`, `get_workflow_history`.
+- Operations Center workflow overview.
+
+Approvals only record governance state. No workflow executor, shell execution,
+automatic provider action, policy change, or external system mutation is part
+of v0.7.0.
+
 # Clawforge v0.6.0 Decision Intelligence
 
 ## Decision Intelligence

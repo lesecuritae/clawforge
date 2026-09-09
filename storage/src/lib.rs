@@ -35,6 +35,16 @@ pub struct DecisionInput {
     pub metadata: serde_json::Value,
 }
 
+#[derive(Debug, Clone)]
+pub struct WorkflowRunInput {
+    pub workflow_id: Uuid,
+    pub decision_id: Option<Uuid>,
+    pub status: String,
+    pub result: serde_json::Value,
+    pub actor: String,
+    pub audit_action: String,
+}
+
 impl PostgresStore {
     pub async fn connect(database_url: &str) -> Result<Self> {
         let pool = PgPoolOptions::new()
@@ -2104,6 +2114,134 @@ impl PostgresStore {
         let result = sqlx::query("UPDATE decisions SET status='expired',updated_at=NOW() WHERE status='open' AND updated_at < NOW()-INTERVAL '30 days'")
             .execute(&self.pool).await?;
         Ok(result.rows_affected())
+    }
+
+    /// Return bounded workflow metadata and step summaries. Step
+    /// configuration is deliberately kept out of this view.
+    pub async fn list_workflows(
+        &self,
+        workflow_id: Option<Uuid>,
+        enabled: Option<bool>,
+        limit: i64,
+    ) -> Result<Vec<serde_json::Value>> {
+        let rows = sqlx::query("SELECT id,name,description,category,enabled,created_at,updated_at FROM workflows WHERE ($1::uuid IS NULL OR id=$1) AND ($2::bool IS NULL OR enabled=$2) ORDER BY name ASC LIMIT $3")
+            .bind(workflow_id).bind(enabled).bind(limit.clamp(1, 200))
+            .fetch_all(&self.pool).await?;
+        let mut values = Vec::with_capacity(rows.len());
+        for row in rows {
+            let id = row.get::<Uuid, _>("id");
+            let steps = sqlx::query("SELECT id,name,step_order,type,required_approval,created_at FROM workflow_steps WHERE workflow_id=$1 ORDER BY step_order ASC")
+                .bind(id).fetch_all(&self.pool).await?.into_iter().map(|step| serde_json::json!({
+                    "id": step.get::<Uuid,_>("id"), "name": step.get::<String,_>("name"),
+                    "step_order": step.get::<i32,_>("step_order"), "type": step.get::<String,_>("type"),
+                    "required_approval": step.get::<bool,_>("required_approval"),
+                    "created_at": step.get::<chrono::DateTime<chrono::Utc>,_>("created_at")
+                })).collect::<Vec<_>>();
+            values.push(serde_json::json!({
+                "id": id, "name": row.get::<String,_>("name"),
+                "description": row.get::<String,_>("description"), "category": row.get::<String,_>("category"),
+                "enabled": row.get::<bool,_>("enabled"),
+                "created_at": row.get::<chrono::DateTime<chrono::Utc>,_>("created_at"),
+                "updated_at": row.get::<chrono::DateTime<chrono::Utc>,_>("updated_at"), "steps": steps
+            }));
+        }
+        Ok(values)
+    }
+
+    pub async fn list_workflow_runs(
+        &self,
+        workflow_id: Option<Uuid>,
+        status: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<serde_json::Value>> {
+        let rows = sqlx::query("SELECT r.id,r.workflow_id,r.decision_id,r.status,r.started_at,r.finished_at,w.name AS workflow_name,w.category FROM workflow_runs r JOIN workflows w ON w.id=r.workflow_id WHERE ($1::uuid IS NULL OR r.workflow_id=$1) AND ($2::text IS NULL OR r.status=$2) ORDER BY r.started_at DESC LIMIT $3")
+            .bind(workflow_id).bind(status).bind(limit.clamp(1, 500)).fetch_all(&self.pool).await?;
+        Ok(rows.into_iter().map(|row| serde_json::json!({
+            "id": row.get::<Uuid,_>("id"), "workflow_id": row.get::<Uuid,_>("workflow_id"),
+            "workflow_name": row.get::<String,_>("workflow_name"), "category": row.get::<String,_>("category"),
+            "decision_id": row.get::<Option<Uuid>,_>("decision_id"), "status": row.get::<String,_>("status"),
+            "started_at": row.get::<chrono::DateTime<chrono::Utc>,_>("started_at"),
+            "finished_at": row.get::<Option<chrono::DateTime<chrono::Utc>>,_>("finished_at")
+        })).collect())
+    }
+
+    pub async fn list_workflow_audit(
+        &self,
+        workflow_id: Uuid,
+        limit: i64,
+    ) -> Result<Vec<serde_json::Value>> {
+        let rows = sqlx::query("SELECT id,workflow_id,actor,action,timestamp FROM workflow_audit_log WHERE workflow_id=$1 ORDER BY timestamp DESC LIMIT $2")
+            .bind(workflow_id).bind(limit.clamp(1, 500)).fetch_all(&self.pool).await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                serde_json::json!({
+                    "id": row.get::<Uuid,_>("id"), "workflow_id": row.get::<Uuid,_>("workflow_id"),
+                    "actor": row.get::<String,_>("actor"), "action": row.get::<String,_>("action"),
+                    "timestamp": row.get::<chrono::DateTime<chrono::Utc>,_>("timestamp")
+                })
+            })
+            .collect())
+    }
+
+    pub async fn prepare_workflow_run(&self, input: &WorkflowRunInput) -> Result<Uuid> {
+        if input.status == "waiting_approval" && input.decision_id.is_none() {
+            anyhow::bail!("approval-gated workflow run requires a decision");
+        }
+        let mut tx = self.pool.begin().await?;
+        if let Some(existing) = sqlx::query_scalar::<_, Uuid>("SELECT id FROM workflow_runs WHERE workflow_id=$1 AND decision_id IS NOT DISTINCT FROM $2 AND status IN ('pending','running','waiting_approval') ORDER BY started_at DESC LIMIT 1")
+            .bind(input.workflow_id).bind(input.decision_id).fetch_optional(&mut *tx).await? {
+            return Ok(existing);
+        }
+        let id = Uuid::new_v4();
+        sqlx::query("INSERT INTO workflow_runs (id,workflow_id,decision_id,status,result) VALUES ($1,$2,$3,$4,$5)")
+            .bind(id).bind(input.workflow_id).bind(input.decision_id).bind(&input.status).bind(&input.result).execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO workflow_audit_log (id,workflow_id,actor,action,metadata) VALUES ($1,$2,$3,$4,$5)")
+            .bind(Uuid::new_v4()).bind(input.workflow_id).bind(&input.actor).bind(&input.audit_action).bind(&input.result).execute(&mut *tx).await?;
+        if input.status == "waiting_approval" {
+            if let Some(decision_id) = input.decision_id {
+                sqlx::query("INSERT INTO approvals (id,decision_id,requested_by,status,decision_reason) SELECT $1,$2,$3,'pending',$4 WHERE NOT EXISTS (SELECT 1 FROM approvals WHERE decision_id=$2 AND status='pending')")
+                    .bind(Uuid::new_v4()).bind(decision_id).bind(&input.actor)
+                    .bind(input.result.get("reason").and_then(serde_json::Value::as_str)).execute(&mut *tx).await?;
+            }
+        }
+        tx.commit().await?;
+        Ok(id)
+    }
+
+    pub async fn approve_workflow_run(
+        &self,
+        workflow_id: Uuid,
+        run_id: Uuid,
+        approved_by: Uuid,
+        actor: &str,
+        comment: Option<&str>,
+        decision_reason: Option<&str>,
+    ) -> Result<serde_json::Value> {
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query("SELECT decision_id,status FROM workflow_runs WHERE id=$1 AND workflow_id=$2 FOR UPDATE")
+            .bind(run_id).bind(workflow_id).fetch_optional(&mut *tx).await?
+            .ok_or_else(|| anyhow::anyhow!("workflow run not found"))?;
+        if row.get::<String, _>("status") != "waiting_approval" {
+            anyhow::bail!("workflow run is not waiting for approval");
+        }
+        let decision_id = row
+            .get::<Option<Uuid>, _>("decision_id")
+            .ok_or_else(|| anyhow::anyhow!("approval-gated workflow run requires a decision"))?;
+        let changed = sqlx::query("UPDATE approvals SET status='approved',approved_by=$2,approved_at=NOW(),comment=$3,decision_reason=$4 WHERE id=(SELECT id FROM approvals WHERE decision_id=$1 AND status='pending' ORDER BY created_at DESC LIMIT 1)")
+            .bind(decision_id).bind(approved_by).bind(comment).bind(decision_reason).execute(&mut *tx).await?;
+        if changed.rows_affected() != 1 {
+            anyhow::bail!("no pending approval for workflow run");
+        }
+        sqlx::query("UPDATE workflow_runs SET status='pending',result=jsonb_set(result,'{approval}','{\"approved\":true}'::jsonb,true) WHERE id=$1")
+            .bind(run_id).execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO workflow_audit_log (id,workflow_id,actor,action,metadata) VALUES ($1,$2,$3,'approval_recorded',$4)")
+            .bind(Uuid::new_v4()).bind(workflow_id).bind(actor)
+            .bind(serde_json::json!({"run_id":run_id,"comment":comment,"decision_reason":decision_reason})).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(
+            serde_json::json!({"run_id":run_id,"workflow_id":workflow_id,"status":"pending","approval":"approved"}),
+        )
     }
 
     pub async fn create_knowledge_entry(

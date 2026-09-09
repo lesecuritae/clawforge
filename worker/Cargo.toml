@@ -12,6 +12,7 @@ clawforge-policy = { path = "../policy" }
 clawforge-risk = { path = "../risk" }
 clawforge-storage = { path = "../storage" }
 clawforge-decision = { path = "../decision" }
+clawforge-workflow = { path = "../workflow" }
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

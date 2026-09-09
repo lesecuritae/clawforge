@@ -52,6 +52,8 @@ const SCOPE_INCIDENT_REPLAY: &str = "agent:incident:replay";
 const SCOPE_HISTORY: &str = "agent:history:read";
 const SCOPE_SECURITY_BRIEFING: &str = "agent:security:briefing";
 const SCOPE_SYSTEM_GRAPH: &str = "agent:system:graph:read";
+const SCOPE_WORKFLOW: &str = "agent:workflow:read";
+const SCOPE_WORKFLOW_APPROVE: &str = "agent:workflow:approve";
 const SCOPE_ALL: &str = "agent:read";
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_REQUEST_BYTES: usize = 256 * 1024;
@@ -151,6 +153,26 @@ struct DecisionArgs {
     status: Option<String>,
     #[schemars(description = "Decision category filter")]
     category: Option<String>,
+    #[schemars(description = "1-based page number")]
+    page: Option<i64>,
+    #[schemars(description = "Page size, capped at 100")]
+    page_size: Option<i64>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+struct WorkflowIdArgs {
+    #[schemars(description = "Workflow UUID")]
+    id: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+struct WorkflowRunArgs {
+    #[schemars(description = "Workflow UUID filter")]
+    workflow_id: Option<String>,
+    #[schemars(
+        description = "Run status: pending, running, waiting_approval, completed, failed, or cancelled"
+    )]
+    status: Option<String>,
     #[schemars(description = "1-based page number")]
     page: Option<i64>,
     #[schemars(description = "Page size, capped at 100")]
@@ -352,6 +374,8 @@ fn parse_scopes(value: &str) -> Result<HashSet<String>> {
         SCOPE_HISTORY,
         SCOPE_SECURITY_BRIEFING,
         SCOPE_SYSTEM_GRAPH,
+        SCOPE_WORKFLOW,
+        SCOPE_WORKFLOW_APPROVE,
         SCOPE_ALL,
     ];
     if scopes.is_empty()
@@ -1051,6 +1075,70 @@ impl McpServer {
                 .await?,
         ))
     }
+
+    #[tool(
+        name = "list_workflows",
+        description = "List enabled, declarative read-only workflow definitions and approval requirements; no workflow step is executed; requires agent:workflow:read"
+    )]
+    async fn list_workflows(
+        &self,
+        Parameters(_args): Parameters<EmptyArgs>,
+    ) -> Result<Json<ToolResponse>, ErrorData> {
+        Ok(Json(
+            self.get(SCOPE_WORKFLOW, "/api/v1/workflows", &[]).await?,
+        ))
+    }
+
+    #[tool(
+        name = "get_workflow_status",
+        description = "Read one workflow definition, prepared runs, and sanitized audit status; no approvals or actions are performed; requires agent:workflow:read"
+    )]
+    async fn get_workflow_status(
+        &self,
+        Parameters(args): Parameters<WorkflowIdArgs>,
+    ) -> Result<Json<ToolResponse>, ErrorData> {
+        let id = Uuid::parse_str(&args.id).map_err(|_| {
+            ErrorData::invalid_params("workflow id must be a UUID", Some(json!({"field":"id"})))
+        })?;
+        Ok(Json(
+            self.get(SCOPE_WORKFLOW, &format!("/api/v1/workflows/{id}"), &[])
+                .await?,
+        ))
+    }
+
+    #[tool(
+        name = "get_workflow_history",
+        description = "Read prepared workflow runs and their approval state with optional filters; workflows remain read-only for MCP; requires agent:workflow:read"
+    )]
+    async fn get_workflow_history(
+        &self,
+        Parameters(args): Parameters<WorkflowRunArgs>,
+    ) -> Result<Json<ToolResponse>, ErrorData> {
+        if let Some(value) = args.workflow_id.as_deref() {
+            Uuid::parse_str(value).map_err(|_| {
+                ErrorData::invalid_params(
+                    "workflow_id must be a UUID",
+                    Some(json!({"field":"workflow_id"})),
+                )
+            })?;
+        }
+        let query = pairs([
+            ("workflow_id".into(), args.workflow_id),
+            ("status".into(), args.status),
+            (
+                "page".into(),
+                args.page.map(|value| value.max(1).to_string()),
+            ),
+            (
+                "page_size".into(),
+                args.page_size.map(|value| value.clamp(1, 100).to_string()),
+            ),
+        ]);
+        Ok(Json(
+            self.get(SCOPE_WORKFLOW, "/api/v1/workflow-runs", &query)
+                .await?,
+        ))
+    }
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -1454,9 +1542,12 @@ mod tests {
                 "get_status",
                 "get_system_graph",
                 "get_trust_status",
+                "get_workflow_history",
+                "get_workflow_status",
                 "list_events",
                 "list_incidents",
                 "list_security_findings",
+                "list_workflows",
             ]
         );
     }
@@ -1590,7 +1681,7 @@ mod tests {
         );
         let client = ClientInfo::default().serve(transport).await.unwrap();
         let tools = client.list_tools(None).await.unwrap();
-        assert_eq!(tools.tools.len(), 25);
+        assert_eq!(tools.tools.len(), 28);
         let expected = [
             "get_status",
             "get_agent_status",
@@ -1617,6 +1708,9 @@ mod tests {
             "get_security_posture",
             "get_system_graph",
             "get_knowledge_context",
+            "list_workflows",
+            "get_workflow_status",
+            "get_workflow_history",
         ];
         for name in expected {
             let tool = tools
@@ -1677,6 +1771,11 @@ mod tests {
                 "/api/v1/operations/recommendations" | "/api/v1/decisions/history" => json!([
                     {"id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","severity":"high","category":"provider_health","title":"Provider outage","reason":"timeout","recommendation":"Review fallback","confidence":0.91,"status":"open"}
                 ]),
+                "/api/v1/workflows" => json!([
+                    {"id":"00000000-0000-4000-8000-000000000030","name":"Security Incident Workflow","category":"incident","enabled":true,"steps":[{"type":"approval","required_approval":true}]}
+                ]),
+                "/api/v1/workflow-runs" => json!([]),
+                "/api/v1/workflows/00000000-0000-4000-8000-000000000030" => json!({"id":"00000000-0000-4000-8000-000000000030","name":"Security Incident Workflow","category":"incident","enabled":true,"steps":[],"runs":[],"audit":[]}),
                 "/api/v1/security/overview" => json!({"findings_total":1,"active_findings":1}),
                 "/api/v1/incidents" => json!([
                     {"id":incident_id,"status":"detected","severity":"high","confidence":88,"risk_score":70,"summary":"test incident","raw_payload":{"secret":"removed"}}
@@ -1754,6 +1853,9 @@ mod tests {
             "get_security_overview",
             "get_security_briefing",
             "get_system_graph",
+            "list_workflows",
+            "get_workflow_status",
+            "get_workflow_history",
         ] {
             let params = if tool == "list_incidents" {
                 CallToolRequestParams::new(tool)
@@ -1765,6 +1867,13 @@ mod tests {
                     | "get_incident_relations"
             ) {
                 CallToolRequestParams::new(tool).with_arguments(id_arguments.clone())
+            } else if tool == "get_workflow_status" {
+                let mut workflow_arguments = serde_json::Map::new();
+                workflow_arguments.insert(
+                    "id".to_string(),
+                    json!("00000000-0000-4000-8000-000000000030"),
+                );
+                CallToolRequestParams::new(tool).with_arguments(workflow_arguments)
             } else {
                 CallToolRequestParams::new(tool)
             };
@@ -1796,6 +1905,9 @@ mod tests {
                 "get_operations_recommendations" | "get_decision_history"
             ) {
                 assert!(serialized.contains("\"recommendation\""));
+            }
+            if tool == "list_workflows" {
+                assert!(serialized.contains("Security Incident Workflow"));
             }
         }
 

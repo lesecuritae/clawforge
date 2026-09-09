@@ -20,6 +20,7 @@ Für ein read-only Agent-Profil werden nur die benötigten Scopes vergeben:
 - `agent:operations:read`
 - `agent:operations:briefing`
 - `agent:operations:recommend`
+- `agent:workflow:read`
 - `agent:context:read`
 - `agent:decision:read`
 - `agent:incident:read`
@@ -41,7 +42,7 @@ bewusst breit lesendes Profil verwendet werden. Für `get_status`,
 
 1. MCP-Container und API im isolierten Compose-Netz starten.
 2. MCP-Token und Agent-Token getrennt rotieren und als Secrets laden.
-3. Tool-Liste abrufen und die 25 read-only Tools erkennen.
+3. Tool-Liste abrufen und die 28 read-only Tools erkennen.
 4. `get_status`, `get_agent_context`, `get_decisions`,
    `get_operations_summary`, `get_daily_operations_briefing`,
    `get_operations_recommendations`, `get_decision_history`,
@@ -64,8 +65,9 @@ historischen ungeschützten Routen verwenden.
 ## Live-Abnahme
 
 Die produktive Testverbindung wurde mit einem getrennten MCP-Token und einem
-separaten Agent-API-Token geprüft. Die MCP-Discovery liefert alle 21
-read-only Tools. Erfolgreich geprüft wurden `get_operations_summary`,
+separaten Agent-API-Token geprüft. Die MCP-Discovery liefert alle 28
+read-only Tools einschließlich `list_workflows`, `get_workflow_status` und
+`get_workflow_history`. Erfolgreich geprüft wurden `get_operations_summary`,
 `get_agent_context` und `list_incidents`; die Agent-API-Auditspur enthält
 Quelle, Ressource und Zeitpunkt, aber keine Tokenwerte.
 
