@@ -129,7 +129,7 @@ curl http://127.0.0.1:8080/ready
 
 Für einen lokalen Build: `docker compose up -d --build`. Veröffentlicht werden
 API, MCP, Frontend, Correlation, Incidents, Worker und Executor unter
-`ghcr.io/lesecuritae/clawforge-<service>:1.0.0`. Details zu Updates, Backups
+`ghcr.io/lesecuritae/clawforge-<service>:v1.0.0` (zusätzlich `1.0.0`). Details zu Updates, Backups
 und Health Checks stehen in [docs/deployment.de.md](docs/deployment.de.md) und
 [docs/deployment.md](docs/deployment.md).
 

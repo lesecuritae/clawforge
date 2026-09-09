@@ -15,12 +15,12 @@ ghcr.io/lesecuritae/clawforge-<service>
 
 Veröffentlicht werden `api`, `mcp`, `frontend`, `correlation`, `incidents`,
 `worker` und `executor`. Das Release-Tag wird über
-`CLAWFORGE_IMAGE_TAG=1.0.0` gewählt.
+`CLAWFORGE_IMAGE_TAG=v1.0.0` oder `1.0.0` gewählt.
 
 ```sh
 cp .env.example .env
 # unveränderliches Release-Tag verwenden
-CLAWFORGE_IMAGE_TAG=1.0.0
+CLAWFORGE_IMAGE_TAG=v1.0.0
 docker compose pull
 docker compose up -d
 ```
@@ -45,7 +45,7 @@ und meldet den angewendeten Migrationsstand. Für Updates Volume behalten.
 ## Upgrade von v0.x
 
 1. PostgreSQL-Backup erstellen und prüfen.
-2. `CLAWFORGE_IMAGE_TAG=1.0.0` setzen.
+2. `CLAWFORGE_IMAGE_TAG=v1.0.0` setzen.
 3. Images laden und Compose neu starten:
 
 ```sh

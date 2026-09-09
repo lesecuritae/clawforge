@@ -207,7 +207,8 @@ ghcr.io/lesecuritae/clawforge-worker:1.0.0
 ghcr.io/lesecuritae/clawforge-executor:1.0.0
 ```
 
-Each image also receives `1.0` and `latest` tags. Release builds target
+The same images are also published with the release alias `v1.0.0`. Each image
+also receives `1.0` and `latest` tags. Release builds target
 `linux/amd64` and `linux/arm64`, include OCI revision metadata, provenance,
 and an SBOM, and are scanned with Trivy. See [docs/deployment.md](docs/deployment.md)
 for pull-based installation and upgrade instructions.
@@ -239,7 +240,8 @@ ziehen, Compose neu starten und `/ready` sowie MCP-Discovery prüfen.
 ### Docker Images
 
 Die Images sind unter `ghcr.io/lesecuritae` verfügbar und erhalten die Tags
-`1.0.0`, `1.0` und `latest`. Unterstützt werden `linux/amd64` und `linux/arm64`.
+`v1.0.0`, `1.0.0`, `1.0` und `latest`. Unterstützt werden `linux/amd64` und
+`linux/arm64`.
 Sie enthalten OCI-Revision, Provenance und SBOM und werden mit Trivy geprüft.
 
 ### LLM-Integration

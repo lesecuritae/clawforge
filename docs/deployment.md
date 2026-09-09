@@ -21,7 +21,7 @@ release source in the standard Compose deployment.
 ```sh
 cp .env.example .env
 # keep the immutable release tag for production
-CLAWFORGE_IMAGE_TAG=1.0.0
+CLAWFORGE_IMAGE_TAG=v1.0.0
 docker compose pull
 docker compose up -d
 ```
@@ -29,8 +29,8 @@ docker compose up -d
 Use `docker compose build && docker compose up -d` for a local build. The
 published images carry OCI title, description, version, revision, source, and
 Apache-2.0 license labels. GitHub Actions publishes linux/amd64 and linux/arm64
-when tests and security checks pass. Use `1.0.0` in production; `1.0` and
-`latest` are convenience tags.
+when tests and security checks pass. Use `v1.0.0` or `1.0.0` in production;
+`1.0` and `latest` are convenience tags.
 
 ## Fresh installation
 
@@ -50,7 +50,7 @@ PostgreSQL connection and applied migration count. Stop safely with
 ## Upgrade from v0.x
 
 1. Create and verify a PostgreSQL backup.
-2. Set `CLAWFORGE_IMAGE_TAG=1.0.0`.
+2. Set `CLAWFORGE_IMAGE_TAG=v1.0.0`.
 3. Pull the release images and restart Compose:
 
 ```sh

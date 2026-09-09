@@ -121,6 +121,7 @@ jobs:
           push: true
           tags: |
             ghcr.io/lesecuritae/clawforge-${{ matrix.service }}:${{ steps.version.outputs.version }}
+            ghcr.io/lesecuritae/clawforge-${{ matrix.service }}:v${{ steps.version.outputs.version }}
             ghcr.io/lesecuritae/clawforge-${{ matrix.service }}:${{ steps.version.outputs.minor }}
             ghcr.io/lesecuritae/clawforge-${{ matrix.service }}:latest
           build-args: |

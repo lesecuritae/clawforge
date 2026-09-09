@@ -62,7 +62,7 @@ services:
     restart: unless-stopped
 
   clawforge-api:
-    image: ${CLAWFORGE_IMAGE_REGISTRY:-ghcr.io/lesecuritae}/clawforge-api:${CLAWFORGE_IMAGE_TAG:-1.0.0}
+    image: ${CLAWFORGE_IMAGE_REGISTRY:-ghcr.io/lesecuritae}/clawforge-api:${CLAWFORGE_IMAGE_TAG:-v1.0.0}
     build:
       context: .
       dockerfile: docker/Dockerfile
@@ -209,7 +209,7 @@ services:
     restart: unless-stopped
 
   clawforge-correlation:
-    image: ${CLAWFORGE_IMAGE_REGISTRY:-ghcr.io/lesecuritae}/clawforge-correlation:${CLAWFORGE_IMAGE_TAG:-1.0.0}
+    image: ${CLAWFORGE_IMAGE_REGISTRY:-ghcr.io/lesecuritae}/clawforge-correlation:${CLAWFORGE_IMAGE_TAG:-v1.0.0}
     build:
       context: .
       dockerfile: docker/Dockerfile
@@ -241,7 +241,7 @@ services:
     restart: unless-stopped
 
   clawforge-incidents:
-    image: ${CLAWFORGE_IMAGE_REGISTRY:-ghcr.io/lesecuritae}/clawforge-incidents:${CLAWFORGE_IMAGE_TAG:-1.0.0}
+    image: ${CLAWFORGE_IMAGE_REGISTRY:-ghcr.io/lesecuritae}/clawforge-incidents:${CLAWFORGE_IMAGE_TAG:-v1.0.0}
     build:
       context: .
       dockerfile: docker/Dockerfile
@@ -272,7 +272,7 @@ services:
     restart: unless-stopped
 
   clawforge-mcp:
-    image: ${CLAWFORGE_IMAGE_REGISTRY:-ghcr.io/lesecuritae}/clawforge-mcp:${CLAWFORGE_IMAGE_TAG:-1.0.0}
+    image: ${CLAWFORGE_IMAGE_REGISTRY:-ghcr.io/lesecuritae}/clawforge-mcp:${CLAWFORGE_IMAGE_TAG:-v1.0.0}
     build:
       context: .
       dockerfile: docker/Dockerfile
@@ -308,7 +308,7 @@ services:
     restart: unless-stopped
 
   clawforge-executor:
-    image: ${CLAWFORGE_IMAGE_REGISTRY:-ghcr.io/lesecuritae}/clawforge-executor:${CLAWFORGE_IMAGE_TAG:-1.0.0}
+    image: ${CLAWFORGE_IMAGE_REGISTRY:-ghcr.io/lesecuritae}/clawforge-executor:${CLAWFORGE_IMAGE_TAG:-v1.0.0}
     build:
       context: .
       dockerfile: docker/Dockerfile
@@ -342,7 +342,7 @@ services:
     restart: unless-stopped
 
   clawforge-frontend:
-    image: ${CLAWFORGE_IMAGE_REGISTRY:-ghcr.io/lesecuritae}/clawforge-frontend:${CLAWFORGE_IMAGE_TAG:-1.0.0}
+    image: ${CLAWFORGE_IMAGE_REGISTRY:-ghcr.io/lesecuritae}/clawforge-frontend:${CLAWFORGE_IMAGE_TAG:-v1.0.0}
     build:
       context: ./frontend
       dockerfile: Dockerfile
@@ -371,7 +371,7 @@ services:
     restart: unless-stopped
 
   clawforge-worker:
-    image: ${CLAWFORGE_IMAGE_REGISTRY:-ghcr.io/lesecuritae}/clawforge-worker:${CLAWFORGE_IMAGE_TAG:-1.0.0}
+    image: ${CLAWFORGE_IMAGE_REGISTRY:-ghcr.io/lesecuritae}/clawforge-worker:${CLAWFORGE_IMAGE_TAG:-v1.0.0}
     build:
       context: .
       dockerfile: docker/Dockerfile

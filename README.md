@@ -125,8 +125,9 @@ curl http://127.0.0.1:8080/ready
 ```
 
 Use `docker compose up -d --build` for a local build. Published images are
-available from `ghcr.io/lesecuritae/clawforge-<service>:1.0.0` for API, MCP,
-frontend, correlation, incidents, worker, and executor. See
+available from `ghcr.io/lesecuritae/clawforge-<service>:v1.0.0` (also published
+as `1.0.0`) for API, MCP, frontend, correlation, incidents, worker, and
+executor. See
 [docs/deployment.md](docs/deployment.md) and
 [docs/deployment.de.md](docs/deployment.de.md) for upgrades, backups, and
 health checks.
