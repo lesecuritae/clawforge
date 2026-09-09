@@ -11,6 +11,7 @@ ARG VCS_REF=unknown
 LABEL org.opencontainers.image.source="https://github.com/lesecuritae/clawforge" \
       org.opencontainers.image.title="Clawforge Operations Console" \
       org.opencontainers.image.description="Read-only Operations Intelligence dashboard" \
+      org.opencontainers.image.description.de="Schreibgeschütztes Operations-Intelligence-Dashboard" \
       org.opencontainers.image.version="$RELEASE_VERSION" \
       org.opencontainers.image.revision="$VCS_REF" \
       org.opencontainers.image.licenses="Apache-2.0"

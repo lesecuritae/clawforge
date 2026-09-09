@@ -7,8 +7,9 @@ FROM debian:bookworm-slim AS runtime
 ARG RELEASE_VERSION=dev
 ARG VCS_REF=unknown
 LABEL org.opencontainers.image.source="https://github.com/lesecuritae/clawforge" \
-      org.opencontainers.image.title="Clawforge Security Platform" \
+      org.opencontainers.image.title="Clawforge Services" \
       org.opencontainers.image.description="Rust Operations Intelligence API, worker, MCP gateway, connectors, and incident services" \
+      org.opencontainers.image.description.de="Selbsthostbare Operations-Intelligence-Plattform für Infrastruktur, Incidents und kontrollierte LLM-Abläufe" \
       org.opencontainers.image.version="$RELEASE_VERSION" \
       org.opencontainers.image.revision="$VCS_REF" \
       org.opencontainers.image.licenses="Apache-2.0"

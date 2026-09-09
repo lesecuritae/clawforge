@@ -2,34 +2,33 @@
 
 **Self-hosted Operations Intelligence Platform**
 
-Clawforge verbindet Infrastruktur, Events, Sicherheitsinformationen,
-Betriebsdaten und kontrollierte Automatisierung in einer gemeinsamen
-Operations-Schicht. Menschen und LLM-Agenten erhalten den gleichen
-nachvollziehbaren Kontext über die versionierte Agent API und den read-only
-MCP-Server.
+Clawforge connects infrastructure, events, security information, operational
+telemetry, and controlled automation in one auditable operations layer. People
+and LLM agents receive the same redacted context through the versioned Agent
+API and the read-only MCP server.
 
-Clawforge ist kein autonomer KI-Administrator. Es sammelt und bewertet
-Informationen, erklärt Zusammenhänge und stellt kontrollierte Schnittstellen
-für Menschen und Agenten bereit. Externe Aktionen sind allowlisted,
-policy-geprüft, approvalgebunden und im aktuellen Release weiterhin Dry-Run.
+Clawforge is not an autonomous AI administrator. It collects and evaluates
+information, explains relationships, and exposes controlled interfaces for
+people and agents. External actions are allowlisted, policy checked, approval
+gated, audited, and dry-run by default in v1.0.0.
 
-[🇩🇪 Deutsch](README.de.md) · [🇬🇧 English](README.en.md)
+[English](README.md) · [Deutsch](README.de.md)
 
-![Clawforge Security Platform](assets/branding/rebranding-announcement.png)
+![Clawforge Operations Intelligence](assets/branding/rebranding-announcement.png)
 
-## Warum Clawforge?
+## Why Clawforge?
 
-Moderne Systeme bestehen aus Containern, Servern, Cloud-Diensten,
-Repositories, Monitoring, Security-Feeds und Automatisierungen. Informationen
-entstehen an vielen Stellen, aber ihre Zusammenhänge fehlen oft. Clawforge
-schafft eine zentrale Operations-Intelligence-Ebene: Ereignisse werden
-gesammelt, korreliert, als Incidents nachvollziehbar gemacht und mit Risiko,
-Trust, Provider-Zustand und Empfehlungen verbunden.
+Modern environments combine containers, servers, cloud services, repositories,
+monitoring, security feeds, and automation. Information is produced in many
+places, while the relationships between signals are difficult to see.
+Clawforge provides one Operations Intelligence layer: it collects events,
+correlates them, preserves traceable incidents, and combines risk, trust,
+provider health, and recommendations.
 
-## Gesamtarchitektur
+## Architecture
 
 ```text
-Infrastruktur
+Infrastructure
       |
 Connector Layer
       |
@@ -56,100 +55,111 @@ MCP Server
 LLM Agent
 ```
 
-- **Connector Layer** verbindet Docker, GitHub und Proxmox mit sicheren,
-  normalisierten Projektionen.
-- **Provider Intelligence** synchronisiert Threat-, ASN-, BGP- und RPKI-Daten.
-- **Event Backbone** speichert strukturierte Ereignisse und verteilt sie an
-  Correlation, Incident, Alert und Audit Consumer.
-- **Correlation und Incident Intelligence** erkennen zusammengehörige Events,
-  bewahren Beziehungen und führen einen auditierten Incident-Lifecycle.
-- **Risk, Trust und Policy** bewerten Signale getrennt. Kein einzelner Feed,
-  ASN, RPKI-Status oder Connector darf allein blockieren.
-- **Decision und Workflow Governance** erzeugen erklärbare Empfehlungen und
-  verwalten Freigaben.
-- **Controlled Operations** kennt nur registrierte Actions. Der Executor ist
-  in v1.0 standardmäßig Dry-Run.
-- **Agent API und MCP** liefern redigierten read-only Kontext an OpenClaw und
-  andere Agenten.
+- **Connectors** read safe projections from Docker, GitHub, and Proxmox.
+- **Provider Intelligence** normalizes threat, ASN, BGP, and RPKI data.
+- **Event Backbone** persists structured events for correlation, incidents,
+  alerts, and audit consumers.
+- **Correlation and Incident Intelligence** preserve relationships and an
+  auditable incident lifecycle.
+- **Risk, Trust, and Policy** evaluate signals separately. A single feed, ASN,
+  RPKI status, or connector cannot block by itself.
+- **Decision and Workflow Governance** produce explainable recommendations and
+  manage approvals.
+- **Controlled Operations** only knows registered actions. The v1.0 executor
+  is dry-run and performs no external mutation.
+- **Agent API and MCP** expose bounded, redacted, read-only context to OpenClaw
+  and other agents.
 
-Die ausführliche Beschreibung steht in [docs/architecture.md](docs/architecture.md).
+The detailed architecture is in [docs/architecture.md](docs/architecture.md)
+(and [Deutsch](docs/architecture.de.md)).
 
-## Feature-Matrix
+## Feature matrix
 
-| Bereich | Funktionen |
+| Area | Capabilities |
 | --- | --- |
-| Security Intelligence | Events, Correlation, Incidents, Alerts, Risk- und Trust-Bewertung |
-| Operations Intelligence | Context API, Operations Summary, Briefings, Decisions, Historie |
-| Automation Governance | Workflows, Actions, Approvals, Execution Queue, Audit |
+| Security Intelligence | Events, correlation, incidents, alerts, risk and trust evaluation |
+| Operations Intelligence | Context API, Operations Summary, briefings, decisions, history |
+| Automation Governance | Workflows, actions, approvals, execution queue, audit |
 | Integration | MCP, OpenAPI, Docker, GitHub, Proxmox, OpenClaw |
-| Platform | Rust, PostgreSQL/sqlx, Migrationen, Backup/Restore, Prometheus, Dashboard |
+| Platform | Rust, PostgreSQL/sqlx, migrations, backup/restore, Prometheus, dashboard |
 
-## LLM- und MCP-Integration
+Clawforge uses an extensible Connector Framework rather than a technology-
+specific administrator. Connectors provide normalized state, health, and
+capabilities for container platforms, infrastructure systems, virtualization,
+repositories, cloud services, monitoring, and external data sources. Docker,
+GitHub, and Proxmox are the initial examples.
 
-LLMs erhalten keine direkte Infrastruktur- oder Datenbankkenntnis. Der MCP-
-Server ruft ausschließlich die Agent API v1 auf und liefert begrenzte,
-redigierte Antworten. Scopes, Timeouts, Response-Limits und Auditierung gelten
-für jeden Aufruf.
+## LLM and MCP integration
+
+LLMs do not receive direct infrastructure or database access. MCP calls only the
+Agent API v1 and returns bounded, redacted responses. Scopes, timeouts,
+response limits, and audit records apply to every call.
 
 ```text
-LLM -> MCP -> Agent Context API -> Events / Incidents / Risiko / Provider
-     -> formulierte Erklärung oder Empfehlung
+LLM -> MCP -> Agent Context API -> Events / Incidents / Risk / Provider health
+     -> explanation or recommendation
 ```
 
-Der Ablauf einer später freigegebenen kontrollierten Aktion ist:
+A controlled operation follows this path:
 
 ```text
 LLM -> Decision -> Policy -> Approval -> Execution Queue -> Worker -> Audit
 ```
 
-MCP bleibt read-only: keine direkten Datenbankzugriffe, keine versteckten
-Aktionen und keine Schreibwerkzeuge. Siehe
-[docs/llm-integration.md](docs/llm-integration.md) und
-[docs/openclaw-integration.md](docs/openclaw-integration.md).
+MCP remains read-only: it has no direct database access, hidden actions, or
+write tools. See [docs/llm-integration.md](docs/llm-integration.md) and
+[docs/llm-integration.de.md](docs/llm-integration.de.md).
 
-## Schnellstart
+## Docker installation
+
+Requirements: Docker Engine and the Docker Compose plugin.
 
 ```bash
+git clone https://github.com/lesecuritae/clawforge.git
+cd clawforge
 cp .env.example .env
-docker compose up -d --build
-curl http://127.0.0.1:8080/health
+# create private secret files from secrets/*.example
+docker compose pull
+docker compose up -d
 curl http://127.0.0.1:8080/ready
-curl http://127.0.0.1:8080/version
 ```
 
-Die Standardinstallation startet API, Worker, PostgreSQL, Frontend,
-Event-/Correlation-/Incident-Dienste, MCP, Notifier, Executor und Backup.
-Optionale Analyzer-, Redis- und Observability-Profile sind in
-[docs/deployment.md](docs/deployment.md) beschrieben. Provider bleiben ohne
-explizite Aktivierung und Secrets deaktiviert.
+Use `docker compose up -d --build` for a local build. Published images are
+available from `ghcr.io/lesecuritae/clawforge-<service>:1.0.0` for API, MCP,
+frontend, correlation, incidents, worker, and executor. See
+[docs/deployment.md](docs/deployment.md) and
+[docs/deployment.de.md](docs/deployment.de.md) for upgrades, backups, and
+health checks.
 
-## Sicherheit
+## Security boundaries
 
-- Least Privilege über Rollen und Agent-Scopes
-- Audit First für Zugriffe, Statusänderungen, Freigaben und Executions
-- keine automatischen Block- oder Remediation-Aktionen aus einem einzelnen Signal
-- Human Approval für kritische Abläufe
-- Secret Separation über Docker Secrets oder externe Referenzen
-- keine Secret-Werte, Rohfeeds oder Rohpayloads in MCP-Antworten
-- nicht-root Container, Health Checks, Migration- und Backup-Prüfungen
+- Least privilege through roles and explicit agent scopes.
+- Append-only audit records for access, state changes, approvals, and
+  executions.
+- No automatic blocking or remediation from one signal or from an LLM.
+- Human approval for critical operations.
+- Secrets are injected with Docker Secrets or external references and never
+  returned by API, MCP, logs, or frontend projections.
+- Non-root containers, health checks, migration checks, and backup workflows.
 
-Das Modell ist in [docs/security-model.md](docs/security-model.md) und der
-Security-Prüfung in [docs/security-audit.md](docs/security-audit.md)
-dokumentiert.
+See [docs/security.md](docs/security.md),
+[docs/security.de.md](docs/security.de.md), and the
+[security audit](docs/security-audit.md).
 
-## Betrieb und Dokumentation
+## Documentation
 
-- [Deployment und Updates](docs/deployment.md)
-- [Backup und Recovery](docs/backup.md)
-- [Provider](docs/providers.md)
+- [Architecture](docs/architecture.md) · [Deutsch](docs/architecture.de.md)
+- [LLM/MCP integration](docs/llm-integration.md) · [Deutsch](docs/llm-integration.de.md)
+- [Deployment and updates](docs/deployment.md) · [Deutsch](docs/deployment.de.md)
+- [Security model](docs/security.md) · [Deutsch](docs/security.de.md)
 - [Agent API v1](docs/agent-api.md)
-- [MCP Server](docs/mcp-server.md)
-- [Connectoren](docs/connectors.md)
-- [Incident Intelligence v0.12](docs/incident-intelligence-v0.12.md)
-- [Secret Provider](docs/secret-providers.md)
-- [v1.0-Finalpositionierung](docs/final-release.md)
+- [MCP server](docs/mcp-server.md)
+- [Providers](docs/providers.md)
+- [Connectors](docs/connectors.md)
+- [Backup and recovery](docs/backup.md)
+- [Final release](docs/final-release.md) · [Deutsch](docs/final-release.de.md)
 
-## Entwicklung und Validierung
+## Validation
 
 ```bash
 cargo fmt --all -- --check
@@ -161,9 +171,7 @@ docker compose config
 docker compose build
 ```
 
-Die PostgreSQL-Migrations- und Backup/Restore-Tests liegen unter `scripts/`.
+## License
 
-## Lizenz
-
-Apache License 2.0. Clawforge ist ein eigenständiges Rust-Projekt und enthält
-keine KorbKlar-, Supermarkt- oder OpenClaw-Runtime-Logik.
+Apache License 2.0. Clawforge is an independent Rust project and contains no
+KorbKlar, supermarket, or OpenClaw runtime code.

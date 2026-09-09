@@ -32,6 +32,18 @@ summary, relevant events, incident timeline, connector health, and provider
 status. Clawforge returns stored, evaluated context; it does not ask the LLM
 to calculate security scores from raw data.
 
+The connector path is generic:
+
+```text
+LLM -> MCP -> Operations Layer -> Connector Framework -> infrastructure source
+```
+
+Connectors may represent container platforms, infrastructure systems,
+virtualization, repositories, cloud services, monitoring, or external data
+sources. Docker, GitHub, and Proxmox are examples rather than product
+boundaries. A connector contributes normalized state, health, and capabilities;
+it does not expose unnecessary raw data.
+
 ## Controlled operations
 
 A request such as “restart the container” follows the controlled path:

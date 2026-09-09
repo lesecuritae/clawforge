@@ -16,6 +16,8 @@ Weitere Änderungen für die nächste Version werden hier gesammelt.
   with SBOM and Trivy validation.
 - Preserved read-only MCP access, approval-gated dry-run execution, and
   secret separation as release boundaries.
+- Added equivalent German and English release documentation for architecture,
+  LLM/MCP integration, deployment, security, and final-release guidance.
 
 ## [0.12.0] - 2026-09-09
 

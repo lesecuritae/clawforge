@@ -212,6 +212,43 @@ Each image also receives `1.0` and `latest` tags. Release builds target
 and an SBOM, and are scanned with Trivy. See [docs/deployment.md](docs/deployment.md)
 for pull-based installation and upgrade instructions.
 
+## Übersicht (Deutsch)
+
+Clawforge v1.0.0 ist die erste stabile Version einer selbsthostbaren
+Operations-Intelligence-Plattform. Sie verbindet Infrastruktur, Ereignisse,
+Incidents, Risiko- und Trust-Kontext, Decisions, kontrollierte Workflows,
+Connectoren und LLM-Zugriff über auditierten APIs und eine read-only
+MCP-Schnittstelle.
+
+### Highlights
+
+- Event-Correlation, Incident Management, Provider Intelligence, Decision-
+  Unterstützung, Workflow Governance und kontrollierte Dry-Run-Abläufe.
+- Agent API v1, MCP/OpenClaw-Hinweise, Audit, PostgreSQL-Migrationen,
+  Health Checks, Monitoring und Backup-Dokumentation.
+- MCP und LLM-Zugriff bleiben read-only. Keine automatische Remediation und
+  kein direkter MCP-Datenbankzugriff.
+
+### Änderungen und Upgrade-Hinweise
+
+Die Version hebt die dokumentierte Projektbasis und alle Workspace-Pakete auf
+1.0.0 an. Bestehende Migrationen werden vor dem Readiness-Status ausgeführt.
+Vor einem Upgrade von v0.x ein PostgreSQL-Backup erstellen; danach Images
+ziehen, Compose neu starten und `/ready` sowie MCP-Discovery prüfen.
+
+### Docker Images
+
+Die Images sind unter `ghcr.io/lesecuritae` verfügbar und erhalten die Tags
+`1.0.0`, `1.0` und `latest`. Unterstützt werden `linux/amd64` und `linux/arm64`.
+Sie enthalten OCI-Revision, Provenance und SBOM und werden mit Trivy geprüft.
+
+### LLM-Integration
+
+OpenClaw verwendet MCP ausschließlich read-only mit begrenzten Agent-Scopes.
+Kontrollierte Aktionen benötigen weiterhin Decision, Policy, menschliche
+Freigabe, Queue, Worker und Audit. Details stehen in
+`docs/llm-integration.de.md` und `docs/llm-integration.md`.
+
 # Clawforge v0.10.0 Production Operations
 
 ## Production operations maturity
