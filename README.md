@@ -21,3 +21,4 @@ curl http://127.0.0.1:8080/ready
 
 Read the [German documentation](README.de.md) or [English documentation](README.en.md) for configuration, providers, deployment, and security details.
 See [production.md](docs/production.md), [security-audit.md](docs/security-audit.md), [roadmap-v1.md](docs/roadmap-v1.md), [openclaw-integration.md](docs/openclaw-integration.md), [openclaw-architecture.md](docs/openclaw-architecture.md), and [openclaw-config.example.json](docs/openclaw-config.example.json) for production operation and the OpenClaw MCP contract.
+For the v0.12 incident, alert-correlation, connector-action, and secret-reference boundaries, see [incident-intelligence-v0.12.md](docs/incident-intelligence-v0.12.md) and [secret-providers.md](docs/secret-providers.md).

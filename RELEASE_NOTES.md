@@ -208,3 +208,21 @@ Productive connector actions remain disabled. The executor requires
 `CLAWFORGE_EXECUTOR_DRY_RUN=true`; no shell commands or automatic remediation
 are available. Apply migration `0026_platform_hardening.sql` through the
 standard startup migration path and run the documented backup/restore check.
+
+# Clawforge v0.12.0 Incident Intelligence
+
+- Incident Management Core adds sanitized append-only timeline records while
+  preserving existing correlation and lifecycle APIs.
+- Declarative alert rules, alert groups, and deduplicated correlation events
+  provide a safe foundation for alert correlation.
+- Docker, Proxmox, and GitHub actions are registered as disabled,
+  approval-gated metadata only. The executor remains dry-run and performs no
+  external operation.
+- Secret provider and reference metadata supports Docker Secrets, environment
+  references, Vaultwarden, SOPS, and external providers without storing values.
+- MCP adds the read-only `get_incident_details` alias; no write tool or direct
+  database access was added.
+
+Apply `0027_incidents.sql` and `0028_incident_status_compatibility.sql` through the standard startup migration path. Verify
+`/ready`, run the fresh migration test, and complete a backup/restore check
+before production rollout.

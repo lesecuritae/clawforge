@@ -1,5 +1,5 @@
 export type Provider = { id: string; name: string; source: string; enabled: boolean; status?: string; last_success_at?: string; last_failure_at?: string; last_data_at?: string; last_error?: string; quality_score?: number; data_age_seconds?: number; indicator_count?: number; sync_duration_ms?: number };
-export type Incident = { id: string; status: string; severity: string; source?: string; risk_score: number; summary: string; correlation_key: string; event_count?: number; created_at: string; updated_at: string };
+export type Incident = { id: string; title?: string; status: string; severity: string; source?: string; risk_score: number; summary: string; correlation_key: string; event_count?: number; created_at: string; updated_at: string };
 export type Indicator = { id: number; value: string; indicator_type: string; source: string; confidence: number; risk_score?: number; trust_score?: number; last_seen: string; expires_at: string; status?: string };
 export type NetworkRecord = Record<string, unknown> & { timestamp?: string; source?: string; status?: string; confidence?: number };
 export type AuditEvent = { id: number; actor: string; action: string; resource: string; severity: string; reason: string; recorded_at: string };

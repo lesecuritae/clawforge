@@ -922,6 +922,18 @@ impl McpServer {
     }
 
     #[tool(
+        name = "get_incident_details",
+        description = "Read the safe, redacted details of one incident by UUID; no actions, notes mutation, or raw payloads; requires agent:incident:read"
+    )]
+    async fn get_incident_details(
+        &self,
+        Parameters(args): Parameters<IncidentIdArgs>,
+    ) -> Result<Json<ToolResponse>, ErrorData> {
+        let path = incident_path(&args.id, "")?;
+        Ok(Json(self.get_incident(&path, &[]).await?))
+    }
+
+    #[tool(
         name = "get_incident_timeline",
         description = "Read a redacted paginated incident timeline by UUID with status, severity, and time filters; requires agent:incident:read"
     )]
@@ -1731,6 +1743,7 @@ mod tests {
                 "get_execution_status",
                 "get_health_overview",
                 "get_incident",
+                "get_incident_details",
                 "get_incident_relations",
                 "get_incident_replay",
                 "get_incident_timeline",
@@ -1890,7 +1903,7 @@ mod tests {
         );
         let client = ClientInfo::default().serve(transport).await.unwrap();
         let tools = client.list_tools(None).await.unwrap();
-        assert_eq!(tools.tools.len(), 38);
+        assert_eq!(tools.tools.len(), 39);
         let expected = [
             "list_connectors",
             "get_connector_status",
@@ -1904,6 +1917,7 @@ mod tests {
             "list_events",
             "list_incidents",
             "get_incident",
+            "get_incident_details",
             "get_incident_replay",
             "get_incident_timeline",
             "get_incident_relations",

@@ -29,6 +29,65 @@ pub struct CorrelationOutcome {
     pub summary: String,
 }
 
+/// Declarative grouping rule loaded from the `alert_rules` table. No scripts
+/// or executable expressions are accepted by this type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlertRule {
+    pub name: String,
+    pub source: Option<String>,
+    pub error_class: Option<String>,
+    pub infrastructure: Option<String>,
+    pub window: Duration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlertGroup {
+    pub group_key: String,
+    pub event_ids: Vec<Uuid>,
+    pub first_seen: DateTime<Utc>,
+    pub last_seen: DateTime<Utc>,
+    pub confidence: u8,
+}
+
+/// Group events using only bounded time/source/infrastructure keys. Payloads
+/// are never copied into the resulting group, keeping this layer safe for
+/// storage and notification consumers.
+pub fn group_alert_events(events: &[EventRecord], rule: &AlertRule) -> Vec<AlertGroup> {
+    let mut groups: Vec<AlertGroup> = Vec::new();
+    for event in events.iter().filter(|event| {
+        rule.source
+            .as_deref()
+            .is_none_or(|source| source == event.source)
+            && rule
+                .error_class
+                .as_deref()
+                .is_none_or(|class| event.event_type == class)
+    }) {
+        let key = format!(
+            "{}:{}",
+            rule.source.as_deref().unwrap_or(&event.source),
+            rule.error_class.as_deref().unwrap_or(&event.event_type)
+        );
+        if let Some(group) = groups.iter_mut().find(|group| {
+            group.group_key == key && (event.occurred_at - group.last_seen).abs() <= rule.window
+        }) {
+            group.last_seen = event.occurred_at;
+            group.first_seen = group.first_seen.min(event.occurred_at);
+            group.event_ids.push(event.event_id);
+            group.confidence = group.confidence.saturating_add(3).min(100);
+        } else {
+            groups.push(AlertGroup {
+                group_key: key,
+                event_ids: vec![event.event_id],
+                first_seen: event.occurred_at,
+                last_seen: event.occurred_at,
+                confidence: 60,
+            });
+        }
+    }
+    groups
+}
+
 /// Event types that can contribute to a security incident candidate. Events
 /// such as audit and lifecycle notifications are deliberately excluded so the
 /// analysis layer cannot create feedback loops from its own observations.
@@ -327,5 +386,25 @@ mod tests {
         let outcome = derive_outcome(&[first, second], &[matched]);
         assert_eq!(outcome.severity, "high");
         assert!(outcome.confidence > 90);
+    }
+
+    #[test]
+    fn alert_grouping_is_bounded_and_deduplicated_by_key() {
+        let first = event(1, "provider_error", "docker", 10, serde_json::json!({}));
+        let second = event(2, "provider_error", "docker", 20, serde_json::json!({}));
+        let outside = event(3, "provider_error", "docker", 500, serde_json::json!({}));
+        let groups = group_alert_events(
+            &[first, second, outside],
+            &AlertRule {
+                name: "same source".into(),
+                source: Some("docker".into()),
+                error_class: Some("provider_error".into()),
+                infrastructure: None,
+                window: Duration::seconds(60),
+            },
+        );
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].event_ids.len(), 2);
+        assert_eq!(groups[0].confidence, 63);
     }
 }

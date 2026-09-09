@@ -1283,6 +1283,7 @@ fn agent_finding_view(value: &serde_json::Value) -> serde_json::Value {
 fn agent_incident_view(value: &serde_json::Value) -> serde_json::Value {
     serde_json::json!({
         "id": value.get("id"),
+        "title": value.get("title"),
         "status": value.get("status"),
         "severity": value.get("severity"),
         "source": value.get("source"),
@@ -1338,6 +1339,12 @@ fn agent_incident_timeline_view(value: &serde_json::Value) -> serde_json::Value 
             "timestamp": value.get("timestamp"),
             "recorded": true
         }),
+        Some("timeline") => serde_json::json!({
+            "kind": "timeline",
+            "timestamp": value.get("timestamp"),
+            "action": data.get("action"),
+            "recorded": true
+        }),
         _ => serde_json::json!({
             "kind": "unknown",
             "timestamp": value.get("timestamp")
@@ -1362,7 +1369,7 @@ fn context_is_active_incident(value: &serde_json::Value) -> bool {
         .is_some_and(|status| {
             matches!(
                 status,
-                "detected" | "investigating" | "confirmed" | "mitigated"
+                "open" | "acknowledged" | "detected" | "investigating" | "confirmed" | "mitigated"
             )
         })
 }
@@ -6691,6 +6698,7 @@ struct IncidentStatusRequest {
 fn canonical_incident_status(value: &str) -> Option<&'static str> {
     match value.to_ascii_lowercase().as_str() {
         "open" | "detected" => Some("detected"),
+        "acknowledged" => Some("acknowledged"),
         "investigating" => Some("investigating"),
         "confirmed" => Some("confirmed"),
         "mitigated" => Some("mitigated"),

@@ -41,6 +41,27 @@ pub const CAPABILITIES: &[&str] = &[
 ];
 pub const CAPABILITY_MODES: &[&str] = &["read", "execute"];
 
+/// Actions are registered in PostgreSQL as disabled policy metadata. They are
+/// deliberately not returned by the read-only connector projections until an
+/// operator enables a reviewed policy and the executor supports it.
+pub const REGISTERED_ACTIONS: &[&str] = &[
+    "docker.restart_container",
+    "docker.rebuild_container",
+    "docker.update_image",
+    "proxmox.restart_vm",
+    "proxmox.shutdown_vm",
+    "proxmox.snapshot_vm",
+    "github.create_issue",
+    "github.trigger_workflow",
+];
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ConnectorPermission {
+    Read,
+    Execute,
+    Destructive,
+}
+
 /// Connector actions are declarative capability metadata only. Productive
 /// execution is intentionally absent from the v0.9 connector contract.
 pub fn action_mode_is_safe(mode: &str) -> bool {
@@ -341,5 +362,7 @@ mod tests {
         assert!(action_mode_is_safe("execute"));
         assert!(!action_mode_is_safe("shell"));
         assert!(!productive_execution_enabled());
+        assert!(REGISTERED_ACTIONS.contains(&"docker.rebuild_container"));
+        assert_eq!(ConnectorPermission::Read, ConnectorPermission::Read);
     }
 }

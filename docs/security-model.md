@@ -33,3 +33,16 @@ source, severity, lifecycle status and delivery status. Alerts do not change
 risk, trust or policy and do not execute remediation. Acknowledgement,
 resolution and suppression are role-protected and audited. Notification
 delivery remains an independent, optional concern.
+
+## v0.12 incident and connector boundaries
+
+Incident timelines accept only bounded actor/action values and sanitized
+metadata. Alert correlation rules are declarative data with bounded time
+windows; they cannot execute scripts. Connector actions are allowlisted in the
+registry but remain disabled and approval-gated. The executor is still dry-run
+only, with no free shell interface or automatic remediation.
+
+Secret provider records contain references and health metadata only. Docker
+Secrets, environment references, Vaultwarden, SOPS, and external providers
+must inject values outside PostgreSQL. No agent, MCP tool, audit response, or
+frontend projection can retrieve a secret value.

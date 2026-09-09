@@ -253,6 +253,65 @@ async fn migrations_and_restart_persist() -> anyhow::Result<()> {
         .fetch_one(restarted.pool())
         .await?;
     assert_eq!(incident_status, "investigating");
+    let timeline_id = restarted
+        .record_incident_timeline(
+            incident_row.0,
+            "integration-test",
+            "reviewed",
+            json!({"token":"removed","reason":"fixture review"}),
+        )
+        .await?;
+    assert!(timeline_id > 0);
+    let timeline_metadata: serde_json::Value =
+        sqlx::query_scalar("SELECT metadata FROM incident_timeline WHERE id=$1")
+            .bind(timeline_id)
+            .fetch_one(restarted.pool())
+            .await?;
+    assert!(timeline_metadata.get("token").is_none());
+    let timeline_entries = restarted
+        .incident_timeline(incident_row.0)
+        .await?
+        .expect("incident exists");
+    assert!(timeline_entries
+        .iter()
+        .any(|entry| entry["kind"] == "timeline"));
+    let secret_provider_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM secret_providers")
+        .fetch_one(restarted.pool())
+        .await?;
+    assert!(secret_provider_count >= 1);
+    let secret_provider_id: uuid::Uuid =
+        sqlx::query_scalar("SELECT id FROM secret_providers WHERE name='Docker Secrets'")
+            .fetch_one(restarted.pool())
+            .await?;
+    let secret_reference_id = restarted
+        .register_secret_reference(
+            secret_provider_id,
+            "integration-webhook",
+            "/run/secrets/test_webhook",
+            "notification",
+        )
+        .await?;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM secret_references WHERE id=$1 AND reference NOT LIKE '%=%'",
+        )
+        .bind(secret_reference_id)
+        .fetch_one(restarted.pool())
+        .await?,
+        1
+    );
+    let secret_reference_columns: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.columns WHERE table_name='secret_references' AND column_name='reference'",
+    )
+    .fetch_one(restarted.pool())
+    .await?;
+    assert_eq!(secret_reference_columns, 1);
+    let disabled_action: (bool, bool) = sqlx::query_as(
+        "SELECT enabled,requires_approval FROM actions WHERE name='docker.rebuild_container'",
+    )
+    .fetch_one(restarted.pool())
+    .await?;
+    assert_eq!(disabled_action, (false, true));
     let analysis_id = restarted
         .store_incident_analysis(
             incident_row.0,

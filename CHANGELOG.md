@@ -4,6 +4,19 @@
 
 Weitere Änderungen für die nächste Version werden hier gesammelt.
 
+## [0.12.0] - 2026-09-09
+
+- Added additive incident intelligence storage with incident titles, sources,
+  sanitized append-only timelines, declarative alert grouping, and correlation
+  event deduplication.
+- Added disabled, approval-gated Docker, Proxmox, and GitHub action metadata;
+  the executor remains dry-run only and no external mutation is enabled.
+- Added secret provider/reference metadata for Docker Secrets, environment
+  references, Vaultwarden, SOPS, and external providers without persisting
+  secret values.
+- Added the read-only MCP alias `get_incident_details` and documented the
+  v0.12 upgrade, security boundaries, and operational checks.
+
 ## [0.11.0] - 2026-09-09
 
 - Added production execution worker registration, heartbeats, bounded leases,

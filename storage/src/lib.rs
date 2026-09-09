@@ -1050,14 +1050,16 @@ impl PostgresStore {
         status: Option<&str>,
         limit: i64,
     ) -> Result<Vec<serde_json::Value>> {
-        let rows = sqlx::query("SELECT i.id,i.status,i.severity,i.confidence,i.candidate_id,i.created_at,i.updated_at,i.risk_score,i.summary,i.correlation_key,(SELECT string_agg(DISTINCT e.source, ', ' ORDER BY e.source) FROM incident_relations source_relation JOIN events e ON e.event_id=source_relation.event_id WHERE source_relation.incident_id=i.id) AS source,(COUNT(DISTINCT ie.event_id)+COUNT(DISTINCT ir.event_id)) AS event_count FROM incidents i LEFT JOIN incident_events ie ON ie.incident_id=i.id LEFT JOIN incident_relations ir ON ir.incident_id=i.id AND ir.relation_type='event' WHERE ($1::text IS NULL OR i.status=$1) GROUP BY i.id ORDER BY i.updated_at DESC LIMIT $2")
+        let rows = sqlx::query("SELECT i.id,i.title,i.status,i.source,i.severity,i.confidence,i.candidate_id,i.created_at,i.updated_at,i.risk_score,i.summary,i.correlation_key,(SELECT string_agg(DISTINCT e.source, ', ' ORDER BY e.source) FROM incident_relations source_relation JOIN events e ON e.event_id=source_relation.event_id WHERE source_relation.incident_id=i.id) AS event_sources,(COUNT(DISTINCT ie.event_id)+COUNT(DISTINCT ir.event_id)) AS event_count FROM incidents i LEFT JOIN incident_events ie ON ie.incident_id=i.id LEFT JOIN incident_relations ir ON ir.incident_id=i.id AND ir.relation_type='event' WHERE ($1::text IS NULL OR i.status=$1) GROUP BY i.id ORDER BY i.updated_at DESC LIMIT $2")
             .bind(status).bind(limit.clamp(1, 500)).fetch_all(&self.pool).await?;
         Ok(rows
             .into_iter()
             .map(|row| {
                 serde_json::json!({
                     "id": row.get::<Uuid,_>("id"),
+                    "title": row.get::<String,_>("title"),
                     "status": row.get::<String,_>("status"),
+                    "source": row.get::<String,_>("source"),
                     "severity": row.get::<String,_>("severity"),
                     "confidence": row.get::<i16,_>("confidence"),
                     "candidate_id": row.get::<Option<Uuid>,_>("candidate_id"),
@@ -1066,20 +1068,68 @@ impl PostgresStore {
                     "risk_score": row.get::<i16,_>("risk_score"),
                     "summary": row.get::<String,_>("summary"),
                     "correlation_key": row.get::<String,_>("correlation_key"),
-                    "source": row.get::<Option<String>,_>("source"),
+                    "event_sources": row.get::<Option<String>,_>("event_sources"),
                     "event_count": row.get::<i64,_>("event_count")
                 })
             })
             .collect())
     }
 
+    /// Return secret-provider health metadata without exposing references that
+    /// could be used to retrieve a value. Secret contents never cross this
+    /// storage API.
+    pub async fn list_secret_provider_status(&self) -> Result<Vec<serde_json::Value>> {
+        let rows = sqlx::query("SELECT id,name,provider_type,status,last_check,last_error,updated_at FROM secret_providers ORDER BY name")
+            .fetch_all(&self.pool).await?;
+        Ok(rows.into_iter().map(|row| serde_json::json!({
+            "id": row.get::<Uuid,_>("id"),
+            "name": row.get::<String,_>("name"),
+            "provider_type": row.get::<String,_>("provider_type"),
+            "status": row.get::<String,_>("status"),
+            "last_check": row.get::<Option<chrono::DateTime<chrono::Utc>>,_>("last_check"),
+            "last_error": row.get::<Option<String>,_>("last_error").map(|value| value.chars().take(256).collect::<String>()),
+            "updated_at": row.get::<chrono::DateTime<chrono::Utc>,_>("updated_at")
+        })).collect())
+    }
+
+    /// Register a reference to a runtime-managed secret. The input is a
+    /// provider reference (file/key/path), never a secret value.
+    pub async fn register_secret_reference(
+        &self,
+        provider_id: Uuid,
+        name: &str,
+        reference: &str,
+        purpose: &str,
+    ) -> Result<Uuid> {
+        let name = name.trim();
+        let reference = reference.trim();
+        let purpose = purpose.trim();
+        if name.is_empty()
+            || name.len() > 160
+            || reference.is_empty()
+            || reference.len() > 512
+            || purpose.is_empty()
+            || purpose.len() > 160
+            || reference.contains('=')
+        {
+            anyhow::bail!("invalid secret reference");
+        }
+        let id = Uuid::new_v4();
+        sqlx::query("INSERT INTO secret_references (id,provider_id,name,reference,purpose) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (provider_id,name) DO UPDATE SET reference=EXCLUDED.reference,purpose=EXCLUDED.purpose,updated_at=NOW() RETURNING id")
+            .bind(id).bind(provider_id).bind(name).bind(reference).bind(purpose)
+            .fetch_one(&self.pool).await.map(|row| row.get::<Uuid,_>("id"))
+            .map_err(Into::into)
+    }
+
     pub async fn get_incident(&self, id: Uuid) -> Result<Option<serde_json::Value>> {
-        let row = sqlx::query("SELECT id,status,severity,confidence,candidate_id,created_at,updated_at,risk_score,summary,correlation_key FROM incidents WHERE id=$1")
+        let row = sqlx::query("SELECT id,title,status,source,severity,confidence,candidate_id,created_at,updated_at,risk_score,summary,correlation_key FROM incidents WHERE id=$1")
             .bind(id).fetch_optional(&self.pool).await?;
         Ok(row.map(|row| {
             serde_json::json!({
                 "id": row.get::<Uuid,_>("id"),
+                "title": row.get::<String,_>("title"),
                 "status": row.get::<String,_>("status"),
+                "source": row.get::<String,_>("source"),
                 "severity": row.get::<String,_>("severity"),
                 "confidence": row.get::<i16,_>("confidence"),
                 "candidate_id": row.get::<Option<Uuid>,_>("candidate_id"),
@@ -1187,6 +1237,14 @@ impl PostgresStore {
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
+        let _ = self
+            .record_incident_timeline(
+                id,
+                changed_by,
+                "status_changed",
+                serde_json::json!({"previous_status": current, "status": status, "reason": reason}),
+            )
+            .await;
         if status == "closed" {
             let _ = self
                 .enqueue_notification_event(
@@ -1284,7 +1342,57 @@ impl PostgresStore {
             .bind(body)
             .execute(&self.pool)
             .await?;
+        let _ = self
+            .record_incident_timeline(
+                id,
+                author,
+                "note_added",
+                serde_json::json!({"note_id": note_id}),
+            )
+            .await;
         Ok(note_id)
+    }
+
+    /// Record a sanitized, append-only incident timeline entry. Metadata is
+    /// intentionally redacted before it crosses the storage boundary.
+    pub async fn record_incident_timeline(
+        &self,
+        incident_id: Uuid,
+        actor: &str,
+        action: &str,
+        metadata: serde_json::Value,
+    ) -> Result<i64> {
+        if actor.trim().is_empty()
+            || actor.len() > 160
+            || action.trim().is_empty()
+            || action.len() > 160
+        {
+            anyhow::bail!("invalid incident timeline entry");
+        }
+        let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM incidents WHERE id=$1)")
+            .bind(incident_id)
+            .fetch_one(&self.pool)
+            .await?;
+        if !exists {
+            anyhow::bail!("incident not found");
+        }
+        let metadata = sanitize_analysis_value(metadata, None);
+        let id: i64 = sqlx::query_scalar("INSERT INTO incident_timeline (incident_id,actor,action,metadata) VALUES ($1,$2,$3,$4) RETURNING id")
+            .bind(incident_id).bind(actor.trim()).bind(action.trim()).bind(metadata)
+            .fetch_one(&self.pool).await?;
+        Ok(id)
+    }
+
+    pub async fn list_incident_timeline_entries(&self, id: Uuid) -> Result<Vec<serde_json::Value>> {
+        let rows = sqlx::query("SELECT id,actor,action,timestamp,metadata FROM incident_timeline WHERE incident_id=$1 ORDER BY timestamp ASC,id ASC")
+            .bind(id).fetch_all(&self.pool).await?;
+        Ok(rows.into_iter().map(|row| serde_json::json!({
+            "id": row.get::<i64,_>("id"),
+            "actor": row.get::<String,_>("actor"),
+            "action": row.get::<String,_>("action"),
+            "timestamp": row.get::<chrono::DateTime<chrono::Utc>,_>("timestamp"),
+            "metadata": sanitize_analysis_value(row.get::<serde_json::Value,_>("metadata"), None)
+        })).collect())
     }
 
     pub async fn incident_timeline(&self, id: Uuid) -> Result<Option<Vec<serde_json::Value>>> {
@@ -1303,6 +1411,13 @@ impl PostgresStore {
             timeline.push(serde_json::json!({
                 "kind": "note",
                 "timestamp": entry.get("created_at"),
+                "data": entry
+            }));
+        }
+        for entry in self.list_incident_timeline_entries(id).await? {
+            timeline.push(serde_json::json!({
+                "kind": "timeline",
+                "timestamp": entry.get("timestamp"),
                 "data": entry
             }));
         }
@@ -3279,6 +3394,7 @@ fn max_incident_severity(current: &str, incoming: &str) -> String {
 fn canonical_incident_status(value: &str) -> Option<&'static str> {
     match value.to_ascii_lowercase().as_str() {
         "open" | "detected" => Some("detected"),
+        "acknowledged" => Some("acknowledged"),
         "investigating" => Some("investigating"),
         "confirmed" => Some("confirmed"),
         "mitigated" => Some("mitigated"),
@@ -3290,7 +3406,11 @@ fn canonical_incident_status(value: &str) -> Option<&'static str> {
 
 fn incident_status_transition_allowed(current: &str, next: &str) -> bool {
     match current {
-        "detected" => matches!(next, "investigating" | "confirmed" | "closed"),
+        "detected" => matches!(
+            next,
+            "acknowledged" | "investigating" | "confirmed" | "closed"
+        ),
+        "acknowledged" => matches!(next, "investigating" | "confirmed" | "resolved" | "closed"),
         "investigating" => matches!(next, "confirmed" | "mitigated" | "resolved" | "closed"),
         "confirmed" => matches!(next, "mitigated" | "resolved" | "closed"),
         "mitigated" => matches!(next, "resolved" | "closed"),

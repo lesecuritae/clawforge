@@ -526,7 +526,8 @@ fachliche Zugriffsspur.
 ## Implementierung und Betrieb
 
 1. Das Crate `mcp/` nutzt `rmcp` mit Streamable HTTP und registriert genau die
-   38 read-only Tools.
+   39 read-only Tools. `get_incident_details` is a compatibility alias for
+   `get_incident` and uses the same `agent:incident:read` scope.
 2. Der Upstream-Client liest getrennte Agent-API- und MCP-Credentials aus
    Docker Secrets, validiert die Agent-API-Envelope und setzt Timeouts.
 3. Die Compose-Datei startet `clawforge-mcp` intern auf Port 8090. Der Dienst
@@ -540,8 +541,10 @@ fachliche Zugriffsspur.
 
 ## Tests
 
-- `tools/list` enthält genau die 38 read-only Tools einschließlich der neuen
+- `tools/list` enthält genau die 39 read-only Tools einschließlich der neuen
   Workflow-Tools.
+- `get_incident_details` ist ein kompatibler read-only Alias für
+  `get_incident` und verwendet denselben Scope `agent:incident:read`.
 - Incident-Tools rufen ausschließlich die vier versionierten Incident-
   Endpunkte der Agent API auf und akzeptieren den kanonischen Scope
   `agent:incident:read` (der alte Plural bleibt kompatibel).
