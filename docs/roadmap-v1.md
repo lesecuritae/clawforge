@@ -37,3 +37,13 @@ Jede Phase ist erst abgeschlossen, wenn Code, Tests, Docker, Dokumentation,
 Auditierbarkeit und `origin/main` konsistent sind. MCP bleibt read-only; direkte
 Datenbankzugriffe, Secrets im Repository und automatische Remediation sind
 ausgeschlossen. Breaking Changes erhalten eine neue API-Version.
+
+## Nach v1.0: Operations Firewall Foundation
+
+Die v1.0 bleibt eine Operations-Intelligence-Plattform. Eine spätere
+Kontrollschicht kann zwischen LLM-Agenten, MCP/API und Infrastruktur liegen und
+Kontext, Risiko, Policy, Freigaben, Audit und Ausführung gemeinsam begrenzen.
+Sie ergänzt eine Governance-Firewall für Agenten und Automatisierung; sie
+ersetzt keine klassische Netzwerk-Firewall. Jede Erweiterung muss die
+Read-only-Grenze von MCP, Approval-Pflichten, Auditierbarkeit und
+Secret-Isolation bewahren.

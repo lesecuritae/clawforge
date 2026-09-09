@@ -159,6 +159,24 @@ See [docs/security.md](docs/security.md),
 - [Backup and recovery](docs/backup.md)
 - [Final release](docs/final-release.md) · [Deutsch](docs/final-release.de.md)
 
+## Roadmap after v1.0: Operations Firewall foundation
+
+Clawforge v1.0 remains an Operations Intelligence Platform. Future releases
+may add a control layer for agent governance and infrastructure operations:
+
+```text
+LLM Agent -> MCP/API -> Clawforge Control Firewall
+                         Context | Policy | Risk | Approval | Audit | Execution
+                                      -> Infrastructure
+```
+
+The planned layer is not a replacement for a network firewall. It is a
+governance boundary for AI agents, automation, infrastructure actions and
+operational decisions. Possible capabilities include agent capability control,
+context filtering, risk-based approvals, sandbox execution, rollback,
+configuration guardrails, drift detection and complete decision auditing.
+The v1.0 release does not claim to be an Operations Firewall.
+
 ## Validation
 
 ```bash

@@ -249,6 +249,13 @@ Kontrollierte Aktionen benötigen weiterhin Decision, Policy, menschliche
 Freigabe, Queue, Worker und Audit. Details stehen in
 `docs/llm-integration.de.md` und `docs/llm-integration.md`.
 
+### Zukunftsroadmap: Operations Firewall Foundation
+
+Clawforge v1.0 bleibt eine Operations-Intelligence-Plattform. Eine spätere
+Kontrollschicht kann Agent-Fähigkeiten, Kontext, Policy, Risiko, Freigaben,
+Audit und Ausführung zwischen MCP/API und Infrastruktur steuern. Die v1.0
+behauptet damit nicht, eine klassische Netzwerk-Firewall zu ersetzen.
+
 # Clawforge v0.10.0 Production Operations
 
 ## Production operations maturity

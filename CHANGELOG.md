@@ -18,6 +18,8 @@ Weitere Änderungen für die nächste Version werden hier gesammelt.
   secret separation as release boundaries.
 - Added equivalent German and English release documentation for architecture,
   LLM/MCP integration, deployment, security, and final-release guidance.
+- Documented the post-v1.0 Operations Firewall foundation as a future roadmap;
+  v1.0 remains an Operations Intelligence Platform.
 
 ## [0.12.0] - 2026-09-09
 

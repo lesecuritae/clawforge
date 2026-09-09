@@ -62,4 +62,33 @@ Künftige Releases können geprüfte Connector-Ausführung, erweiterten Knowledg
 und Trend-Kontext sowie signierte Image-Attestierungen ergänzen. Read-only MCP,
 Approval-Pflicht, Audit und Secret-Isolation bleiben erhalten.
 
+### Grundlage für eine Operations Firewall
+
+Clawforge v1.0 bleibt eine Operations-Intelligence-Plattform. Eine spätere
+Kontrollschicht kann KI-Agenten, Automatisierung, Infrastrukturaktionen und
+Betriebsentscheidungen steuern, ohne eine klassische Netzwerk-Firewall zu
+ersetzen:
+
+```text
+LLM-Agent
+   |
+ MCP/API
+   |
+Clawforge Control Firewall
+   |-- Kontext
+   |-- Policy
+   |-- Risiko
+   |-- Freigabe
+   |-- Audit
+   `-- Ausführungskontrolle
+   |
+Infrastruktur
+```
+
+Mögliche Bausteine sind Capability Control, Kontextfilter, risikobasierte
+Freigaben, Sandbox-Ausführung, Rollback, Konfigurationsschutz,
+Drift-Erkennung und vollständige Entscheidungs-Audits. Dies ist eine Richtung
+für die Zeit nach v1.0; die v1.0 behauptet nicht, eine Operations Firewall zu
+sein.
+
 Die englische Referenz ist [final-release.md](final-release.md).

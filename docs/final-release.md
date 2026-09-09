@@ -62,3 +62,30 @@ Future releases may add reviewed connector execution, richer knowledge and
 trend intelligence, additional integrations, and signed image attestations.
 They must preserve the read-only MCP boundary, approval requirements, audit
 coverage, and secret isolation.
+
+### Operations Firewall foundation
+
+The v1.0 product remains an Operations Intelligence Platform. A later control
+layer may govern AI agents, automation, infrastructure actions and operational
+decisions without replacing a classical network firewall:
+
+```text
+LLM Agent
+   |
+ MCP/API
+   |
+Clawforge Control Firewall
+   |-- Context
+   |-- Policy
+   |-- Risk
+   |-- Approval
+   |-- Audit
+   `-- Execution Control
+   |
+Infrastructure
+```
+
+Possible capabilities include agent capability control, context filtering,
+risk-based approvals, sandbox execution, rollback, configuration guardrails,
+drift detection and complete decision auditing. This is a post-v1.0 direction;
+the v1.0 release does not claim to be an Operations Firewall.
