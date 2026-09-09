@@ -4,6 +4,19 @@
 
 Weitere Änderungen für die nächste Version werden hier gesammelt.
 
+## [1.0.0] - 2026-09-09
+
+- Marked the first stable Clawforge release as a self-hosted Operations
+  Intelligence Platform for people and read-only LLM agents.
+- Consolidated the documented Event, Correlation, Incident, Risk, Trust,
+  Decision, Workflow, Connector, Agent API, and MCP architecture.
+- Added the final LLM/MCP integration, deployment, security, and release
+  documentation for installation and long-term operation.
+- Added a GHCR release pipeline for OCI-labelled, multi-architecture images
+  with SBOM and Trivy validation.
+- Preserved read-only MCP access, approval-gated dry-run execution, and
+  secret separation as release boundaries.
+
 ## [0.12.0] - 2026-09-09
 
 - Added additive incident intelligence storage with incident titles, sources,

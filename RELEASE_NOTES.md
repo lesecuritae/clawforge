@@ -177,6 +177,41 @@ Authenticated providers remain disabled unless their Docker Secrets are explicit
 
 Migrations 0023 and 0024 are applied automatically. Productive connector
 execution is intentionally unavailable in this release.
+# Clawforge v1.0.0 — Operations Intelligence Platform
+
+Clawforge v1.0.0 is the first stable release of the self-hosted Operations
+Intelligence Platform. It brings infrastructure, events, incidents, risk and
+trust context, decisions, controlled workflows, connectors, and LLM access
+together behind audited APIs and a read-only MCP interface.
+
+## Highlights
+
+- Event correlation, incident management, provider intelligence, decision
+  support, workflow governance, and controlled dry-run operations.
+- Agent API v1, MCP integration, OpenClaw integration guidance, audit trails,
+  PostgreSQL migrations, health checks, monitoring, and backup documentation.
+- MCP and LLM access remain read-only. No automatic remediation or direct MCP
+  database access is enabled.
+
+## Docker Images
+
+The production images are published at `ghcr.io/lesecuritae`:
+
+```text
+ghcr.io/lesecuritae/clawforge-api:1.0.0
+ghcr.io/lesecuritae/clawforge-mcp:1.0.0
+ghcr.io/lesecuritae/clawforge-frontend:1.0.0
+ghcr.io/lesecuritae/clawforge-correlation:1.0.0
+ghcr.io/lesecuritae/clawforge-incidents:1.0.0
+ghcr.io/lesecuritae/clawforge-worker:1.0.0
+ghcr.io/lesecuritae/clawforge-executor:1.0.0
+```
+
+Each image also receives `1.0` and `latest` tags. Release builds target
+`linux/amd64` and `linux/arm64`, include OCI revision metadata, provenance,
+and an SBOM, and are scanned with Trivy. See [docs/deployment.md](docs/deployment.md)
+for pull-based installation and upgrade instructions.
+
 # Clawforge v0.10.0 Production Operations
 
 ## Production operations maturity

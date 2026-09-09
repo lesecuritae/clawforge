@@ -240,7 +240,7 @@ dependencies = [
 
 [[package]]
 name = "clawforge-analyzer"
-version = "0.12.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -257,7 +257,7 @@ dependencies = [
 
 [[package]]
 name = "clawforge-api"
-version = "0.12.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -280,7 +280,7 @@ dependencies = [
 
 [[package]]
 name = "clawforge-connector"
-version = "0.12.0"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "serde",
@@ -290,7 +290,7 @@ dependencies = [
 
 [[package]]
 name = "clawforge-correlation"
-version = "0.12.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -304,7 +304,7 @@ dependencies = [
 
 [[package]]
 name = "clawforge-decision"
-version = "0.12.0"
+version = "1.0.0"
 dependencies = [
  "chrono",
  "serde",
@@ -314,7 +314,7 @@ dependencies = [
 
 [[package]]
 name = "clawforge-events"
-version = "0.12.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "reqwest 0.12.28",
@@ -327,7 +327,7 @@ dependencies = [
 
 [[package]]
 name = "clawforge-executor"
-version = "0.12.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "clawforge-storage",
@@ -338,7 +338,7 @@ dependencies = [
 
 [[package]]
 name = "clawforge-incidents"
-version = "0.12.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "clawforge-storage",
@@ -349,7 +349,7 @@ dependencies = [
 
 [[package]]
 name = "clawforge-intelligence"
-version = "0.12.0"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -363,7 +363,7 @@ dependencies = [
 
 [[package]]
 name = "clawforge-mcp"
-version = "0.12.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -382,7 +382,7 @@ dependencies = [
 
 [[package]]
 name = "clawforge-notifier"
-version = "0.12.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -398,14 +398,14 @@ dependencies = [
 
 [[package]]
 name = "clawforge-policy"
-version = "0.12.0"
+version = "1.0.0"
 dependencies = [
  "clawforge-risk",
 ]
 
 [[package]]
 name = "clawforge-risk"
-version = "0.12.0"
+version = "1.0.0"
 dependencies = [
  "chrono",
  "clawforge-intelligence",
@@ -415,7 +415,7 @@ dependencies = [
 
 [[package]]
 name = "clawforge-storage"
-version = "0.12.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -431,7 +431,7 @@ dependencies = [
 
 [[package]]
 name = "clawforge-worker"
-version = "0.12.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -451,7 +451,7 @@ dependencies = [
 
 [[package]]
 name = "clawforge-workflow"
-version = "0.12.0"
+version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
