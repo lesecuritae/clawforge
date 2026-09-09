@@ -177,6 +177,8 @@ Scopes sind:
 | `agent:workflow:read` | `/api/v1/workflows`, `/api/v1/workflows/{id}`, `/api/v1/workflow-runs` |
 | `agent:workflow:approve` | Für spätere, separat geschützte Freigabeflüsse reserviert; OpenClaw erhält keine Schreibroute |
 | `agent:connector:read` | `/api/v1/connectors` und Connector-Detail-, Health- und Capability-Routen; nur Lesedaten |
+| `agent:action:read` | `/api/v1/actions` und Action-Details; registrierte Aktionen ohne Ausführung |
+| `agent:execution:read` | `/api/v1/executions` und Execution-Details; Status und begrenzte Ergebniszusammenfassung |
 | `agent:knowledge:read` | `/api/v1/knowledge` |
 | `agent:history:read` | `/api/v1/history/summary` |
 | `agent:incident:replay` | `/api/v1/incidents/{id}/replay` |
@@ -213,6 +215,14 @@ Provider-Aktivierung, manuelle Synchronisation, Trust-Änderung,
 Incident-Statusänderung, Policy- oder Blockaktion.
 
 ## Connector Framework v0.8
+
+## Controlled Operations v0.9
+
+`GET /api/v1/actions` and `GET /api/v1/actions/{id}` expose only registered
+action metadata. `GET /api/v1/executions` and `GET /api/v1/executions/{id}`
+expose sanitized request state and bounded summaries. Agent tokens have no
+write scope. Administrative approval and cancellation are separate protected
+routes and every transition is audited; the executor accepts dry-run mode only.
 
 Die Connector-Ressourcen liefern ausschließlich sanitisiertes Registry-,
 Health- und Capability-Material. Docker, GitHub und die Proxmox-Foundation

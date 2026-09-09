@@ -39,6 +39,8 @@ agent:security:read
 agent:knowledge:read
 agent:workflow:read
 agent:connector:read
+agent:action:read
+agent:execution:read
 ```
 
 Für Netzwerk-, Trust-, Event- oder Systemtools müssen die entsprechenden

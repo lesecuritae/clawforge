@@ -26,7 +26,20 @@ pub const CAPABILITIES: &[&str] = &[
     "repository.security_alerts",
     "repository.workflow_status",
     "platform.health",
+    "container.restart",
+    "container.pull",
+    "repository.workflow_retry",
 ];
+pub const CAPABILITY_MODES: &[&str] = &["read", "execute"];
+
+/// Connector actions are declarative capability metadata only. Productive
+/// execution is intentionally absent from the v0.9 connector contract.
+pub fn action_mode_is_safe(mode: &str) -> bool {
+    CAPABILITY_MODES.contains(&mode)
+}
+pub fn productive_execution_enabled() -> bool {
+    false
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConnectorMetadata {
@@ -306,5 +319,13 @@ mod tests {
             .unwrap(),
             "ok"
         );
+    }
+
+    #[test]
+    fn execute_capabilities_are_explicit_and_disabled_by_default() {
+        assert!(action_mode_is_safe("read"));
+        assert!(action_mode_is_safe("execute"));
+        assert!(!action_mode_is_safe("shell"));
+        assert!(!productive_execution_enabled());
     }
 }

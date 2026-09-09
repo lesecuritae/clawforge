@@ -1,6 +1,6 @@
 # Connector Framework
 
-Clawforge v0.8 führt ein modulares, read-only Connector-Registry ein. Jeder
+Clawforge v0.9 führt ein modulares Connector-Registry ein. Jeder
 Connector beschreibt Typ, Version, Zustand, Health und eine explizite Liste
 seiner Fähigkeiten. Connector-Metadaten enthalten keine Zugangsdaten.
 
@@ -13,7 +13,9 @@ seiner Fähigkeiten. Connector-Metadaten enthalten keine Zugangsdaten.
 - **Proxmox Connector Foundation**: Interface, Secret-Referenz und Health-Check
   für eine spätere Integration; noch keine vollständige Infrastrukturabfrage.
 
-Alle Fähigkeiten sind read-only. Es gibt keine Restart-, Schreib-, Policy- oder
+Read-Fähigkeiten bleiben verfügbar; Execute-Fähigkeiten sind explizit markiert,
+standardmäßig deaktiviert und werden in v0.9 ausschließlich als Dry-Run-
+Metadaten verwendet. Es gibt keine produktive Restart-, Schreib-, Policy- oder
 Workflow-Aktion.
 
 ## Sicherheit

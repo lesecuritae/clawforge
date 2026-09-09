@@ -167,3 +167,13 @@ The previous v0.1.0 foundation is retained below for historical reference.
 - Frontend `npm test`, production build, dependency audit, Docker build, Compose smoke test, and security-header check
 
 Authenticated providers remain disabled unless their Docker Secrets are explicitly supplied. No feed directly performs a block action.
+# Clawforge v0.9.0 Controlled Operations
+
+- Allowlisted Action Registry and declarative action policy
+- Approval-gated, fully audited execution requests
+- Dry-run-only executor service with no external mutation
+- Read-only Agent API and MCP status tools
+- Operations Center Controlled Operations view
+
+Migrations 0023 and 0024 are applied automatically. Productive connector
+execution is intentionally unavailable in this release.

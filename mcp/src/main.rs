@@ -55,6 +55,8 @@ const SCOPE_SYSTEM_GRAPH: &str = "agent:system:graph:read";
 const SCOPE_WORKFLOW: &str = "agent:workflow:read";
 const SCOPE_WORKFLOW_APPROVE: &str = "agent:workflow:approve";
 const SCOPE_CONNECTOR: &str = "agent:connector:read";
+const SCOPE_ACTION: &str = "agent:action:read";
+const SCOPE_EXECUTION: &str = "agent:execution:read";
 const SCOPE_ALL: &str = "agent:read";
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_REQUEST_BYTES: usize = 256 * 1024;
@@ -170,6 +172,16 @@ struct WorkflowIdArgs {
 struct ConnectorIdArgs {
     #[schemars(description = "Connector UUID")]
     id: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+struct ExecutionListArgs {
+    #[schemars(description = "Execution status filter")]
+    status: Option<String>,
+    #[schemars(description = "1-based page number")]
+    page: Option<i64>,
+    #[schemars(description = "Page size, capped at 100")]
+    page_size: Option<i64>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
@@ -384,6 +396,8 @@ fn parse_scopes(value: &str) -> Result<HashSet<String>> {
         SCOPE_WORKFLOW,
         SCOPE_WORKFLOW_APPROVE,
         SCOPE_CONNECTOR,
+        SCOPE_ACTION,
+        SCOPE_EXECUTION,
         SCOPE_ALL,
     ];
     if scopes.is_empty()
@@ -1202,6 +1216,59 @@ impl McpServer {
             .await?,
         ))
     }
+
+    #[tool(
+        name = "list_actions",
+        description = "List registered controlled operations and their risk and approval requirements; actions are disabled by default and MCP cannot execute them; requires agent:action:read"
+    )]
+    async fn list_actions(
+        &self,
+        Parameters(_args): Parameters<EmptyArgs>,
+    ) -> Result<Json<ToolResponse>, ErrorData> {
+        Ok(Json(self.get(SCOPE_ACTION, "/api/v1/actions", &[]).await?))
+    }
+
+    #[tool(
+        name = "get_execution_status",
+        description = "Read one controlled execution request status and sanitized result; no execution or approval is possible through MCP; requires agent:execution:read"
+    )]
+    async fn get_execution_status(
+        &self,
+        Parameters(args): Parameters<ConnectorIdArgs>,
+    ) -> Result<Json<ToolResponse>, ErrorData> {
+        let id = Uuid::parse_str(&args.id).map_err(|_| {
+            ErrorData::invalid_params("execution id must be a UUID", Some(json!({"field":"id"})))
+        })?;
+        Ok(Json(
+            self.get(SCOPE_EXECUTION, &format!("/api/v1/executions/{id}"), &[])
+                .await?,
+        ))
+    }
+
+    #[tool(
+        name = "list_pending_executions",
+        description = "List pending and approval-waiting controlled execution requests; read-only and no action can be started by MCP; requires agent:execution:read"
+    )]
+    async fn list_pending_executions(
+        &self,
+        Parameters(args): Parameters<ExecutionListArgs>,
+    ) -> Result<Json<ToolResponse>, ErrorData> {
+        let query = pairs([
+            (
+                "status".into(),
+                args.status.or(Some("waiting_approval".into())),
+            ),
+            ("page".into(), args.page.map(|v| v.to_string())),
+            (
+                "page_size".into(),
+                args.page_size.map(|v| v.clamp(1, 100).to_string()),
+            ),
+        ]);
+        Ok(Json(
+            self.get(SCOPE_EXECUTION, "/api/v1/executions", &query)
+                .await?,
+        ))
+    }
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -1590,6 +1657,7 @@ mod tests {
                 "get_daily_operations_briefing",
                 "get_decision_history",
                 "get_decisions",
+                "get_execution_status",
                 "get_health_overview",
                 "get_incident",
                 "get_incident_relations",
@@ -1609,9 +1677,11 @@ mod tests {
                 "get_trust_status",
                 "get_workflow_history",
                 "get_workflow_status",
+                "list_actions",
                 "list_connectors",
                 "list_events",
                 "list_incidents",
+                "list_pending_executions",
                 "list_security_findings",
                 "list_workflows",
             ]
@@ -1747,7 +1817,7 @@ mod tests {
         );
         let client = ClientInfo::default().serve(transport).await.unwrap();
         let tools = client.list_tools(None).await.unwrap();
-        assert_eq!(tools.tools.len(), 31);
+        assert_eq!(tools.tools.len(), 34);
         let expected = [
             "list_connectors",
             "get_connector_status",
@@ -1780,6 +1850,9 @@ mod tests {
             "list_workflows",
             "get_workflow_status",
             "get_workflow_history",
+            "list_actions",
+            "get_execution_status",
+            "list_pending_executions",
         ];
         for name in expected {
             let tool = tools

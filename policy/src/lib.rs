@@ -32,6 +32,56 @@ pub fn decide(assessment: &RiskAssessment, evidence_sources: usize) -> PolicyDec
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActionPolicy {
+    pub name: &'static str,
+    pub role: &'static str,
+    pub risk_level: &'static str,
+    pub requires_approval: bool,
+}
+
+pub const ACTION_POLICIES: &[ActionPolicy] = &[
+    ActionPolicy {
+        name: "docker.restart_container",
+        role: "Operator",
+        risk_level: "medium",
+        requires_approval: true,
+    },
+    ActionPolicy {
+        name: "docker.pull_image",
+        role: "Operator",
+        risk_level: "high",
+        requires_approval: true,
+    },
+    ActionPolicy {
+        name: "backup.start",
+        role: "Operator",
+        risk_level: "low",
+        requires_approval: false,
+    },
+    ActionPolicy {
+        name: "github.retry_workflow",
+        role: "Operator",
+        risk_level: "medium",
+        requires_approval: true,
+    },
+];
+
+pub fn action_policy(name: &str) -> Option<ActionPolicy> {
+    ACTION_POLICIES
+        .iter()
+        .copied()
+        .find(|policy| policy.name == name)
+}
+
+pub fn authorize_action(name: &str, role: &str) -> Result<ActionPolicy, &'static str> {
+    let policy = action_policy(name).ok_or("action is not allowlisted")?;
+    if role != "Administrator" && role != policy.role {
+        return Err("role is not permitted for action");
+    }
+    Ok(policy)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -50,5 +100,21 @@ mod tests {
     fn one_source_cannot_block() {
         assert_eq!(decide(&assessment(95), 1).decision, Decision::RateLimit);
         assert_eq!(decide(&assessment(95), 2).decision, Decision::Block);
+    }
+
+    #[test]
+    fn controlled_actions_are_allowlisted_and_approval_gated() {
+        assert!(
+            authorize_action("docker.restart_container", "Operator")
+                .unwrap()
+                .requires_approval
+        );
+        assert!(authorize_action("docker.restart_container", "Viewer").is_err());
+        assert!(authorize_action("shell.exec", "Administrator").is_err());
+        assert!(
+            !authorize_action("backup.start", "Administrator")
+                .unwrap()
+                .requires_approval
+        );
     }
 }

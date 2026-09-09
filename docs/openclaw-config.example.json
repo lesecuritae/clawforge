@@ -30,6 +30,9 @@
             "list_connectors",
             "get_connector_status",
             "get_connector_capabilities"
+            ,"list_actions"
+            ,"get_execution_status"
+            ,"list_pending_executions"
           ]
         }
       }

@@ -43,7 +43,7 @@ bewusst breit lesendes Profil verwendet werden. Für `get_status`,
 
 1. MCP-Container und API im isolierten Compose-Netz starten.
 2. MCP-Token und Agent-Token getrennt rotieren und als Secrets laden.
-3. Tool-Liste abrufen und die 31 read-only Tools erkennen.
+3. Tool-Liste abrufen und die 34 read-only Tools erkennen.
 4. `get_status`, `get_agent_context`, `get_decisions`,
    `get_operations_summary`, `get_daily_operations_briefing`,
    `get_operations_recommendations`, `get_decision_history`,
@@ -66,7 +66,7 @@ historischen ungeschützten Routen verwenden.
 ## Live-Abnahme
 
 Die produktive Testverbindung wurde mit einem getrennten MCP-Token und einem
-separaten Agent-API-Token geprüft. Die MCP-Discovery liefert alle 31
+separaten Agent-API-Token geprüft. Die MCP-Discovery liefert alle 34
 read-only Tools einschließlich `list_workflows`, `get_workflow_status` und
 `get_workflow_history`. Erfolgreich geprüft wurden `get_operations_summary`,
 `get_agent_context` und `list_incidents`; die Agent-API-Auditspur enthält

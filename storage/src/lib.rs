@@ -45,6 +45,14 @@ pub struct WorkflowRunInput {
     pub audit_action: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct ExecutionRequestInput {
+    pub action_id: Uuid,
+    pub workflow_run_id: Option<Uuid>,
+    pub decision_id: Option<Uuid>,
+    pub requested_by: String,
+}
+
 impl PostgresStore {
     pub async fn connect(database_url: &str) -> Result<Self> {
         let pool = PgPoolOptions::new()
@@ -2125,7 +2133,7 @@ impl PostgresStore {
         let rows = sqlx::query(
             "SELECT r.id,r.name,r.version,r.connector_type,r.status,r.last_check,r.health,
                     r.created_at,r.updated_at,h.status AS health_status,h.checked_at,h.latency_ms,h.error,
-                    COALESCE((SELECT jsonb_agg(jsonb_build_object('name',c.capability,'read_only',c.read_only) ORDER BY c.capability)
+                    COALESCE((SELECT jsonb_agg(jsonb_build_object('name',c.capability,'read_only',c.read_only,'mode',c.mode) ORDER BY c.capability)
                               FROM connector_capabilities c WHERE c.connector_id=r.id), '[]'::jsonb) AS capabilities,
                     m.description,m.read_only
              FROM connector_registry r
@@ -2166,7 +2174,7 @@ impl PostgresStore {
         connector_id: Uuid,
     ) -> Result<Vec<serde_json::Value>> {
         let rows = sqlx::query(
-            "SELECT capability,read_only,created_at FROM connector_capabilities WHERE connector_id=$1 ORDER BY capability",
+            "SELECT capability,read_only,mode,created_at FROM connector_capabilities WHERE connector_id=$1 ORDER BY capability",
         )
         .bind(connector_id)
         .fetch_all(&self.pool)
@@ -2177,10 +2185,124 @@ impl PostgresStore {
                 serde_json::json!({
                     "capability": row.get::<String,_>("capability"),
                     "read_only": row.get::<bool,_>("read_only"),
+                    "mode": row.get::<String,_>("mode"),
                     "created_at": row.get::<chrono::DateTime<chrono::Utc>,_>("created_at")
                 })
             })
             .collect())
+    }
+
+    pub async fn list_actions(
+        &self,
+        id: Option<Uuid>,
+        enabled: Option<bool>,
+        limit: i64,
+    ) -> Result<Vec<serde_json::Value>> {
+        let rows = sqlx::query("SELECT a.id,a.connector_id,a.name,a.type,a.description,a.risk_level,a.required_scope,a.requires_approval,a.enabled,a.created_at,a.updated_at,c.name AS connector_name FROM actions a LEFT JOIN connector_registry c ON c.id=a.connector_id WHERE ($1::uuid IS NULL OR a.id=$1) AND ($2::bool IS NULL OR a.enabled=$2) ORDER BY a.name LIMIT $3")
+            .bind(id).bind(enabled).bind(limit.clamp(1, 200)).fetch_all(&self.pool).await?;
+        Ok(rows.into_iter().map(|r| serde_json::json!({
+            "id": r.get::<Uuid,_>("id"), "connector_id": r.get::<Option<Uuid>,_>("connector_id"),
+            "connector_name": r.get::<Option<String>,_>("connector_name"), "name": r.get::<String,_>("name"),
+            "type": r.get::<String,_>("type"), "description": r.get::<String,_>("description"),
+            "risk_level": r.get::<String,_>("risk_level"), "required_scope": r.get::<String,_>("required_scope"),
+            "requires_approval": r.get::<bool,_>("requires_approval"), "enabled": r.get::<bool,_>("enabled"),
+            "created_at": r.get::<chrono::DateTime<chrono::Utc>,_>("created_at"), "updated_at": r.get::<chrono::DateTime<chrono::Utc>,_>("updated_at")
+        })).collect())
+    }
+
+    pub async fn list_execution_requests(
+        &self,
+        id: Option<Uuid>,
+        status: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<serde_json::Value>> {
+        let rows = sqlx::query("SELECT e.id,e.action_id,e.workflow_run_id,e.decision_id,e.requested_by,e.status,e.created_at,e.started_at,e.finished_at,e.result_summary,e.error_summary,a.name AS action_name,a.risk_level,a.requires_approval FROM execution_requests e JOIN actions a ON a.id=e.action_id WHERE ($1::uuid IS NULL OR e.id=$1) AND ($2::text IS NULL OR e.status=$2) ORDER BY e.created_at DESC LIMIT $3")
+            .bind(id).bind(status).bind(limit.clamp(1, 500)).fetch_all(&self.pool).await?;
+        Ok(rows.into_iter().map(|r| serde_json::json!({
+            "id": r.get::<Uuid,_>("id"), "action_id": r.get::<Uuid,_>("action_id"),
+            "workflow_run_id": r.get::<Option<Uuid>,_>("workflow_run_id"), "decision_id": r.get::<Option<Uuid>,_>("decision_id"),
+            "requested_by": r.get::<String,_>("requested_by"), "status": r.get::<String,_>("status"),
+            "created_at": r.get::<chrono::DateTime<chrono::Utc>,_>("created_at"), "started_at": r.get::<Option<chrono::DateTime<chrono::Utc>>,_>("started_at"),
+            "finished_at": r.get::<Option<chrono::DateTime<chrono::Utc>>,_>("finished_at"), "result_summary": r.get::<Option<String>,_>("result_summary"),
+            "error_summary": r.get::<Option<String>,_>("error_summary"), "action_name": r.get::<String,_>("action_name"),
+            "risk_level": r.get::<String,_>("risk_level"), "requires_approval": r.get::<bool,_>("requires_approval")
+        })).collect())
+    }
+
+    pub async fn create_execution_request(&self, input: &ExecutionRequestInput) -> Result<Uuid> {
+        let action = sqlx::query("SELECT enabled,requires_approval FROM actions WHERE id=$1")
+            .bind(input.action_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("action not found"))?;
+        if !action.get::<bool, _>("enabled") {
+            anyhow::bail!("action is disabled")
+        }
+        let status = if action.get::<bool, _>("requires_approval") {
+            "waiting_approval"
+        } else {
+            "pending"
+        };
+        let id = Uuid::new_v4();
+        sqlx::query("INSERT INTO execution_requests (id,action_id,workflow_run_id,decision_id,requested_by,status) VALUES ($1,$2,$3,$4,$5,$6)").bind(id).bind(input.action_id).bind(input.workflow_run_id).bind(input.decision_id).bind(input.requested_by.trim()).bind(status).execute(&self.pool).await?;
+        self.record_audit_event(
+            &input.requested_by,
+            "execution_request_created",
+            &id.to_string(),
+            serde_json::json!({"action_id":input.action_id,"status":status}),
+        )
+        .await?;
+        Ok(id)
+    }
+
+    pub async fn update_execution_status(
+        &self,
+        id: Uuid,
+        status: &str,
+        actor: &str,
+        result: Option<&str>,
+        error: Option<&str>,
+    ) -> Result<()> {
+        if !matches!(
+            status,
+            "approved" | "running" | "completed" | "failed" | "cancelled"
+        ) {
+            anyhow::bail!("invalid execution status")
+        }
+        let changed = sqlx::query("UPDATE execution_requests SET status=$2, started_at=CASE WHEN $2='running' THEN NOW() ELSE started_at END, finished_at=CASE WHEN $2 IN ('completed','failed','cancelled') THEN NOW() ELSE finished_at END, result_summary=COALESCE($3,result_summary), error_summary=COALESCE($4,error_summary) WHERE id=$1 AND status IN ('waiting_approval','pending','approved','running')").bind(id).bind(status).bind(result).bind(error).execute(&self.pool).await?;
+        if changed.rows_affected() == 0 {
+            anyhow::bail!("execution request is not available")
+        }
+        self.record_audit_event(
+            actor,
+            &format!("execution_request_{status}"),
+            &id.to_string(),
+            serde_json::json!({"status":status}),
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn process_one_dry_run(&self) -> Result<()> {
+        let id: Option<Uuid> = sqlx::query_scalar("UPDATE execution_requests SET status='running',started_at=NOW() WHERE id=(SELECT id FROM execution_requests WHERE status='approved' ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1) RETURNING id").fetch_optional(&self.pool).await?;
+        if let Some(id) = id {
+            self.record_audit_event(
+                "executor",
+                "execution_request_running",
+                &id.to_string(),
+                serde_json::json!({"mode":"dry_run"}),
+            )
+            .await?;
+            self.update_execution_status(
+                id,
+                "completed",
+                "executor",
+                Some("dry_run: no external operation executed"),
+                None,
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     pub async fn record_connector_health(

@@ -24,6 +24,7 @@ use axum::{
 };
 use chrono::{DateTime, Duration, Utc};
 use clawforge_intelligence::{NetworkType, TrustedNetwork, VerificationStatus};
+use clawforge_policy::authorize_action;
 use clawforge_storage::{
     database_url_from_env, AdminPrincipal, AgentPrincipal, AuditEventFilter, MigrationStatus,
     PostgresStore,
@@ -97,6 +98,8 @@ const AGENT_SCOPE_SYSTEM_GRAPH: &str = "agent:system:graph:read";
 const AGENT_SCOPE_WORKFLOW_READ: &str = "agent:workflow:read";
 const AGENT_SCOPE_WORKFLOW_APPROVE: &str = "agent:workflow:approve";
 const AGENT_SCOPE_CONNECTOR_READ: &str = "agent:connector:read";
+const AGENT_SCOPE_ACTION_READ: &str = "agent:action:read";
+const AGENT_SCOPE_EXECUTION_READ: &str = "agent:execution:read";
 const AGENT_SCOPE_ALL_READ: &str = "agent:read";
 
 const AGENT_SCOPES: &[&str] = &[
@@ -120,6 +123,8 @@ const AGENT_SCOPES: &[&str] = &[
     AGENT_SCOPE_WORKFLOW_READ,
     AGENT_SCOPE_WORKFLOW_APPROVE,
     AGENT_SCOPE_CONNECTOR_READ,
+    AGENT_SCOPE_ACTION_READ,
+    AGENT_SCOPE_EXECUTION_READ,
     AGENT_SCOPE_ALL_READ,
 ];
 
@@ -3776,6 +3781,321 @@ async fn agent_connector_capabilities(
     Ok(envelope(values, None))
 }
 
+fn action_view(value: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "id": value.get("id"), "connector_id": value.get("connector_id"), "connector_name": value.get("connector_name"),
+        "name": value.get("name"), "type": value.get("type"), "description": value.get("description"),
+        "risk_level": value.get("risk_level"), "required_scope": value.get("required_scope"),
+        "requires_approval": value.get("requires_approval"), "enabled": value.get("enabled"),
+        "created_at": value.get("created_at"), "updated_at": value.get("updated_at")
+    })
+}
+
+fn execution_view(value: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "id": value.get("id"), "action_id": value.get("action_id"), "action_name": value.get("action_name"),
+        "workflow_run_id": value.get("workflow_run_id"), "decision_id": value.get("decision_id"),
+        "requested_by": value.get("requested_by"), "status": value.get("status"), "risk_level": value.get("risk_level"),
+        "requires_approval": value.get("requires_approval"), "created_at": value.get("created_at"),
+        "started_at": value.get("started_at"), "finished_at": value.get("finished_at"),
+        "result_summary": value.get("result_summary"), "error_summary": value.get("error_summary")
+    })
+}
+
+async fn admin_actions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<ApiEnvelope<Vec<serde_json::Value>>>> {
+    let principal = authenticate(&state, &headers).await?;
+    require_role(&principal, &["Administrator", "Operator", "Viewer"])?;
+    let values = state
+        .store
+        .list_actions(None, None, 200)
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "action registry unavailable",
+            )
+        })?;
+    audit(
+        &state,
+        &principal,
+        "actions_read",
+        "actions",
+        serde_json::json!({}),
+    )
+    .await;
+    Ok(envelope(values.iter().map(action_view).collect(), None))
+}
+
+async fn admin_executions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AgentQuery>,
+) -> ApiResult<Json<ApiEnvelope<Vec<serde_json::Value>>>> {
+    let principal = authenticate(&state, &headers).await?;
+    require_role(&principal, &["Administrator", "Operator", "Viewer"])?;
+    validate_execution_status(query.status.as_deref())?;
+    let values = state
+        .store
+        .list_execution_requests(None, query.status.as_deref(), 500)
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "execution history unavailable",
+            )
+        })?;
+    audit(
+        &state,
+        &principal,
+        "executions_read",
+        "executions",
+        serde_json::json!({"status":query.status}),
+    )
+    .await;
+    let values = values.iter().map(execution_view).collect::<Vec<_>>();
+    let (page, page_size) = agent_page(&query, 50);
+    let (data, pagination) = paged_values(values, page, page_size);
+    Ok(envelope(data, Some(pagination)))
+}
+
+async fn agent_actions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<ApiEnvelope<Vec<serde_json::Value>>>> {
+    let principal = authenticate_agent(&state, &headers).await?;
+    require_agent_scope(&principal, AGENT_SCOPE_ACTION_READ)?;
+    let values = state
+        .store
+        .list_actions(None, None, 200)
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "action registry unavailable",
+            )
+        })?;
+    audit_agent_read(
+        &state,
+        &principal,
+        "/api/v1/actions",
+        AGENT_SCOPE_ACTION_READ,
+    )
+    .await;
+    Ok(envelope(values.iter().map(action_view).collect(), None))
+}
+
+async fn agent_action_detail(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<ApiEnvelope<serde_json::Value>>> {
+    let principal = authenticate_agent(&state, &headers).await?;
+    require_agent_scope(&principal, AGENT_SCOPE_ACTION_READ)?;
+    let value = state
+        .store
+        .list_actions(Some(id), None, 1)
+        .await
+        .map_err(|_| api_error(StatusCode::SERVICE_UNAVAILABLE, "action unavailable"))?
+        .into_iter()
+        .next()
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "action not found"))?;
+    audit_agent_read(
+        &state,
+        &principal,
+        "/api/v1/actions/{id}",
+        AGENT_SCOPE_ACTION_READ,
+    )
+    .await;
+    Ok(envelope(action_view(&value), None))
+}
+
+async fn agent_executions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AgentQuery>,
+) -> ApiResult<Json<ApiEnvelope<Vec<serde_json::Value>>>> {
+    let principal = authenticate_agent(&state, &headers).await?;
+    require_agent_scope(&principal, AGENT_SCOPE_EXECUTION_READ)?;
+    validate_execution_status(query.status.as_deref())?;
+    let status = query.status.as_deref();
+    let values = state
+        .store
+        .list_execution_requests(None, status, 500)
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "execution history unavailable",
+            )
+        })?;
+    audit_agent_read(
+        &state,
+        &principal,
+        "/api/v1/executions",
+        AGENT_SCOPE_EXECUTION_READ,
+    )
+    .await;
+    let values = values.iter().map(execution_view).collect::<Vec<_>>();
+    let (page, page_size) = agent_page(&query, 50);
+    let (data, pagination) = paged_values(values, page, page_size);
+    Ok(envelope(data, Some(pagination)))
+}
+
+fn validate_execution_status(status: Option<&str>) -> ApiResult<()> {
+    if let Some(status) = status {
+        if !matches!(
+            status,
+            "pending"
+                | "waiting_approval"
+                | "approved"
+                | "running"
+                | "completed"
+                | "failed"
+                | "cancelled"
+        ) {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid execution status",
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn agent_execution_detail(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<ApiEnvelope<serde_json::Value>>> {
+    let principal = authenticate_agent(&state, &headers).await?;
+    require_agent_scope(&principal, AGENT_SCOPE_EXECUTION_READ)?;
+    let value = state
+        .store
+        .list_execution_requests(Some(id), None, 1)
+        .await
+        .map_err(|_| api_error(StatusCode::SERVICE_UNAVAILABLE, "execution unavailable"))?
+        .into_iter()
+        .next()
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "execution not found"))?;
+    audit_agent_read(
+        &state,
+        &principal,
+        "/api/v1/executions/{id}",
+        AGENT_SCOPE_EXECUTION_READ,
+    )
+    .await;
+    Ok(envelope(execution_view(&value), None))
+}
+
+#[derive(Debug, Deserialize)]
+struct ExecutionRequestBody {
+    action_id: Uuid,
+    workflow_run_id: Option<Uuid>,
+    decision_id: Option<Uuid>,
+}
+
+async fn admin_create_execution(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ExecutionRequestBody>,
+) -> ApiResult<Json<ApiEnvelope<serde_json::Value>>> {
+    let principal = authenticate(&state, &headers).await?;
+    require_role(&principal, &["Administrator", "Operator"])?;
+    let action = state
+        .store
+        .list_actions(Some(body.action_id), None, 1)
+        .await
+        .map_err(|_| api_error(StatusCode::SERVICE_UNAVAILABLE, "action unavailable"))?
+        .into_iter()
+        .next()
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "action not found"))?;
+    let name = action
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    authorize_action(name, &principal.role)
+        .map_err(|_| api_error(StatusCode::FORBIDDEN, "action policy denied"))?;
+    if action.get("enabled").and_then(serde_json::Value::as_bool) != Some(true) {
+        return Err(api_error(StatusCode::CONFLICT, "action is disabled"));
+    }
+    let id = state
+        .store
+        .create_execution_request(&clawforge_storage::ExecutionRequestInput {
+            action_id: body.action_id,
+            workflow_run_id: body.workflow_run_id,
+            decision_id: body.decision_id,
+            requested_by: principal.username.clone(),
+        })
+        .await
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "execution request rejected"))?;
+    audit(
+        &state,
+        &principal,
+        "execution_request_created",
+        &id.to_string(),
+        serde_json::json!({"action_id":body.action_id}),
+    )
+    .await;
+    Ok(envelope(
+        serde_json::json!({"id":id,"status":action.get("requires_approval").and_then(serde_json::Value::as_bool).map(|v| if v {"waiting_approval"} else {"pending"}).unwrap_or("pending")}),
+        None,
+    ))
+}
+
+async fn admin_execution_transition(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    status: &'static str,
+) -> ApiResult<Json<ApiEnvelope<serde_json::Value>>> {
+    let principal = authenticate(&state, &headers).await?;
+    require_role(&principal, &["Administrator", "Operator"])?;
+    state
+        .store
+        .update_execution_status(id, status, &principal.username, None, None)
+        .await
+        .map_err(|e| {
+            if e.to_string().contains("not available") {
+                api_error(
+                    StatusCode::CONFLICT,
+                    "execution state transition unavailable",
+                )
+            } else {
+                api_error(
+                    StatusCode::BAD_REQUEST,
+                    "execution state transition rejected",
+                )
+            }
+        })?;
+    audit(
+        &state,
+        &principal,
+        &format!("execution_request_{status}"),
+        &id.to_string(),
+        serde_json::json!({}),
+    )
+    .await;
+    Ok(envelope(serde_json::json!({"id":id,"status":status}), None))
+}
+
+async fn admin_approve_execution(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<ApiEnvelope<serde_json::Value>>> {
+    admin_execution_transition(State(state), headers, Path(id), "approved").await
+}
+async fn admin_cancel_execution(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<ApiEnvelope<serde_json::Value>>> {
+    admin_execution_transition(State(state), headers, Path(id), "cancelled").await
+}
+
 fn validate_decision_query(query: &AgentQuery) -> ApiResult<()> {
     if let Some(status) = query.status.as_deref() {
         if !matches!(
@@ -6845,6 +7165,19 @@ async fn main() -> anyhow::Result<()> {
             "/connectors/{id}/capabilities",
             get(admin_connector_capabilities),
         )
+        .route("/actions", get(admin_actions))
+        .route(
+            "/executions",
+            get(admin_executions).post(admin_create_execution),
+        )
+        .route(
+            "/admin/executions/{id}/approve",
+            post(admin_approve_execution),
+        )
+        .route(
+            "/admin/executions/{id}/cancel",
+            post(admin_cancel_execution),
+        )
         .route(
             "/api/v1/workflows/{id}/approve",
             post(admin_approve_workflow),
@@ -6939,6 +7272,10 @@ async fn main() -> anyhow::Result<()> {
                     "/connectors/{id}/capabilities",
                     get(agent_connector_capabilities),
                 )
+                .route("/actions", get(agent_actions))
+                .route("/actions/{id}", get(agent_action_detail))
+                .route("/executions", get(agent_executions))
+                .route("/executions/{id}", get(agent_execution_detail))
                 .route("/history", get(agent_history))
                 .route("/history/summary", get(agent_history_summary))
                 .route("/knowledge", get(agent_knowledge))

@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: Clawforge API
-  version: 0.8.0
+  version: 0.9.0
   description: Backend-only intelligence, incident, and administration API.
   x-rate-limit-contract: Responses may include X-RateLimit-Limit and X-RateLimit-Remaining; 429 responses include Retry-After.
   x-response-contract: Every JSON endpoint returns status, data, timestamp, pagination, and errors.
@@ -46,7 +46,7 @@ components:
       required: [service, version, status, migrations, runtime, events, providers]
       properties:
         service: { type: string, example: clawforge }
-        version: { type: string, example: 0.8.0 }
+        version: { type: string, example: 0.9.0 }
         status: { type: string, enum: [ok] }
         migrations: { type: object, additionalProperties: true }
         runtime: { type: array, items: { type: object, additionalProperties: true } }
@@ -666,6 +666,62 @@ paths:
         '401': { description: Agent token missing or invalid }
         '403': { description: agent:connector:read scope missing }
         '404': { description: Connector not found }
+  /api/v1/actions:
+    get:
+      security: [{ agentBearerAuth: [] }]
+      description: Read-only registered controlled actions. Actions are disabled by default and cannot be executed through the Agent API. Requires agent:action:read.
+      responses:
+        '200': { description: Action registry envelope }
+        '401': { description: Agent token missing or invalid }
+        '403': { description: agent:action:read scope missing }
+  /api/v1/actions/{id}:
+    get:
+      security: [{ agentBearerAuth: [] }]
+      description: Read one sanitized action definition.
+      parameters: [{ in: path, name: id, required: true, schema: { type: string, format: uuid } }]
+      responses:
+        '200': { description: Action detail }
+        '404': { description: Action not found }
+  /api/v1/executions:
+    get:
+      security: [{ agentBearerAuth: [] }]
+      description: Read-only execution request history. MCP and agents cannot create, approve, cancel, or execute requests.
+      parameters:
+        - { in: query, name: status, schema: { type: string, enum: [pending, waiting_approval, approved, running, completed, failed, cancelled] } }
+        - { in: query, name: page, schema: { type: integer, minimum: 1 } }
+        - { in: query, name: page_size, schema: { type: integer, minimum: 1, maximum: 100 } }
+      responses:
+        '200': { description: Execution request history }
+        '401': { description: Agent token missing or invalid }
+        '403': { description: agent:execution:read scope missing }
+  /api/v1/executions/{id}:
+    get:
+      security: [{ agentBearerAuth: [] }]
+      description: Read one sanitized execution request status and result summary.
+      parameters: [{ in: path, name: id, required: true, schema: { type: string, format: uuid } }]
+      responses:
+        '200': { description: Execution detail }
+        '404': { description: Execution not found }
+  /admin/executions/{id}/approve:
+    post:
+      security: [{ bearerAuth: [] }]
+      description: Operator or Administrator approval transition. Approval records governance state only; it never executes an action.
+      parameters: [{ in: path, name: id, required: true, schema: { type: string, format: uuid } }]
+      responses:
+        '200': { description: Execution approved }
+        '401': { description: Authentication required }
+        '403': { description: Operator or Administrator role required }
+        '409': { description: Invalid execution state }
+  /admin/executions/{id}/cancel:
+    post:
+      security: [{ bearerAuth: [] }]
+      description: Operator or Administrator cancellation transition. The transition is audited and performs no external operation.
+      parameters: [{ in: path, name: id, required: true, schema: { type: string, format: uuid } }]
+      responses:
+        '200': { description: Execution cancelled }
+        '401': { description: Authentication required }
+        '403': { description: Operator or Administrator role required }
+        '409': { description: Invalid execution state }
   /api/v1/history:
     get:
       security: [{ agentBearerAuth: [] }]

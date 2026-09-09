@@ -18,6 +18,7 @@ COPY --from=builder /src/target/release/clawforge-events /usr/local/bin/clawforg
 COPY --from=builder /src/target/release/clawforge-mcp /usr/local/bin/clawforge-mcp
 COPY --from=builder /src/target/release/clawforge-correlation /usr/local/bin/clawforge-correlation
 COPY --from=builder /src/target/release/clawforge-incidents /usr/local/bin/clawforge-incidents
+COPY --from=builder /src/target/release/clawforge-executor /usr/local/bin/clawforge-executor
 USER 10001:10001
 EXPOSE 8080 8090
 CMD ["/usr/local/bin/clawforge-api"]

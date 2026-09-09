@@ -278,7 +278,7 @@ services:
       CLAWFORGE_MCP_BIND: 0.0.0.0:8090
       CLAWFORGE_MCP_AGENT_TOKEN_FILE: /run/secrets/mcp_agent_api_token
       CLAWFORGE_MCP_AUTH_TOKEN_FILE: /run/secrets/mcp_auth_token
-      CLAWFORGE_MCP_SCOPES: ${CLAWFORGE_MCP_SCOPES:-agent:operations:read,agent:operations:briefing,agent:operations:recommend,agent:context:read,agent:decision:read,agent:incident:read,agent:provider:read,agent:security:read,agent:knowledge:read,agent:workflow:read,agent:connector:read}
+      CLAWFORGE_MCP_SCOPES: ${CLAWFORGE_MCP_SCOPES:-agent:operations:read,agent:operations:briefing,agent:operations:recommend,agent:context:read,agent:decision:read,agent:incident:read,agent:provider:read,agent:security:read,agent:knowledge:read,agent:workflow:read,agent:connector:read,agent:action:read,agent:execution:read}
       CLAWFORGE_MCP_UPSTREAM_TIMEOUT_SECONDS: ${CLAWFORGE_MCP_UPSTREAM_TIMEOUT_SECONDS:-10}
       RUST_LOG: ${RUST_LOG:-info}
     read_only: true
@@ -298,6 +298,37 @@ services:
       - backend
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8090/health >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  clawforge-executor:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    command: ["/usr/local/bin/clawforge-executor"]
+    environment:
+      DATABASE_URL_FILE: /run/secrets/database_url
+      CLAWFORGE_EXECUTOR_DRY_RUN: ${CLAWFORGE_EXECUTOR_DRY_RUN:-true}
+      CLAWFORGE_EXECUTOR_POLL_SECONDS: ${CLAWFORGE_EXECUTOR_POLL_SECONDS:-10}
+      RUST_LOG: ${RUST_LOG:-info}
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=32m
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    depends_on:
+      postgres:
+        condition: service_healthy
+    secrets:
+      - database_url
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "kill -0 1"]
       interval: 10s
       timeout: 5s
       retries: 5

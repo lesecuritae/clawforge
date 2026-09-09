@@ -4,6 +4,18 @@
 
 Weitere Änderungen für die nächste Version werden hier gesammelt.
 
+## [0.9.0] - 2026-09-09
+
+- Added the controlled operations layer with an allowlisted Action Registry,
+  explicit connector read/execute capability metadata, and audited execution
+  request state transitions.
+- Added policy checks, administrative approval/cancel endpoints, Agent API v1
+  read-only action/execution resources, and three read-only MCP tools.
+- Added the non-invasive `clawforge-executor` service. It accepts only
+  `CLAWFORGE_EXECUTOR_DRY_RUN=true` and records no-op results; no shell or
+  external operation is executed.
+- Added the Controlled Operations dashboard and migration/backup documentation.
+
 ## [0.8.0] - 2026-09-09
 
 - Added the read-only Connector Framework with Docker, GitHub, and Proxmox
