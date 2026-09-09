@@ -33,6 +33,10 @@
             ,"list_actions"
             ,"get_execution_status"
             ,"list_pending_executions"
+            ,"get_operations_state"
+            ,"get_pending_approvals"
+            ,"get_execution_history"
+            ,"get_connector_health"
           ]
         }
       }

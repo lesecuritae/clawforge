@@ -172,6 +172,7 @@ Scopes sind:
 | `agent:decision:read` | `/api/v1/decisions` |
 | `agent:provider:read` | `/api/v1/providers` |
 | `agent:operations:read` | `/api/v1/operations/summary`, `/api/v1/history` |
+| `agent:operations:state` | `/api/v1/operations/state`; Queue, Freigaben, Retry-/Timeout-Zustand sowie Connector- und Provider-Health |
 | `agent:operations:briefing` | `/api/v1/operations/briefing` |
 | `agent:operations:recommend` | `/api/v1/operations/recommendations`, `/api/v1/decisions/history` |
 | `agent:workflow:read` | `/api/v1/workflows`, `/api/v1/workflows/{id}`, `/api/v1/workflow-runs` |
@@ -543,3 +544,11 @@ Die nächste Phase ist erst abnahmefähig, wenn die `/api/v1`-Routen unter
 Bearer-Authentifizierung laufen, alle Antworten OpenAPI-konform sind,
 Agent-Tokens auf Read-Scopes begrenzt sind und die Regressionstests für
 Event Backbone, Risk/Policy/Trust, Provider und Frontend erfolgreich sind.
+
+## Production Operations v0.10
+
+`GET /api/v1/operations/state` liefert die read-only Lage der kontrollierten
+Operations-Schicht: Warteschlange, offene Freigaben, laufende Executions sowie
+Connector- und Provider-Health. Der Zugriff benötigt den Scope
+`agent:operations:state`. Retry-, Timeout- und Recovery-Zustände werden nur
+angezeigt; MCP erhält weiterhin keine Schreib- oder Ausführungsrechte.

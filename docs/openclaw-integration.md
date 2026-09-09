@@ -20,6 +20,7 @@ Für ein read-only Agent-Profil werden nur die benötigten Scopes vergeben:
 - `agent:operations:read`
 - `agent:operations:briefing`
 - `agent:operations:recommend`
+- `agent:operations:state`
 - `agent:workflow:read`
 - `agent:context:read`
 - `agent:decision:read`
@@ -32,6 +33,8 @@ Für ein read-only Agent-Profil werden nur die benötigten Scopes vergeben:
 - `agent:history:read`
 - `agent:security:briefing`
 - `agent:system:graph:read`
+- `agent:action:read`
+- `agent:execution:read`
 
 `agent:read` kann diese Einzelrechte zusammenfassen, sollte aber nur für ein
 bewusst breit lesendes Profil verwendet werden. Für `get_status`,
@@ -43,12 +46,14 @@ bewusst breit lesendes Profil verwendet werden. Für `get_status`,
 
 1. MCP-Container und API im isolierten Compose-Netz starten.
 2. MCP-Token und Agent-Token getrennt rotieren und als Secrets laden.
-3. Tool-Liste abrufen und die 34 read-only Tools erkennen.
+3. Tool-Liste abrufen und die 38 read-only Tools erkennen.
 4. `get_status`, `get_agent_context`, `get_decisions`,
    `get_operations_summary`, `get_daily_operations_briefing`,
    `get_operations_recommendations`, `get_decision_history`,
    `get_operations_history`, `get_knowledge_context`,
-   `get_security_briefing` und `get_system_graph` aufrufen.
+   `get_security_briefing`, `get_system_graph`, `get_operations_state`,
+   `get_pending_approvals`, `get_execution_history` und
+   `get_connector_health` aufrufen.
 5. Incident-Replay sowie Incident-, Security-, Trust-, Network-, Provider- und Event-Tools mit den
    jeweils dokumentierten Scopes prüfen.
 6. Fehlender, falscher, abgelaufener und widerrufener Token müssen abgewiesen
@@ -66,9 +71,9 @@ historischen ungeschützten Routen verwenden.
 ## Live-Abnahme
 
 Die produktive Testverbindung wurde mit einem getrennten MCP-Token und einem
-separaten Agent-API-Token geprüft. Die MCP-Discovery liefert alle 34
-read-only Tools einschließlich `list_workflows`, `get_workflow_status` und
-`get_workflow_history`. Erfolgreich geprüft wurden `get_operations_summary`,
+separaten Agent-API-Token geprüft. Die MCP-Discovery liefert alle 38
+read-only Tools einschließlich `list_workflows`, `get_workflow_status`,
+ `get_workflow_history` und der Produktionsstatus-Werkzeuge. Erfolgreich geprüft wurden `get_operations_summary`,
 `get_agent_context` und `list_incidents`; die Agent-API-Auditspur enthält
 Quelle, Ressource und Zeitpunkt, aber keine Tokenwerte.
 

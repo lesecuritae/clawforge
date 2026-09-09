@@ -57,6 +57,7 @@ const SCOPE_WORKFLOW_APPROVE: &str = "agent:workflow:approve";
 const SCOPE_CONNECTOR: &str = "agent:connector:read";
 const SCOPE_ACTION: &str = "agent:action:read";
 const SCOPE_EXECUTION: &str = "agent:execution:read";
+const SCOPE_OPERATIONS_STATE: &str = "agent:operations:state";
 const SCOPE_ALL: &str = "agent:read";
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_REQUEST_BYTES: usize = 256 * 1024;
@@ -189,7 +190,7 @@ struct WorkflowRunArgs {
     #[schemars(description = "Workflow UUID filter")]
     workflow_id: Option<String>,
     #[schemars(
-        description = "Run status: pending, running, waiting_approval, completed, failed, or cancelled"
+        description = "Run status: pending, queued, waiting_approval, starting, running, success, completed, failed, timeout, rollback_required, or cancelled"
     )]
     status: Option<String>,
     #[schemars(description = "1-based page number")]
@@ -398,6 +399,7 @@ fn parse_scopes(value: &str) -> Result<HashSet<String>> {
         SCOPE_CONNECTOR,
         SCOPE_ACTION,
         SCOPE_EXECUTION,
+        SCOPE_OPERATIONS_STATE,
         SCOPE_ALL,
     ];
     if scopes.is_empty()
@@ -1269,6 +1271,73 @@ impl McpServer {
                 .await?,
         ))
     }
+
+    #[tool(
+        name = "get_operations_state",
+        description = "Read consolidated production operations state, queue, approvals, connector and provider health; no actions are performed; requires agent:operations:state"
+    )]
+    async fn get_operations_state(
+        &self,
+        Parameters(_args): Parameters<EmptyArgs>,
+    ) -> Result<Json<ToolResponse>, ErrorData> {
+        Ok(Json(
+            self.get(SCOPE_OPERATIONS_STATE, "/api/v1/operations/state", &[])
+                .await?,
+        ))
+    }
+
+    #[tool(
+        name = "get_pending_approvals",
+        description = "Read pending approval records without approving or changing them; requires agent:execution:read"
+    )]
+    async fn get_pending_approvals(
+        &self,
+        Parameters(_args): Parameters<EmptyArgs>,
+    ) -> Result<Json<ToolResponse>, ErrorData> {
+        Ok(Json(
+            self.get(
+                SCOPE_EXECUTION,
+                "/api/v1/executions",
+                &[("status".into(), "waiting_approval".into())],
+            )
+            .await?,
+        ))
+    }
+
+    #[tool(
+        name = "get_execution_history",
+        description = "Read sanitized execution history including retries and bounded results; no execution is possible; requires agent:execution:read"
+    )]
+    async fn get_execution_history(
+        &self,
+        Parameters(args): Parameters<ExecutionListArgs>,
+    ) -> Result<Json<ToolResponse>, ErrorData> {
+        let query = pairs([
+            ("status".into(), args.status),
+            ("page".into(), args.page.map(|v| v.to_string())),
+            (
+                "page_size".into(),
+                args.page_size.map(|v| v.clamp(1, 100).to_string()),
+            ),
+        ]);
+        Ok(Json(
+            self.get(SCOPE_EXECUTION, "/api/v1/executions", &query)
+                .await?,
+        ))
+    }
+
+    #[tool(
+        name = "get_connector_health",
+        description = "Read connector health records without credentials or configuration; no connector action is available; requires agent:connector:read"
+    )]
+    async fn get_connector_health(
+        &self,
+        Parameters(_args): Parameters<EmptyArgs>,
+    ) -> Result<Json<ToolResponse>, ErrorData> {
+        Ok(Json(
+            self.get(SCOPE_CONNECTOR, "/api/v1/connectors", &[]).await?,
+        ))
+    }
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -1653,10 +1722,12 @@ mod tests {
                 "get_agent_context",
                 "get_agent_status",
                 "get_connector_capabilities",
+                "get_connector_health",
                 "get_connector_status",
                 "get_daily_operations_briefing",
                 "get_decision_history",
                 "get_decisions",
+                "get_execution_history",
                 "get_execution_status",
                 "get_health_overview",
                 "get_incident",
@@ -1667,7 +1738,9 @@ mod tests {
                 "get_network_overview",
                 "get_operations_history",
                 "get_operations_recommendations",
+                "get_operations_state",
                 "get_operations_summary",
+                "get_pending_approvals",
                 "get_provider_status",
                 "get_security_briefing",
                 "get_security_overview",
@@ -1817,11 +1890,12 @@ mod tests {
         );
         let client = ClientInfo::default().serve(transport).await.unwrap();
         let tools = client.list_tools(None).await.unwrap();
-        assert_eq!(tools.tools.len(), 34);
+        assert_eq!(tools.tools.len(), 38);
         let expected = [
             "list_connectors",
             "get_connector_status",
             "get_connector_capabilities",
+            "get_connector_health",
             "get_status",
             "get_agent_status",
             "get_daily_operations_briefing",
@@ -1841,6 +1915,7 @@ mod tests {
             "get_decisions",
             "get_provider_status",
             "get_operations_summary",
+            "get_operations_state",
             "get_operations_history",
             "get_health_overview",
             "get_security_briefing",
@@ -1853,6 +1928,8 @@ mod tests {
             "list_actions",
             "get_execution_status",
             "list_pending_executions",
+            "get_pending_approvals",
+            "get_execution_history",
         ];
         for name in expected {
             let tool = tools
@@ -1996,6 +2073,10 @@ mod tests {
             "get_operations_recommendations",
             "get_decision_history",
             "get_operations_history",
+            "get_operations_state",
+            "get_pending_approvals",
+            "get_execution_history",
+            "get_connector_health",
             "get_status",
             "get_security_overview",
             "get_security_briefing",

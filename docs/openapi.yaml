@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: Clawforge API
-  version: 0.9.0
+  version: 0.10.0
   description: Backend-only intelligence, incident, and administration API.
   x-rate-limit-contract: Responses may include X-RateLimit-Limit and X-RateLimit-Remaining; 429 responses include Retry-After.
   x-response-contract: Every JSON endpoint returns status, data, timestamp, pagination, and errors.
@@ -46,7 +46,7 @@ components:
       required: [service, version, status, migrations, runtime, events, providers]
       properties:
         service: { type: string, example: clawforge }
-        version: { type: string, example: 0.9.0 }
+        version: { type: string, example: 0.10.0 }
         status: { type: string, enum: [ok] }
         migrations: { type: object, additionalProperties: true }
         runtime: { type: array, items: { type: object, additionalProperties: true } }
@@ -666,6 +666,14 @@ paths:
         '401': { description: Agent token missing or invalid }
         '403': { description: agent:connector:read scope missing }
         '404': { description: Connector not found }
+  /api/v1/operations/state:
+    get:
+      security: [{ agentBearerAuth: [] }]
+      description: Consolidated read-only production operations state, including execution queue, pending approvals, connector health, provider health, and recommendations. Requires agent:operations:state.
+      responses:
+        '200': { description: Operations state envelope }
+        '401': { description: Agent token missing or invalid }
+        '403': { description: agent:operations:state scope missing }
   /api/v1/actions:
     get:
       security: [{ agentBearerAuth: [] }]
@@ -854,7 +862,7 @@ paths:
                   minItems: 1
                   items:
                     type: string
-                    enum: [agent:system:read, agent:events:read, agent:incident:read, agent:incidents:read, agent:context:read, agent:decision:read, agent:provider:read, agent:operations:read, agent:security:read, agent:network:read, agent:read]
+                    enum: [agent:system:read, agent:events:read, agent:incident:read, agent:incidents:read, agent:context:read, agent:decision:read, agent:provider:read, agent:operations:read, agent:operations:state, agent:security:read, agent:network:read, agent:read]
                 expires_in_hours: { type: integer, minimum: 1, maximum: 8760, default: 720 }
       responses:
         '200': { description: Token envelope; the secret is not persisted and is shown once }

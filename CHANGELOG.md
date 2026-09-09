@@ -4,6 +4,19 @@
 
 Weitere Änderungen für die nächste Version werden hier gesammelt.
 
+## [0.10.0] - 2026-09-09
+
+- Added the production operations maturity layer with execution queue state,
+  idempotency keys, retry/timeout metadata, safe dry-run status transitions,
+  and recovery records. Productive destructive execution remains disabled.
+- Added connector permission metadata, approval policies, and entity
+  relationship storage with conservative defaults (`read` only enabled).
+- Added the read-only Agent API operations state resource and four MCP tools
+  for operations state, pending approvals, execution history, and connector
+  health. All responses stay redacted and audit-compatible.
+- Extended the Operations Center with queue, approval, connector-health, and
+  provider-health visibility.
+
 ## [0.9.0] - 2026-09-09
 
 - Added the controlled operations layer with an allowlisted Action Registry,

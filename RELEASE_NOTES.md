@@ -177,3 +177,21 @@ Authenticated providers remain disabled unless their Docker Secrets are explicit
 
 Migrations 0023 and 0024 are applied automatically. Productive connector
 execution is intentionally unavailable in this release.
+# Clawforge v0.10.0 Production Operations
+
+## Production operations maturity
+
+- Execution requests now expose queued, starting, running, success, failed,
+  timeout, and rollback-required states with bounded retry and timeout
+  metadata.
+- Idempotency keys prevent duplicate execution requests. Connector permission
+  records default to read-only; execute and destructive permissions remain
+  disabled.
+- Approval policies describe the minimum review depth for each risk level. They
+  do not grant approval automatically.
+- `GET /api/v1/operations/state` and MCP tools
+  `get_operations_state`, `get_pending_approvals`, `get_execution_history`,
+  and `get_connector_health` provide a sanitized read-only view.
+
+The executor remains dry-run only. No shell commands, connector mutations, or
+automatic remediation are enabled in this release.

@@ -100,6 +100,7 @@ const AGENT_SCOPE_WORKFLOW_APPROVE: &str = "agent:workflow:approve";
 const AGENT_SCOPE_CONNECTOR_READ: &str = "agent:connector:read";
 const AGENT_SCOPE_ACTION_READ: &str = "agent:action:read";
 const AGENT_SCOPE_EXECUTION_READ: &str = "agent:execution:read";
+const AGENT_SCOPE_OPERATIONS_STATE: &str = "agent:operations:state";
 const AGENT_SCOPE_ALL_READ: &str = "agent:read";
 
 const AGENT_SCOPES: &[&str] = &[
@@ -125,6 +126,7 @@ const AGENT_SCOPES: &[&str] = &[
     AGENT_SCOPE_CONNECTOR_READ,
     AGENT_SCOPE_ACTION_READ,
     AGENT_SCOPE_EXECUTION_READ,
+    AGENT_SCOPE_OPERATIONS_STATE,
     AGENT_SCOPE_ALL_READ,
 ];
 
@@ -3037,6 +3039,60 @@ async fn agent_operations_summary(
     Ok(envelope(summary, None))
 }
 
+async fn agent_operations_state(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<ApiEnvelope<serde_json::Value>>> {
+    let principal = authenticate_agent(&state, &headers).await?;
+    require_agent_scope(&principal, AGENT_SCOPE_OPERATIONS_STATE)?;
+    let summary = load_operations_summary(&state).await?;
+    let state_view = state.store.operations_state().await.map_err(|_| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "operations state unavailable",
+        )
+    })?;
+    let mut combined = state_view;
+    if let Some(object) = combined.as_object_mut() {
+        object.insert(
+            "system_state".into(),
+            summary
+                .get("overall_status")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!("unknown")),
+        );
+        object.insert(
+            "risk_level".into(),
+            summary
+                .get("risk_level")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!("unknown")),
+        );
+        object.insert(
+            "active_incidents".into(),
+            summary
+                .get("active_incidents")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!(0)),
+        );
+        object.insert(
+            "recommended_actions".into(),
+            summary
+                .get("recommended_checks")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!([])),
+        );
+    }
+    audit_agent_read(
+        &state,
+        &principal,
+        "/api/v1/operations/state",
+        AGENT_SCOPE_OPERATIONS_STATE,
+    )
+    .await;
+    Ok(envelope(combined, None))
+}
+
 /// Compact, read-only daily briefing assembled from the existing operations
 /// summary and normalized event/provider views. No additional scoring or
 /// action is performed here.
@@ -3535,7 +3591,8 @@ fn connector_view(value: &serde_json::Value) -> serde_json::Value {
         "latency_ms": value.get("latency_ms"),
         "description": value.get("description"),
         "read_only": true,
-        "capabilities": value.get("capabilities")
+        "capabilities": value.get("capabilities"),
+        "permissions": value.get("permissions")
     })
 }
 
@@ -3798,7 +3855,9 @@ fn execution_view(value: &serde_json::Value) -> serde_json::Value {
         "requested_by": value.get("requested_by"), "status": value.get("status"), "risk_level": value.get("risk_level"),
         "requires_approval": value.get("requires_approval"), "created_at": value.get("created_at"),
         "started_at": value.get("started_at"), "finished_at": value.get("finished_at"),
-        "result_summary": value.get("result_summary"), "error_summary": value.get("error_summary")
+        "result_summary": value.get("result_summary"), "error_summary": value.get("error_summary"),
+        "retry_count": value.get("retry_count"), "max_retries": value.get("max_retries"),
+        "timeout_seconds": value.get("timeout_seconds"), "next_retry_at": value.get("next_retry_at")
     })
 }
 
@@ -3951,9 +4010,14 @@ fn validate_execution_status(status: Option<&str>) -> ApiResult<()> {
             "pending"
                 | "waiting_approval"
                 | "approved"
+                | "queued"
+                | "starting"
                 | "running"
+                | "success"
                 | "completed"
                 | "failed"
+                | "timeout"
+                | "rollback_required"
                 | "cancelled"
         ) {
             return Err(api_error(
@@ -3995,6 +4059,7 @@ struct ExecutionRequestBody {
     action_id: Uuid,
     workflow_run_id: Option<Uuid>,
     decision_id: Option<Uuid>,
+    idempotency_key: Option<String>,
 }
 
 async fn admin_create_execution(
@@ -4028,6 +4093,7 @@ async fn admin_create_execution(
             workflow_run_id: body.workflow_run_id,
             decision_id: body.decision_id,
             requested_by: principal.username.clone(),
+            idempotency_key: body.idempotency_key,
         })
         .await
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "execution request rejected"))?;
@@ -4235,6 +4301,33 @@ async fn admin_operations_summary(
     )
     .await;
     Ok(envelope(summary, None))
+}
+
+async fn admin_operations_state(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<ApiEnvelope<serde_json::Value>>> {
+    let principal = authenticate(&state, &headers).await?;
+    require_role(&principal, &["Administrator", "Operator", "Viewer"])?;
+    let summary = load_operations_summary(&state).await?;
+    let view = state.store.operations_state().await.map_err(|_| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "operations state unavailable",
+        )
+    })?;
+    audit(
+        &state,
+        &principal,
+        "operations_state_read",
+        "operations/state",
+        serde_json::json!({}),
+    )
+    .await;
+    Ok(envelope(
+        serde_json::json!({"summary":summary,"state":view}),
+        None,
+    ))
 }
 
 #[derive(Deserialize)]
@@ -7146,6 +7239,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/admin/providers/{id}", post(admin_update_provider))
         .route("/admin/providers/{id}/sync", post(admin_sync_provider))
         .route("/operations/summary", get(admin_operations_summary))
+        .route("/operations/state", get(admin_operations_state))
         .route(
             "/operations/recommendations",
             get(admin_operations_recommendations),
@@ -7256,6 +7350,7 @@ async fn main() -> anyhow::Result<()> {
                 .route("/providers", get(agent_provider_status))
                 .route("/providers/{id}/history", get(agent_provider_history))
                 .route("/operations/summary", get(agent_operations_summary))
+                .route("/operations/state", get(agent_operations_state))
                 .route("/operations/briefing", get(agent_operations_briefing))
                 .route(
                     "/operations/recommendations",
@@ -7541,6 +7636,10 @@ mod tests {
         assert!(validate_agent_scopes(&[
             AGENT_SCOPE_OPERATIONS_BRIEFING.to_string(),
             AGENT_SCOPE_KNOWLEDGE_READ.to_string()
+        ]));
+        assert!(validate_agent_scopes(&[
+            AGENT_SCOPE_OPERATIONS_STATE.to_string(),
+            AGENT_SCOPE_EXECUTION_READ.to_string()
         ]));
         assert!(validate_agent_scopes(&[AGENT_SCOPE_ALL_READ.to_string()]));
         assert!(!validate_agent_scopes(&["agent:admin:write".to_string()]));

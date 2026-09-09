@@ -362,6 +362,10 @@ async fn migrations_and_restart_persist() -> anyhow::Result<()> {
         "events",
         "event_consumers",
         "event_delivery",
+        "connector_permissions",
+        "approval_policies",
+        "execution_recovery",
+        "entity_relationships",
     ] {
         let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
             .bind(format!("public.{table}"))
@@ -369,6 +373,68 @@ async fn migrations_and_restart_persist() -> anyhow::Result<()> {
             .await?;
         assert!(exists, "missing administration table {table}");
     }
+    let maturity_columns: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.columns WHERE table_name='execution_requests' AND column_name = ANY($1)",
+    )
+    .bind(["idempotency_key", "retry_count", "max_retries", "timeout_seconds", "next_retry_at"])
+    .fetch_one(restarted.pool())
+    .await?;
+    assert_eq!(maturity_columns, 5);
+    let high_policy: (i32, i32, String) = sqlx::query_as(
+        "SELECT required_approvals, approval_timeout, escalation_rule FROM approval_policies WHERE risk_level='high'",
+    )
+    .fetch_one(restarted.pool())
+    .await?;
+    assert_eq!(high_policy.0, 2);
+    assert!(high_policy.1 > 0);
+    assert_eq!(high_policy.2, "two_operators");
+    let operations_state = restarted.operations_state().await?;
+    assert_eq!(operations_state["execution_mode"], "dry_run");
+    let connector_id: uuid::Uuid =
+        sqlx::query_scalar("SELECT id FROM connector_registry ORDER BY name LIMIT 1")
+            .fetch_one(restarted.pool())
+            .await?;
+    let action_id = uuid::Uuid::new_v4();
+    sqlx::query("INSERT INTO actions (id,connector_id,name,type,description,risk_level,required_scope,requires_approval,enabled) VALUES ($1,$2,$3,'connector_action','integration action','low','agent:action:read',false,true)")
+        .bind(action_id)
+        .bind(connector_id)
+        .bind("test.idempotent")
+        .execute(restarted.pool())
+        .await?;
+    let first_execution = restarted
+        .create_execution_request(&clawforge_storage::ExecutionRequestInput {
+            action_id,
+            workflow_run_id: None,
+            decision_id: None,
+            requested_by: "integration-test".into(),
+            idempotency_key: Some("production-maturity-test-key".into()),
+        })
+        .await?;
+    let duplicate_execution = restarted
+        .create_execution_request(&clawforge_storage::ExecutionRequestInput {
+            action_id,
+            workflow_run_id: None,
+            decision_id: None,
+            requested_by: "integration-test".into(),
+            idempotency_key: Some("production-maturity-test-key".into()),
+        })
+        .await?;
+    assert_eq!(first_execution, duplicate_execution);
+    restarted.process_one_dry_run().await?;
+    let dry_run_status: String =
+        sqlx::query_scalar("SELECT status FROM execution_requests WHERE id=$1")
+            .bind(first_execution)
+            .fetch_one(restarted.pool())
+            .await?;
+    assert_eq!(dry_run_status, "success");
+    sqlx::query("DELETE FROM execution_requests WHERE id=$1")
+        .bind(first_execution)
+        .execute(restarted.pool())
+        .await?;
+    sqlx::query("DELETE FROM actions WHERE id=$1")
+        .bind(action_id)
+        .execute(restarted.pool())
+        .await?;
     let admin_id = restarted
         .create_admin_user("storage-admin", "Administrator", "argon2-hash")
         .await?;
