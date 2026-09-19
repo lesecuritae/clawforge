@@ -150,6 +150,8 @@ See [docs/security.md](docs/security.md),
 ## Documentation
 
 - [Architecture](docs/architecture.md) · [Deutsch](docs/architecture.de.md)
+- [Security Control Plane architecture and gap analysis (Deutsch)](docs/security-control-plane-architecture.de.md)
+- [Security Control Plane implementation roadmap (Deutsch)](docs/security-control-plane-roadmap.de.md)
 - [LLM/MCP integration](docs/llm-integration.md) · [Deutsch](docs/llm-integration.de.md)
 - [Deployment and updates](docs/deployment.md) · [Deutsch](docs/deployment.de.md)
 - [Security model](docs/security.md) · [Deutsch](docs/security.de.md)

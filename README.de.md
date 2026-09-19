@@ -151,6 +151,8 @@ Siehe [docs/security.de.md](docs/security.de.md),
 ## Dokumentation
 
 - [Architektur](docs/architecture.de.md) · [English](docs/architecture.md)
+- [Security Control Plane: Bestandsanalyse und Zielarchitektur](docs/security-control-plane-architecture.de.md)
+- [Security Control Plane: Umsetzungsroadmap](docs/security-control-plane-roadmap.de.md)
 - [LLM/MCP-Integration](docs/llm-integration.de.md) · [English](docs/llm-integration.md)
 - [Deployment und Updates](docs/deployment.de.md) · [English](docs/deployment.md)
 - [Sicherheitsmodell](docs/security.de.md) · [English](docs/security.md)
