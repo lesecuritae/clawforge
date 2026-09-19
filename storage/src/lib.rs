@@ -10,8 +10,9 @@ use clawforge_intelligence::{
     AsnRecord, BgpEvent, Indicator, IndicatorSink, IntelligenceEvent, NetworkSink, Provider,
     ProviderError, RpkiRecord, TrustedNetwork,
 };
+use clawforge_secret::{contains_placeholder, load_required};
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
-use std::{env, fs};
+use std::env;
 use uuid::Uuid;
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../migrations");
@@ -892,13 +893,26 @@ impl PostgresStore {
     pub async fn complete_event_delivery(
         &self,
         delivery_id: Uuid,
+        consumer: &str,
         success: bool,
         error: Option<&str>,
     ) -> Result<()> {
-        if success {
-            sqlx::query("UPDATE event_delivery SET status='processed',processed_at=NOW(),error=NULL WHERE id=$1").bind(delivery_id).execute(&self.pool).await?;
+        let result = if success {
+            sqlx::query("UPDATE event_delivery AS d SET status='processed',processed_at=NOW(),error=NULL FROM event_consumers AS c WHERE d.id=$1 AND d.consumer_id=c.id AND c.name=$2 AND d.status='processing'")
+                .bind(delivery_id)
+                .bind(consumer)
+                .execute(&self.pool)
+                .await?
         } else {
-            sqlx::query("UPDATE event_delivery SET status=CASE WHEN attempts >= 5 THEN 'dead' ELSE 'failed' END, available_at=NOW() + (LEAST(3600, POWER(2, attempts)) * INTERVAL '1 second'), error=$2 WHERE id=$1").bind(delivery_id).bind(error.map(|value| value.chars().take(1000).collect::<String>())).execute(&self.pool).await?;
+            sqlx::query("UPDATE event_delivery AS d SET status=CASE WHEN d.attempts >= 5 THEN 'dead' ELSE 'failed' END, available_at=NOW() + (LEAST(3600, POWER(2, d.attempts)) * INTERVAL '1 second'), error=$3 FROM event_consumers AS c WHERE d.id=$1 AND d.consumer_id=c.id AND c.name=$2 AND d.status='processing'")
+                .bind(delivery_id)
+                .bind(consumer)
+                .bind(error.map(|value| value.chars().take(1000).collect::<String>()))
+                .execute(&self.pool)
+                .await?
+        };
+        if result.rows_affected() == 0 {
+            anyhow::bail!("event delivery is not owned by the active consumer");
         }
         Ok(())
     }
@@ -3441,18 +3455,14 @@ pub struct AuditEventFilter<'a> {
 }
 
 pub fn database_url_from_env() -> Result<String> {
-    if let Ok(url) = env::var("DATABASE_URL") {
-        if !url.trim().is_empty() {
-            return Ok(url);
-        }
+    let url = load_required("DATABASE_URL_FILE", "DATABASE_URL")?;
+    if contains_placeholder(&url) {
+        anyhow::bail!("database URL contains a known placeholder credential");
     }
-    let path = env::var("DATABASE_URL_FILE")
-        .context("DATABASE_URL or DATABASE_URL_FILE must be configured")?;
-    let url = fs::read_to_string(path).context("read DATABASE_URL_FILE")?;
-    if url.trim().is_empty() {
-        anyhow::bail!("DATABASE_URL_FILE is empty");
+    if !url.starts_with("postgres://") && !url.starts_with("postgresql://") {
+        anyhow::bail!("database URL must use the postgres or postgresql scheme");
     }
-    Ok(url.trim().to_string())
+    Ok(url)
 }
 
 #[async_trait]

@@ -1,9 +1,9 @@
 # Deployment
 
 Clawforge läuft als API, Worker, Event Backbone, Notifier, Frontend,
-PostgreSQL, MCP, Correlation-, Incident-, Executor- und Backup-Services. Der
-Analyzer ist hinter dem Profil `analysis` isoliert; Redis ist unter `cache`
-optional und nicht für die Korrektheit erforderlich.
+PostgreSQL, Correlation-, Incident-, Executor- und Backup-Services. MCP ist
+hinter dem Profil `agent`, der Analyzer hinter `analysis` isoliert; Redis ist
+unter `cache` optional und nicht für die Korrektheit erforderlich.
 
 ## Veröffentliche Release-Images
 
@@ -19,6 +19,8 @@ Veröffentlicht werden `api`, `mcp`, `frontend`, `correlation`, `incidents`,
 
 ```sh
 cp .env.example .env
+./scripts/init-secrets.sh
+./scripts/validate-secrets.sh --bootstrap
 # unveränderliches Release-Tag verwenden
 CLAWFORGE_IMAGE_TAG=v1.0.0
 docker compose pull
@@ -34,10 +36,19 @@ Apache-2.0-Lizenz. GitHub Actions veröffentlicht `linux/amd64` und
 
 1. Docker Engine und Compose-Plugin installieren.
 2. `.env.example` nach `.env` kopieren und Image-Tag und Ports konfigurieren.
-3. Private Secret-Dateien aus `secrets/*.example` anlegen; niemals committen.
+3. `./scripts/init-secrets.sh` ausführen, optionale Provider-Credentials
+   ergänzen und mit `./scripts/validate-secrets.sh --bootstrap` prüfen. Private Dateien
+   werden nicht versioniert und erhalten Modus `0600`; eingecheckte Beispiele
+   sind keine Runtime-Defaults.
 4. `docker compose pull && docker compose up -d` ausführen (oder lokal bauen).
-5. API mit `/health`, `/ready` und `/version` prüfen.
-6. MCP intern unter `http://clawforge-mcp:8090/health` prüfen.
+5. Die API vorübergehend mit `compose.bootstrap.yml` neu erzeugen, den
+   einmaligen Admin-Bootstrap durchführen, die API danach wieder ausschließlich
+   aus `compose.yml` erzeugen und `secrets/admin_bootstrap_token` löschen.
+6. API mit `/health`, `/ready` und `/version` prüfen.
+7. Für MCP zuerst `mcp_agent_api_token` durch ein ausgestelltes Read-only-
+   Agent-API-Token ersetzen und dann
+   `docker compose --profile agent up -d clawforge-mcp` starten. Anschließend
+   MCP intern unter `http://clawforge-mcp:8090/health` prüfen.
 
 Die API führt sqlx-Migrationen vor dem Listening aus. `/ready` prüft PostgreSQL
 und meldet den angewendeten Migrationsstand. Für Updates Volume behalten.
@@ -70,6 +81,7 @@ Optionale Dienste:
 docker compose --profile analysis up -d
 docker compose --profile cache up -d
 docker compose --profile observability up -d
+docker compose --profile agent up -d clawforge-mcp
 ```
 
 Die englische Referenz ist [deployment.md](deployment.md).

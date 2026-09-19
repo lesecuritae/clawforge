@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    env, fs,
+    env,
     net::SocketAddr,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -24,7 +24,9 @@ use axum::{
 };
 use chrono::{DateTime, Duration, Utc};
 use clawforge_intelligence::{NetworkType, TrustedNetwork, VerificationStatus};
+use clawforge_notification::{allowed_hosts, validate_channel};
 use clawforge_policy::authorize_action;
+use clawforge_secret::{ensure_distinct, load_optional, load_required_token, validate_token};
 use clawforge_storage::{
     database_url_from_env, AdminPrincipal, AgentPrincipal, AuditEventFilter, MigrationStatus,
     PostgresStore,
@@ -50,6 +52,27 @@ struct RuntimeConfig {
     analyzer_token: Option<String>,
     notifier_token: Option<String>,
     events_token: Option<String>,
+    operations_token: Option<String>,
+    notification_hosts: HashSet<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InternalIdentity {
+    Analyzer,
+    Events,
+    Notifier,
+    Operations,
+}
+
+impl InternalIdentity {
+    fn event_consumer(self) -> Option<&'static str> {
+        match self {
+            Self::Analyzer => Some("analyzer"),
+            Self::Events => Some("events"),
+            Self::Notifier => Some("notifier"),
+            Self::Operations => None,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -5077,56 +5100,34 @@ fn new_secret() -> String {
     Uuid::new_v4().to_string() + &Uuid::new_v4().to_string()
 }
 
-fn configured_bootstrap_token() -> Option<String> {
-    if let Ok(path) = env::var("CLAWFORGE_ADMIN_BOOTSTRAP_TOKEN_FILE") {
-        if let Ok(value) = fs::read_to_string(path) {
-            if !value.trim().is_empty() {
-                return Some(value.trim().to_string());
-            }
-        }
+fn configured_bootstrap_token() -> anyhow::Result<Option<String>> {
+    let token = load_optional(
+        "CLAWFORGE_ADMIN_BOOTSTRAP_TOKEN_FILE",
+        "CLAWFORGE_ADMIN_BOOTSTRAP_TOKEN",
+    )?;
+    if let Some(value) = token.as_deref() {
+        validate_token("CLAWFORGE_ADMIN_BOOTSTRAP_TOKEN", value)?;
     }
-    env::var("CLAWFORGE_ADMIN_BOOTSTRAP_TOKEN")
-        .ok()
-        .filter(|v| !v.trim().is_empty())
+    Ok(token)
 }
 
-fn configured_analyzer_token() -> Option<String> {
-    if let Ok(path) = env::var("CLAWFORGE_ANALYZER_TOKEN_FILE") {
-        if let Ok(value) = fs::read_to_string(path) {
-            if !value.trim().is_empty() {
-                return Some(value.trim().to_string());
-            }
-        }
-    }
-    env::var("CLAWFORGE_ANALYZER_TOKEN")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
+fn configured_analyzer_token() -> anyhow::Result<String> {
+    load_required_token("CLAWFORGE_ANALYZER_TOKEN_FILE", "CLAWFORGE_ANALYZER_TOKEN")
 }
 
-fn configured_notifier_token() -> Option<String> {
-    if let Ok(path) = env::var("CLAWFORGE_NOTIFIER_TOKEN_FILE") {
-        if let Ok(value) = fs::read_to_string(path) {
-            if !value.trim().is_empty() {
-                return Some(value.trim().to_string());
-            }
-        }
-    }
-    env::var("CLAWFORGE_NOTIFIER_TOKEN")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
+fn configured_notifier_token() -> anyhow::Result<String> {
+    load_required_token("CLAWFORGE_NOTIFIER_TOKEN_FILE", "CLAWFORGE_NOTIFIER_TOKEN")
 }
 
-fn configured_events_token() -> Option<String> {
-    if let Ok(path) = env::var("CLAWFORGE_EVENTS_TOKEN_FILE") {
-        if let Ok(value) = fs::read_to_string(path) {
-            if !value.trim().is_empty() {
-                return Some(value.trim().to_string());
-            }
-        }
-    }
-    env::var("CLAWFORGE_EVENTS_TOKEN")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
+fn configured_events_token() -> anyhow::Result<String> {
+    load_required_token("CLAWFORGE_EVENTS_TOKEN_FILE", "CLAWFORGE_EVENTS_TOKEN")
+}
+
+fn configured_operations_token() -> anyhow::Result<String> {
+    load_required_token(
+        "CLAWFORGE_OPERATIONS_TOKEN_FILE",
+        "CLAWFORGE_OPERATIONS_TOKEN",
+    )
 }
 
 fn bearer(headers: &HeaderMap) -> Option<&str> {
@@ -5285,13 +5286,45 @@ async fn admin_bootstrap(
             "bootstrap already completed",
         ));
     }
-    let expected = configured_bootstrap_token().ok_or_else(|| {
+    let expected = configured_bootstrap_token()
+        .map_err(|_| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "bootstrap secret configuration is invalid",
+            )
+        })?
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "bootstrap secret is not configured",
+            )
+        })?;
+    ensure_distinct(&[
+        ("bootstrap token", expected.as_str()),
+        (
+            "analyzer token",
+            state.config.analyzer_token.as_deref().unwrap_or_default(),
+        ),
+        (
+            "notifier token",
+            state.config.notifier_token.as_deref().unwrap_or_default(),
+        ),
+        (
+            "events token",
+            state.config.events_token.as_deref().unwrap_or_default(),
+        ),
+        (
+            "operations token",
+            state.config.operations_token.as_deref().unwrap_or_default(),
+        ),
+    ])
+    .map_err(|_| {
         api_error(
             StatusCode::SERVICE_UNAVAILABLE,
-            "bootstrap secret is not configured",
+            "bootstrap secret must be distinct from service credentials",
         )
     })?;
-    if request.bootstrap_token != expected {
+    if digest(&request.bootstrap_token) != digest(&expected) {
         return Err(api_error(
             StatusCode::UNAUTHORIZED,
             "invalid bootstrap token",
@@ -6787,6 +6820,15 @@ async fn admin_create_notification_channel(
 ) -> ApiResult<Json<ApiEnvelope<serde_json::Value>>> {
     let principal = authenticate(&state, &headers).await?;
     require_role(&principal, &["Administrator"])?;
+    let config = request.config.unwrap_or_else(|| serde_json::json!({}));
+    validate_channel(
+        &request.channel_type,
+        &request.target,
+        request.secret_ref.as_deref(),
+        &config,
+        &state.config.notification_hosts,
+    )
+    .map_err(|_| api_error(StatusCode::BAD_REQUEST, "invalid notification channel"))?;
     let id = state
         .store
         .create_notification_channel(
@@ -6794,7 +6836,7 @@ async fn admin_create_notification_channel(
             &request.channel_type,
             &request.target,
             request.secret_ref.as_deref(),
-            request.config.unwrap_or_else(|| serde_json::json!({})),
+            config,
         )
         .await
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "invalid notification channel"))?;
@@ -6952,26 +6994,27 @@ async fn events_status(
         .map_err(|_| api_error(StatusCode::SERVICE_UNAVAILABLE, "event status unavailable"))
 }
 
-fn notifier_authorized(state: &AppState, headers: &HeaderMap) -> bool {
-    let Some(expected) = state.config.notifier_token.as_deref() else {
-        return false;
-    };
-    bearer(headers).is_some_and(|provided| digest(provided) == digest(expected))
+fn internal_identity(config: &RuntimeConfig, headers: &HeaderMap) -> Option<InternalIdentity> {
+    let provided = bearer(headers)?;
+    [
+        (InternalIdentity::Analyzer, config.analyzer_token.as_deref()),
+        (InternalIdentity::Events, config.events_token.as_deref()),
+        (InternalIdentity::Notifier, config.notifier_token.as_deref()),
+        (
+            InternalIdentity::Operations,
+            config.operations_token.as_deref(),
+        ),
+    ]
+    .into_iter()
+    .find_map(|(identity, expected)| {
+        expected
+            .is_some_and(|value| digest(provided) == digest(value))
+            .then_some(identity)
+    })
 }
 
-fn events_authorized(state: &AppState, headers: &HeaderMap) -> bool {
-    let provided = bearer(headers);
-    state
-        .config
-        .events_token
-        .as_deref()
-        .is_some_and(|expected| provided.is_some_and(|value| digest(value) == digest(expected)))
-        || notifier_authorized(state, headers)
-        || state
-            .config
-            .analyzer_token
-            .as_deref()
-            .is_some_and(|expected| provided.is_some_and(|value| digest(value) == digest(expected)))
+fn notifier_authorized(state: &AppState, headers: &HeaderMap) -> bool {
+    internal_identity(&state.config, headers) == Some(InternalIdentity::Notifier)
 }
 
 async fn internal_notifier_events(
@@ -7023,16 +7066,17 @@ async fn internal_operational_event(
     headers: HeaderMap,
     Json(request): Json<InternalOperationalEventRequest>,
 ) -> ApiResult<Json<ApiEnvelope<serde_json::Value>>> {
-    if !events_authorized(&state, &headers) {
+    if internal_identity(&state.config, &headers) != Some(InternalIdentity::Operations) {
         return Err(api_error(
             StatusCode::UNAUTHORIZED,
-            "invalid notifier token",
+            "invalid operations token",
         ));
     }
-    if !matches!(
-        request.event_type.as_str(),
-        "backup_error" | "system_health_error"
-    ) {
+    let valid_source = matches!(
+        (request.event_type.as_str(), request.source.as_str()),
+        ("backup_error", "backup") | ("system_health_error", "health")
+    );
+    if !valid_source {
         return Err(api_error(
             StatusCode::BAD_REQUEST,
             "unsupported operational event",
@@ -7063,20 +7107,13 @@ async fn internal_events_consume(
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
 ) -> ApiResult<Json<ApiEnvelope<Vec<serde_json::Value>>>> {
-    if !events_authorized(&state, &headers) {
-        return Err(api_error(
-            StatusCode::UNAUTHORIZED,
-            "invalid event service token",
-        ));
-    }
-    let consumer = query
-        .get("consumer")
-        .map(String::as_str)
-        .unwrap_or("events");
+    let identity = internal_identity(&state.config, &headers)
+        .and_then(InternalIdentity::event_consumer)
+        .ok_or_else(|| api_error(StatusCode::UNAUTHORIZED, "invalid event consumer token"))?;
     state
         .store
         .claim_event_deliveries(
-            consumer,
+            identity,
             query
                 .get("limit")
                 .and_then(|v| v.parse().ok())
@@ -7098,15 +7135,12 @@ async fn internal_event_result(
     Path(id): Path<Uuid>,
     Json(request): Json<NotificationResultRequest>,
 ) -> ApiResult<Json<ApiEnvelope<serde_json::Value>>> {
-    if !events_authorized(&state, &headers) {
-        return Err(api_error(
-            StatusCode::UNAUTHORIZED,
-            "invalid event service token",
-        ));
-    }
+    let consumer = internal_identity(&state.config, &headers)
+        .and_then(InternalIdentity::event_consumer)
+        .ok_or_else(|| api_error(StatusCode::UNAUTHORIZED, "invalid event consumer token"))?;
     state
         .store
-        .complete_event_delivery(id, request.success, request.error.as_deref())
+        .complete_event_delivery(id, consumer, request.success, request.error.as_deref())
         .await
         .map_err(|_| {
             api_error(
@@ -7209,6 +7243,18 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(EnvFilter::from_default_env())
         .init();
     let database_url = database_url_from_env()?;
+    let analyzer_token = configured_analyzer_token()?;
+    let notifier_token = configured_notifier_token()?;
+    let events_token = configured_events_token()?;
+    let operations_token = configured_operations_token()?;
+    let notification_hosts =
+        allowed_hosts(&env::var("CLAWFORGE_NOTIFIER_ALLOWED_HOSTS").unwrap_or_default())?;
+    ensure_distinct(&[
+        ("analyzer token", &analyzer_token),
+        ("notifier token", &notifier_token),
+        ("events token", &events_token),
+        ("operations token", &operations_token),
+    ])?;
     let bind = env::var("CLAWFORGE_API_BIND").unwrap_or_else(|_| "0.0.0.0:8080".into());
     let address: SocketAddr = bind
         .parse()
@@ -7219,6 +7265,7 @@ async fn main() -> anyhow::Result<()> {
     // pending until they are started.
     store.ensure_event_consumer("notifier").await?;
     store.ensure_event_consumer("events").await?;
+    store.ensure_event_consumer("analyzer").await?;
     let runtime_store = store.clone();
     let listener = tokio::net::TcpListener::bind(address).await?;
     runtime_store
@@ -7232,9 +7279,11 @@ async fn main() -> anyhow::Result<()> {
             analyzer_url: env::var("CLAWFORGE_ANALYZER_URL")
                 .ok()
                 .filter(|value| !value.trim().is_empty()),
-            analyzer_token: configured_analyzer_token(),
-            notifier_token: configured_notifier_token(),
-            events_token: configured_events_token(),
+            analyzer_token: Some(analyzer_token),
+            notifier_token: Some(notifier_token),
+            events_token: Some(events_token),
+            operations_token: Some(operations_token),
+            notification_hosts,
         },
         rate_limiter: RateLimiter::default(),
     };
@@ -7447,6 +7496,50 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn internal_headers(token: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        headers
+    }
+
+    #[test]
+    fn internal_tokens_are_bound_to_fixed_service_identities_and_consumers() {
+        let config = RuntimeConfig {
+            bind: "127.0.0.1:8080".parse().unwrap(),
+            database_configured: true,
+            analyzer_url: None,
+            analyzer_token: Some("analyzer-token".into()),
+            notifier_token: Some("notifier-token".into()),
+            events_token: Some("events-token".into()),
+            operations_token: Some("operations-token".into()),
+            notification_hosts: HashSet::new(),
+        };
+
+        assert_eq!(
+            internal_identity(&config, &internal_headers("analyzer-token")),
+            Some(InternalIdentity::Analyzer)
+        );
+        assert_eq!(
+            internal_identity(&config, &internal_headers("notifier-token"))
+                .and_then(InternalIdentity::event_consumer),
+            Some("notifier")
+        );
+        assert_eq!(
+            internal_identity(&config, &internal_headers("events-token"))
+                .and_then(InternalIdentity::event_consumer),
+            Some("events")
+        );
+        assert_eq!(
+            internal_identity(&config, &internal_headers("operations-token"))
+                .and_then(InternalIdentity::event_consumer),
+            None
+        );
+        assert_eq!(internal_identity(&config, &internal_headers("wrong")), None);
+    }
 
     #[test]
     fn credentials_are_hashed_and_not_reversible() {

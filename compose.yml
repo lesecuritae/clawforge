@@ -71,13 +71,14 @@ services:
       DATABASE_URL_FILE: /run/secrets/database_url
       RUST_LOG: ${RUST_LOG:-info}
       CLAWFORGE_API_BIND: 0.0.0.0:8080
-      CLAWFORGE_ADMIN_BOOTSTRAP_TOKEN_FILE: /run/secrets/admin_bootstrap_token
       CLAWFORGE_ADMIN_BOOTSTRAP_USERNAME: ${CLAWFORGE_ADMIN_BOOTSTRAP_USERNAME:-admin}
       CLAWFORGE_ANALYZER_URL: ${CLAWFORGE_ANALYZER_URL:-http://clawforge-analyzer:8081}
       CLAWFORGE_ANALYZER_TOKEN_FILE: /run/secrets/analyzer_token
       CLAWFORGE_ANALYZER_ANONYMIZE_IPS: ${CLAWFORGE_ANALYZER_ANONYMIZE_IPS:-true}
       CLAWFORGE_NOTIFIER_TOKEN_FILE: /run/secrets/notifier_token
       CLAWFORGE_EVENTS_TOKEN_FILE: /run/secrets/events_token
+      CLAWFORGE_OPERATIONS_TOKEN_FILE: /run/secrets/operations_token
+      CLAWFORGE_NOTIFIER_ALLOWED_HOSTS: ${CLAWFORGE_NOTIFIER_ALLOWED_HOSTS:-}
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=64m
@@ -90,10 +91,10 @@ services:
         condition: service_healthy
     secrets:
       - database_url
-      - admin_bootstrap_token
       - analyzer_token
       - notifier_token
       - events_token
+      - operations_token
     networks:
       - backend
       - frontend
@@ -155,6 +156,10 @@ services:
       CLAWFORGE_NOTIFIER_TOKEN_FILE: /run/secrets/notifier_token
       CLAWFORGE_NOTIFIER_POLL_SECONDS: ${CLAWFORGE_NOTIFIER_POLL_SECONDS:-5}
       CLAWFORGE_NOTIFIER_TIMEOUT_SECONDS: ${CLAWFORGE_NOTIFIER_TIMEOUT_SECONDS:-15}
+      CLAWFORGE_NOTIFIER_ALLOWED_HOSTS: ${CLAWFORGE_NOTIFIER_ALLOWED_HOSTS:-}
+      CLAWFORGE_NOTIFIER_WEBHOOK_SECRET_FILE: /run/secrets/notifier_webhook_auth
+      CLAWFORGE_NOTIFIER_MATRIX_SECRET_FILE: /run/secrets/notifier_matrix_auth
+      CLAWFORGE_NOTIFIER_SMTP_SECRET_FILE: /run/secrets/notifier_smtp_password
       RUST_LOG: ${RUST_LOG:-info}
     read_only: true
     tmpfs:
@@ -168,6 +173,9 @@ services:
         condition: service_healthy
     secrets:
       - notifier_token
+      - notifier_webhook_auth
+      - notifier_matrix_auth
+      - notifier_smtp_password
     networks:
       - backend
     healthcheck:
@@ -272,6 +280,7 @@ services:
     restart: unless-stopped
 
   clawforge-mcp:
+    profiles: [agent]
     image: ${CLAWFORGE_IMAGE_REGISTRY:-ghcr.io/lesecuritae}/clawforge-mcp:${CLAWFORGE_IMAGE_TAG:-v1.0.0}
     build:
       context: .
@@ -434,7 +443,7 @@ services:
       CLAWFORGE_CORE_API_URL: ${CLAWFORGE_CORE_API_URL:-http://clawforge-api:8080}
     secrets:
       - postgres_password
-      - notifier_token
+      - operations_token
     volumes:
       - clawforge-backups:/backups
     networks:
@@ -449,23 +458,34 @@ services:
       - /bin/sh
       - -ec
       - |
+        umask 077
+        chmod 700 /backups
         export PGPASSWORD="$$(cat /run/secrets/postgres_password)"
         notify_error() {
           reason="$${1:-backup operation failed}"
-          token="$$(cat /run/secrets/notifier_token)"
+          token="$$(cat /run/secrets/operations_token)"
           escaped="$$(printf '%s' "$${reason}" | sed 's/\\/\\\\/g; s/"/\\"/g')"
           wget -q -O /dev/null --header="Authorization: Bearer $${token}" --header="Content-Type: application/json" --post-data="{\"event_type\":\"backup_error\",\"source\":\"backup\",\"severity\":\"high\",\"reason\":\"$${escaped}\",\"resource\":\"postgres\"}" "$${CLAWFORGE_CORE_API_URL}/internal/notifier/operational-events" 2>/dev/null || true
         }
         while :; do
           stamp="$$(date -u +%Y%m%dT%H%M%SZ)"
-          if ! pg_dump --format=custom --no-owner --file="/backups/clawforge-$${stamp}.dump"; then
+          tmp="$$(mktemp "/backups/.clawforge-$${stamp}.XXXXXX")"
+          suffix="$${tmp##*.}"
+          dump="/backups/clawforge-$${stamp}-$${suffix}.dump"
+          if ! pg_dump --format=custom --no-owner --file="$${tmp}"; then
+            rm -f "$${tmp}"
             notify_error "PostgreSQL backup failed"
             sleep "$${BACKUP_INTERVAL_SECONDS}"
             continue
           fi
-          if ! pg_restore --list "/backups/clawforge-$${stamp}.dump" >/dev/null; then
+          if ! pg_restore --list "$${tmp}" >/dev/null; then
+            rm -f "$${tmp}"
             notify_error "PostgreSQL backup integrity check failed"
+            sleep "$${BACKUP_INTERVAL_SECONDS}"
+            continue
           fi
+          chmod 600 "$${tmp}"
+          mv "$${tmp}" "$${dump}"
           find /backups -type f -name 'clawforge-*.dump' -mtime +"$${BACKUP_RETENTION_DAYS}" -delete
           sleep "$${BACKUP_INTERVAL_SECONDS}"
         done
@@ -485,30 +505,36 @@ networks:
 
 secrets:
   postgres_password:
-    file: ${CLAWFORGE_POSTGRES_SECRET_FILE:-./secrets/postgres_password.example}
+    file: ${CLAWFORGE_POSTGRES_SECRET_FILE:?set CLAWFORGE_POSTGRES_SECRET_FILE to a private secret file}
   database_url:
-    file: ${CLAWFORGE_DATABASE_URL_SECRET_FILE:-./secrets/database_url.example}
+    file: ${CLAWFORGE_DATABASE_URL_SECRET_FILE:?set CLAWFORGE_DATABASE_URL_SECRET_FILE to a private secret file}
   threatfox_auth_key:
-    file: ${CLAWFORGE_THREATFOX_SECRET_FILE:-./secrets/threatfox_auth_key.example}
+    file: ${CLAWFORGE_THREATFOX_SECRET_FILE:?set CLAWFORGE_THREATFOX_SECRET_FILE to a private secret file}
   urlhaus_auth_key:
-    file: ${CLAWFORGE_URLHAUS_SECRET_FILE:-./secrets/urlhaus_auth_key.example}
+    file: ${CLAWFORGE_URLHAUS_SECRET_FILE:?set CLAWFORGE_URLHAUS_SECRET_FILE to a private secret file}
   malwarebazaar_auth_key:
-    file: ${CLAWFORGE_MALWAREBAZAAR_SECRET_FILE:-./secrets/malwarebazaar_auth_key.example}
-  admin_bootstrap_token:
-    file: ${CLAWFORGE_ADMIN_BOOTSTRAP_SECRET_FILE:-./secrets/admin_bootstrap_token.example}
+    file: ${CLAWFORGE_MALWAREBAZAAR_SECRET_FILE:?set CLAWFORGE_MALWAREBAZAAR_SECRET_FILE to a private secret file}
   analyzer_token:
-    file: ${CLAWFORGE_ANALYZER_SECRET_FILE:-./secrets/analyzer_token.example}
+    file: ${CLAWFORGE_ANALYZER_SECRET_FILE:?set CLAWFORGE_ANALYZER_SECRET_FILE to a private secret file}
   analyzer_api_key:
-    file: ${CLAWFORGE_ANALYZER_API_KEY_SECRET_FILE:-./secrets/analyzer_api_key.example}
+    file: ${CLAWFORGE_ANALYZER_API_KEY_SECRET_FILE:?set CLAWFORGE_ANALYZER_API_KEY_SECRET_FILE to a private secret file}
   notifier_token:
-    file: ${CLAWFORGE_NOTIFIER_SECRET_FILE:-./secrets/notifier_token.example}
+    file: ${CLAWFORGE_NOTIFIER_SECRET_FILE:?set CLAWFORGE_NOTIFIER_SECRET_FILE to a private secret file}
   events_token:
-    file: ${CLAWFORGE_EVENTS_SECRET_FILE:-./secrets/events_token.example}
+    file: ${CLAWFORGE_EVENTS_SECRET_FILE:?set CLAWFORGE_EVENTS_SECRET_FILE to a private secret file}
+  operations_token:
+    file: ${CLAWFORGE_OPERATIONS_SECRET_FILE:?set CLAWFORGE_OPERATIONS_SECRET_FILE to a private secret file}
+  notifier_webhook_auth:
+    file: ${CLAWFORGE_NOTIFICATION_WEBHOOK_SECRET_FILE:?set CLAWFORGE_NOTIFICATION_WEBHOOK_SECRET_FILE to a private secret file}
+  notifier_matrix_auth:
+    file: ${CLAWFORGE_NOTIFICATION_MATRIX_SECRET_FILE:?set CLAWFORGE_NOTIFICATION_MATRIX_SECRET_FILE to a private secret file}
+  notifier_smtp_password:
+    file: ${CLAWFORGE_NOTIFICATION_SMTP_SECRET_FILE:?set CLAWFORGE_NOTIFICATION_SMTP_SECRET_FILE to a private secret file}
   mcp_agent_api_token:
-    file: ${CLAWFORGE_MCP_AGENT_TOKEN_FILE:-./secrets/mcp_agent_api_token.example}
+    file: ${CLAWFORGE_MCP_AGENT_TOKEN_FILE:?set CLAWFORGE_MCP_AGENT_TOKEN_FILE to a private secret file}
   mcp_auth_token:
-    file: ${CLAWFORGE_MCP_AUTH_TOKEN_FILE:-./secrets/mcp_auth_token.example}
+    file: ${CLAWFORGE_MCP_AUTH_TOKEN_FILE:?set CLAWFORGE_MCP_AUTH_TOKEN_FILE to a private secret file}
   github_token:
-    file: ${CLAWFORGE_GITHUB_TOKEN_FILE:-./secrets/github_token.example}
+    file: ${CLAWFORGE_GITHUB_TOKEN_FILE:?set CLAWFORGE_GITHUB_TOKEN_FILE to a private secret file}
   proxmox_token:
-    file: ${CLAWFORGE_PROXMOX_TOKEN_FILE:-./secrets/proxmox_token.example}
+    file: ${CLAWFORGE_PROXMOX_TOKEN_FILE:?set CLAWFORGE_PROXMOX_TOKEN_FILE to a private secret file}

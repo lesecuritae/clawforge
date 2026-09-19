@@ -1,4 +1,4 @@
-use std::{env, fs, net::SocketAddr, sync::Arc, time::Duration};
+use std::{env, net::SocketAddr, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use axum::{
@@ -12,6 +12,7 @@ use clawforge_analyzer::{
     AnalysisError, AnalysisOutput, AnalysisProvider, AnalysisRequest, MockProvider,
     OpenAiCompatibleProvider,
 };
+use clawforge_secret::{load_optional, load_required_token};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tracing_subscriber::EnvFilter;
@@ -55,19 +56,6 @@ fn authorized(headers: &HeaderMap, token: &str) -> bool {
     bearer(headers).is_some_and(|value| value == token)
 }
 
-fn secret(name: &str) -> Result<String> {
-    if let Ok(path) = env::var(format!("{name}_FILE")) {
-        let value = fs::read_to_string(path).context("read analyzer secret file")?;
-        if !value.trim().is_empty() {
-            return Ok(value.trim().to_string());
-        }
-    }
-    env::var(name)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .with_context(|| format!("{name} or {name}_FILE must be configured"))
-}
-
 fn build_provider(client: reqwest::Client) -> Result<Arc<dyn AnalysisProvider>> {
     let provider = env::var("CLAWFORGE_ANALYZER_PROVIDER").unwrap_or_else(|_| "mock".into());
     let model = env::var("CLAWFORGE_ANALYZER_MODEL").unwrap_or_else(|_| "offline".into());
@@ -79,7 +67,10 @@ fn build_provider(client: reqwest::Client) -> Result<Arc<dyn AnalysisProvider>> 
     if base_url.trim().is_empty() {
         anyhow::bail!("CLAWFORGE_ANALYZER_BASE_URL is required for non-mock providers");
     }
-    let api_key = secret("CLAWFORGE_ANALYZER_API_KEY").ok();
+    let api_key = load_optional(
+        "CLAWFORGE_ANALYZER_API_KEY_FILE",
+        "CLAWFORGE_ANALYZER_API_KEY",
+    )?;
     Ok(Arc::new(OpenAiCompatibleProvider {
         client,
         base_url,
@@ -191,7 +182,7 @@ async fn event_consumer_loop(state: AppState) {
         let response = match state
             .client
             .get(format!(
-                "{}/internal/events/consume?consumer=analyzer&limit=10",
+                "{}/internal/events/consume?limit=10",
                 state.core_api_url.trim_end_matches('/')
             ))
             .bearer_auth(&state.token)
@@ -258,7 +249,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .init();
-    let token = secret("CLAWFORGE_ANALYZER_TOKEN")?;
+    let token = load_required_token("CLAWFORGE_ANALYZER_TOKEN_FILE", "CLAWFORGE_ANALYZER_TOKEN")?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(
             env::var("CLAWFORGE_ANALYZER_TIMEOUT_SECONDS")

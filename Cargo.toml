@@ -1,5 +1,5 @@
 [workspace]
-members = ["api", "worker", "intelligence", "risk", "policy", "storage", "decision", "workflow", "connector", "analyzer", "notifier", "events", "mcp", "correlation", "incidents", "executor"]
+members = ["api", "worker", "intelligence", "risk", "policy", "storage", "decision", "workflow", "connector", "analyzer", "notifier", "events", "mcp", "correlation", "incidents", "executor", "secret", "notification"]
 resolver = "2"
 
 [workspace.package]
@@ -27,3 +27,4 @@ tower-http = { version = "0.6", features = ["limit"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 uuid = { version = "1", features = ["serde", "v4"] }
+url = "2"

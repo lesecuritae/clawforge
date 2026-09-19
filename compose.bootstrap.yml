@@ -1,0 +1,10 @@
+services:
+  clawforge-api:
+    environment:
+      CLAWFORGE_ADMIN_BOOTSTRAP_TOKEN_FILE: /run/secrets/admin_bootstrap_token
+    secrets:
+      - admin_bootstrap_token
+
+secrets:
+  admin_bootstrap_token:
+    file: ${CLAWFORGE_ADMIN_BOOTSTRAP_SECRET_FILE:?set CLAWFORGE_ADMIN_BOOTSTRAP_SECRET_FILE to a private one-time bootstrap token}

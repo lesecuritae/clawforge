@@ -9,9 +9,10 @@ geschrieben.
 
 Der Compose-Dienst `clawforge-backup` erstellt standardmäßig täglich ein
 komprimiertes PostgreSQL-Dump. `CLAWFORGE_BACKUP_INTERVAL_SECONDS` und
-`CLAWFORGE_BACKUP_RETENTION` steuern Intervall und Rotation. Backups werden in
-dem gemounteten Backup-Volume abgelegt und sollten zusätzlich verschlüsselt an
-einen getrennten Speicher repliziert werden.
+`CLAWFORGE_BACKUP_RETENTION_DAYS` steuern Intervall und Rotation. Dumps werden
+privat erzeugt, vor der atomaren Veröffentlichung validiert und im gemounteten
+Backup-Volume abgelegt. Sie sollten zusätzlich verschlüsselt an einen
+getrennten Speicher repliziert werden.
 
 ## Restore auf frischer Datenbank
 
@@ -37,8 +38,11 @@ für Migration, Neustart und Persistenz ausgeführt.
 
 ## Konfiguration und Secrets
 
-`.env.example` und `docker/secrets/*.example` enthalten nur Platzhalter.
-Produktive Dateien liegen außerhalb des Repositorys. Bei einer
+`.env.example` und `secrets/*.example` dokumentieren nur Namen und Formate;
+sie sind keine produktiven Compose-Defaults. `scripts/init-secrets.sh` erzeugt
+die privaten Dateien, `scripts/validate-secrets.sh` prüft den Normalbetrieb und
+`scripts/validate-secrets.sh --bootstrap` zusätzlich das Einmal-Secret.
+Produktive Werte liegen außerhalb der Versionsverwaltung. Bei einer
 Wiederherstellung werden sie aus dem Secret-Manager beziehungsweise dem
 Deployment-System erneut injiziert. API-Token, Provider-Schlüssel,
 MCP-Service-Token und SMTP/Webhook-Geheimnisse werden nicht aus Logs oder

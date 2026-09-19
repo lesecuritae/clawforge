@@ -1,6 +1,34 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+validation_secret_dir="$(mktemp -d)"
+project="clawforge-release-validation-$$"
+cleanup() {
+  docker compose -p "$project" down -v --remove-orphans >/dev/null 2>&1 || true
+  rm -rf "$validation_secret_dir"
+}
+trap cleanup EXIT INT TERM
+
+./scripts/init-secrets.sh "$validation_secret_dir" >/dev/null
+export CLAWFORGE_POSTGRES_SECRET_FILE="$validation_secret_dir/postgres_password"
+export CLAWFORGE_DATABASE_URL_SECRET_FILE="$validation_secret_dir/database_url"
+export CLAWFORGE_ADMIN_BOOTSTRAP_SECRET_FILE="$validation_secret_dir/admin_bootstrap_token"
+export CLAWFORGE_ANALYZER_SECRET_FILE="$validation_secret_dir/analyzer_token"
+export CLAWFORGE_ANALYZER_API_KEY_SECRET_FILE="$validation_secret_dir/analyzer_api_key"
+export CLAWFORGE_NOTIFIER_SECRET_FILE="$validation_secret_dir/notifier_token"
+export CLAWFORGE_NOTIFICATION_WEBHOOK_SECRET_FILE="$validation_secret_dir/notifier_webhook_auth"
+export CLAWFORGE_NOTIFICATION_MATRIX_SECRET_FILE="$validation_secret_dir/notifier_matrix_auth"
+export CLAWFORGE_NOTIFICATION_SMTP_SECRET_FILE="$validation_secret_dir/notifier_smtp_password"
+export CLAWFORGE_EVENTS_SECRET_FILE="$validation_secret_dir/events_token"
+export CLAWFORGE_OPERATIONS_SECRET_FILE="$validation_secret_dir/operations_token"
+export CLAWFORGE_MCP_AGENT_TOKEN_FILE="$validation_secret_dir/mcp_agent_api_token"
+export CLAWFORGE_MCP_AUTH_TOKEN_FILE="$validation_secret_dir/mcp_auth_token"
+export CLAWFORGE_GITHUB_TOKEN_FILE="$validation_secret_dir/github_token"
+export CLAWFORGE_PROXMOX_TOKEN_FILE="$validation_secret_dir/proxmox_token"
+export CLAWFORGE_THREATFOX_SECRET_FILE="$validation_secret_dir/threatfox_auth_key"
+export CLAWFORGE_URLHAUS_SECRET_FILE="$validation_secret_dir/urlhaus_auth_key"
+export CLAWFORGE_MALWAREBAZAAR_SECRET_FILE="$validation_secret_dir/malwarebazaar_auth_key"
+
 # Full release gate. Live provider requests remain bounded and authenticated
 # feeds are skipped unless their keys are injected into this process.
 export CLAWFORGE_ENABLE_FEEDS=true
@@ -13,13 +41,9 @@ cargo clippy --workspace --all-targets -- -D warnings
 ./scripts/test-postgres.sh
 ./scripts/test-backup-restore.sh
 
-project="clawforge-release-validation-$$"
-cleanup() {
-  docker compose -p "$project" down -v --remove-orphans >/dev/null 2>&1 || true
-}
-trap cleanup EXIT INT TERM
-
 CLAWFORGE_API_PORT=18080 docker compose -p "$project" config --quiet
+./scripts/validate-secrets.sh
+./scripts/test-secret-hardening.sh
 CLAWFORGE_API_PORT=18080 docker compose -p "$project" up -d --build
 until curl --fail --silent http://127.0.0.1:18080/ready >/dev/null; do sleep 2; done
 curl --fail --silent http://127.0.0.1:18080/health >/dev/null

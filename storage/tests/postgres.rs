@@ -148,8 +148,12 @@ async fn migrations_and_restart_persist() -> anyhow::Result<()> {
     assert_eq!(deliveries.len(), 1);
     assert!(deliveries[0]["payload"].get("token").is_none());
     let delivery_id: uuid::Uuid = deliveries[0]["delivery_id"].as_str().unwrap().parse()?;
+    assert!(restarted
+        .complete_event_delivery(delivery_id, "events", true, None)
+        .await
+        .is_err());
     restarted
-        .complete_event_delivery(delivery_id, true, None)
+        .complete_event_delivery(delivery_id, "integration", true, None)
         .await?;
     let channel_id = restarted
         .create_notification_channel(

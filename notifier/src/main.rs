@@ -1,13 +1,19 @@
 use anyhow::{Context, Result};
+use clawforge_notification::{
+    allowed_hosts, is_public_destination, validate_channel, ValidatedChannel, MATRIX_SECRET_ID,
+    SMTP_SECRET_ID, WEBHOOK_SECRET_ID,
+};
+use clawforge_secret::{load_optional, load_required_token};
 use lettre::{
     message::Mailbox, transport::smtp::authentication::Credentials, AsyncSmtpTransport,
     AsyncTransport, Message, Tokio1Executor,
 };
-use reqwest::Client;
+use reqwest::{redirect::Policy, Client};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{env, fs, time::Duration};
+use std::{collections::HashSet, env, net::SocketAddr, time::Duration};
 use tracing::{info, warn};
+use url::Url;
 use uuid::Uuid;
 
 #[derive(Debug, Deserialize)]
@@ -42,6 +48,7 @@ struct Config {
     token: String,
     poll: Duration,
     timeout: Duration,
+    allowed_hosts: HashSet<String>,
 }
 
 fn retry_delay(attempt: i32) -> Duration {
@@ -55,34 +62,45 @@ fn matrix_payload(event: &Event) -> Value {
     })
 }
 
-fn secret_value(reference: Option<&str>) -> Option<String> {
-    let name = reference?;
-    if let Ok(path) = env::var(format!("{name}_FILE")) {
-        if let Ok(value) = fs::read_to_string(path) {
-            if !value.trim().is_empty() {
-                return Some(value.trim().to_string());
-            }
-        }
+fn secret_value(channel_type: &str, reference: Option<&str>) -> Result<Option<String>> {
+    let Some(reference) = reference else {
+        return Ok(None);
+    };
+    let (expected, file_key, value_key) = match channel_type {
+        "webhook" => (
+            WEBHOOK_SECRET_ID,
+            "CLAWFORGE_NOTIFIER_WEBHOOK_SECRET_FILE",
+            "CLAWFORGE_NOTIFIER_WEBHOOK_SECRET",
+        ),
+        "matrix" => (
+            MATRIX_SECRET_ID,
+            "CLAWFORGE_NOTIFIER_MATRIX_SECRET_FILE",
+            "CLAWFORGE_NOTIFIER_MATRIX_SECRET",
+        ),
+        "smtp" => (
+            SMTP_SECRET_ID,
+            "CLAWFORGE_NOTIFIER_SMTP_SECRET_FILE",
+            "CLAWFORGE_NOTIFIER_SMTP_SECRET",
+        ),
+        _ => anyhow::bail!("unsupported notification channel"),
+    };
+    if reference != expected {
+        anyhow::bail!("notification secret is not bound to this channel type");
     }
-    env::var(name).ok().filter(|value| !value.trim().is_empty())
+    load_optional(file_key, value_key)
 }
 
 fn configured_token() -> Result<String> {
-    if let Ok(path) = env::var("CLAWFORGE_NOTIFIER_TOKEN_FILE") {
-        if let Ok(value) = fs::read_to_string(path) {
-            if !value.trim().is_empty() {
-                return Ok(value.trim().to_string());
-            }
-        }
-    }
-    env::var("CLAWFORGE_NOTIFIER_TOKEN")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .context("CLAWFORGE_NOTIFIER_TOKEN_FILE or CLAWFORGE_NOTIFIER_TOKEN must be configured")
+    load_required_token("CLAWFORGE_NOTIFIER_TOKEN_FILE", "CLAWFORGE_NOTIFIER_TOKEN")
 }
 
-async fn deliver_webhook(client: &Client, event: &Event, token: Option<String>) -> Result<()> {
-    let mut request = client.post(&event.target).json(&event.payload);
+async fn deliver_webhook(
+    client: &Client,
+    url: Url,
+    event: &Event,
+    token: Option<String>,
+) -> Result<()> {
+    let mut request = client.post(url).json(&event.payload);
     if let Some(token) = token {
         request = request.bearer_auth(token);
     }
@@ -96,13 +114,8 @@ async fn deliver_webhook(client: &Client, event: &Event, token: Option<String>) 
     Ok(())
 }
 
-async fn deliver_smtp(event: &Event, password: Option<String>) -> Result<()> {
+async fn deliver_smtp(event: &Event, host: &str, password: Option<String>) -> Result<()> {
     let message = build_smtp_message(event)?;
-    let host = event
-        .config
-        .get("host")
-        .and_then(Value::as_str)
-        .context("smtp config.host missing")?;
     let user = event.config.get("username").and_then(Value::as_str);
     let builder = AsyncSmtpTransport::<Tokio1Executor>::relay(host)?;
     let builder = if let (Some(user), Some(password)) = (user, password) {
@@ -136,13 +149,49 @@ fn build_smtp_message(event: &Event) -> Result<Message> {
         .body(body)?)
 }
 
-async fn deliver(client: &Client, event: &Event) -> Result<()> {
-    let secret = secret_value(event.secret_ref.as_deref());
-    match event.channel_type.as_str() {
-        "webhook" => deliver_webhook(client, event, secret).await,
-        "matrix" => {
+async fn resolve_public(host: &str, port: u16) -> Result<Vec<SocketAddr>> {
+    let addresses = tokio::net::lookup_host((host, port))
+        .await
+        .context("notification host lookup failed")?
+        .collect::<Vec<_>>();
+    if addresses.is_empty()
+        || addresses
+            .iter()
+            .any(|address| !is_public_destination(address.ip()))
+    {
+        anyhow::bail!("notification host resolved to a forbidden address");
+    }
+    Ok(addresses)
+}
+
+async fn web_client(host: &str, port: u16, timeout: Duration) -> Result<Client> {
+    let addresses = resolve_public(host, port).await?;
+    Client::builder()
+        .timeout(timeout)
+        .redirect(Policy::none())
+        .resolve_to_addrs(host, &addresses)
+        .build()
+        .context("build pinned notification client")
+}
+
+async fn deliver(event: &Event, config: &Config) -> Result<()> {
+    let destination = validate_channel(
+        &event.channel_type,
+        &event.target,
+        event.secret_ref.as_deref(),
+        &event.config,
+        &config.allowed_hosts,
+    )?;
+    let secret = secret_value(&event.channel_type, event.secret_ref.as_deref())?;
+    match (event.channel_type.as_str(), destination) {
+        ("webhook", ValidatedChannel::Web { url, host, port }) => {
+            let client = web_client(&host, port, config.timeout).await?;
+            deliver_webhook(&client, url, event, secret).await
+        }
+        ("matrix", ValidatedChannel::Web { url, host, port }) => {
+            let client = web_client(&host, port, config.timeout).await?;
             let body = matrix_payload(event);
-            let mut request = client.post(&event.target).json(&body);
+            let mut request = client.post(url).json(&body);
             if let Some(token) = secret {
                 request = request.bearer_auth(token);
             }
@@ -152,15 +201,18 @@ async fn deliver(client: &Client, event: &Event) -> Result<()> {
             }
             Ok(())
         }
-        "smtp" => deliver_smtp(event, secret).await,
-        other => anyhow::bail!("unsupported notification channel {other}"),
+        ("smtp", ValidatedChannel::Smtp { host, port }) => {
+            resolve_public(&host, port).await?;
+            deliver_smtp(event, &host, secret).await
+        }
+        _ => anyhow::bail!("notification channel validation mismatch"),
     }
 }
 
 async fn poll_once(client: &Client, config: &Config) -> Result<()> {
     let events_response = client
         .get(format!(
-            "{}/internal/events/consume?consumer=notifier&limit=25",
+            "{}/internal/events/consume?limit=25",
             config.api_url.trim_end_matches('/')
         ))
         .bearer_auth(&config.token)
@@ -197,7 +249,7 @@ async fn poll_once(client: &Client, config: &Config) -> Result<()> {
         .error_for_status()?;
     let envelope: Envelope<Vec<Event>> = response.json().await?;
     for event in envelope.data {
-        let result = deliver(client, &event).await;
+        let result = deliver(&event, config).await;
         let (success, error) = match &result {
             Ok(()) => (true, None),
             Err(error) => (false, Some(error.to_string())),
@@ -245,6 +297,9 @@ fn config() -> Result<Config> {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(15),
         ),
+        allowed_hosts: allowed_hosts(
+            &env::var("CLAWFORGE_NOTIFIER_ALLOWED_HOSTS").unwrap_or_default(),
+        )?,
     })
 }
 
@@ -252,7 +307,10 @@ fn config() -> Result<Config> {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     let config = config()?;
-    let client = Client::builder().timeout(config.timeout).build()?;
+    let client = Client::builder()
+        .timeout(config.timeout)
+        .redirect(Policy::none())
+        .build()?;
     info!(api_url=%config.api_url, "Clawforge notifier started");
     let mut interval = tokio::time::interval(config.poll);
     loop {
@@ -281,12 +339,18 @@ async fn shutdown_signal() {
 mod tests {
     use super::*;
     #[test]
-    fn secret_values_are_loaded_from_environment_only() {
-        std::env::set_var("CLAWFORGE_NOTIFICATION_TEST_SECRET", "value");
+    fn channel_secret_ids_are_fixed_and_cannot_select_arbitrary_environment_values() {
+        std::env::set_var("CLAWFORGE_NOTIFIER_WEBHOOK_SECRET", "value");
+        std::env::set_var("CLAWFORGE_NOTIFICATION_TEST_SECRET", "must-not-be-readable");
         assert_eq!(
-            secret_value(Some("CLAWFORGE_NOTIFICATION_TEST_SECRET")).as_deref(),
+            secret_value("webhook", Some(WEBHOOK_SECRET_ID))
+                .unwrap()
+                .as_deref(),
             Some("value")
         );
+        assert!(secret_value("webhook", Some("CLAWFORGE_NOTIFICATION_TEST_SECRET")).is_err());
+        std::env::remove_var("CLAWFORGE_NOTIFIER_WEBHOOK_SECRET");
+        std::env::remove_var("CLAWFORGE_NOTIFICATION_TEST_SECRET");
     }
 
     #[test]
@@ -294,6 +358,11 @@ mod tests {
         assert_eq!(retry_delay(0), Duration::from_secs(1));
         assert_eq!(retry_delay(3), Duration::from_secs(8));
         assert_eq!(retry_delay(99), Duration::from_secs(3600));
+    }
+
+    #[tokio::test]
+    async fn dns_resolution_rejects_loopback_destinations() {
+        assert!(resolve_public("localhost", 443).await.is_err());
     }
 
     #[test]
@@ -328,7 +397,7 @@ mod tests {
             channel_type: "smtp".into(),
             payload: serde_json::json!({"risk_score":80}),
             retry_count: 0,
-            secret_ref: Some("SMTP_PASSWORD".into()),
+            secret_ref: Some(SMTP_SECRET_ID.into()),
             config: serde_json::json!({"from":"clawforge@example.test","host":"smtp.example.test"}),
         };
         let message = build_smtp_message(&event).expect("valid mock SMTP message");
@@ -377,7 +446,9 @@ mod tests {
             .timeout(Duration::from_secs(3))
             .build()
             .unwrap();
-        deliver_webhook(&client, &event, None).await.unwrap();
+        deliver_webhook(&client, Url::parse(&event.target).unwrap(), &event, None)
+            .await
+            .unwrap();
         task.await.unwrap();
     }
 }

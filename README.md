@@ -118,11 +118,20 @@ Requirements: Docker Engine and the Docker Compose plugin.
 git clone https://github.com/lesecuritae/clawforge.git
 cd clawforge
 cp .env.example .env
-# create private secret files from secrets/*.example
+./scripts/init-secrets.sh
+./scripts/validate-secrets.sh --bootstrap
 docker compose pull
 docker compose up -d
 curl http://127.0.0.1:8080/ready
 ```
+
+The initializer creates private, untracked files with restrictive permissions;
+it never overwrites existing secrets. The one-time administrator bootstrap
+secret is not mounted during normal operation. Enable it only with
+`compose.bootstrap.yml`, complete bootstrap, recreate the API with the base
+Compose file, and remove the bootstrap secret. The MCP service is similarly
+opt-in through the `agent` profile after replacing `mcp_agent_api_token` with
+an issued, read-only Agent API token.
 
 Use `docker compose up -d --build` for a local build. Published images are
 available from `ghcr.io/lesecuritae/clawforge-<service>:v1.0.0` (also published

@@ -2,7 +2,7 @@
 
 The worker is an ingestion and scoring service. A feed error, a single indicator, or a single ASN/BGP/RPKI signal cannot trigger a block. The policy boundary remains downstream of risk scoring and requires corroboration before a block decision.
 
-`/health` checks that the process and runtime configuration are valid. `/ready` additionally checks PostgreSQL and verifies that the applied sqlx migration set is complete. `/version` reports the application release and schema state. Database and provider credentials use Compose secret files by default; `.env` and non-example secret files are ignored by Git.
+`/health` checks that the process and runtime configuration are valid. `/ready` additionally checks PostgreSQL and verifies that the applied sqlx migration set is complete. `/version` reports the application release and schema state. Database and provider credentials use private Compose secret files; checked-in examples are never runtime defaults. Secret-file reads fail closed, and preflight enforces permissions, token strength, and separation. `.env` and non-example secret files are ignored by Git.
 
 Trusted infrastructure is administrator-registered and must be `Verified`. Tailscale, NetBird, VLAN, VPN, IP ranges, ASNs, and prefixes do not receive trust from their technology name. Risk history and audit events remain append-oriented so feed and trust decisions can be explained later.
 
@@ -20,6 +20,13 @@ is persisted. Event and consumer endpoints require an internal Docker Secret
 service token; administrative event reads require an Administrator or Operator
 credential. Delivery retries are bounded and dead-lettered without triggering
 security actions.
+
+Each internal token maps to one fixed service identity. Consumer names are
+derived by the API, and only the owning consumer may acknowledge a delivery.
+The separate operations producer can submit only allowlisted backup/health
+events and has no queue access. Notification targets use an exact host
+allowlist, fixed per-channel secret IDs, HTTPS without redirects, and public
+DNS results pinned for delivery.
 
 ## Agent and alert boundaries
 

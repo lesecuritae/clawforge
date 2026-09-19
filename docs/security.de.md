@@ -6,8 +6,11 @@ oder ein einzelnes ASN/BGP/RPKI-Signal kann keine Sperre auslösen.
 
 `/health` prüft Prozess und Runtime-Konfiguration. `/ready` prüft PostgreSQL
 und den vollständigen sqlx-Migrationsstand. `/version` meldet Release und
-Schema. Datenbank- und Provider-Credentials werden über Compose-Secret-Dateien
-bezogen; `.env` und echte Secret-Dateien sind von Git ausgeschlossen.
+Schema. Datenbank- und Provider-Credentials werden über private Compose-
+Secret-Dateien bezogen; eingecheckte Beispiele sind keine Runtime-Defaults.
+Secret-Dateifehler führen zum sicheren Abbruch, und ein Preflight prüft
+Dateirechte, Tokenstärke sowie getrennte interne Credentials. `.env` und echte
+Secret-Dateien sind von Git ausgeschlossen.
 
 Trusted Infrastructure muss vom Administrator registriert und `Verified` sein.
 Tailscale, NetBird, VLAN, VPN, IP-Bereiche, ASNs und Prefixes erhalten allein
@@ -29,6 +32,13 @@ für Feeds, Secrets, Tokens, Passwörter und API-Keys werden vor Speicherung
 entfernt. Interne Event- und Consumer-Endpunkte verlangen Service-Tokens aus
 Docker Secrets; wiederholte Zustellfehler werden begrenzt und in Dead Letters
 verschoben.
+
+Jeder interne Token steht für genau eine Dienstidentität. Die API leitet den
+Consumer daraus ab, und nur dessen Eigentümer darf eine Zustellung bestätigen.
+Ein getrenntes Operations-Producer-Token darf ausschließlich begrenzte Backup-
+und Health-Events einstellen und keine Queue lesen. Notification-Ziele werden
+über exakte Host-Allowlist, feste kanalgebundene Secret-IDs, redirectfreies
+HTTPS und vor der Zustellung gebundene öffentliche DNS-Ergebnisse geschützt.
 
 ## Agent- und Alert-Grenzen
 

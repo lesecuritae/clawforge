@@ -7,15 +7,15 @@ Backups werden außerhalb des Repositorys gespeichert und geschützt.
 ## Regelmäßiges Backup
 
 ```sh
-docker compose exec -T postgres pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
-  --format=custom --file=/tmp/clawforge.dump
-docker compose cp postgres:/tmp/clawforge.dump ./backup/clawforge-$(date -u +%Y%m%dT%H%M%SZ).dump
+./scripts/backup.sh ./backups
 ```
 
-Backup-Dateien enthalten sensible Betriebsdaten. Zugriff beschränken,
-verschlüsseln und nach einer definierten Retention rotieren. Secret-Dateien
-werden separat gesichert; Secretwerte gehören nicht in PostgreSQL-Dumps oder
-Git.
+Das Skript verwendet Verzeichnismodus `0700` und Dateimodus `0600`, prüft das
+Dump mit `pg_restore --list` und veröffentlicht es erst danach atomar. Ein
+fehlgeschlagenes oder ungültiges temporäres Dump wird entfernt. Backup-Dateien
+enthalten sensible Betriebsdaten. Zusätzlich verschlüsseln und nach einer
+definierten Retention rotieren. Secret-Dateien werden separat gesichert;
+Secretwerte gehören nicht in PostgreSQL-Dumps oder Git.
 
 ## Restore
 

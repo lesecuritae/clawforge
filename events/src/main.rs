@@ -1,8 +1,9 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
+use clawforge_secret::load_required_token;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::Value;
-use std::{env, fs, time::Duration};
+use std::{env, time::Duration};
 use tracing::{info, warn};
 
 #[derive(Deserialize)]
@@ -18,23 +19,13 @@ struct Config {
 }
 
 fn configured_token() -> Result<String> {
-    if let Ok(path) = env::var("CLAWFORGE_EVENTS_TOKEN_FILE") {
-        if let Ok(value) = fs::read_to_string(path) {
-            if !value.trim().is_empty() {
-                return Ok(value.trim().to_string());
-            }
-        }
-    }
-    env::var("CLAWFORGE_EVENTS_TOKEN")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .context("event service token is not configured")
+    load_required_token("CLAWFORGE_EVENTS_TOKEN_FILE", "CLAWFORGE_EVENTS_TOKEN")
 }
 
 async fn poll_once(client: &Client, config: &Config) -> Result<()> {
     let response = client
         .get(format!(
-            "{}/internal/events/consume?consumer=events&limit=50",
+            "{}/internal/events/consume?limit=50",
             config.api_url.trim_end_matches('/')
         ))
         .bearer_auth(&config.token)

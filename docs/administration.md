@@ -4,7 +4,7 @@ The administration API is a backend-only surface. It does not provide a public U
 
 ## Bootstrap and authentication
 
-On a new database, `POST /admin/auth/bootstrap` accepts a one-time bootstrap secret and an administrator password. The bootstrap secret is read from `CLAWFORGE_ADMIN_BOOTSTRAP_TOKEN_FILE` (Docker Secret in production) and is never written to PostgreSQL. Passwords are stored as Argon2 hashes.
+On a new database, `POST /admin/auth/bootstrap` accepts a one-time bootstrap secret and an administrator password. The bootstrap secret is read from `CLAWFORGE_ADMIN_BOOTSTRAP_TOKEN_FILE` (Docker Secret in production) and is never written to PostgreSQL. It is not mounted by the base Compose stack: temporarily apply `compose.bootstrap.yml`, complete bootstrap, recreate the API from `compose.yml`, and delete the secret file. Passwords are stored as Argon2 hashes.
 
 The response contains a short-lived session bearer token. Subsequent calls use `Authorization: Bearer <token>`. Sessions expire after twelve hours. Administrators can create API tokens with `POST /admin/auth/tokens`; only the hash, prefix, and metadata are stored, and the token is shown once. Rotation revokes the previous token before issuing a new one.
 
@@ -26,7 +26,10 @@ Trusted networks are managed at `/admin/trust-networks`. New registrations start
 
 `/admin/config` stores only allow-listed non-secret JSON settings such as intervals, thresholds, and network settings. Keys containing `secret`, `password`, `token`, or `api_key` are rejected. Provider credentials remain Docker Secret files and are injected through environment variables ending in `_FILE`; they are not returned by the API or persisted in the database.
 
-The bootstrap secret must be replaced before deployment. Revoke sessions and rotate API tokens after an operator or administrator leaves the system.
+Secret preflight rejects known placeholders, weak or duplicated internal
+tokens, permissive file modes, symlinks, and files not owned by the deployment
+user. The bootstrap secret must be removed after initial setup. Revoke sessions
+and rotate API tokens after an operator or administrator leaves the system.
 
 ## Rate limiting
 

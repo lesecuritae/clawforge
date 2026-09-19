@@ -300,10 +300,10 @@ Dateneigentümerschaft und zwei-Personen-Freigabe.
 
 ## Empfohlene erste Pull Requests
 
-1. `deployment-secret-hardening`: Beispiel-Secrets entkoppeln, Placeholder-
-   Erkennung und sichere Backup-Rechte.
-2. `internal-identity-hardening`: Dienst-/Consumer-Bindung und Notifier-Egress-
-   Schutz.
+1. `deployment-secret-hardening` (umgesetzt): Beispiel-Secrets entkoppeln,
+   Placeholder-Erkennung und sichere Backup-Rechte.
+2. `internal-identity-hardening` (umgesetzt): Dienst-/Consumer-Bindung und
+   Notifier-Egress-Schutz.
 3. `approval-audit-integrity`: Approval-State-Machine, atomare Audit-Outbox und
    PostgreSQL-Integrationstest in CI.
 4. `incident-correlation-convergence`: Legacy-Pfad konsolidieren und geschützte

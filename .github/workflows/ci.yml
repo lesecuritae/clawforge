@@ -61,8 +61,36 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+      - name: Create private test secrets
+        shell: bash
+        run: |
+          secret_dir="$RUNNER_TEMP/clawforge-secrets"
+          ./scripts/init-secrets.sh "$secret_dir"
+          for mapping in \
+            CLAWFORGE_POSTGRES_SECRET_FILE=postgres_password \
+            CLAWFORGE_DATABASE_URL_SECRET_FILE=database_url \
+            CLAWFORGE_ADMIN_BOOTSTRAP_SECRET_FILE=admin_bootstrap_token \
+            CLAWFORGE_ANALYZER_SECRET_FILE=analyzer_token \
+            CLAWFORGE_ANALYZER_API_KEY_SECRET_FILE=analyzer_api_key \
+            CLAWFORGE_NOTIFIER_SECRET_FILE=notifier_token \
+            CLAWFORGE_NOTIFICATION_WEBHOOK_SECRET_FILE=notifier_webhook_auth \
+            CLAWFORGE_NOTIFICATION_MATRIX_SECRET_FILE=notifier_matrix_auth \
+            CLAWFORGE_NOTIFICATION_SMTP_SECRET_FILE=notifier_smtp_password \
+            CLAWFORGE_EVENTS_SECRET_FILE=events_token \
+            CLAWFORGE_OPERATIONS_SECRET_FILE=operations_token \
+            CLAWFORGE_MCP_AGENT_TOKEN_FILE=mcp_agent_api_token \
+            CLAWFORGE_MCP_AUTH_TOKEN_FILE=mcp_auth_token \
+            CLAWFORGE_GITHUB_TOKEN_FILE=github_token \
+            CLAWFORGE_PROXMOX_TOKEN_FILE=proxmox_token \
+            CLAWFORGE_THREATFOX_SECRET_FILE=threatfox_auth_key \
+            CLAWFORGE_URLHAUS_SECRET_FILE=urlhaus_auth_key \
+            CLAWFORGE_MALWAREBAZAAR_SECRET_FILE=malwarebazaar_auth_key; do
+            printf '%s=%s/%s\n' "${mapping%%=*}" "$secret_dir" "${mapping#*=}" >> "$GITHUB_ENV"
+          done
+      - run: ./scripts/test-secret-hardening.sh
       - run: docker compose config --quiet
       - run: docker compose --profile observability config --quiet
+      - run: docker compose --profile agent config --quiet
       - run: docker compose build
 
   release-images:

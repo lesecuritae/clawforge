@@ -121,11 +121,20 @@ Voraussetzungen: Docker Engine und das Docker-Compose-Plugin.
 git clone https://github.com/lesecuritae/clawforge.git
 cd clawforge
 cp .env.example .env
-# private Secret-Dateien aus secrets/*.example anlegen
+./scripts/init-secrets.sh
+./scripts/validate-secrets.sh --bootstrap
 docker compose pull
 docker compose up -d
 curl http://127.0.0.1:8080/ready
 ```
+
+Der Initialisierer erzeugt private, nicht versionierte Dateien mit restriktiven
+Rechten und überschreibt keine vorhandenen Secrets. Das einmalige
+Admin-Bootstrap-Secret wird im Normalbetrieb nicht eingebunden. Es wird nur mit
+`compose.bootstrap.yml` aktiviert, nach dem Bootstrap wird die API wieder mit
+der Basis-Compose-Datei erzeugt und das Bootstrap-Secret entfernt. Auch MCP ist
+erst über das Profil `agent` aktiv, nachdem `mcp_agent_api_token` durch ein
+ausgestelltes Read-only-Agent-API-Token ersetzt wurde.
 
 Für einen lokalen Build: `docker compose up -d --build`. Veröffentlicht werden
 API, MCP, Frontend, Correlation, Incidents, Worker und Executor unter

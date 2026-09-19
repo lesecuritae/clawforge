@@ -8,6 +8,7 @@ use std::{env, net::IpAddr, time::Duration};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use clawforge_secret::load_required;
 use reqwest::{Client, Method, StatusCode};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -453,19 +454,9 @@ impl HttpFeedProvider {
 }
 
 fn secret_from_env(variable: &str) -> Result<String, ProviderError> {
-    if let Ok(value) = env::var(variable) {
-        if !value.trim().is_empty() {
-            return Ok(value);
-        }
-    }
     let file_variable = format!("{variable}_FILE");
-    let path =
-        env::var(&file_variable).map_err(|_| ProviderError::Configuration(variable.to_string()))?;
-    std::fs::read_to_string(&path)
-        .map(|value| value.trim().to_string())
-        .map_err(|error| {
-            ProviderError::Configuration(format!("{variable}: cannot read secret file: {error}"))
-        })
+    load_required(&file_variable, variable)
+        .map_err(|error| ProviderError::Configuration(format!("{variable}: {error}")))
 }
 
 fn classify(value: &str) -> Option<IndicatorType> {

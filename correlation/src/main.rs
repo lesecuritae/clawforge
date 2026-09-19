@@ -168,7 +168,7 @@ async fn main() -> Result<()> {
                         };
                         let error_text = result.as_ref().err().map(ToString::to_string);
                         if let Some(delivery_id) = delivery_id {
-                            if let Err(error) = store.complete_event_delivery(delivery_id, result.is_ok(), error_text.as_deref()).await {
+                            if let Err(error) = store.complete_event_delivery(delivery_id, "correlation", result.is_ok(), error_text.as_deref()).await {
                                 warn!(%error, "could not complete correlation delivery");
                             }
                         }

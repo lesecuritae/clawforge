@@ -1,7 +1,6 @@
 use std::{
     collections::HashSet,
     net::SocketAddr,
-    path::Path,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -19,6 +18,7 @@ use axum::{
     routing::get,
     Router,
 };
+use clawforge_secret::load_required_token;
 use reqwest::{Client, Url};
 use rmcp::{
     handler::server::wrapper::{Json, Parameters},
@@ -338,12 +338,12 @@ impl Config {
                 .unwrap_or_else(|_| "http://clawforge-api:8080".to_string()),
         )
         .context("invalid CLAWFORGE_AGENT_API_URL")?;
-        let agent_api_token = read_secret_env(
+        let agent_api_token = load_required_token(
             "CLAWFORGE_MCP_AGENT_TOKEN_FILE",
             "CLAWFORGE_MCP_AGENT_TOKEN",
         )?;
         let mcp_auth_token =
-            read_secret_env("CLAWFORGE_MCP_AUTH_TOKEN_FILE", "CLAWFORGE_MCP_AUTH_TOKEN")?;
+            load_required_token("CLAWFORGE_MCP_AUTH_TOKEN_FILE", "CLAWFORGE_MCP_AUTH_TOKEN")?;
         if agent_api_token == mcp_auth_token {
             return Err(anyhow!("MCP and Agent API credentials must be different"));
         }
@@ -410,20 +410,6 @@ fn parse_scopes(value: &str) -> Result<HashSet<String>> {
         return Err(anyhow!("unsupported or empty MCP scope list"));
     }
     Ok(scopes)
-}
-
-fn read_secret_env(file_key: &str, value_key: &str) -> Result<String> {
-    let value = if let Ok(path) = std::env::var(file_key) {
-        std::fs::read_to_string(Path::new(&path))
-            .with_context(|| format!("could not read {file_key}"))?
-    } else {
-        std::env::var(value_key).with_context(|| format!("{file_key} or {value_key} required"))?
-    };
-    let value = value.trim().to_string();
-    if value.is_empty() {
-        return Err(anyhow!("{file_key} cannot be empty"));
-    }
-    Ok(value)
 }
 
 fn redact(value: Value) -> Value {

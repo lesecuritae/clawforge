@@ -20,6 +20,8 @@ release source in the standard Compose deployment.
 
 ```sh
 cp .env.example .env
+./scripts/init-secrets.sh
+./scripts/validate-secrets.sh --bootstrap
 # keep the immutable release tag for production
 CLAWFORGE_IMAGE_TAG=v1.0.0
 docker compose pull
@@ -36,12 +38,19 @@ when tests and security checks pass. Use `v1.0.0` or `1.0.0` in production;
 
 1. Install Docker Engine and the Docker Compose plugin.
 2. Copy `.env.example` to `.env` and configure the image tag and ports.
-3. Create private secret files from `secrets/*.example`; never commit them.
+3. Run `./scripts/init-secrets.sh`, supply optional provider credentials, and
+   run `./scripts/validate-secrets.sh --bootstrap`. Generated private files are ignored by
+   Git and use `0600` permissions; checked-in example values are never runtime
+   defaults.
 4. Run `docker compose pull && docker compose up -d` (or build locally).
-5. Verify the API with `curl http://127.0.0.1:8080/health` and
+5. Temporarily recreate the API with `compose.bootstrap.yml`, complete the
+   one-time administrator bootstrap, recreate the API from `compose.yml`, and
+   delete `secrets/admin_bootstrap_token`.
+6. Verify the API with `curl http://127.0.0.1:8080/health` and
    `curl http://127.0.0.1:8080/ready`.
-6. Verify `curl http://127.0.0.1:8080/version` and MCP health from the internal
-   network at `http://clawforge-mcp:8090/health`.
+7. To use MCP, replace `mcp_agent_api_token` with an issued read-only Agent API
+   token and start `docker compose --profile agent up -d clawforge-mcp`. Then
+   verify its internal health endpoint at `http://clawforge-mcp:8090/health`.
 
 The API applies sqlx migrations before listening. `/ready` reports the
 PostgreSQL connection and applied migration count. Stop safely with
@@ -77,6 +86,7 @@ Enable optional services explicitly:
 docker compose --profile analysis up -d
 docker compose --profile cache up -d
 docker compose --profile observability up -d
+docker compose --profile agent up -d clawforge-mcp
 ```
 
 The analyzer remains isolated and receives only sanitized incident context.

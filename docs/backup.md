@@ -2,7 +2,10 @@
 
 The `clawforge-backup` Compose service creates a validated PostgreSQL custom
 format dump immediately at startup and every 24 hours thereafter. It keeps
-`CLAWFORGE_BACKUP_RETENTION_DAYS` days in the `clawforge-backups` volume.
+`CLAWFORGE_BACKUP_RETENTION_DAYS` days in the `clawforge-backups` volume. The
+backup directory uses mode `0700`; each dump is created privately, validated,
+and only then atomically published with mode `0600`. A failed or invalid dump
+is removed instead of being exposed as a usable backup.
 
 For an operator-managed backup, run:
 

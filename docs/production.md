@@ -7,14 +7,19 @@ MCP greift ausschließlich über die Agent API v1 zu.
 
 ## Produktionsstart
 
-1. `.env.example` kopieren und alle Secret-Dateien außerhalb von Git durch
-   hochentropische Werte ersetzen.
-2. `docker compose config` prüfen.
+1. `.env.example` nach `.env` kopieren und mit
+   `./scripts/init-secrets.sh` private Secret-Dateien erzeugen. Das Skript
+   überschreibt keine vorhandenen Werte.
+2. Optionale Provider-Credentials ergänzen und
+   `./scripts/validate-secrets.sh --bootstrap` sowie `docker compose config`
+   ausführen. Nach dem Bootstrap prüft `./scripts/validate-secrets.sh` den
+   Normalbetrieb ohne das entfernte Einmal-Secret.
 3. `docker compose up -d --build` ausführen.
 4. `/health` und `/ready` prüfen. `/ready` muss PostgreSQL verbinden und alle
    sqlx-Migrationen als aktuell melden.
-5. Admin Bootstrap einmalig durchführen und den Bootstrap-Token danach
-   rotieren beziehungsweise entfernen.
+5. Nur für den einmaligen Admin-Bootstrap die API mit
+   `compose.bootstrap.yml` neu erzeugen. Danach wieder die Basis-Compose-Datei
+   anwenden und `secrets/admin_bootstrap_token` entfernen.
 
 Alle Container verwenden einen unprivilegierten Benutzer, Read-only-
 Dateisysteme, `cap_drop: ALL`, `no-new-privileges`, begrenzte PID-/tmpfs-
@@ -23,9 +28,12 @@ Ressourcen und Compose-Healthchecks. Die interne Backend-Netzwerkzone ist
 
 ## OpenClaw und MCP
 
-Der interne MCP-Endpunkt ist `http://clawforge-mcp:8090/mcp`. Der MCP-Token
+MCP wird erst über das Profil `agent` gestartet. Der interne MCP-Endpunkt ist
+`http://clawforge-mcp:8090/mcp`. Der MCP-Token
 für OpenClaw und das ausgehende Agent-API-Token sind getrennte Docker
-Secrets. Der Standardzugang ist minimal read-only:
+Secrets. Vor dem Start muss das von `init-secrets.sh` angelegte
+`mcp_agent_api_token` durch ein tatsächlich ausgestelltes Agent-API-Token
+ersetzt werden. Der Standardzugang ist minimal read-only:
 
 ```text
 agent:operations:read
