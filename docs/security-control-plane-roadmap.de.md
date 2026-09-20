@@ -304,8 +304,8 @@ Dateneigentümerschaft und zwei-Personen-Freigabe.
    Placeholder-Erkennung und sichere Backup-Rechte.
 2. `internal-identity-hardening` (umgesetzt): Dienst-/Consumer-Bindung und
    Notifier-Egress-Schutz.
-3. `approval-audit-integrity`: Approval-State-Machine, atomare Audit-Outbox und
-   PostgreSQL-Integrationstest in CI.
+3. `approval-audit-integrity` (umgesetzt): Approval-State-Machine, atomare
+   Audit-Outbox und PostgreSQL-Integrationstest in CI.
 4. `incident-correlation-convergence`: Legacy-Pfad konsolidieren und geschützte
    IP-Korrelation von Read-Redaction trennen.
 5. `security-events-domain`: Event-Katalog, Envelope, Validatoren, Fixtures und

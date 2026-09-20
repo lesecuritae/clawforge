@@ -11,10 +11,16 @@ read-only MCP adapter.
   shell command or connector mutation.
 - Connector permissions are explicit. `read` is enabled for registered
   connectors; `execute` and `destructive` are disabled by default.
-- Approval policies describe the minimum approvals for each risk level. They
-  do not grant approval automatically.
+- Approval policies are enforced when the request is created. High and
+  critical requests need two different approvers, self-approval and duplicate
+  approval are rejected, approval windows expire, and every approval carries
+  the immutable request-context hash. PostgreSQL independently blocks invalid
+  transitions and attempts to mutate or delete approval records.
 - Idempotency keys, bounded retries, timeout metadata, and recovery records
   make requests auditable and prevent accidental duplicate submissions.
+- Execution mutations and their append-only audit/outbox records commit
+  atomically. Event publication can be retried without repeating the state
+  change or creating a second canonical event.
 
 ## Read-only operations state
 
@@ -47,6 +53,16 @@ separate reviewed release activates a specific connector action.
 Migration `0026_platform_hardening.sql` adds worker registration, leases,
 execution metrics, explicit RBAC permission mappings, and disabled connector
 action metadata. See [production-hardening-v0.11.md](production-hardening-v0.11.md).
+
+Migration `0029_execution_approval_integrity.sql` adds the execution approval
+ledger and the database-enforced transition matrix. Existing legacy requests
+without a requester identity or context hash fail closed and must be cancelled
+and recreated before approval.
+
+Migration `0030_audit_outbox.sql` adds the durable audit outbox and the
+append-only audit trigger. CI runs the ignored PostgreSQL suite against a real
+PostgreSQL 16 service, including an injected audit failure that proves approval
+and status changes roll back together.
 
 ## Dependency validation
 

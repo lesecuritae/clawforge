@@ -13,6 +13,22 @@ permissions:
 jobs:
   rust:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: clawforge_test
+          POSTGRES_USER: clawforge
+          POSTGRES_PASSWORD: test-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U clawforge -d clawforge_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      CLAWFORGE_TEST_DATABASE_URL: postgres://clawforge:test-password@127.0.0.1:5432/clawforge_test
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -20,6 +36,7 @@ jobs:
           components: rustfmt, clippy
       - run: cargo fmt --all -- --check
       - run: cargo test --workspace
+      - run: cargo test -p clawforge-storage --test postgres -- --ignored
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
   frontend:

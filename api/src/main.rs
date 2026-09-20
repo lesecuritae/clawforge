@@ -3890,7 +3890,9 @@ fn execution_view(value: &serde_json::Value) -> serde_json::Value {
         "started_at": value.get("started_at"), "finished_at": value.get("finished_at"),
         "result_summary": value.get("result_summary"), "error_summary": value.get("error_summary"),
         "retry_count": value.get("retry_count"), "max_retries": value.get("max_retries"),
-        "timeout_seconds": value.get("timeout_seconds"), "next_retry_at": value.get("next_retry_at")
+        "timeout_seconds": value.get("timeout_seconds"), "next_retry_at": value.get("next_retry_at"),
+        "required_approvals": value.get("required_approvals"), "approval_count": value.get("approval_count"),
+        "approval_expires_at": value.get("approval_expires_at")
     })
 }
 
@@ -4126,18 +4128,11 @@ async fn admin_create_execution(
             workflow_run_id: body.workflow_run_id,
             decision_id: body.decision_id,
             requested_by: principal.username.clone(),
+            requested_by_id: Some(principal.id),
             idempotency_key: body.idempotency_key,
         })
         .await
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "execution request rejected"))?;
-    audit(
-        &state,
-        &principal,
-        "execution_request_created",
-        &id.to_string(),
-        serde_json::json!({"action_id":body.action_id}),
-    )
-    .await;
     Ok(envelope(
         serde_json::json!({"id":id,"status":action.get("requires_approval").and_then(serde_json::Value::as_bool).map(|v| if v {"waiting_approval"} else {"pending"}).unwrap_or("pending")}),
         None,
@@ -4151,12 +4146,7 @@ async fn admin_execution_transition(
     status: &'static str,
 ) -> ApiResult<Json<ApiEnvelope<serde_json::Value>>> {
     let principal = authenticate(&state, &headers).await?;
-    let allowed_roles = if status == "approved" {
-        &["Administrator", "Approver"][..]
-    } else {
-        &["Administrator", "Operator"][..]
-    };
-    require_role(&principal, allowed_roles)?;
+    require_role(&principal, &["Administrator", "Operator"])?;
     state
         .store
         .update_execution_status(id, status, &principal.username, None, None)
@@ -4174,14 +4164,6 @@ async fn admin_execution_transition(
                 )
             }
         })?;
-    audit(
-        &state,
-        &principal,
-        &format!("execution_request_{status}"),
-        &id.to_string(),
-        serde_json::json!({}),
-    )
-    .await;
     Ok(envelope(serde_json::json!({"id":id,"status":status}), None))
 }
 
@@ -4190,7 +4172,21 @@ async fn admin_approve_execution(
     headers: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<ApiEnvelope<serde_json::Value>>> {
-    admin_execution_transition(State(state), headers, Path(id), "approved").await
+    let principal = authenticate(&state, &headers).await?;
+    require_role(&principal, &["Administrator", "Approver"])?;
+    let value = state
+        .store
+        .approve_execution_request(id, principal.id, &principal.username)
+        .await
+        .map_err(|error| {
+            let message = error.to_string();
+            if message.contains("not found") {
+                api_error(StatusCode::NOT_FOUND, "execution request not found")
+            } else {
+                api_error(StatusCode::CONFLICT, "execution approval is not available")
+            }
+        })?;
+    Ok(envelope(value, None))
 }
 async fn admin_cancel_execution(
     State(state): State<AppState>,

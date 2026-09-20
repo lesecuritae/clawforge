@@ -427,6 +427,8 @@ async fn migrations_and_restart_persist() -> anyhow::Result<()> {
         "event_delivery",
         "connector_permissions",
         "approval_policies",
+        "audit_outbox",
+        "execution_approvals",
         "execution_recovery",
         "entity_relationships",
         "execution_workers",
@@ -443,10 +445,21 @@ async fn migrations_and_restart_persist() -> anyhow::Result<()> {
     let maturity_columns: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM information_schema.columns WHERE table_name='execution_requests' AND column_name = ANY($1)",
     )
-    .bind(["idempotency_key", "retry_count", "max_retries", "timeout_seconds", "next_retry_at"])
+    .bind([
+        "idempotency_key",
+        "retry_count",
+        "max_retries",
+        "timeout_seconds",
+        "next_retry_at",
+        "requested_by_id",
+        "required_approvals",
+        "approval_expires_at",
+        "approval_context",
+        "approval_context_hash",
+    ])
     .fetch_one(restarted.pool())
     .await?;
-    assert_eq!(maturity_columns, 5);
+    assert_eq!(maturity_columns, 10);
     let high_policy: (i32, i32, String) = sqlx::query_as(
         "SELECT required_approvals, approval_timeout, escalation_rule FROM approval_policies WHERE risk_level='high'",
     )
@@ -489,6 +502,7 @@ async fn migrations_and_restart_persist() -> anyhow::Result<()> {
             workflow_run_id: None,
             decision_id: None,
             requested_by: "integration-test".into(),
+            requested_by_id: None,
             idempotency_key: Some("production-maturity-test-key".into()),
         })
         .await?;
@@ -498,6 +512,7 @@ async fn migrations_and_restart_persist() -> anyhow::Result<()> {
             workflow_run_id: None,
             decision_id: None,
             requested_by: "integration-test".into(),
+            requested_by_id: None,
             idempotency_key: Some("production-maturity-test-key".into()),
         })
         .await?;
@@ -520,6 +535,129 @@ async fn migrations_and_restart_persist() -> anyhow::Result<()> {
     let admin_id = restarted
         .create_admin_user("storage-admin", "Administrator", "argon2-hash")
         .await?;
+    let first_approver = restarted
+        .create_admin_user("storage-approver-one", "Approver", "argon2-hash")
+        .await?;
+    let second_approver = restarted
+        .create_admin_user("storage-approver-two", "Approver", "argon2-hash")
+        .await?;
+    let approval_action_id = uuid::Uuid::new_v4();
+    sqlx::query("INSERT INTO actions (id,connector_id,name,type,description,risk_level,required_scope,requires_approval,enabled) VALUES ($1,$2,$3,'connector_action','approval integration action','high','agent:action:read',true,true)")
+        .bind(approval_action_id)
+        .bind(connector_id)
+        .bind("test.two-person-approval")
+        .execute(restarted.pool())
+        .await?;
+    let approval_execution = restarted
+        .create_execution_request(&clawforge_storage::ExecutionRequestInput {
+            action_id: approval_action_id,
+            workflow_run_id: None,
+            decision_id: None,
+            requested_by: "storage-admin".into(),
+            requested_by_id: Some(admin_id),
+            idempotency_key: Some("two-person-approval-test-key".into()),
+        })
+        .await?;
+    assert!(restarted
+        .approve_execution_request(approval_execution, admin_id, "storage-admin")
+        .await
+        .is_err());
+    let first_approval = restarted
+        .approve_execution_request(approval_execution, first_approver, "storage-approver-one")
+        .await?;
+    assert_eq!(first_approval["status"], "waiting_approval");
+    assert_eq!(first_approval["approval_count"], 1);
+    assert!(restarted
+        .approve_execution_request(approval_execution, first_approver, "storage-approver-one",)
+        .await
+        .is_err());
+    assert!(
+        sqlx::query("UPDATE execution_requests SET status='approved' WHERE id=$1")
+            .bind(approval_execution)
+            .execute(restarted.pool())
+            .await
+            .is_err()
+    );
+    assert!(
+        sqlx::query("UPDATE execution_requests SET approval_context='{}'::jsonb WHERE id=$1")
+            .bind(approval_execution)
+            .execute(restarted.pool())
+            .await
+            .is_err()
+    );
+    sqlx::query("CREATE OR REPLACE FUNCTION test_reject_execution_audit() RETURNS TRIGGER LANGUAGE plpgsql AS $$ BEGIN IF NEW.actor='storage-approver-two' THEN RAISE EXCEPTION 'injected audit failure'; END IF; RETURN NEW; END $$")
+        .execute(restarted.pool())
+        .await?;
+    sqlx::query("CREATE TRIGGER test_reject_execution_audit BEFORE INSERT ON audit_events FOR EACH ROW EXECUTE FUNCTION test_reject_execution_audit()")
+        .execute(restarted.pool())
+        .await?;
+    assert!(restarted
+        .approve_execution_request(approval_execution, second_approver, "storage-approver-two")
+        .await
+        .is_err());
+    let approvals_after_audit_failure: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM execution_approvals WHERE execution_id=$1")
+            .bind(approval_execution)
+            .fetch_one(restarted.pool())
+            .await?;
+    assert_eq!(approvals_after_audit_failure, 1);
+    let status_after_audit_failure: String =
+        sqlx::query_scalar("SELECT status FROM execution_requests WHERE id=$1")
+            .bind(approval_execution)
+            .fetch_one(restarted.pool())
+            .await?;
+    assert_eq!(status_after_audit_failure, "waiting_approval");
+    sqlx::query("DROP TRIGGER test_reject_execution_audit ON audit_events")
+        .execute(restarted.pool())
+        .await?;
+    sqlx::query("DROP FUNCTION test_reject_execution_audit()")
+        .execute(restarted.pool())
+        .await?;
+    let second_approval = restarted
+        .approve_execution_request(approval_execution, second_approver, "storage-approver-two")
+        .await?;
+    assert_eq!(second_approval["status"], "approved");
+    assert_eq!(second_approval["approval_count"], 2);
+    let approval_audit_outbox: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_outbox WHERE event_type='execution_approval_recorded' AND resource=$1")
+        .bind(approval_execution.to_string())
+        .fetch_one(restarted.pool())
+        .await?;
+    assert_eq!(approval_audit_outbox, 2);
+    assert!(
+        sqlx::query("DELETE FROM execution_approvals WHERE execution_id=$1")
+            .bind(approval_execution)
+            .execute(restarted.pool())
+            .await
+            .is_err()
+    );
+    assert!(sqlx::query("INSERT INTO execution_requests (id,action_id,requested_by,status) VALUES ($1,$2,'database-bypass','approved')")
+        .bind(uuid::Uuid::new_v4())
+        .bind(approval_action_id)
+        .execute(restarted.pool())
+        .await
+        .is_err());
+    let expired_execution = uuid::Uuid::new_v4();
+    sqlx::query("INSERT INTO execution_requests (id,action_id,requested_by,requested_by_id,status,required_approvals,approval_expires_at,approval_context,approval_context_hash) VALUES ($1,$2,'storage-admin',$3,'waiting_approval',2,clock_timestamp()+INTERVAL '100 milliseconds','{}'::jsonb,$4)")
+        .bind(expired_execution)
+        .bind(approval_action_id)
+        .bind(admin_id)
+        .bind("a".repeat(64))
+        .execute(restarted.pool())
+        .await?;
+    sqlx::query("SELECT pg_sleep(0.2)")
+        .execute(restarted.pool())
+        .await?;
+    assert!(restarted
+        .approve_execution_request(expired_execution, first_approver, "storage-approver-one",)
+        .await
+        .is_err());
+    restarted.process_one_dry_run().await?;
+    let approved_status: String =
+        sqlx::query_scalar("SELECT status FROM execution_requests WHERE id=$1")
+            .bind(approval_execution)
+            .fetch_one(restarted.pool())
+            .await?;
+    assert_eq!(approved_status, "success");
     let raw_token = "token-is-never-stored";
     let token_hash = "hashed-token-value";
     let token_id = restarted

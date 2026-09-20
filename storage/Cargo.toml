@@ -12,6 +12,7 @@ clawforge-intelligence = { path = "../intelligence" }
 clawforge-risk = { path = "../risk" }
 sqlx.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 clawforge-secret = { path = "../secret" }

@@ -11,6 +11,7 @@ use clawforge_intelligence::{
     ProviderError, RpkiRecord, TrustedNetwork,
 };
 use clawforge_secret::{contains_placeholder, load_required};
+use sha2::{Digest, Sha256};
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 use std::env;
 use uuid::Uuid;
@@ -52,8 +53,12 @@ pub struct ExecutionRequestInput {
     pub workflow_run_id: Option<Uuid>,
     pub decision_id: Option<Uuid>,
     pub requested_by: String,
+    pub requested_by_id: Option<Uuid>,
     pub idempotency_key: Option<String>,
 }
+
+const DEFAULT_EXECUTION_MAX_RETRIES: i32 = 3;
+const DEFAULT_EXECUTION_TIMEOUT_SECONDS: i32 = 60;
 
 impl PostgresStore {
     pub async fn connect(database_url: &str) -> Result<Self> {
@@ -139,6 +144,67 @@ impl PostgresStore {
         Ok(row.map(|value| value.get::<i64, _>("version").to_string()))
     }
 
+    async fn insert_audit_outbox(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        actor: &str,
+        action: &str,
+        resource: &str,
+        details: &serde_json::Value,
+    ) -> Result<i64> {
+        let id = sqlx::query_scalar::<_, i64>(
+            "INSERT INTO audit_events (actor,action,resource,details) VALUES ($1,$2,$3,$4) RETURNING id",
+        )
+        .bind(actor)
+        .bind(action)
+        .bind(resource)
+        .bind(details)
+        .fetch_one(&mut **tx)
+        .await?;
+        sqlx::query("INSERT INTO audit_outbox (id,audit_event_id,event_type,resource,payload) VALUES ($1,$2,$3,$4,$5)")
+            .bind(Uuid::new_v4()).bind(id).bind(action).bind(resource).bind(details)
+            .execute(&mut **tx).await?;
+        Ok(id)
+    }
+
+    pub async fn flush_audit_outbox(&self, limit: i64) -> Result<u64> {
+        let rows = sqlx::query("SELECT id,audit_event_id,event_type,resource,payload FROM audit_outbox WHERE published_at IS NULL ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT $1")
+            .bind(limit.clamp(1, 500)).fetch_all(&self.pool).await?;
+        let mut published = 0;
+        for row in rows {
+            let outbox_id = row.get::<Uuid, _>("id");
+            let audit_event_id = row.get::<i64, _>("audit_event_id");
+            let event_type = row.get::<String, _>("event_type");
+            let resource = row.get::<String, _>("resource");
+            let payload = row.get::<serde_json::Value, _>("payload");
+            match self
+                .publish_event(
+                    &event_type,
+                    "audit",
+                    "info",
+                    chrono::Utc::now(),
+                    Some(&resource),
+                    payload,
+                    serde_json::json!({"audit_event_id": audit_event_id}),
+                    &format!("audit:{audit_event_id}"),
+                )
+                .await
+            {
+                Ok(_) => {
+                    sqlx::query("UPDATE audit_outbox SET published_at=NOW(),attempts=attempts+1,last_error=NULL WHERE id=$1 AND published_at IS NULL")
+                        .bind(outbox_id).execute(&self.pool).await?;
+                    published += 1;
+                }
+                Err(error) => {
+                    sqlx::query("UPDATE audit_outbox SET attempts=attempts+1,last_error=$2 WHERE id=$1 AND published_at IS NULL")
+                        .bind(outbox_id)
+                        .bind(error.to_string().chars().take(1000).collect::<String>())
+                        .execute(&self.pool).await?;
+                }
+            }
+        }
+        Ok(published)
+    }
+
     pub async fn record_audit_event(
         &self,
         actor: &str,
@@ -146,27 +212,10 @@ impl PostgresStore {
         resource: &str,
         details: serde_json::Value,
     ) -> Result<i64> {
-        let id = sqlx::query_scalar::<_, i64>(
-            "INSERT INTO audit_events (actor, action, resource, details) VALUES ($1, $2, $3, $4) RETURNING id",
-        )
-        .bind(actor)
-        .bind(action)
-        .bind(resource)
-        .bind(&details)
-        .fetch_one(&self.pool)
-        .await?;
-        let _ = self
-            .publish_event(
-                action,
-                "audit",
-                "info",
-                chrono::Utc::now(),
-                Some(resource),
-                details,
-                serde_json::json!({"audit_event_id": id}),
-                &format!("audit:{id}"),
-            )
-            .await;
+        let mut tx = self.pool.begin().await?;
+        let id = Self::insert_audit_outbox(&mut tx, actor, action, resource, &details).await?;
+        tx.commit().await?;
+        let _ = self.flush_audit_outbox(100).await;
         Ok(id)
     }
 
@@ -2365,7 +2414,7 @@ impl PostgresStore {
         status: Option<&str>,
         limit: i64,
     ) -> Result<Vec<serde_json::Value>> {
-        let rows = sqlx::query("SELECT e.id,e.action_id,e.workflow_run_id,e.decision_id,e.requested_by,e.status,e.created_at,e.started_at,e.finished_at,e.result_summary,e.error_summary,e.retry_count,e.max_retries,e.timeout_seconds,e.next_retry_at,a.name AS action_name,a.risk_level,a.requires_approval FROM execution_requests e JOIN actions a ON a.id=e.action_id WHERE ($1::uuid IS NULL OR e.id=$1) AND ($2::text IS NULL OR e.status=$2) ORDER BY e.created_at DESC LIMIT $3")
+        let rows = sqlx::query("SELECT e.id,e.action_id,e.workflow_run_id,e.decision_id,e.requested_by,e.status,e.created_at,e.started_at,e.finished_at,e.result_summary,e.error_summary,e.retry_count,e.max_retries,e.timeout_seconds,e.next_retry_at,e.required_approvals,e.approval_expires_at,(SELECT COUNT(*) FROM execution_approvals ea WHERE ea.execution_id=e.id AND ea.context_hash=e.approval_context_hash)::bigint AS approval_count,a.name AS action_name,a.risk_level,a.requires_approval FROM execution_requests e JOIN actions a ON a.id=e.action_id WHERE ($1::uuid IS NULL OR e.id=$1) AND ($2::text IS NULL OR e.status=$2) ORDER BY e.created_at DESC LIMIT $3")
             .bind(id).bind(status).bind(limit.clamp(1, 500)).fetch_all(&self.pool).await?;
         Ok(rows.into_iter().map(|r| serde_json::json!({
             "id": r.get::<Uuid,_>("id"), "action_id": r.get::<Uuid,_>("action_id"),
@@ -2376,12 +2425,14 @@ impl PostgresStore {
             "error_summary": r.get::<Option<String>,_>("error_summary"), "action_name": r.get::<String,_>("action_name"),
             "risk_level": r.get::<String,_>("risk_level"), "requires_approval": r.get::<bool,_>("requires_approval"),
             "retry_count": r.get::<i32,_>("retry_count"), "max_retries": r.get::<i32,_>("max_retries"),
-            "timeout_seconds": r.get::<i32,_>("timeout_seconds"), "next_retry_at": r.get::<Option<chrono::DateTime<chrono::Utc>>,_>("next_retry_at")
+            "timeout_seconds": r.get::<i32,_>("timeout_seconds"), "next_retry_at": r.get::<Option<chrono::DateTime<chrono::Utc>>,_>("next_retry_at"),
+            "required_approvals": r.get::<i32,_>("required_approvals"), "approval_count": r.get::<i64,_>("approval_count"),
+            "approval_expires_at": r.get::<Option<chrono::DateTime<chrono::Utc>>,_>("approval_expires_at")
         })).collect())
     }
 
     pub async fn create_execution_request(&self, input: &ExecutionRequestInput) -> Result<Uuid> {
-        let action = sqlx::query("SELECT enabled,requires_approval FROM actions WHERE id=$1")
+        let action = sqlx::query("SELECT a.name,a.risk_level,a.enabled,a.requires_approval,p.required_approvals,p.approval_timeout FROM actions a LEFT JOIN approval_policies p ON p.risk_level=a.risk_level WHERE a.id=$1")
             .bind(input.action_id)
             .fetch_optional(&self.pool)
             .await?
@@ -2389,7 +2440,28 @@ impl PostgresStore {
         if !action.get::<bool, _>("enabled") {
             anyhow::bail!("action is disabled")
         }
-        let status = if action.get::<bool, _>("requires_approval") {
+        let requires_approval = action.get::<bool, _>("requires_approval");
+        let required_approvals = if requires_approval {
+            action
+                .get::<Option<i32>, _>("required_approvals")
+                .ok_or_else(|| anyhow::anyhow!("approval policy not found"))?
+                .max(1)
+        } else {
+            0
+        };
+        let approval_timeout = if requires_approval {
+            Some(
+                action
+                    .get::<Option<i32>, _>("approval_timeout")
+                    .ok_or_else(|| anyhow::anyhow!("approval policy not found"))?,
+            )
+        } else {
+            None
+        };
+        if requires_approval && input.requested_by_id.is_none() {
+            anyhow::bail!("approval-gated execution requires a requester identity");
+        }
+        let status = if requires_approval {
             "waiting_approval"
         } else {
             "pending"
@@ -2400,27 +2472,133 @@ impl PostgresStore {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(|value| value.chars().take(160).collect::<String>());
+        let approval_context = serde_json::json!({
+            "version": 1,
+            "action_id": input.action_id,
+            "action_name": action.get::<String, _>("name"),
+            "risk_level": action.get::<String, _>("risk_level"),
+            "requires_approval": requires_approval,
+            "required_approvals": required_approvals,
+            "approval_timeout_seconds": approval_timeout,
+            "max_retries": DEFAULT_EXECUTION_MAX_RETRIES,
+            "execution_timeout_seconds": DEFAULT_EXECUTION_TIMEOUT_SECONDS,
+            "workflow_run_id": input.workflow_run_id,
+            "decision_id": input.decision_id,
+            "requested_by": input.requested_by.trim(),
+            "requested_by_id": input.requested_by_id,
+            "idempotency_key": idempotency_key,
+        });
+        let context_hash = execution_context_hash(&approval_context)?;
         if let Some(key) = idempotency_key.as_deref() {
-            if let Some(existing) = sqlx::query_scalar::<_, Uuid>(
-                "SELECT id FROM execution_requests WHERE idempotency_key=$1",
+            if let Some(existing) = sqlx::query(
+                "SELECT id,approval_context_hash FROM execution_requests WHERE idempotency_key=$1",
             )
             .bind(key)
             .fetch_optional(&self.pool)
             .await?
             {
-                return Ok(existing);
+                if existing
+                    .get::<Option<String>, _>("approval_context_hash")
+                    .as_deref()
+                    == Some(context_hash.as_str())
+                {
+                    return Ok(existing.get("id"));
+                }
+                anyhow::bail!("idempotency key is already bound to another execution request");
             }
         }
         let id = Uuid::new_v4();
-        sqlx::query("INSERT INTO execution_requests (id,action_id,workflow_run_id,decision_id,requested_by,status,idempotency_key) VALUES ($1,$2,$3,$4,$5,$6,$7)").bind(id).bind(input.action_id).bind(input.workflow_run_id).bind(input.decision_id).bind(input.requested_by.trim()).bind(status).bind(idempotency_key).execute(&self.pool).await?;
-        self.record_audit_event(
+        let approval_expires_at = approval_timeout
+            .map(|seconds| chrono::Utc::now() + chrono::Duration::seconds(i64::from(seconds)));
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("INSERT INTO execution_requests (id,action_id,workflow_run_id,decision_id,requested_by,requested_by_id,status,idempotency_key,required_approvals,approval_expires_at,approval_context,approval_context_hash,max_retries,timeout_seconds) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)")
+            .bind(id).bind(input.action_id).bind(input.workflow_run_id).bind(input.decision_id)
+            .bind(input.requested_by.trim()).bind(input.requested_by_id).bind(status)
+            .bind(idempotency_key).bind(required_approvals).bind(approval_expires_at)
+            .bind(&approval_context).bind(&context_hash).bind(DEFAULT_EXECUTION_MAX_RETRIES)
+            .bind(DEFAULT_EXECUTION_TIMEOUT_SECONDS).execute(&mut *tx).await?;
+        Self::insert_audit_outbox(
+            &mut tx,
             &input.requested_by,
             "execution_request_created",
             &id.to_string(),
-            serde_json::json!({"action_id":input.action_id,"status":status}),
+            &serde_json::json!({"action_id":input.action_id,"status":status,"context_hash":context_hash}),
         )
         .await?;
+        tx.commit().await?;
+        let _ = self.flush_audit_outbox(100).await;
         Ok(id)
+    }
+
+    pub async fn approve_execution_request(
+        &self,
+        id: Uuid,
+        approver_id: Uuid,
+        actor: &str,
+    ) -> Result<serde_json::Value> {
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query("SELECT status,requested_by_id,required_approvals,approval_expires_at,approval_context,approval_context_hash FROM execution_requests WHERE id=$1 FOR UPDATE")
+            .bind(id).fetch_optional(&mut *tx).await?
+            .ok_or_else(|| anyhow::anyhow!("execution request not found"))?;
+        if row.get::<String, _>("status") != "waiting_approval" {
+            anyhow::bail!("execution request is not waiting for approval");
+        }
+        if row.get::<Option<Uuid>, _>("requested_by_id") == Some(approver_id) {
+            anyhow::bail!("execution requester cannot approve the request");
+        }
+        let expires_at = row
+            .get::<Option<chrono::DateTime<chrono::Utc>>, _>("approval_expires_at")
+            .ok_or_else(|| anyhow::anyhow!("execution approval window missing"))?;
+        if expires_at <= chrono::Utc::now() {
+            anyhow::bail!("execution approval window expired");
+        }
+        let context = row.get::<serde_json::Value, _>("approval_context");
+        let stored_hash = row
+            .get::<Option<String>, _>("approval_context_hash")
+            .ok_or_else(|| anyhow::anyhow!("execution approval context missing"))?;
+        if execution_context_hash(&context)? != stored_hash {
+            anyhow::bail!("execution approval context mismatch");
+        }
+        let inserted = sqlx::query("INSERT INTO execution_approvals (id,execution_id,approver_id,approver_name,context_hash) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (execution_id,approver_id) DO NOTHING")
+            .bind(Uuid::new_v4()).bind(id).bind(approver_id).bind(actor).bind(&stored_hash)
+            .execute(&mut *tx).await?;
+        if inserted.rows_affected() != 1 {
+            anyhow::bail!("identity has already approved this execution request");
+        }
+        let approval_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM execution_approvals WHERE execution_id=$1 AND context_hash=$2",
+        )
+        .bind(id)
+        .bind(&stored_hash)
+        .fetch_one(&mut *tx)
+        .await?;
+        let required_approvals = row.get::<i32, _>("required_approvals");
+        let status = if approval_count >= i64::from(required_approvals) {
+            sqlx::query("UPDATE execution_requests SET status='approved' WHERE id=$1")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            "approved"
+        } else {
+            "waiting_approval"
+        };
+        Self::insert_audit_outbox(
+            &mut tx,
+            actor,
+            "execution_approval_recorded",
+            &id.to_string(),
+            &serde_json::json!({"approval_count":approval_count,"required_approvals":required_approvals,"status":status,"context_hash":stored_hash}),
+        )
+        .await?;
+        tx.commit().await?;
+        let _ = self.flush_audit_outbox(100).await;
+        Ok(serde_json::json!({
+            "id": id,
+            "status": status,
+            "approval_count": approval_count,
+            "required_approvals": required_approvals,
+            "approval_expires_at": expires_at,
+        }))
     }
 
     pub async fn update_execution_status(
@@ -2446,17 +2624,31 @@ impl PostgresStore {
         ) {
             anyhow::bail!("invalid execution status")
         }
-        let changed = sqlx::query("UPDATE execution_requests SET status=$2, started_at=CASE WHEN $2 IN ('starting','running') THEN NOW() ELSE started_at END, finished_at=CASE WHEN $2 IN ('success','completed','failed','timeout','rollback_required','cancelled') THEN NOW() ELSE finished_at END, result_summary=COALESCE($3,result_summary), error_summary=COALESCE($4,error_summary) WHERE id=$1 AND status IN ('waiting_approval','pending','queued','approved','starting','running')").bind(id).bind(status).bind(result).bind(error).execute(&self.pool).await?;
+        let mut tx = self.pool.begin().await?;
+        let current = sqlx::query_scalar::<_, String>(
+            "SELECT status FROM execution_requests WHERE id=$1 FOR UPDATE",
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("execution request is not available"))?;
+        if !execution_status_transition_allowed(&current, status) {
+            anyhow::bail!("execution status transition is not allowed");
+        }
+        let changed = sqlx::query("UPDATE execution_requests SET status=$2, started_at=CASE WHEN $2 IN ('starting','running') THEN NOW() ELSE started_at END, finished_at=CASE WHEN $2 IN ('success','completed','failed','timeout','rollback_required','cancelled') THEN NOW() ELSE finished_at END, result_summary=COALESCE($3,result_summary), error_summary=COALESCE($4,error_summary) WHERE id=$1 AND status=$5").bind(id).bind(status).bind(result).bind(error).bind(&current).execute(&mut *tx).await?;
         if changed.rows_affected() == 0 {
             anyhow::bail!("execution request is not available")
         }
-        self.record_audit_event(
+        Self::insert_audit_outbox(
+            &mut tx,
             actor,
             &format!("execution_request_{status}"),
             &id.to_string(),
-            serde_json::json!({"status":status}),
+            &serde_json::json!({"previous_status":current,"status":status}),
         )
         .await?;
+        tx.commit().await?;
+        let _ = self.flush_audit_outbox(100).await;
         Ok(())
     }
 
@@ -2601,49 +2793,67 @@ impl PostgresStore {
         let started = std::time::Instant::now();
         // Reclaim leases from workers that stopped heartbeating. The request
         // is queued again only when it was still in a non-terminal state.
+        let mut maintenance_tx = self.pool.begin().await?;
         sqlx::query("UPDATE execution_leases SET status='expired',updated_at=NOW() WHERE status='active' AND expires_at<=NOW()")
-            .execute(&self.pool)
+            .execute(&mut *maintenance_tx)
             .await?;
-        sqlx::query("UPDATE execution_requests SET status='queued',started_at=NULL,next_retry_at=NULL,error_summary='worker lease expired; request reclaimed' WHERE id IN (SELECT execution_id FROM execution_leases WHERE status='expired') AND status IN ('starting','running')")
-            .execute(&self.pool)
+        let reclaimed: Vec<Uuid> = sqlx::query_scalar("UPDATE execution_requests SET status='queued',started_at=NULL,next_retry_at=NULL,error_summary='worker lease expired; request reclaimed' WHERE id IN (SELECT execution_id FROM execution_leases WHERE status='expired') AND status IN ('starting','running') RETURNING id")
+            .fetch_all(&mut *maintenance_tx).await?;
+        for id in &reclaimed {
+            Self::insert_audit_outbox(
+                &mut maintenance_tx,
+                "executor",
+                "execution_request_reclaimed",
+                &id.to_string(),
+                &serde_json::json!({"mode":"dry_run","reason":"lease_expired"}),
+            )
             .await?;
+        }
         let timed_out: Vec<Uuid> = sqlx::query_scalar("UPDATE execution_requests SET status='timeout',finished_at=NOW(),error_summary='dry-run execution timeout' WHERE status IN ('starting','running') AND started_at IS NOT NULL AND started_at < NOW() - (timeout_seconds * INTERVAL '1 second') RETURNING id")
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *maintenance_tx)
             .await?;
-        for id in timed_out {
-            self.record_audit_event(
+        for id in &timed_out {
+            Self::insert_audit_outbox(
+                &mut maintenance_tx,
                 "executor",
                 "execution_request_timeout",
                 &id.to_string(),
-                serde_json::json!({"mode":"dry_run"}),
+                &serde_json::json!({"mode":"dry_run"}),
             )
             .await?;
         }
         let retryable: Vec<Uuid> = sqlx::query_scalar("UPDATE execution_requests SET status='queued',retry_count=retry_count+1,next_retry_at=NULL WHERE status='failed' AND retry_count < max_retries AND (next_retry_at IS NULL OR next_retry_at<=NOW()) RETURNING id")
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *maintenance_tx)
             .await?;
-        for id in retryable {
-            self.record_audit_event(
+        for id in &retryable {
+            Self::insert_audit_outbox(
+                &mut maintenance_tx,
                 "executor",
                 "execution_request_requeued",
                 &id.to_string(),
-                serde_json::json!({"mode":"dry_run"}),
+                &serde_json::json!({"mode":"dry_run"}),
             )
             .await?;
         }
-        let id: Option<Uuid> = sqlx::query_scalar("UPDATE execution_requests SET status='starting',started_at=NOW() WHERE id=(SELECT id FROM execution_requests WHERE status IN ('approved','pending','queued') ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1) RETURNING id").fetch_optional(&self.pool).await?;
+        maintenance_tx.commit().await?;
+
+        let mut claim_tx = self.pool.begin().await?;
+        let id: Option<Uuid> = sqlx::query_scalar("UPDATE execution_requests SET status='starting',started_at=NOW() WHERE id=(SELECT id FROM execution_requests WHERE status IN ('approved','pending','queued') ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1) RETURNING id").fetch_optional(&mut *claim_tx).await?;
         if let Some(id) = id {
             if let Some(worker_id) = worker_id {
                 sqlx::query("INSERT INTO execution_leases (id,execution_id,worker_id,expires_at) VALUES ($1,$2,$3,NOW()+INTERVAL '2 minutes') ON CONFLICT (execution_id) DO UPDATE SET worker_id=$3,status='active',expires_at=NOW()+INTERVAL '2 minutes',updated_at=NOW()")
-                    .bind(Uuid::new_v4()).bind(id).bind(worker_id).execute(&self.pool).await?;
+                    .bind(Uuid::new_v4()).bind(id).bind(worker_id).execute(&mut *claim_tx).await?;
             }
-            self.record_audit_event(
+            Self::insert_audit_outbox(
+                &mut claim_tx,
                 "executor",
                 "execution_request_starting",
                 &id.to_string(),
-                serde_json::json!({"mode":"dry_run"}),
+                &serde_json::json!({"mode":"dry_run"}),
             )
             .await?;
+            claim_tx.commit().await?;
+            let _ = self.flush_audit_outbox(100).await;
             self.update_execution_status(id, "running", "executor", None, None)
                 .await?;
             self.update_execution_status(
@@ -2666,6 +2876,9 @@ impl PostgresStore {
                 )
                 .await?;
             }
+        } else {
+            claim_tx.commit().await?;
+            let _ = self.flush_audit_outbox(100).await;
         }
         Ok(())
     }
@@ -3434,6 +3647,39 @@ fn incident_status_transition_allowed(current: &str, next: &str) -> bool {
     }
 }
 
+fn execution_context_hash(context: &serde_json::Value) -> Result<String> {
+    let encoded = serde_json::to_vec(context)?;
+    let mut hasher = Sha256::new();
+    hasher.update(encoded);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn execution_status_transition_allowed(current: &str, next: &str) -> bool {
+    matches!(
+        (current, next),
+        ("waiting_approval", "approved" | "cancelled")
+            | ("pending", "queued" | "starting" | "cancelled")
+            | ("approved", "queued" | "starting" | "cancelled")
+            | ("queued", "starting" | "cancelled")
+            | (
+                "starting",
+                "running" | "queued" | "failed" | "timeout" | "rollback_required" | "cancelled"
+            )
+            | (
+                "running",
+                "success"
+                    | "completed"
+                    | "queued"
+                    | "failed"
+                    | "timeout"
+                    | "rollback_required"
+                    | "cancelled"
+            )
+            | ("failed", "queued")
+            | ("rollback_required", "cancelled")
+    )
+}
+
 #[derive(Debug, Clone)]
 pub struct MigrationStatus {
     pub applied: usize,
@@ -3511,7 +3757,10 @@ impl NetworkSink for PostgresStore {
 
 #[cfg(test)]
 mod incident_lifecycle_tests {
-    use super::{canonical_incident_status, incident_status_transition_allowed};
+    use super::{
+        canonical_incident_status, execution_status_transition_allowed,
+        incident_status_transition_allowed,
+    };
 
     #[test]
     fn candidate_lifecycle_starts_detected_and_allows_forward_progression() {
@@ -3537,5 +3786,27 @@ mod incident_lifecycle_tests {
         ));
         assert_eq!(canonical_incident_status("unknown"), None);
         assert_eq!(canonical_incident_status("Ignored"), Some("closed"));
+    }
+
+    #[test]
+    fn execution_transitions_are_explicit_and_terminal_states_stay_terminal() {
+        assert!(execution_status_transition_allowed(
+            "waiting_approval",
+            "approved"
+        ));
+        assert!(execution_status_transition_allowed("approved", "starting"));
+        assert!(execution_status_transition_allowed("starting", "running"));
+        assert!(execution_status_transition_allowed("running", "success"));
+        assert!(execution_status_transition_allowed("failed", "queued"));
+        assert!(!execution_status_transition_allowed(
+            "waiting_approval",
+            "running"
+        ));
+        assert!(!execution_status_transition_allowed("pending", "success"));
+        assert!(!execution_status_transition_allowed("success", "running"));
+        assert!(!execution_status_transition_allowed(
+            "cancelled",
+            "approved"
+        ));
     }
 }
