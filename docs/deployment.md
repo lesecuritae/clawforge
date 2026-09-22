@@ -51,6 +51,25 @@ when tests and security checks pass. Use `v1.0.0` or `1.0.0` in production;
 7. To use MCP, replace `mcp_agent_api_token` with an issued read-only Agent API
    token and start `docker compose --profile agent up -d clawforge-mcp`. Then
    verify its internal health endpoint at `http://clawforge-mcp:8090/health`.
+   The Streamable HTTP transport only accepts `localhost`/`127.0.0.1`/`::1`
+   `Host` headers by default (DNS-rebinding protection, not authentication).
+   A client outside `clawforge-mcp`'s own network namespace — the common case,
+   since MCP clients such as OpenClaw run as a separate process or host — is
+   refused with `403 Forbidden: Host header is not allowed` until you add its
+   connecting authority to `CLAWFORGE_MCP_ALLOWED_HOSTS`. This setting only
+   widens the Host allowlist; `mcp_auth_token` remains the actual access
+   control and every request still needs it.
+
+   `backend` is `internal: true` by design, so `docker compose`'s `ports:`
+   mechanism cannot actually publish a host port for a container on it (the
+   binding is accepted and recorded but silently never forwards traffic).
+   `clawforge-mcp` therefore gets a fixed address on `backend`
+   (`CLAWFORGE_MCP_BACKEND_IP`, default `10.77.77.90`) instead. A client
+   running on the same Docker host — OpenClaw's usual deployment — reaches it
+   directly over the bridge network at `http://10.77.77.90:8090/mcp`; set
+   `CLAWFORGE_MCP_ALLOWED_HOSTS=10.77.77.90:8090` to match (already the
+   default in `.env.example`). Change `CLAWFORGE_BACKEND_SUBNET` first if
+   `10.77.77.0/24` collides with another Docker network on the host.
 
 The one-shot `clawforge-migrate` service applies sqlx migrations with the
 database owner. `clawforge-db-roles` then idempotently provisions separate,

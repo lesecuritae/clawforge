@@ -81,6 +81,15 @@ struct Config {
     mcp_auth_token: String,
     mcp_scopes: HashSet<String>,
     timeout: Duration,
+    /// `Host` header authorities accepted by the Streamable HTTP transport, in
+    /// addition to the SDK's built-in loopback defaults (`localhost`,
+    /// `127.0.0.1`, `::1`). Empty unless an operator opts in via
+    /// `CLAWFORGE_MCP_ALLOWED_HOSTS`; deployments where the MCP client is not
+    /// in the server's own network namespace (every container-to-container or
+    /// cross-host case) must set this explicitly. This is DNS-rebinding
+    /// protection, not authentication: the bearer token in `mcp_auth_token`
+    /// remains the actual access control.
+    mcp_allowed_hosts: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -299,10 +308,24 @@ struct ApiEnvelope {
 #[derive(Debug, Serialize, JsonSchema)]
 struct ToolResponse {
     status: String,
+    #[schemars(schema_with = "any_json_value_schema")]
     data: Value,
     timestamp: String,
+    #[schemars(schema_with = "any_json_value_schema")]
     pagination: Option<Value>,
     errors: Vec<String>,
+}
+
+/// `serde_json::Value`'s built-in schemars impl emits the JSON Schema boolean
+/// shorthand `true` ("matches anything"). That is spec-compliant, but MCP
+/// clients that validate `outputSchema` with a Zod-derived parser (OpenClaw's
+/// bundled MCP client, at least) reject a bare boolean where they expect a
+/// schema object and refuse to register the tool at all. An empty object
+/// schema `{}` means exactly the same thing per JSON Schema and every
+/// observed consumer accepts it, so every "any JSON value" field in
+/// [`ToolResponse`] uses this instead of the derive's default.
+fn any_json_value_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    serde_json::Map::new().into()
 }
 
 impl From<ApiEnvelope> for ToolResponse {
@@ -359,14 +382,58 @@ impl Config {
         if timeout.is_zero() {
             return Err(anyhow!("MCP upstream timeout must be greater than zero"));
         }
+        let mcp_allowed_hosts =
+            parse_allowed_hosts(&std::env::var("CLAWFORGE_MCP_ALLOWED_HOSTS").unwrap_or_default())?;
         Ok(Self {
             agent_api_url,
             agent_api_token,
             mcp_auth_token,
             mcp_scopes,
             timeout,
+            mcp_allowed_hosts,
         })
     }
+}
+
+/// Parse a comma-separated `CLAWFORGE_MCP_ALLOWED_HOSTS` value into a
+/// deduplicated, order-preserving authority list. An unset or blank
+/// environment variable yields an empty list, which leaves the transport's
+/// loopback-only default untouched; a value containing only blank entries
+/// (e.g. `","`) is rejected so a misconfiguration cannot silently fall back
+/// to that safe default when the operator meant to widen it.
+fn parse_allowed_hosts(value: &str) -> Result<Vec<String>> {
+    if value.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut seen = HashSet::new();
+    let mut hosts = Vec::new();
+    for entry in value.split(',') {
+        let host = entry.trim();
+        if host.is_empty() {
+            continue;
+        }
+        if seen.insert(host.to_string()) {
+            hosts.push(host.to_string());
+        }
+    }
+    if hosts.is_empty() {
+        return Err(anyhow!(
+            "CLAWFORGE_MCP_ALLOWED_HOSTS must contain at least one non-empty host when set"
+        ));
+    }
+    Ok(hosts)
+}
+
+/// Add operator-configured authorities to the transport's built-in loopback
+/// list without dropping or reordering the defaults, and without duplicating
+/// an authority the defaults (or an earlier entry) already cover.
+fn extend_allowed_hosts(mut base: Vec<String>, extra: &[String]) -> Vec<String> {
+    for host in extra {
+        if !base.contains(host) {
+            base.push(host.clone());
+        }
+    }
+    base
 }
 
 fn parse_scopes(value: &str) -> Result<HashSet<String>> {
@@ -1536,10 +1603,17 @@ fn build_app(config: Arc<Config>) -> Router {
     let state = AppState {
         config: config.clone(),
     };
-    let service_config = StreamableHttpServerConfig::default()
+    let mut service_config = StreamableHttpServerConfig::default()
         .with_legacy_session_mode(false)
         .with_json_response(true)
         .with_sse_keep_alive(None);
+    if !config.mcp_allowed_hosts.is_empty() {
+        let hosts = extend_allowed_hosts(
+            service_config.allowed_hosts.clone(),
+            &config.mcp_allowed_hosts,
+        );
+        service_config = service_config.with_allowed_hosts(hosts);
+    }
     let service: StreamableHttpService<McpServer, LocalSessionManager> = StreamableHttpService::new(
         move || Ok(McpServer::new(config.clone())),
         Default::default(),
@@ -1574,6 +1648,7 @@ mod tests {
             mcp_auth_token: "mcp-secret".into(),
             mcp_scopes: scopes.iter().map(|scope| (*scope).to_string()).collect(),
             timeout: Duration::from_millis(50),
+            mcp_allowed_hosts: Vec::new(),
         })
     }
 
@@ -1634,6 +1709,88 @@ mod tests {
         assert!(knowledge.require_scope(SCOPE_SECURITY).is_err());
     }
 
+    #[test]
+    fn unset_allowed_hosts_keep_the_transport_default_untouched() {
+        assert_eq!(parse_allowed_hosts("").unwrap(), Vec::<String>::new());
+        assert_eq!(parse_allowed_hosts("   ").unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn allowed_hosts_are_trimmed_deduplicated_and_order_preserved() {
+        let hosts = parse_allowed_hosts(" clawforge-mcp:8090 , 10.0.0.5:8090,clawforge-mcp:8090 ,")
+            .unwrap();
+        assert_eq!(hosts, vec!["clawforge-mcp:8090", "10.0.0.5:8090"]);
+    }
+
+    #[test]
+    fn allowed_hosts_reject_a_value_with_only_blank_entries() {
+        assert!(parse_allowed_hosts(",  ,").is_err());
+    }
+
+    #[test]
+    fn tool_output_schemas_never_use_the_json_schema_boolean_shorthand() {
+        // `{"properties": {"data": true}}` is valid JSON Schema ("any value"),
+        // but Zod-based MCP clients (OpenClaw's bundled client, at least)
+        // reject a bare boolean where they expect a schema object and refuse
+        // to register the tool. Every `any` field must render as `{}`
+        // instead; see `any_json_value_schema`.
+        let server = McpServer::new(test_config(&[SCOPE_ALL]));
+        let tools = server.tool_router.list_all();
+        assert!(!tools.is_empty());
+        let mut checked_a_data_field = false;
+        for tool in &tools {
+            let Some(output_schema) = &tool.output_schema else {
+                continue;
+            };
+            let Some(properties) = output_schema.get("properties").and_then(Value::as_object)
+            else {
+                continue;
+            };
+            for (field, schema) in properties {
+                let tool_name = &tool.name;
+                assert!(
+                    !schema.is_boolean(),
+                    "tool {tool_name} field {field} uses the JSON Schema boolean shorthand ({schema}); MCP clients that expect a schema object will reject this tool"
+                );
+                if field == "data" {
+                    checked_a_data_field = true;
+                }
+            }
+        }
+        assert!(
+            checked_a_data_field,
+            "expected at least one tool response to have a data field to check"
+        );
+    }
+
+    #[test]
+    fn extend_allowed_hosts_keeps_defaults_and_adds_new_authorities() {
+        let base = StreamableHttpServerConfig::default().allowed_hosts;
+        assert!(base.contains(&"localhost".to_string()));
+        assert!(base.contains(&"127.0.0.1".to_string()));
+        assert!(base.contains(&"::1".to_string()));
+        let extended = extend_allowed_hosts(base.clone(), &["clawforge-mcp:8090".to_string()]);
+        for default_host in &base {
+            assert!(extended.contains(default_host));
+        }
+        assert!(extended.contains(&"clawforge-mcp:8090".to_string()));
+        assert_eq!(extended.len(), base.len() + 1);
+    }
+
+    #[test]
+    fn extend_allowed_hosts_does_not_duplicate_an_authority_already_present() {
+        let base = vec!["127.0.0.1".to_string()];
+        let extended = extend_allowed_hosts(base.clone(), &["127.0.0.1".to_string()]);
+        assert_eq!(extended, base);
+    }
+
+    #[test]
+    fn build_app_accepts_a_configuration_with_extra_allowed_hosts() {
+        let mut config = (*test_config(&[SCOPE_EVENTS])).clone();
+        config.mcp_allowed_hosts = vec!["clawforge-mcp:8090".to_string()];
+        let _ = build_app(Arc::new(config));
+    }
+
     #[tokio::test]
     async fn upstream_errors_are_sanitized_for_context_and_decisions() {
         let agent_app = Router::new().fallback(|| async {
@@ -1664,6 +1821,7 @@ mod tests {
                 .map(str::to_string)
                 .collect(),
             timeout: Duration::from_secs(2),
+            mcp_allowed_hosts: Vec::new(),
         });
         let server = McpServer::new(config);
         let context_error = match server
@@ -2043,6 +2201,7 @@ mod tests {
             mcp_auth_token: "mcp-secret".into(),
             mcp_scopes: [SCOPE_ALL.to_string()].into_iter().collect(),
             timeout: Duration::from_secs(2),
+            mcp_allowed_hosts: Vec::new(),
         });
         let app = build_app(config);
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))

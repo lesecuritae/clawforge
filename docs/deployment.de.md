@@ -50,6 +50,27 @@ Apache-2.0-Lizenz. GitHub Actions veröffentlicht `linux/amd64` und
    `docker compose --profile agent up -d clawforge-mcp` starten. Anschließend
    MCP intern unter `http://clawforge-mcp:8090/health` prüfen.
 
+   Der Streamable-HTTP-Transport akzeptiert standardmäßig nur `Host`-Header
+   `localhost`/`127.0.0.1`/`::1` (Schutz vor DNS-Rebinding, keine
+   Authentifizierung). Ein Client außerhalb des eigenen Netzwerk-Namespace von
+   `clawforge-mcp` – der Normalfall, da MCP-Clients wie OpenClaw als eigener
+   Prozess oder auf einem eigenen Host laufen – bekommt
+   `403 Forbidden: Host header is not allowed`, bis seine anfragende Adresse in
+   `CLAWFORGE_MCP_ALLOWED_HOSTS` eingetragen ist. Das erweitert nur die
+   Host-Erlaubnisliste; `mcp_auth_token` bleibt die eigentliche Zugriffskontrolle
+   und wird weiterhin bei jeder Anfrage verlangt.
+
+   `backend` ist absichtlich `internal: true`, weshalb `docker compose` für
+   einen Container darauf keinen Host-Port wirklich veröffentlichen kann (die
+   Bindung wird übernommen, aber nie tatsächlich weitergeleitet). `clawforge-mcp`
+   bekommt deshalb eine feste Adresse auf `backend`
+   (`CLAWFORGE_MCP_BACKEND_IP`, Standard `10.77.77.90`). Ein Client auf
+   demselben Docker-Host – der übliche Fall bei OpenClaw – erreicht ihn direkt
+   über die Bridge unter `http://10.77.77.90:8090/mcp`; dazu passend
+   `CLAWFORGE_MCP_ALLOWED_HOSTS=10.77.77.90:8090` setzen (bereits Standard in
+   `.env.example`). `CLAWFORGE_BACKEND_SUBNET` nur ändern, wenn `10.77.77.0/24`
+   mit einem anderen Docker-Netz auf dem Host kollidiert.
+
 Der einmalige Dienst `clawforge-migrate` führt sqlx-Migrationen mit dem
 Eigentümerkonto aus. Danach provisioniert `clawforge-db-roles` idempotent je
 ein minimales Konto für API, Worker, Correlation, Incidents, Executor und

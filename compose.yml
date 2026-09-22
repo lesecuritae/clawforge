@@ -347,6 +347,13 @@ services:
       CLAWFORGE_MCP_AUTH_TOKEN_FILE: /run/secrets/mcp_auth_token
       CLAWFORGE_MCP_SCOPES: ${CLAWFORGE_MCP_SCOPES:-agent:operations:read,agent:operations:briefing,agent:operations:recommend,agent:operations:state,agent:context:read,agent:decision:read,agent:incident:read,agent:provider:read,agent:security:read,agent:knowledge:read,agent:workflow:read,agent:connector:read,agent:action:read,agent:execution:read}
       CLAWFORGE_MCP_UPSTREAM_TIMEOUT_SECONDS: ${CLAWFORGE_MCP_UPSTREAM_TIMEOUT_SECONDS:-10}
+      # DNS-rebinding Host allowlist, in addition to the SDK's built-in
+      # localhost/127.0.0.1/::1. Empty by default: an MCP client outside this
+      # container's own network namespace (the common case) needs its
+      # connecting authority listed here, e.g. the container's address on the
+      # backend network or a dedicated hostname. Not a substitute for
+      # mcp_auth_token, which remains the real access control.
+      CLAWFORGE_MCP_ALLOWED_HOSTS: ${CLAWFORGE_MCP_ALLOWED_HOSTS:-}
       RUST_LOG: ${RUST_LOG:-info}
     read_only: true
     tmpfs:
@@ -362,7 +369,14 @@ services:
       - mcp_agent_api_token
       - mcp_auth_token
     networks:
-      - backend
+      # `backend` is `internal: true` by design (no route to the internet, no
+      # NAT-published host ports); Docker accepts a `ports:` mapping for a
+      # container on it but never actually publishes it. A same-host MCP
+      # client (OpenClaw's usual deployment) reaches this fixed address
+      # directly over the Docker bridge instead; see CLAWFORGE_MCP_ALLOWED_HOSTS
+      # above and docs/deployment.md.
+      backend:
+        ipv4_address: ${CLAWFORGE_MCP_BACKEND_IP:-10.77.77.90}
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8090/health >/dev/null"]
       interval: 10s
@@ -556,6 +570,9 @@ networks:
   frontend:
   backend:
     internal: true
+    ipam:
+      config:
+        - subnet: ${CLAWFORGE_BACKEND_SUBNET:-10.77.77.0/24}
 
 secrets:
   postgres_password:
