@@ -80,3 +80,8 @@ CLAWFORGE_TEST_INCIDENTS_DATABASE_URL="$(cat "$secret_dir/database_incidents_url
 CLAWFORGE_TEST_EXECUTOR_DATABASE_URL="$(cat "$secret_dir/database_executor_url")" \
 CLAWFORGE_TEST_BACKUP_DATABASE_URL="postgres://clawforge_backup:${backup_password}@127.0.0.1:55432/clawforge_test" \
   run_cargo test -p clawforge-storage --test postgres -- --ignored --test-threads=1
+
+CLAWFORGE_TEST_DATABASE_URL="$owner_url" \
+CLAWFORGE_TEST_CORRELATION_DATABASE_URL="$(cat "$secret_dir/database_correlation_url")" \
+CLAWFORGE_TEST_INCIDENTS_DATABASE_URL="$(cat "$secret_dir/database_incidents_url")" \
+  run_cargo test -p clawforge-correlation --bin clawforge-correlation -- --ignored --test-threads=1

@@ -97,12 +97,22 @@ GRANT INSERT, UPDATE ON TABLE event_consumers, event_delivery,
   runtime_status TO clawforge_correlation;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO clawforge_correlation;
 
+-- Promotion also backfills alerts.incident_id for alerts that were created
+-- before their candidate was promoted, and announces new incidents on the
+-- event bus and notification queue (publish_event/enqueue_notification_event
+-- in storage/src/lib.rs's promote_incident_candidates) - hence the grants on
+-- alerts, events, event_consumers, event_delivery, notification_rules,
+-- notification_channels, and notification_events below.
 GRANT SELECT ON TABLE _sqlx_migrations, incident_candidates,
   incident_candidate_events, incidents, incident_events, incident_relations,
-  incident_status_history, event_relationships, indicators, runtime_status
+  incident_status_history, event_relationships, indicators, runtime_status,
+  alerts, events, event_consumers, notification_rules, notification_channels
   TO clawforge_incidents;
 GRANT INSERT, UPDATE ON TABLE incident_candidates, incidents,
-  incident_events, incident_relations, incident_status_history, runtime_status
+  incident_events, incident_relations, incident_status_history, runtime_status,
+  alerts
+  TO clawforge_incidents;
+GRANT INSERT ON TABLE events, event_delivery, notification_events
   TO clawforge_incidents;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO clawforge_incidents;
 

@@ -263,11 +263,18 @@ impl PostgresStore {
             .fetch_one(&self.pool)
             .await?
             ;
-        self.correlate_incident(event_id, event).await?;
+        // Incidents are no longer created synchronously here - the
+        // correlation service and promote_incident_candidates own that (see
+        // the incident-correlation-convergence note on
+        // promote_incident_candidates below). If this resource's
+        // correlation id already has a promoted incident, link the alert to
+        // it right away instead of leaving it to be backfilled on the next
+        // promotion pass; a resource that instead correlated by shared
+        // source or indicator still gets linked there, just one pass later.
         let incident_id: Option<Uuid> = sqlx::query_scalar(
             "SELECT id FROM incidents WHERE correlation_key=$1 ORDER BY updated_at DESC LIMIT 1",
         )
-        .bind(&event.resource)
+        .bind(format!("correlation-id:{}", event.resource))
         .fetch_optional(&self.pool)
         .await?;
         self.publish_event(
@@ -587,114 +594,6 @@ impl PostgresStore {
         Ok(())
     }
 
-    async fn correlate_incident(&self, event_id: i64, event: &IntelligenceEvent) -> Result<()> {
-        if !matches!(
-            event.event_type.as_str(),
-            "new_threat_indicator"
-                | "bgp_change"
-                | "rpki_invalid"
-                | "asn_change"
-                | "trusted_network_change"
-                | "provider_error"
-        ) {
-            return Ok(());
-        }
-        let severity = normalize_incident_severity(&event.severity);
-        let increment = event
-            .details
-            .get("risk_score")
-            .and_then(serde_json::Value::as_i64)
-            .unwrap_or(match event.event_type.as_str() {
-                "rpki_invalid" => 30,
-                "bgp_change" => 25,
-                "new_threat_indicator" => 20,
-                "asn_change" => 10,
-                "provider_error" => 5,
-                _ => 5,
-            });
-        let mut tx = self.pool.begin().await?;
-        let existing: Option<(Uuid, String)> = sqlx::query_as(
-            "SELECT id, severity FROM incidents WHERE correlation_key=$1 AND status IN ('detected','investigating','confirmed','mitigated') ORDER BY updated_at DESC LIMIT 1 FOR UPDATE",
-        )
-        .bind(&event.resource)
-        .fetch_optional(&mut *tx)
-        .await?;
-        let (incident_id, created, escalated) = if let Some((id, current_severity)) = existing {
-            let next_severity = max_incident_severity(&current_severity, &severity);
-            let escalated = next_severity != current_severity;
-            sqlx::query("UPDATE incidents SET severity=$2, risk_score=LEAST(100, risk_score+$3), summary=$4, updated_at=NOW() WHERE id=$1")
-                .bind(id)
-                .bind(&next_severity)
-                .bind(increment.clamp(0, 100) as i16)
-                .bind(format!("{}: {}", event.event_type, event.reason))
-                .execute(&mut *tx)
-                .await?;
-            (id, false, escalated)
-        } else {
-            let id = Uuid::new_v4();
-            sqlx::query("INSERT INTO incidents (id,status,severity,confidence,risk_score,summary,correlation_key,detected_at,created_at,updated_at) VALUES ($1,'detected',$2,$3,$4,$5,$6,$7,$7,$7)")
-                .bind(id)
-                .bind(&severity)
-                .bind(0_i16)
-                .bind(increment.clamp(0, 100) as i16)
-                .bind(format!("{}: {}", event.event_type, event.reason))
-                .bind(&event.resource)
-                .bind(event.timestamp)
-                .execute(&mut *tx)
-                .await?;
-            (id, true, false)
-        };
-        sqlx::query("INSERT INTO incident_events (incident_id,event_id,timestamp) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING")
-            .bind(incident_id)
-            .bind(event_id)
-            .bind(event.timestamp)
-            .execute(&mut *tx)
-            .await?;
-        tx.commit().await?;
-        if created {
-            self.publish_event(
-                "incident.created",
-                "incident-correlator",
-                &severity,
-                event.timestamp,
-                Some(&incident_id.to_string()),
-                serde_json::json!({"incident_id": incident_id, "event_type": event.event_type, "severity": severity, "reason": event.reason, "risk_score": increment.clamp(0, 100)}),
-                serde_json::json!({"source_event_id": event_id}),
-                &format!("incident.created:{incident_id}:{event_id}"),
-            ).await?;
-            self.enqueue_notification_event(
-                Some(event_id),
-                "incident_created",
-                &severity,
-                &incident_id.to_string(),
-                serde_json::json!({"incident_id": incident_id, "event_type": event.event_type, "severity": severity, "reason": event.reason, "risk_score": increment.clamp(0, 100)}),
-                &format!("incident_created:{incident_id}"),
-            )
-            .await?;
-        } else if escalated {
-            self.publish_event(
-                "incident.updated",
-                "incident-correlator",
-                &severity,
-                event.timestamp,
-                Some(&incident_id.to_string()),
-                serde_json::json!({"incident_id": incident_id, "event_type": event.event_type, "severity": severity, "reason": event.reason}),
-                serde_json::json!({"source_event_id": event_id}),
-                &format!("incident.updated:{incident_id}:{event_id}"),
-            ).await?;
-            self.enqueue_notification_event(
-                Some(event_id),
-                "incident_severity_changed",
-                &severity,
-                &incident_id.to_string(),
-                serde_json::json!({"incident_id": incident_id, "event_type": event.event_type, "severity": severity, "reason": event.reason}),
-                &format!("incident_severity_changed:{incident_id}:{event_id}"),
-            )
-            .await?;
-        }
-        Ok(())
-    }
-
     /// Fan an audited event out to the currently active notification rules.
     /// The queue contains only a safe, structured payload and a secret
     /// reference; credentials themselves never enter PostgreSQL.
@@ -904,7 +803,14 @@ impl PostgresStore {
     pub async fn persist_correlation(&self, request: CorrelationPersistence<'_>) -> Result<Uuid> {
         let candidate_from = request.first_seen - request.window;
         let mut tx = self.pool.begin().await?;
-        let existing = sqlx::query("SELECT id,severity FROM incident_candidates WHERE correlation_key=$1 AND status='open' AND last_seen >= $2 ORDER BY last_seen DESC LIMIT 1 FOR UPDATE")
+        // Matching a candidate that was already promoted, not just an open
+        // one, is deliberate: a later related event for the same
+        // correlation key must extend the existing incident, not spawn a
+        // second one with the same key. Reopening it to 'open' below is what
+        // makes promote_incident_candidates (run under the incidents
+        // service's own role - correlation has no access to `incidents`) go
+        // back and re-apply the escalation to the incident it already owns.
+        let existing = sqlx::query("SELECT id,severity FROM incident_candidates WHERE correlation_key=$1 AND status IN ('open','promoted') AND last_seen >= $2 ORDER BY last_seen DESC LIMIT 1 FOR UPDATE")
             .bind(request.correlation_key)
             .bind(candidate_from)
             .fetch_optional(&mut *tx)
@@ -913,7 +819,7 @@ impl PostgresStore {
             let id: Uuid = row.get("id");
             let current_severity: String = row.get("severity");
             let next_severity = max_incident_severity(&current_severity, request.severity);
-            sqlx::query("UPDATE incident_candidates SET confidence=GREATEST(confidence,$2), severity=$3, first_seen=LEAST(first_seen,$4), last_seen=GREATEST(last_seen,$5), summary=$6, updated_at=NOW() WHERE id=$1")
+            sqlx::query("UPDATE incident_candidates SET status='open', confidence=GREATEST(confidence,$2), severity=$3, first_seen=LEAST(first_seen,$4), last_seen=GREATEST(last_seen,$5), summary=$6, updated_at=NOW() WHERE id=$1")
                 .bind(id)
                 .bind(request.confidence.clamp(0, 100))
                 .bind(next_severity)
@@ -1561,14 +1467,45 @@ impl PostgresStore {
             .fetch_all(&mut *tx)
             .await?;
         let mut promoted = 0;
+        // Collected so the transaction can commit before any notification
+        // fan-out runs; publish_event/enqueue_notification_event each open
+        // their own connection and must not execute against a still-open tx.
+        let mut newly_created: Vec<(Uuid, String, String, i16)> = Vec::new();
+        // A candidate can come back through this loop after already being
+        // promoted: persist_correlation reopens a 'promoted' candidate to
+        // 'open' when a later event still matches its correlation key (see
+        // its comment), so the same incident is escalated in place instead
+        // of a second one being created for the same key.
+        let mut escalated: Vec<(Uuid, String, String, i16)> = Vec::new();
         for candidate in candidates {
             let candidate_id: Uuid = candidate.get("id");
-            let incident_id = if let Some(id) =
-                sqlx::query_scalar::<_, Uuid>("SELECT id FROM incidents WHERE candidate_id=$1")
-                    .bind(candidate_id)
-                    .fetch_optional(&mut *tx)
-                    .await?
-            {
+            let existing_incident = sqlx::query(
+                "SELECT id,severity,confidence,summary FROM incidents WHERE candidate_id=$1",
+            )
+            .bind(candidate_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let incident_id = if let Some(row) = existing_incident {
+                let id: Uuid = row.get("id");
+                let previous_severity: String = row.get("severity");
+                let previous_confidence: i16 = row.get("confidence");
+                let previous_summary: String = row.get("summary");
+                let severity = candidate.get::<String, _>("severity");
+                let confidence = candidate.get::<i16, _>("confidence").clamp(0, 100);
+                let summary = candidate.get::<String, _>("summary");
+                if severity != previous_severity
+                    || confidence != previous_confidence
+                    || summary != previous_summary
+                {
+                    sqlx::query("UPDATE incidents SET severity=$2, confidence=$3, summary=$4, updated_at=NOW() WHERE id=$1")
+                        .bind(id)
+                        .bind(&severity)
+                        .bind(confidence)
+                        .bind(&summary)
+                        .execute(&mut *tx)
+                        .await?;
+                    escalated.push((id, severity, summary, confidence));
+                }
                 id
             } else {
                 let id = Uuid::new_v4();
@@ -1590,6 +1527,12 @@ impl PostgresStore {
                     .execute(&mut *tx)
                     .await?;
                 promoted += 1;
+                newly_created.push((
+                    id,
+                    candidate.get::<String, _>("severity"),
+                    candidate.get::<String, _>("summary"),
+                    candidate.get::<i16, _>("confidence").clamp(0, 100),
+                ));
                 id
             };
             let event_rows = sqlx::query(
@@ -1598,8 +1541,38 @@ impl PostgresStore {
             .bind(candidate_id)
             .fetch_all(&mut *tx)
             .await?;
+            // Alerts are created synchronously alongside the audit event they
+            // came from (record_intelligence_event), before correlation and
+            // promotion have had a chance to run, so they start without an
+            // incident_id. Link them now: `events.metadata->>'audit_event_id'`
+            // is the bridge back to the `audit_events.id` that
+            // `alerts.source_event_id` actually references (two distinct id
+            // spaces - see the incident-correlation-convergence note in
+            // storage/src/lib.rs's module docs). Only alerts still unlinked
+            // are touched, so a later duplicate promotion pass is a no-op.
+            sqlx::query(
+                "UPDATE alerts SET incident_id=$1, group_key='incident:'||$1, updated_at=NOW() \
+                 WHERE incident_id IS NULL AND source_event_id IN ( \
+                     SELECT (e.metadata->>'audit_event_id')::bigint \
+                     FROM incident_candidate_events ice JOIN events e ON e.event_id = ice.event_id \
+                     WHERE ice.candidate_id=$2 AND e.metadata ? 'audit_event_id' \
+                 )",
+            )
+            .bind(incident_id)
+            .bind(candidate_id)
+            .execute(&mut *tx)
+            .await?;
             for event in event_rows {
-                sqlx::query("INSERT INTO incident_relations (id,incident_id,relation_type,event_id,confidence,reason,created_at) VALUES ($1,$2,'event',$3,$4,'correlated event',$5) ON CONFLICT DO NOTHING")
+                // Not ON CONFLICT DO NOTHING: incident_relations_event_unique_idx
+                // covers (incident_id, relation_type, event_id, related_event_id),
+                // but related_event_id is always NULL for a plain 'event'
+                // relation, and Postgres treats NULL as distinct from NULL in
+                // a unique index - so that constraint never actually catches a
+                // duplicate here. A re-promoted (escalated) candidate
+                // reprocesses its whole event set, including events already
+                // linked by an earlier pass, so this must be a real duplicate
+                // check, not a no-op safety net.
+                sqlx::query("INSERT INTO incident_relations (id,incident_id,relation_type,event_id,confidence,reason,created_at) SELECT $1,$2,'event',$3,$4,'correlated event',$5 WHERE NOT EXISTS (SELECT 1 FROM incident_relations WHERE incident_id=$2 AND relation_type='event' AND event_id=$3)")
                     .bind(Uuid::new_v4())
                     .bind(incident_id)
                     .bind(event.get::<Uuid,_>("event_id"))
@@ -1651,6 +1624,55 @@ impl PostgresStore {
             .await?;
         }
         tx.commit().await?;
+        let now = chrono::Utc::now();
+        for (incident_id, severity, summary, confidence) in newly_created {
+            self.publish_event(
+                "incident.created",
+                "incident-correlator",
+                &severity,
+                now,
+                Some(&incident_id.to_string()),
+                serde_json::json!({"incident_id": incident_id, "severity": severity, "reason": summary, "confidence": confidence}),
+                serde_json::json!({}),
+                &format!("incident.created:{incident_id}"),
+            )
+            .await?;
+            self.enqueue_notification_event(
+                None,
+                "incident_created",
+                &severity,
+                &incident_id.to_string(),
+                serde_json::json!({"incident_id": incident_id, "severity": severity, "reason": summary, "confidence": confidence}),
+                &format!("incident_created:{incident_id}"),
+            )
+            .await?;
+        }
+        for (incident_id, severity, summary, confidence) in escalated {
+            // Distinct from incident.created's dedupe key: an incident can
+            // be escalated more than once, and each occurrence must reach
+            // operators, not just the first.
+            let occurrence = now.timestamp_nanos_opt().unwrap_or_default();
+            self.publish_event(
+                "incident.escalated",
+                "incident-correlator",
+                &severity,
+                now,
+                Some(&incident_id.to_string()),
+                serde_json::json!({"incident_id": incident_id, "severity": severity, "reason": summary, "confidence": confidence}),
+                serde_json::json!({}),
+                &format!("incident.escalated:{incident_id}:{occurrence}"),
+            )
+            .await?;
+            self.enqueue_notification_event(
+                None,
+                "incident_escalated",
+                &severity,
+                &incident_id.to_string(),
+                serde_json::json!({"incident_id": incident_id, "severity": severity, "reason": summary, "confidence": confidence}),
+                &format!("incident_escalated:{incident_id}:{occurrence}"),
+            )
+            .await?;
+        }
         Ok(promoted)
     }
 
@@ -3552,17 +3574,6 @@ pub struct CorrelationPersistence<'a> {
     pub window: chrono::Duration,
     pub event_ids: &'a [Uuid],
     pub relationships: &'a [EventRelationship],
-}
-
-fn normalize_incident_severity(value: &str) -> String {
-    match value.to_ascii_lowercase().as_str() {
-        "critical" => "critical",
-        "high" => "high",
-        "medium" => "medium",
-        "low" => "low",
-        _ => "info",
-    }
-    .to_string()
 }
 
 fn notification_severity_rank(value: &str) -> i16 {

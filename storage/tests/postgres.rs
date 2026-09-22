@@ -3,7 +3,7 @@ use clawforge_intelligence::{
     AsnRecord, BgpEvent, BgpStatus, Indicator, IndicatorType, IntelligenceEvent, Provider,
     RpkiRecord, RpkiStatus,
 };
-use clawforge_storage::PostgresStore;
+use clawforge_storage::{CorrelationPersistence, PostgresStore};
 use serde_json::json;
 
 fn runtime_url(name: &str) -> anyhow::Result<String> {
@@ -309,18 +309,44 @@ async fn migrations_and_restart_persist() -> anyhow::Result<()> {
             "fixture event".into()
         )
     );
-    let incident_row: (uuid::Uuid, i16) = sqlx::query_as(
-        "SELECT id, risk_score FROM incidents WHERE correlation_key=$1 AND status='detected' LIMIT 1",
+    // Incidents are no longer created synchronously inside
+    // record_intelligence_event - the correlation service (process_event)
+    // and promote_incident_candidates own that now. Drive that pipeline
+    // directly here, the same way those services do, to keep exercising it
+    // as part of this broader smoke test.
+    let new_threat_event_id: uuid::Uuid = sqlx::query_scalar(
+        "SELECT event_id FROM events WHERE event_type='new_threat_indicator' AND correlation_id=$1 ORDER BY occurred_at DESC LIMIT 1",
     )
     .bind(&updated.value)
     .fetch_one(restarted.pool())
     .await?;
-    assert!(incident_row.1 > 0);
-    let incident_events: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM incident_events WHERE incident_id=$1")
-            .bind(incident_row.0)
-            .fetch_one(restarted.pool())
-            .await?;
+    let candidate_key = format!("correlation-id:{}", updated.value);
+    restarted
+        .persist_correlation(CorrelationPersistence {
+            correlation_key: &candidate_key,
+            confidence: 60,
+            severity: "high",
+            summary: "fixture correlation",
+            first_seen: now,
+            last_seen: now,
+            window: Duration::seconds(900),
+            event_ids: &[new_threat_event_id],
+            relationships: &[],
+        })
+        .await?;
+    assert_eq!(restarted.promote_incident_candidates(10).await?, 1);
+    let incident_row: (uuid::Uuid,) = sqlx::query_as(
+        "SELECT id FROM incidents WHERE correlation_key=$1 AND status='detected' LIMIT 1",
+    )
+    .bind(&candidate_key)
+    .fetch_one(restarted.pool())
+    .await?;
+    let incident_events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM incident_relations WHERE incident_id=$1 AND relation_type='event'",
+    )
+    .bind(incident_row.0)
+    .fetch_one(restarted.pool())
+    .await?;
     assert_eq!(incident_events, 1);
     restarted
         .update_incident_status(incident_row.0, "investigating")
@@ -422,17 +448,41 @@ async fn migrations_and_restart_persist() -> anyhow::Result<()> {
             details: json!({"risk_score": 25}),
         })
         .await?;
+    let bgp_change_event_id: uuid::Uuid = sqlx::query_scalar(
+        "SELECT event_id FROM events WHERE event_type='bgp_change' AND correlation_id=$1 ORDER BY occurred_at DESC LIMIT 1",
+    )
+    .bind(&updated.value)
+    .fetch_one(restarted.pool())
+    .await?;
+    restarted
+        .persist_correlation(CorrelationPersistence {
+            correlation_key: &candidate_key,
+            confidence: 70,
+            severity: "high",
+            summary: "fixture correlation",
+            first_seen: now,
+            last_seen: now + Duration::seconds(1),
+            window: Duration::seconds(900),
+            event_ids: &[bgp_change_event_id],
+            relationships: &[],
+        })
+        .await?;
+    // The candidate was already promoted once; persist_correlation reopens
+    // it for the same correlation key, so this escalates the existing
+    // incident instead of creating a second one with the same key.
+    assert_eq!(restarted.promote_incident_candidates(10).await?, 0);
     let correlated_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM incidents WHERE correlation_key=$1")
-            .bind(&updated.value)
+            .bind(&candidate_key)
             .fetch_one(restarted.pool())
             .await?;
     assert_eq!(correlated_count, 1);
-    let correlated_events: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM incident_events WHERE incident_id=$1")
-            .bind(incident_row.0)
-            .fetch_one(restarted.pool())
-            .await?;
+    let correlated_events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM incident_relations WHERE incident_id=$1 AND relation_type='event'",
+    )
+    .bind(incident_row.0)
+    .fetch_one(restarted.pool())
+    .await?;
     assert_eq!(correlated_events, 2);
 
     let asn = AsnRecord {
