@@ -7255,7 +7255,7 @@ async fn main() -> anyhow::Result<()> {
     let address: SocketAddr = bind
         .parse()
         .map_err(|error| anyhow::anyhow!("invalid CLAWFORGE_API_BIND: {error}"))?;
-    let store = PostgresStore::connect(&database_url).await?;
+    let store = PostgresStore::connect_runtime(&database_url).await?;
     // Register internal consumers before accepting events. Consumers remain
     // independent; disabled services can simply leave their delivery rows
     // pending until they are started.

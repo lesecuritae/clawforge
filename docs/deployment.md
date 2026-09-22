@@ -52,9 +52,13 @@ when tests and security checks pass. Use `v1.0.0` or `1.0.0` in production;
    token and start `docker compose --profile agent up -d clawforge-mcp`. Then
    verify its internal health endpoint at `http://clawforge-mcp:8090/health`.
 
-The API applies sqlx migrations before listening. `/ready` reports the
-PostgreSQL connection and applied migration count. Stop safely with
-`docker compose down`; preserve the named PostgreSQL volume for upgrades.
+The one-shot `clawforge-migrate` service applies sqlx migrations with the
+database owner. `clawforge-db-roles` then idempotently provisions separate,
+least-privilege accounts for the API, worker, correlation, incidents,
+executor, and backup services. Runtime services cannot execute DDL and refuse
+to start against a stale or newer schema. `/ready` reports the PostgreSQL
+connection and applied migration count. Stop safely with `docker compose
+down`; preserve the named PostgreSQL volume for upgrades.
 
 ## Upgrade from v0.x
 
@@ -68,7 +72,8 @@ docker compose pull
 docker compose up -d
 ```
 
-The API applies forward migrations before becoming ready. Wait for `/ready`,
+The migration and role-provisioning jobs must complete successfully before the
+runtime services start. Wait for `/ready`,
 then verify incident data, audit history, provider status, frontend access,
 MCP health, and MCP discovery. Do not delete the PostgreSQL volume during an
 ordinary upgrade. Use the documented restore procedure for rollback.

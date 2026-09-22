@@ -1,6 +1,6 @@
 # Runtime and operations
 
-`compose.yml` runs `clawforge-api`, `clawforge-worker`, `clawforge-frontend`, PostgreSQL, and the scheduled `clawforge-backup` service. Redis is present only under the optional `cache` profile. The API, worker, and backup service wait for PostgreSQL health and use the same sqlx migration set. The frontend waits for API readiness. See [deployment.md](deployment.md) and [configuration.md](configuration.md) for operations.
+`compose.yml` runs `clawforge-api`, `clawforge-worker`, `clawforge-frontend`, PostgreSQL, and the scheduled `clawforge-backup` service. Redis is present only under the optional `cache` profile. A one-shot migration service applies the shared sqlx migration set with the owner account, followed by an idempotent role-provisioning job. Each database-backed runtime service then uses its own restricted account; the backup account is read-only. The frontend waits for API readiness. See [deployment.md](deployment.md) and [configuration.md](configuration.md) for operations.
 
 When `REDIS_URL` is configured, the worker uses a short-lived Redis lock to prevent duplicate scheduler runs across worker replicas. Redis is never the source of truth for providers, indicators, network records, risk history, or audit events; those remain in PostgreSQL.
 
@@ -17,4 +17,7 @@ details. A single feed or event is never used as a block decision.
 
 Configuration is supplied through environment variables. Keep `.env` and database credentials outside version control. PostgreSQL's named volume is the primary persistence layer; take a database dump before upgrades and preserve the configuration and trusted-network registry together.
 
-For a PostgreSQL integration test, set `CLAWFORGE_TEST_DATABASE_URL` to an isolated PostgreSQL 16 container and run the ignored storage test. The backup/restore script validates a real dump and restore cycle.
+Run `scripts/test-postgres.sh` for an isolated PostgreSQL 16 migration and
+least-privilege test. It checks allowed service writes and rejects cross-domain
+writes, credential-table reads, audit mutation, and backup writes. The
+backup/restore script validates a real dump and restore cycle.

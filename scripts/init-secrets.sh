@@ -38,6 +38,22 @@ if [ ! -e "$postgres_path" ]; then
   write_new database_url "postgres://clawforge:${postgres_password}@postgres:5432/clawforge"
 fi
 
+for role in api worker correlation incidents executor; do
+  password_path="$secret_dir/database_${role}_password"
+  url_path="$secret_dir/database_${role}_url"
+  if { [ -e "$password_path" ] && [ ! -e "$url_path" ]; } ||
+     { [ ! -e "$password_path" ] && [ -e "$url_path" ]; }; then
+    echo "database_${role}_password and database_${role}_url must either both exist or both be absent" >&2
+    exit 1
+  fi
+  if [ ! -e "$password_path" ]; then
+    role_password="$(generate_secret)"
+    write_new "database_${role}_password" "$role_password"
+    write_new "database_${role}_url" "postgres://clawforge_${role}:${role_password}@postgres:5432/clawforge"
+  fi
+done
+write_new database_backup_password "$(generate_secret)"
+
 for name in admin_bootstrap_token analyzer_token notifier_token events_token operations_token mcp_auth_token; do
   write_new "$name" "$(generate_secret)"
 done

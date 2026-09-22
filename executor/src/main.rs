@@ -17,7 +17,7 @@ async fn main() -> anyhow::Result<()> {
             "productive execution is disabled; CLAWFORGE_EXECUTOR_DRY_RUN must remain true"
         );
     }
-    let store = PostgresStore::connect(&database_url_from_env()?).await?;
+    let store = PostgresStore::connect_runtime(&database_url_from_env()?).await?;
     let worker_name = env::var("CLAWFORGE_EXECUTOR_WORKER_NAME")
         .unwrap_or_else(|_| format!("executor-{}", std::process::id()));
     let worker_capacity = env::var("CLAWFORGE_EXECUTOR_WORKER_CAPACITY")

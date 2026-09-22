@@ -306,13 +306,15 @@ Dateneigentümerschaft und zwei-Personen-Freigabe.
    Notifier-Egress-Schutz.
 3. `approval-audit-integrity` (umgesetzt): Approval-State-Machine, atomare
    Audit-Outbox und PostgreSQL-Integrationstest in CI.
-4. `incident-correlation-convergence`: Legacy-Pfad konsolidieren und geschützte
+4. `database-least-privilege` (umgesetzt): eigener Migrationsjob, getrennte
+   Laufzeitrollen und PostgreSQL-Negativtests für fremde Tabellen und Audit.
+5. `incident-correlation-convergence`: Legacy-Pfad konsolidieren und geschützte
    IP-Korrelation von Read-Redaction trennen.
-5. `security-events-domain`: Event-Katalog, Envelope, Validatoren, Fixtures und
+6. `security-events-domain`: Event-Katalog, Envelope, Validatoren, Fixtures und
    Dokumentation ohne API- oder Datenbankänderung.
-6. `security-events-storage`: additive Migration, persistente Sensoridentitäten
+7. `security-events-storage`: additive Migration, persistente Sensoridentitäten
    und PostgreSQL-Integrationstest in CI.
-7. `security-events-ingress`: interner Batch-Endpunkt, Auth/Rate Limit/Audit,
+8. `security-events-ingress`: interner Batch-Endpunkt, Auth/Rate Limit/Audit,
    Contract- und Negativtests sowie ein Fixture-Sender.
 
 Erst danach beginnen Sensorimplementierungen. So bleibt jede Änderung klein,

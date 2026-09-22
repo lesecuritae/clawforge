@@ -36,7 +36,7 @@ jobs:
           components: rustfmt, clippy
       - run: cargo fmt --all -- --check
       - run: cargo test --workspace
-      - run: cargo test -p clawforge-storage --test postgres -- --ignored
+      - run: ./scripts/test-postgres.sh
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
   frontend:
@@ -86,6 +86,17 @@ jobs:
           for mapping in \
             CLAWFORGE_POSTGRES_SECRET_FILE=postgres_password \
             CLAWFORGE_DATABASE_URL_SECRET_FILE=database_url \
+            CLAWFORGE_DATABASE_API_PASSWORD_SECRET_FILE=database_api_password \
+            CLAWFORGE_DATABASE_API_URL_SECRET_FILE=database_api_url \
+            CLAWFORGE_DATABASE_WORKER_PASSWORD_SECRET_FILE=database_worker_password \
+            CLAWFORGE_DATABASE_WORKER_URL_SECRET_FILE=database_worker_url \
+            CLAWFORGE_DATABASE_CORRELATION_PASSWORD_SECRET_FILE=database_correlation_password \
+            CLAWFORGE_DATABASE_CORRELATION_URL_SECRET_FILE=database_correlation_url \
+            CLAWFORGE_DATABASE_INCIDENTS_PASSWORD_SECRET_FILE=database_incidents_password \
+            CLAWFORGE_DATABASE_INCIDENTS_URL_SECRET_FILE=database_incidents_url \
+            CLAWFORGE_DATABASE_EXECUTOR_PASSWORD_SECRET_FILE=database_executor_password \
+            CLAWFORGE_DATABASE_EXECUTOR_URL_SECRET_FILE=database_executor_url \
+            CLAWFORGE_DATABASE_BACKUP_PASSWORD_SECRET_FILE=database_backup_password \
             CLAWFORGE_ADMIN_BOOTSTRAP_SECRET_FILE=admin_bootstrap_token \
             CLAWFORGE_ANALYZER_SECRET_FILE=analyzer_token \
             CLAWFORGE_ANALYZER_API_KEY_SECRET_FILE=analyzer_api_key \

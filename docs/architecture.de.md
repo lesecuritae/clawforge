@@ -12,7 +12,10 @@ Clawforge.
 
 ## Aktueller Stand
 
-Die API verbindet sich mit PostgreSQL, führt sqlx-Migrationen aus und stellt
+Ein einmaliger Migrationsdienst verbindet sich als Datenbankeigentümer mit
+PostgreSQL und führt sqlx-Migrationen aus. Danach starten API, Worker,
+Correlation, Incidents, Executor und Backup mit getrennten, eingeschränkten
+Laufzeitrollen. Die API stellt
 Health/Readiness, Intelligence-, Netzwerk-, Trust-, Incident-, Alert- und
 Prometheus-Endpunkte bereit. Der Worker verwendet Tokio und speichert Provider-
 und Netzwerkjobs, Retry/Backoff, Risk-Verbrauch, typisierte Audit-Events und

@@ -50,8 +50,12 @@ Apache-2.0-Lizenz. GitHub Actions veröffentlicht `linux/amd64` und
    `docker compose --profile agent up -d clawforge-mcp` starten. Anschließend
    MCP intern unter `http://clawforge-mcp:8090/health` prüfen.
 
-Die API führt sqlx-Migrationen vor dem Listening aus. `/ready` prüft PostgreSQL
-und meldet den angewendeten Migrationsstand. Für Updates Volume behalten.
+Der einmalige Dienst `clawforge-migrate` führt sqlx-Migrationen mit dem
+Eigentümerkonto aus. Danach provisioniert `clawforge-db-roles` idempotent je
+ein minimales Konto für API, Worker, Correlation, Incidents, Executor und
+Backup. Erst anschließend starten die Laufzeitdienste; sie können keine DDL
+ausführen und verweigern einen veralteten oder neueren Schema-Stand. `/ready`
+meldet den angewendeten Migrationsstand. Für Updates das Volume behalten.
 
 ## Upgrade von v0.x
 
@@ -65,7 +69,8 @@ docker compose pull
 docker compose up -d
 ```
 
-Auf die Bereitschaft warten und Incidents, Audit, Providerstatus, Frontend,
+Migration und Rollen-Provisionierung müssen erfolgreich beendet sein. Danach
+auf die Bereitschaft warten und Incidents, Audit, Providerstatus, Frontend,
 MCP-Health und MCP-Discovery prüfen. PostgreSQL-Volume nicht löschen. Für ein
 Rollback die dokumentierte Restore-Prozedur verwenden.
 

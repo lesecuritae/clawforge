@@ -15,7 +15,7 @@ fn poll_interval() -> Duration {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
-    let store = PostgresStore::connect(&database_url_from_env()?).await?;
+    let store = PostgresStore::connect_runtime(&database_url_from_env()?).await?;
     store
         .set_runtime_status("incidents", "running", None)
         .await?;

@@ -154,7 +154,7 @@ Produktivmodus des Executors.
 | ungebundene Service-Tokens | `api/src/main.rs`, `storage/src/lib.rs` | gestohlener Nebenservice-Token claimt oder bestätigt eine fremde Queue | jede Identity darf nur ihren festen Consumer und erlaubte Operationen nutzen | umgesetzt; Identity-Ableitung und eigentümergebundenes SQL |
 | Approval nicht erzwungen | `migrations/0029_execution_approval_integrity.sql`, `api/src/main.rs`, `storage/src/lib.rs` | einzelner/eigener Approver gibt high/critical Action frei | verschiedene Approver, kein Self-Approval, Hash-Bindung, Expiry und Transitionen | umgesetzt; PostgreSQL-Trigger und realer Integrationstest |
 | Mutation/Audit nicht atomar | `migrations/0030_audit_outbox.sql`, `storage/src/lib.rs` | DB-/Auditfehler hinterlässt ausführbaren, unvollständig auditierten Zustand | injizierter Auditfehler rollt Mutation zurück; Outbox und State committen gemeinsam | umgesetzt; atomare Execution-Transaktionen und Fault-Injection-Test |
-| geteilter DB-Account/veränderbares Audit | `compose.yml`, `migrations/0001_initial.sql` | kompromittierter Dienst ändert Tokens, Policy, Execution oder Audit | Dienstrollen dürfen fremde Tabellen und Audit-UPDATE/DELETE nicht ausführen | offen |
+| geteilter DB-Account/veränderbares Audit | `compose.yml`, `scripts/provision-db-roles.sh`, `storage/src/lib.rs` | kompromittierter Dienst ändert Tokens, Policy, Execution oder Audit | Dienstrollen dürfen fremde Tabellen und Audit-UPDATE/DELETE nicht ausführen | umgesetzt; getrennte Runtime-Rollen, eigener Migrationsjob und reale PostgreSQL-Negativtests |
 
 ## Zielarchitektur
 

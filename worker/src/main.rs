@@ -25,7 +25,7 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(EnvFilter::from_default_env())
         .init();
     let database_url = database_url_from_env()?;
-    let store = PostgresStore::connect(&database_url).await?;
+    let store = PostgresStore::connect_runtime(&database_url).await?;
     store.set_runtime_status("worker", "running", None).await?;
     let seconds = env::var("CLAWFORGE_WORKER_POLL_SECONDS")
         .ok()

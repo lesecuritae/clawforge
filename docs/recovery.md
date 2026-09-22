@@ -18,10 +18,10 @@ getrennten Speicher repliziert werden.
 
 1. Compose stoppen und eine leere PostgreSQL-Instanz bereitstellen.
 2. Das gewünschte Dump mit `scripts/restore.sh` einspielen.
-3. API starten. `PostgresStore::connect` prüft Downgrades und führt die
-   sqlx-Migrationen idempotent aus.
-4. `/ready` muss `current: true` melden und die erwartete Migration (aktuell
-   16) ausweisen.
+3. `clawforge-migrate` starten. Der Dienst prüft Downgrades und führt die
+   sqlx-Migrationen idempotent aus. Danach `clawforge-db-roles` ausführen und
+   erst anschließend die Laufzeitdienste starten.
+4. `/ready` muss `current: true` melden und die erwartete Migration ausweisen.
 5. API, Worker, Event-/Correlation-Service, Notifier und MCP auf Healthchecks
    prüfen.
 6. Einen repräsentativen Incident-, Event-, Provider- und Audit-Read prüfen.

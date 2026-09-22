@@ -62,6 +62,37 @@ const DEFAULT_EXECUTION_TIMEOUT_SECONDS: i32 = 60;
 
 impl PostgresStore {
     pub async fn connect(database_url: &str) -> Result<Self> {
+        let store = Self::open(database_url).await?;
+        store.reject_newer_schema().await?;
+        MIGRATOR
+            .run(&store.pool)
+            .await
+            .context("run database migrations")?;
+        Ok(store)
+    }
+
+    /// Connect with a service account without ever attempting DDL. Runtime
+    /// services fail closed until the dedicated migration job has applied the
+    /// exact schema version compiled into this binary.
+    pub async fn connect_runtime(database_url: &str) -> Result<Self> {
+        let store = Self::open(database_url).await?;
+        let status = store
+            .readiness()
+            .await
+            .context("verify runtime database schema")?;
+        if !status.current {
+            anyhow::bail!(
+                "database schema is not current (applied {}, latest {}; expected {}, latest {}); run clawforge-migrate",
+                status.applied,
+                status.latest,
+                status.expected,
+                status.expected_latest
+            );
+        }
+        Ok(store)
+    }
+
+    async fn open(database_url: &str) -> Result<Self> {
         let pool = PgPoolOptions::new()
             .min_connections(1)
             .max_connections(10)
@@ -69,6 +100,10 @@ impl PostgresStore {
             .connect(database_url)
             .await
             .context("connect to PostgreSQL")?;
+        Ok(Self { pool })
+    }
+
+    async fn reject_newer_schema(&self) -> Result<()> {
         // Refuse to start an older binary against a database that already has
         // migrations this binary does not know about. sqlx protects checksums
         // and applies forward migrations; this explicit guard protects the
@@ -80,13 +115,13 @@ impl PostgresStore {
             .unwrap_or(0);
         let migration_table: Option<String> =
             sqlx::query_scalar("SELECT to_regclass('public._sqlx_migrations')::text")
-                .fetch_one(&pool)
+                .fetch_one(&self.pool)
                 .await
                 .context("inspect migration metadata")?;
         if migration_table.is_some() {
             let applied_latest: Option<i64> =
                 sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
-                    .fetch_one(&pool)
+                    .fetch_one(&self.pool)
                     .await
                     .context("read applied migration version")?;
             if applied_latest.unwrap_or(0) > expected_latest {
@@ -97,11 +132,7 @@ impl PostgresStore {
                 );
             }
         }
-        MIGRATOR
-            .run(&pool)
-            .await
-            .context("run database migrations")?;
-        Ok(Self { pool })
+        Ok(())
     }
 
     pub fn pool(&self) -> &PgPool {

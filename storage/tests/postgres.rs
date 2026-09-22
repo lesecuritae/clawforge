@@ -6,6 +6,79 @@ use clawforge_intelligence::{
 use clawforge_storage::PostgresStore;
 use serde_json::json;
 
+fn runtime_url(name: &str) -> anyhow::Result<String> {
+    Ok(std::env::var(format!(
+        "CLAWFORGE_TEST_{}_DATABASE_URL",
+        name.to_ascii_uppercase()
+    ))?)
+}
+
+#[tokio::test]
+#[ignore = "requires provisioned roles in an isolated PostgreSQL test container"]
+async fn runtime_roles_enforce_service_boundaries() -> anyhow::Result<()> {
+    let api = PostgresStore::connect_runtime(&runtime_url("api")?).await?;
+    api.healthcheck().await?;
+    assert!(
+        sqlx::query("UPDATE audit_events SET action=action WHERE FALSE")
+            .execute(api.pool())
+            .await
+            .is_err()
+    );
+
+    let worker = PostgresStore::connect_runtime(&runtime_url("worker")?).await?;
+    worker
+        .set_runtime_status("worker-role-test", "running", None)
+        .await?;
+    assert!(sqlx::query("SELECT password_hash FROM admin_users LIMIT 1")
+        .fetch_optional(worker.pool())
+        .await
+        .is_err());
+
+    let correlation = PostgresStore::connect_runtime(&runtime_url("correlation")?).await?;
+    correlation
+        .set_runtime_status("correlation-role-test", "running", None)
+        .await?;
+    assert!(
+        sqlx::query("UPDATE providers SET enabled=enabled WHERE FALSE")
+            .execute(correlation.pool())
+            .await
+            .is_err()
+    );
+
+    let incidents = PostgresStore::connect_runtime(&runtime_url("incidents")?).await?;
+    incidents
+        .set_runtime_status("incidents-role-test", "running", None)
+        .await?;
+    assert!(
+        sqlx::query("UPDATE execution_requests SET status=status WHERE FALSE")
+            .execute(incidents.pool())
+            .await
+            .is_err()
+    );
+
+    let executor = PostgresStore::connect_runtime(&runtime_url("executor")?).await?;
+    executor
+        .register_execution_worker("least-privilege-test", 1)
+        .await?;
+    assert!(sqlx::query("UPDATE api_tokens SET name=name WHERE FALSE")
+        .execute(executor.pool())
+        .await
+        .is_err());
+
+    let backup = PostgresStore::connect_runtime(&runtime_url("backup")?).await?;
+    let _: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events")
+        .fetch_one(backup.pool())
+        .await?;
+    assert!(sqlx::query(
+        "INSERT INTO runtime_status (component,state) VALUES ('backup-role-test','running')"
+    )
+    .execute(backup.pool())
+    .await
+    .is_err());
+
+    Ok(())
+}
+
 #[tokio::test]
 #[ignore = "requires an isolated PostgreSQL test container"]
 async fn migrations_and_restart_persist() -> anyhow::Result<()> {

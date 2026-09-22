@@ -142,7 +142,7 @@ async fn process_event(store: &PostgresStore, event: EventRecord, window: Durati
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     let (poll, window) = config()?;
-    let store = PostgresStore::connect(&database_url_from_env()?).await?;
+    let store = PostgresStore::connect_runtime(&database_url_from_env()?).await?;
     store.ensure_event_consumer("correlation").await?;
     store.heartbeat_event_consumer("correlation").await?;
     store

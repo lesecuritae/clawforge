@@ -3,7 +3,10 @@
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `DATABASE_URL` | unset | PostgreSQL connection URL for isolated local tests; used only when the file form is not configured |
-| `DATABASE_URL_FILE` | unset | Preferred fail-closed secret-file form used by API and worker |
+| `DATABASE_URL_FILE` | unset | Preferred fail-closed secret-file form; Compose mounts a different URL for every database-backed service |
+| `CLAWFORGE_DATABASE_URL_SECRET_FILE` | `./secrets/database_url` | Database-owner URL used only by the one-shot migration service |
+| `CLAWFORGE_DATABASE_<SERVICE>_URL_SECRET_FILE` | `./secrets/database_<service>_url` | Restricted runtime URL for `API`, `WORKER`, `CORRELATION`, `INCIDENTS`, or `EXECUTOR` |
+| `CLAWFORGE_DATABASE_<SERVICE>_PASSWORD_SECRET_FILE` | `./secrets/database_<service>_password` | Matching credential used only by the idempotent role provisioner; application services receive the URL only, while backup receives its read-only password for `pg_dump` |
 | `CLAWFORGE_API_BIND` | `0.0.0.0:8080` | API listen address |
 | `CLAWFORGE_API_HOST` | `127.0.0.1` | Host bind address in Compose; set explicitly before exposing the API |
 | `CLAWFORGE_API_PORT` | `8080` | Host port in Compose |

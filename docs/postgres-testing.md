@@ -1,9 +1,13 @@
 # PostgreSQL testing
 
-Storage integration tests should run against an isolated PostgreSQL test container rather than SQLite. A CI job can start `postgres:16-alpine`, wait for `pg_isready`, set `CLAWFORGE_TEST_DATABASE_URL`, and execute:
+Storage integration tests run against an isolated PostgreSQL test container
+rather than SQLite. The repository helper migrates the database, provisions
+all runtime roles, and executes both persistence and permission-boundary tests:
 
 ```sh
-cargo test -p clawforge-storage --test postgres -- --ignored
+./scripts/test-postgres.sh
 ```
 
-The migration set is applied on connect, so restart and persistence checks use the same schema path as the runtime services.
+The suite proves that runtime connections cannot migrate, service roles cannot
+read or mutate unrelated domains, audit rows remain append-only, and the backup
+role cannot write.

@@ -17,6 +17,60 @@ services:
     networks:
       - backend
 
+  clawforge-migrate:
+    image: ${CLAWFORGE_IMAGE_REGISTRY:-ghcr.io/lesecuritae}/clawforge-api:${CLAWFORGE_IMAGE_TAG:-v1.0.0}
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    command: ["/usr/local/bin/clawforge-migrate"]
+    environment:
+      DATABASE_URL_FILE: /run/secrets/database_url
+    depends_on:
+      postgres:
+        condition: service_healthy
+    secrets:
+      - database_url
+    networks:
+      - backend
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    restart: "no"
+
+  clawforge-db-roles:
+    image: postgres:16-alpine
+    command: ["/bin/sh", "/usr/local/bin/provision-db-roles.sh"]
+    environment:
+      PGHOST: postgres
+      PGPORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-clawforge}
+      POSTGRES_USER: ${POSTGRES_USER:-clawforge}
+    depends_on:
+      clawforge-migrate:
+        condition: service_completed_successfully
+    secrets:
+      - postgres_password
+      - database_api_password
+      - database_worker_password
+      - database_correlation_password
+      - database_incidents_password
+      - database_executor_password
+      - database_backup_password
+    volumes:
+      - ./scripts/provision-db-roles.sh:/usr/local/bin/provision-db-roles.sh:ro
+    networks:
+      - backend
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    restart: "no"
+
   prometheus:
     profiles: [observability]
     image: prom/prometheus:v2.55.1
@@ -68,7 +122,7 @@ services:
       dockerfile: docker/Dockerfile
     command: ["/usr/local/bin/clawforge-api"]
     environment:
-      DATABASE_URL_FILE: /run/secrets/database_url
+      DATABASE_URL_FILE: /run/secrets/database_api_url
       RUST_LOG: ${RUST_LOG:-info}
       CLAWFORGE_API_BIND: 0.0.0.0:8080
       CLAWFORGE_ADMIN_BOOTSTRAP_USERNAME: ${CLAWFORGE_ADMIN_BOOTSTRAP_USERNAME:-admin}
@@ -87,10 +141,10 @@ services:
       - no-new-privileges:true
     pids_limit: 256
     depends_on:
-      postgres:
-        condition: service_healthy
+      clawforge-db-roles:
+        condition: service_completed_successfully
     secrets:
-      - database_url
+      - database_api_url
       - analyzer_token
       - notifier_token
       - events_token
@@ -223,7 +277,7 @@ services:
       dockerfile: docker/Dockerfile
     command: ["/usr/local/bin/clawforge-correlation"]
     environment:
-      DATABASE_URL_FILE: /run/secrets/database_url
+      DATABASE_URL_FILE: /run/secrets/database_correlation_url
       CLAWFORGE_CORRELATION_POLL_SECONDS: ${CLAWFORGE_CORRELATION_POLL_SECONDS:-5}
       CLAWFORGE_CORRELATION_WINDOW_SECONDS: ${CLAWFORGE_CORRELATION_WINDOW_SECONDS:-900}
       RUST_LOG: ${RUST_LOG:-info}
@@ -235,10 +289,10 @@ services:
       - no-new-privileges:true
     pids_limit: 128
     depends_on:
-      postgres:
-        condition: service_healthy
+      clawforge-db-roles:
+        condition: service_completed_successfully
     secrets:
-      - database_url
+      - database_correlation_url
     networks:
       - backend
     healthcheck:
@@ -255,7 +309,7 @@ services:
       dockerfile: docker/Dockerfile
     command: ["/usr/local/bin/clawforge-incidents"]
     environment:
-      DATABASE_URL_FILE: /run/secrets/database_url
+      DATABASE_URL_FILE: /run/secrets/database_incidents_url
       CLAWFORGE_INCIDENT_POLL_SECONDS: ${CLAWFORGE_INCIDENT_POLL_SECONDS:-5}
       RUST_LOG: ${RUST_LOG:-info}
     read_only: true
@@ -266,10 +320,10 @@ services:
       - no-new-privileges:true
     pids_limit: 128
     depends_on:
-      postgres:
-        condition: service_healthy
+      clawforge-db-roles:
+        condition: service_completed_successfully
     secrets:
-      - database_url
+      - database_incidents_url
     networks:
       - backend
     healthcheck:
@@ -323,7 +377,7 @@ services:
       dockerfile: docker/Dockerfile
     command: ["/usr/local/bin/clawforge-executor"]
     environment:
-      DATABASE_URL_FILE: /run/secrets/database_url
+      DATABASE_URL_FILE: /run/secrets/database_executor_url
       CLAWFORGE_EXECUTOR_DRY_RUN: ${CLAWFORGE_EXECUTOR_DRY_RUN:-true}
       CLAWFORGE_EXECUTOR_POLL_SECONDS: ${CLAWFORGE_EXECUTOR_POLL_SECONDS:-10}
       CLAWFORGE_EXECUTOR_WORKER_NAME: ${CLAWFORGE_EXECUTOR_WORKER_NAME:-executor-primary}
@@ -337,10 +391,10 @@ services:
       - no-new-privileges:true
     pids_limit: 128
     depends_on:
-      postgres:
-        condition: service_healthy
+      clawforge-db-roles:
+        condition: service_completed_successfully
     secrets:
-      - database_url
+      - database_executor_url
     networks:
       - backend
     healthcheck:
@@ -386,7 +440,7 @@ services:
       dockerfile: docker/Dockerfile
     command: ["/usr/local/bin/clawforge-worker"]
     environment:
-      DATABASE_URL_FILE: /run/secrets/database_url
+      DATABASE_URL_FILE: /run/secrets/database_worker_url
       RUST_LOG: ${RUST_LOG:-info}
       CLAWFORGE_WORKER_POLL_SECONDS: ${CLAWFORGE_WORKER_POLL_SECONDS:-60}
       CLAWFORGE_ENABLE_FEEDS: ${CLAWFORGE_ENABLE_FEEDS:-false}
@@ -404,10 +458,10 @@ services:
       - no-new-privileges:true
     pids_limit: 256
     depends_on:
-      postgres:
-        condition: service_healthy
+      clawforge-db-roles:
+        condition: service_completed_successfully
     secrets:
-      - database_url
+      - database_worker_url
       - threatfox_auth_key
       - urlhaus_auth_key
       - malwarebazaar_auth_key
@@ -431,18 +485,18 @@ services:
   clawforge-backup:
     image: postgres:16-alpine
     depends_on:
-      postgres:
-        condition: service_healthy
+      clawforge-db-roles:
+        condition: service_completed_successfully
     environment:
       PGHOST: postgres
       PGPORT: 5432
       PGDATABASE: ${POSTGRES_DB:-clawforge}
-      PGUSER: ${POSTGRES_USER:-clawforge}
+      PGUSER: clawforge_backup
       BACKUP_INTERVAL_SECONDS: ${CLAWFORGE_BACKUP_INTERVAL_SECONDS:-86400}
       BACKUP_RETENTION_DAYS: ${CLAWFORGE_BACKUP_RETENTION_DAYS:-14}
       CLAWFORGE_CORE_API_URL: ${CLAWFORGE_CORE_API_URL:-http://clawforge-api:8080}
     secrets:
-      - postgres_password
+      - database_backup_password
       - operations_token
     volumes:
       - clawforge-backups:/backups
@@ -460,7 +514,7 @@ services:
       - |
         umask 077
         chmod 700 /backups
-        export PGPASSWORD="$$(cat /run/secrets/postgres_password)"
+        export PGPASSWORD="$$(cat /run/secrets/database_backup_password)"
         notify_error() {
           reason="$${1:-backup operation failed}"
           token="$$(cat /run/secrets/operations_token)"
@@ -508,6 +562,28 @@ secrets:
     file: ${CLAWFORGE_POSTGRES_SECRET_FILE:?set CLAWFORGE_POSTGRES_SECRET_FILE to a private secret file}
   database_url:
     file: ${CLAWFORGE_DATABASE_URL_SECRET_FILE:?set CLAWFORGE_DATABASE_URL_SECRET_FILE to a private secret file}
+  database_api_password:
+    file: ${CLAWFORGE_DATABASE_API_PASSWORD_SECRET_FILE:?set CLAWFORGE_DATABASE_API_PASSWORD_SECRET_FILE to a private secret file}
+  database_api_url:
+    file: ${CLAWFORGE_DATABASE_API_URL_SECRET_FILE:?set CLAWFORGE_DATABASE_API_URL_SECRET_FILE to a private secret file}
+  database_worker_password:
+    file: ${CLAWFORGE_DATABASE_WORKER_PASSWORD_SECRET_FILE:?set CLAWFORGE_DATABASE_WORKER_PASSWORD_SECRET_FILE to a private secret file}
+  database_worker_url:
+    file: ${CLAWFORGE_DATABASE_WORKER_URL_SECRET_FILE:?set CLAWFORGE_DATABASE_WORKER_URL_SECRET_FILE to a private secret file}
+  database_correlation_password:
+    file: ${CLAWFORGE_DATABASE_CORRELATION_PASSWORD_SECRET_FILE:?set CLAWFORGE_DATABASE_CORRELATION_PASSWORD_SECRET_FILE to a private secret file}
+  database_correlation_url:
+    file: ${CLAWFORGE_DATABASE_CORRELATION_URL_SECRET_FILE:?set CLAWFORGE_DATABASE_CORRELATION_URL_SECRET_FILE to a private secret file}
+  database_incidents_password:
+    file: ${CLAWFORGE_DATABASE_INCIDENTS_PASSWORD_SECRET_FILE:?set CLAWFORGE_DATABASE_INCIDENTS_PASSWORD_SECRET_FILE to a private secret file}
+  database_incidents_url:
+    file: ${CLAWFORGE_DATABASE_INCIDENTS_URL_SECRET_FILE:?set CLAWFORGE_DATABASE_INCIDENTS_URL_SECRET_FILE to a private secret file}
+  database_executor_password:
+    file: ${CLAWFORGE_DATABASE_EXECUTOR_PASSWORD_SECRET_FILE:?set CLAWFORGE_DATABASE_EXECUTOR_PASSWORD_SECRET_FILE to a private secret file}
+  database_executor_url:
+    file: ${CLAWFORGE_DATABASE_EXECUTOR_URL_SECRET_FILE:?set CLAWFORGE_DATABASE_EXECUTOR_URL_SECRET_FILE to a private secret file}
+  database_backup_password:
+    file: ${CLAWFORGE_DATABASE_BACKUP_PASSWORD_SECRET_FILE:?set CLAWFORGE_DATABASE_BACKUP_PASSWORD_SECRET_FILE to a private secret file}
   threatfox_auth_key:
     file: ${CLAWFORGE_THREATFOX_SECRET_FILE:?set CLAWFORGE_THREATFOX_SECRET_FILE to a private secret file}
   urlhaus_auth_key:
