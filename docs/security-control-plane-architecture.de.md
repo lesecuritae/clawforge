@@ -106,15 +106,23 @@ Firewall-Aktion.
    Executor haben keine eigenen Tests; das Frontend nutzt TypeScript-
    Kompilierung als einzigen Test. Der vollständige Release-Gate läuft nicht in
    CI und seine Wait-Loops besitzen keine Timeouts.
-9. Intelligence Events können über einen Legacy-Pfad direkt Incidents erzeugen,
-   während der neuere Pfad Event, Correlation Candidate und Incident trennt.
-   Beide Wege müssen vor Security Events auf einen kanonischen Pfad
-   konsolidiert werden, damit keine doppelten Incidents entstehen.
-10. IP-Felder werden mit dem Analyzer-Sanitizer vor der Eventpersistenz
-    anonymisiert. Der gleiche Platzhalter kann IP-Korrelation entweder zerstören
-    oder unterschiedliche Adressen falsch verbinden. Kanonische, streng
-    geschützte Korrelationsdaten und redigierte Read-Projektionen müssen getrennt
-    werden; stabile Pseudonyme benötigen einen geheimen HMAC-Schlüssel.
+9. **Behoben** (`incident-correlation-convergence`, siehe Roadmap): Intelligence
+   Events konnten über einen Legacy-Pfad direkt Incidents erzeugen, während der
+   neuere Pfad Event, Correlation Candidate und Incident trennte. Der
+   Legacy-Pfad (`correlate_incident`) ist entfernt; der Kandidat-/
+   Promotion-Pfad ist jetzt kanonisch und erzeugt auch für einen Event ohne
+   Korrelationspartner einen Kandidaten, eskaliert einen bereits promoteten
+   Kandidaten statt einen zweiten Incident anzulegen, und trägt
+   `alerts.incident_id` nach.
+10. **Behoben** (`incident-correlation-convergence`, siehe Roadmap): IP-Felder
+    wurden mit dem Analyzer-Sanitizer vor der Eventpersistenz auf einen festen
+    Platzhalter abgebildet, der IP-Korrelation zerstörte und unterschiedliche
+    Adressen fälschlich verband. Ein geheimer, pro Deployment konfigurierter
+    HMAC-Schlüssel (`CLAWFORGE_ANALYZER_IP_HMAC_KEY`) bildet jede IP jetzt auf
+    ein stabiles, nicht umkehrbares Pseudonym ab (`events.correlation_id`
+    eingeschlossen); ohne konfigurierten Schlüssel wird bei aktiver
+    Anonymisierung fail-closed die Persistenz/Anzeige verweigert statt auf den
+    unsicheren Platzhalter zurückzufallen.
 11. Runtime- und Datenbank-Allowlist für Actions sind nicht synchron. Mehrere
     in Migrationen registrierte Actions werden durch die statische Policy-
     Allowlist abgelehnt.

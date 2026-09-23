@@ -314,10 +314,13 @@ async fn migrations_and_restart_persist() -> anyhow::Result<()> {
     // and promote_incident_candidates own that now. Drive that pipeline
     // directly here, the same way those services do, to keep exercising it
     // as part of this broader smoke test.
+    // Not filtered by correlation_id: it is now the resource's HMAC
+    // pseudonym (see storage's publish_event), not the raw IP this test
+    // fixture uses as a resource, and this event_type is only published
+    // once above.
     let new_threat_event_id: uuid::Uuid = sqlx::query_scalar(
-        "SELECT event_id FROM events WHERE event_type='new_threat_indicator' AND correlation_id=$1 ORDER BY occurred_at DESC LIMIT 1",
+        "SELECT event_id FROM events WHERE event_type='new_threat_indicator' ORDER BY occurred_at DESC LIMIT 1",
     )
-    .bind(&updated.value)
     .fetch_one(restarted.pool())
     .await?;
     let candidate_key = format!("correlation-id:{}", updated.value);
@@ -449,9 +452,8 @@ async fn migrations_and_restart_persist() -> anyhow::Result<()> {
         })
         .await?;
     let bgp_change_event_id: uuid::Uuid = sqlx::query_scalar(
-        "SELECT event_id FROM events WHERE event_type='bgp_change' AND correlation_id=$1 ORDER BY occurred_at DESC LIMIT 1",
+        "SELECT event_id FROM events WHERE event_type='bgp_change' ORDER BY occurred_at DESC LIMIT 1",
     )
-    .bind(&updated.value)
     .fetch_one(restarted.pool())
     .await?;
     restarted

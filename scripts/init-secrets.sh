@@ -54,7 +54,7 @@ for role in api worker correlation incidents executor; do
 done
 write_new database_backup_password "$(generate_secret)"
 
-for name in admin_bootstrap_token analyzer_token notifier_token events_token operations_token mcp_auth_token; do
+for name in admin_bootstrap_token analyzer_token notifier_token events_token operations_token mcp_auth_token analyzer_ip_hmac_key; do
   write_new "$name" "$(generate_secret)"
 done
 

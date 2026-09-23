@@ -308,8 +308,13 @@ Dateneigentümerschaft und zwei-Personen-Freigabe.
    Audit-Outbox und PostgreSQL-Integrationstest in CI.
 4. `database-least-privilege` (umgesetzt): eigener Migrationsjob, getrennte
    Laufzeitrollen und PostgreSQL-Negativtests für fremde Tabellen und Audit.
-5. `incident-correlation-convergence`: Legacy-Pfad konsolidieren und geschützte
-   IP-Korrelation von Read-Redaction trennen.
+5. `incident-correlation-convergence` (umgesetzt): Legacy-Pfad
+   (`correlate_incident`) entfernt, Kandidat-/Promotion-Pfad um Solo-
+   Kandidaten, Alert-Backfill und Re-Eskalation bereits promoteter
+   Kandidaten ergänzt; IP-Korrelation von Read-Redaction getrennt durch ein
+   geheimes HMAC-Pseudonym (`CLAWFORGE_ANALYZER_IP_HMAC_KEY`) statt des
+   alten, IPs kollabierenden Platzhalters, fail-closed ohne konfigurierten
+   Schlüssel.
 6. `security-events-domain`: Event-Katalog, Envelope, Validatoren, Fixtures und
    Dokumentation ohne API- oder Datenbankänderung.
 7. `security-events-storage`: additive Migration, persistente Sensoridentitäten

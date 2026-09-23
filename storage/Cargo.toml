@@ -10,6 +10,7 @@ anyhow.workspace = true
 chrono.workspace = true
 clawforge-intelligence = { path = "../intelligence" }
 clawforge-risk = { path = "../risk" }
+hmac.workspace = true
 sqlx.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

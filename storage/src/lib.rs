@@ -4,13 +4,14 @@
 //! database details. SQLite can be used by future test adapters; production
 //! runtime is PostgreSQL through sqlx.
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use clawforge_intelligence::{
     AsnRecord, BgpEvent, Indicator, IndicatorSink, IntelligenceEvent, NetworkSink, Provider,
     ProviderError, RpkiRecord, TrustedNetwork,
 };
-use clawforge_secret::{contains_placeholder, load_required};
+use clawforge_secret::{contains_placeholder, load_optional, load_required, validate_token};
+use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 use std::env;
@@ -683,8 +684,19 @@ impl PostgresStore {
         dedupe_key: &str,
     ) -> Result<Uuid> {
         let event_id = Uuid::new_v4();
-        let payload = sanitize_analysis_value(payload, None);
-        let metadata = sanitize_analysis_value(metadata, None);
+        let payload = sanitize_analysis_value(payload, None)?;
+        let metadata = sanitize_analysis_value(metadata, None)?;
+        // events.correlation_id is the canonical value the correlation
+        // engine matches on (EventRecord::correlation_id in
+        // clawforge-correlation) and is read back unredacted by
+        // list_events/get_event - unlike payload/metadata, nothing else
+        // sanitizes it, so it must happen here or a raw IP resource leaks
+        // through every read of this column regardless of the anonymization
+        // setting.
+        let correlation_id = correlation_id
+            .map(pseudonymize_correlation_id)
+            .transpose()?;
+        let correlation_id = correlation_id.as_deref();
         let mut tx = self.pool.begin().await?;
         let inserted = sqlx::query("INSERT INTO events (event_id,event_type,source,severity,occurred_at,correlation_id,payload,metadata,dedupe_key) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (dedupe_key) DO NOTHING")
             .bind(event_id).bind(event_type).bind(source).bind(severity).bind(occurred_at).bind(correlation_id)
@@ -1376,7 +1388,7 @@ impl PostgresStore {
         if !exists {
             anyhow::bail!("incident not found");
         }
-        let metadata = sanitize_analysis_value(metadata, None);
+        let metadata = sanitize_analysis_value(metadata, None)?;
         let id: i64 = sqlx::query_scalar("INSERT INTO incident_timeline (incident_id,actor,action,metadata) VALUES ($1,$2,$3,$4) RETURNING id")
             .bind(incident_id).bind(actor.trim()).bind(action.trim()).bind(metadata)
             .fetch_one(&self.pool).await?;
@@ -1386,13 +1398,17 @@ impl PostgresStore {
     pub async fn list_incident_timeline_entries(&self, id: Uuid) -> Result<Vec<serde_json::Value>> {
         let rows = sqlx::query("SELECT id,actor,action,timestamp,metadata FROM incident_timeline WHERE incident_id=$1 ORDER BY timestamp ASC,id ASC")
             .bind(id).fetch_all(&self.pool).await?;
-        Ok(rows.into_iter().map(|row| serde_json::json!({
-            "id": row.get::<i64,_>("id"),
-            "actor": row.get::<String,_>("actor"),
-            "action": row.get::<String,_>("action"),
-            "timestamp": row.get::<chrono::DateTime<chrono::Utc>,_>("timestamp"),
-            "metadata": sanitize_analysis_value(row.get::<serde_json::Value,_>("metadata"), None)
-        })).collect())
+        rows.into_iter()
+            .map(|row| {
+                Ok(serde_json::json!({
+                    "id": row.get::<i64,_>("id"),
+                    "actor": row.get::<String,_>("actor"),
+                    "action": row.get::<String,_>("action"),
+                    "timestamp": row.get::<chrono::DateTime<chrono::Utc>,_>("timestamp"),
+                    "metadata": sanitize_analysis_value(row.get::<serde_json::Value,_>("metadata"), None)?
+                }))
+            })
+            .collect::<Result<Vec<_>>>()
     }
 
     pub async fn incident_timeline(&self, id: Uuid) -> Result<Option<Vec<serde_json::Value>>> {
@@ -1715,11 +1731,11 @@ impl PostgresStore {
             return Ok(None);
         };
         let events = self.list_incident_events(id).await?;
-        let incident = sanitize_analysis_value(incident, None);
+        let incident = sanitize_analysis_value(incident, None)?;
         let events = events
             .into_iter()
             .map(|event| sanitize_analysis_value(event, None))
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>>>()?;
         Ok(Some(serde_json::json!({
             "incident": incident,
             "events": events,
@@ -3610,28 +3626,106 @@ fn ip_analysis_key(key: &str) -> bool {
     )
 }
 
-fn sanitize_analysis_value(value: serde_json::Value, key: Option<&str>) -> serde_json::Value {
+/// A secret, per-deployment HMAC key for turning a raw IP into a stable
+/// pseudonym: the same IP always yields the same pseudonym (so correlation
+/// by recurring IP still works), two different IPs practically never yield
+/// the same one (so unrelated events cannot fuse into one false incident),
+/// and the pseudonym cannot be turned back into the IP without this key.
+/// Read fresh (not cached) so a configured secret file can be rotated
+/// without restarting the process, matching analysis_anonymize_ips() above.
+fn ip_pseudonym_key() -> Result<Option<String>> {
+    match load_optional(
+        "CLAWFORGE_ANALYZER_IP_HMAC_KEY_FILE",
+        "CLAWFORGE_ANALYZER_IP_HMAC_KEY",
+    )? {
+        Some(value) => {
+            validate_token("CLAWFORGE_ANALYZER_IP_HMAC_KEY", &value)?;
+            Ok(Some(value))
+        }
+        None => Ok(None),
+    }
+}
+
+fn ip_pseudonym(key: &str, ip: &str) -> String {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key.as_bytes())
+        .expect("HMAC-SHA256 accepts a key of any length");
+    mac.update(ip.as_bytes());
+    let digest = mac.finalize().into_bytes();
+    use std::fmt::Write;
+    let mut pseudonym = String::with_capacity(48);
+    pseudonym.push_str("ip-pseudonym:");
+    for byte in &digest[..16] {
+        let _ = write!(pseudonym, "{byte:02x}");
+    }
+    pseudonym
+}
+
+/// Replace a raw IP with its stable pseudonym. Fails closed: with no
+/// CLAWFORGE_ANALYZER_IP_HMAC_KEY(_FILE) configured, there is no safe way to
+/// keep an IP both anonymized and correlatable (a plain, unkeyed hash of an
+/// IPv4/IPv6 address is trivially reversible over so small an address
+/// space), so this refuses to persist the event rather than silently fall
+/// back to the old static placeholder that collapsed every distinct IP into
+/// one shared, falsely-correlated value.
+fn pseudonymize_ip(ip: &str) -> Result<String> {
+    match ip_pseudonym_key()? {
+        Some(key) => Ok(ip_pseudonym(&key, ip)),
+        None => Err(anyhow!(
+            "CLAWFORGE_ANALYZER_IP_HMAC_KEY (or _FILE) must be configured while IP anonymization \
+             is enabled (CLAWFORGE_ANALYZER_ANONYMIZE_IPS, default on): refusing to store an IP \
+             value without a way to pseudonymize it safely"
+        )),
+    }
+}
+
+/// Pseudonymize events.correlation_id when it is itself a raw IP (the
+/// common case: most network-intelligence event types key on one). A
+/// non-IP correlation id - a UUID, an ASN, a hostname - passes through
+/// unchanged; it was never the thing being protected.
+fn pseudonymize_correlation_id(value: &str) -> Result<String> {
+    if analysis_anonymize_ips() && value.parse::<std::net::IpAddr>().is_ok() {
+        pseudonymize_ip(value)
+    } else {
+        Ok(value.to_string())
+    }
+}
+
+/// Canonical, protected correlation data and redacted read projections are
+/// the same representation here by design: a stable HMAC pseudonym is safe
+/// to both correlate on internally and expose externally, so this one
+/// sanitizer is applied uniformly at every persistence and read-projection
+/// boundary (see its call sites) rather than keeping two separate values.
+fn sanitize_analysis_value(
+    value: serde_json::Value,
+    key: Option<&str>,
+) -> Result<serde_json::Value> {
     match value {
-        serde_json::Value::Object(values) => serde_json::Value::Object(
-            values
-                .into_iter()
-                .filter(|(name, _)| !sensitive_analysis_key(name))
-                .map(|(name, value)| {
-                    let value = if analysis_anonymize_ips() && ip_analysis_key(&name) {
-                        serde_json::Value::String("<anonymized-ip>".to_string())
-                    } else {
-                        sanitize_analysis_value(value, Some(&name))
-                    };
-                    (name, value)
-                })
-                .collect(),
-        ),
-        serde_json::Value::Array(values) => serde_json::Value::Array(
+        serde_json::Value::Object(values) => {
+            let mut sanitized = serde_json::Map::with_capacity(values.len());
+            for (name, value) in values {
+                if sensitive_analysis_key(&name) {
+                    continue;
+                }
+                let value = if analysis_anonymize_ips() && ip_analysis_key(&name) {
+                    match value {
+                        serde_json::Value::String(ip) => {
+                            serde_json::Value::String(pseudonymize_ip(&ip)?)
+                        }
+                        _ => serde_json::Value::String("<redacted>".to_string()),
+                    }
+                } else {
+                    sanitize_analysis_value(value, Some(&name))?
+                };
+                sanitized.insert(name, value);
+            }
+            Ok(serde_json::Value::Object(sanitized))
+        }
+        serde_json::Value::Array(values) => Ok(serde_json::Value::Array(
             values
                 .into_iter()
                 .map(|value| sanitize_analysis_value(value, key))
-                .collect(),
-        ),
+                .collect::<Result<Vec<_>>>()?,
+        )),
         serde_json::Value::String(value)
             if analysis_anonymize_ips()
                 && key.is_some_and(|name| {
@@ -3639,9 +3733,9 @@ fn sanitize_analysis_value(value: serde_json::Value, key: Option<&str>) -> serde
                 })
                 && value.parse::<std::net::IpAddr>().is_ok() =>
         {
-            serde_json::Value::String("<anonymized-ip>".to_string())
+            Ok(serde_json::Value::String(pseudonymize_ip(&value)?))
         }
-        other => other,
+        other => Ok(other),
     }
 }
 
@@ -3850,5 +3944,114 @@ mod incident_lifecycle_tests {
             "cancelled",
             "approved"
         ));
+    }
+}
+
+#[cfg(test)]
+mod ip_pseudonym_tests {
+    use super::sanitize_analysis_value;
+    use serde_json::json;
+    use std::sync::Mutex;
+
+    // sanitize_analysis_value reads process-wide env vars on every call
+    // (CLAWFORGE_ANALYZER_ANONYMIZE_IPS, CLAWFORGE_ANALYZER_IP_HMAC_KEY) so a
+    // secret file can be rotated without a restart; that also means these
+    // tests must not run concurrently with each other.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn with_env<T>(pairs: &[(&str, Option<&str>)], run: impl FnOnce() -> T) -> T {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        for (key, value) in pairs {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+        let result = run();
+        for (key, _) in pairs {
+            std::env::remove_var(key);
+        }
+        result
+    }
+
+    #[test]
+    fn disabled_anonymization_passes_ips_through_unchanged() {
+        with_env(
+            &[
+                ("CLAWFORGE_ANALYZER_ANONYMIZE_IPS", Some("false")),
+                ("CLAWFORGE_ANALYZER_IP_HMAC_KEY", None),
+            ],
+            || {
+                let value = sanitize_analysis_value(json!({"resource": "203.0.113.7"}), None)
+                    .expect("disabled anonymization never needs the key");
+                assert_eq!(value["resource"], "203.0.113.7");
+            },
+        );
+    }
+
+    #[test]
+    fn enabled_anonymization_without_a_key_fails_closed() {
+        with_env(
+            &[
+                ("CLAWFORGE_ANALYZER_ANONYMIZE_IPS", None),
+                ("CLAWFORGE_ANALYZER_IP_HMAC_KEY", None),
+            ],
+            || {
+                let error = sanitize_analysis_value(json!({"resource": "203.0.113.7"}), None)
+                    .expect_err(
+                        "must refuse to persist an IP with no key to pseudonymize it safely",
+                    );
+                assert!(error.to_string().contains("CLAWFORGE_ANALYZER_IP_HMAC_KEY"));
+            },
+        );
+    }
+
+    #[test]
+    fn a_configured_key_yields_a_stable_pseudonym_that_is_not_the_raw_ip() {
+        with_env(
+            &[
+                ("CLAWFORGE_ANALYZER_ANONYMIZE_IPS", None),
+                (
+                    "CLAWFORGE_ANALYZER_IP_HMAC_KEY",
+                    Some("test-only-hmac-key-with-enough-entropy-0123456789"),
+                ),
+            ],
+            || {
+                let first =
+                    sanitize_analysis_value(json!({"resource": "203.0.113.7"}), None).unwrap();
+                let again =
+                    sanitize_analysis_value(json!({"resource": "203.0.113.7"}), None).unwrap();
+                let other =
+                    sanitize_analysis_value(json!({"resource": "198.51.100.9"}), None).unwrap();
+                assert_eq!(
+                    first["resource"], again["resource"],
+                    "same IP, same pseudonym"
+                );
+                assert_ne!(
+                    first["resource"], other["resource"],
+                    "different IP, different pseudonym"
+                );
+                let pseudonym = first["resource"].as_str().unwrap();
+                assert!(pseudonym.starts_with("ip-pseudonym:"));
+                assert!(!pseudonym.contains("203.0.113.7"));
+            },
+        );
+    }
+
+    #[test]
+    fn a_non_ip_string_under_an_ip_key_is_redacted_without_needing_a_key() {
+        with_env(
+            &[
+                ("CLAWFORGE_ANALYZER_ANONYMIZE_IPS", None),
+                ("CLAWFORGE_ANALYZER_IP_HMAC_KEY", None),
+            ],
+            || {
+                // "source_ip" is an ip_analysis_key regardless of whether the
+                // value under it actually parses as an IP - this must not
+                // require the pseudonym key, unlike a genuine IP value.
+                let value = sanitize_analysis_value(json!({"source_ip": null}), None).unwrap();
+                assert_eq!(value["source_ip"], "<redacted>");
+            },
+        );
     }
 }

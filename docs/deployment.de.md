@@ -39,7 +39,15 @@ Apache-2.0-Lizenz. GitHub Actions veröffentlicht `linux/amd64` und
 3. `./scripts/init-secrets.sh` ausführen, optionale Provider-Credentials
    ergänzen und mit `./scripts/validate-secrets.sh --bootstrap` prüfen. Private Dateien
    werden nicht versioniert und erhalten Modus `0600`; eingecheckte Beispiele
-   sind keine Runtime-Defaults.
+   sind keine Runtime-Defaults. `init-secrets.sh` erzeugt auch
+   `secrets/analyzer_ip_hmac_key`: Bei aktivierter IP-Anonymisierung
+   (`CLAWFORGE_ANALYZER_ANONYMIZE_IPS`, Standard) wird damit aus einer rohen
+   IP ein stabiles, nicht umkehrbares Pseudonym gebildet, bevor sie
+   persistiert wird - statt des früheren festen Platzhalters, in dem jede IP
+   zusammenfiel (das zerstörte Korrelation und konnte unabhängige Ereignisse
+   fälschlich verschmelzen). Ohne diesen Schlüssel verweigern
+   api/worker/correlation/incidents/executor das Persistieren bzw. Anzeigen
+   einer IP, statt auf den unsicheren Platzhalter zurückzufallen.
 4. `docker compose pull && docker compose up -d` ausführen (oder lokal bauen).
 5. Die API vorübergehend mit `compose.bootstrap.yml` neu erzeugen, den
    einmaligen Admin-Bootstrap durchführen, die API danach wieder ausschließlich

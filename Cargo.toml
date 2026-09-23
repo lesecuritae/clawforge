@@ -13,6 +13,7 @@ async-trait = "0.1"
 axum = "0.8"
 argon2 = "0.5"
 chrono = { version = "0.4", features = ["serde"] }
+hmac = "0.12"
 ipnet = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 redis = { version = "0.32", default-features = false, features = ["tokio-comp"] }

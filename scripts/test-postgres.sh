@@ -28,6 +28,8 @@ run_cargo() {
     -e CLAWFORGE_TEST_INCIDENTS_DATABASE_URL \
     -e CLAWFORGE_TEST_EXECUTOR_DATABASE_URL \
     -e CLAWFORGE_TEST_BACKUP_DATABASE_URL \
+    -e CLAWFORGE_ANALYZER_ANONYMIZE_IPS \
+    -e CLAWFORGE_ANALYZER_IP_HMAC_KEY \
     -v "$repo_dir:/src" \
     -v "$secret_dir/cargo-home:/tmp/clawforge-cargo" \
     -v "$secret_dir/cargo-target:/tmp/clawforge-target" \
@@ -72,6 +74,11 @@ docker run --rm --network host \
   -v "$repo_dir/scripts/provision-db-roles.sh:/usr/local/bin/provision-db-roles.sh:ro" \
   postgres:16-alpine sh /usr/local/bin/provision-db-roles.sh
 
+# IP anonymization defaults to on (CLAWFORGE_ANALYZER_ANONYMIZE_IPS) and, with
+# no key configured, publish_event now fails closed on any IP-shaped
+# correlation id or payload/metadata field - which several fixtures below use
+# as a resource. A throwaway key here proves the pseudonymization path itself
+# (see storage's ip_pseudonym_tests for the fail-closed case without one).
 CLAWFORGE_TEST_DATABASE_URL="$owner_url" \
 CLAWFORGE_TEST_API_DATABASE_URL="$(cat "$secret_dir/database_api_url")" \
 CLAWFORGE_TEST_WORKER_DATABASE_URL="$(cat "$secret_dir/database_worker_url")" \
@@ -79,9 +86,11 @@ CLAWFORGE_TEST_CORRELATION_DATABASE_URL="$(cat "$secret_dir/database_correlation
 CLAWFORGE_TEST_INCIDENTS_DATABASE_URL="$(cat "$secret_dir/database_incidents_url")" \
 CLAWFORGE_TEST_EXECUTOR_DATABASE_URL="$(cat "$secret_dir/database_executor_url")" \
 CLAWFORGE_TEST_BACKUP_DATABASE_URL="postgres://clawforge_backup:${backup_password}@127.0.0.1:55432/clawforge_test" \
+CLAWFORGE_ANALYZER_IP_HMAC_KEY="test-only-ip-hmac-key-0123456789-not-for-production" \
   run_cargo test -p clawforge-storage --test postgres -- --ignored --test-threads=1
 
 CLAWFORGE_TEST_DATABASE_URL="$owner_url" \
 CLAWFORGE_TEST_CORRELATION_DATABASE_URL="$(cat "$secret_dir/database_correlation_url")" \
 CLAWFORGE_TEST_INCIDENTS_DATABASE_URL="$(cat "$secret_dir/database_incidents_url")" \
+CLAWFORGE_ANALYZER_IP_HMAC_KEY="test-only-ip-hmac-key-0123456789-not-for-production" \
   run_cargo test -p clawforge-correlation --bin clawforge-correlation -- --ignored --test-threads=1

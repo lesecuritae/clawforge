@@ -41,7 +41,14 @@ when tests and security checks pass. Use `v1.0.0` or `1.0.0` in production;
 3. Run `./scripts/init-secrets.sh`, supply optional provider credentials, and
    run `./scripts/validate-secrets.sh --bootstrap`. Generated private files are ignored by
    Git and use `0600` permissions; checked-in example values are never runtime
-   defaults.
+   defaults. `init-secrets.sh` also generates `secrets/analyzer_ip_hmac_key`:
+   with IP anonymization on (`CLAWFORGE_ANALYZER_ANONYMIZE_IPS`, the default),
+   this key turns a raw IP into a stable, non-reversible pseudonym before it
+   is ever persisted, instead of the fixed placeholder every IP used to
+   collapse into (which broke correlation and could fuse unrelated events
+   together). Without this key configured, api/worker/correlation/incidents/executor
+   refuse to persist or reveal an IP rather than fall back to that unsafe
+   placeholder.
 4. Run `docker compose pull && docker compose up -d` (or build locally).
 5. Temporarily recreate the API with `compose.bootstrap.yml`, complete the
    one-time administrator bootstrap, recreate the API from `compose.yml`, and

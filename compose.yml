@@ -129,6 +129,7 @@ services:
       CLAWFORGE_ANALYZER_URL: ${CLAWFORGE_ANALYZER_URL:-http://clawforge-analyzer:8081}
       CLAWFORGE_ANALYZER_TOKEN_FILE: /run/secrets/analyzer_token
       CLAWFORGE_ANALYZER_ANONYMIZE_IPS: ${CLAWFORGE_ANALYZER_ANONYMIZE_IPS:-true}
+      CLAWFORGE_ANALYZER_IP_HMAC_KEY_FILE: /run/secrets/analyzer_ip_hmac_key
       CLAWFORGE_NOTIFIER_TOKEN_FILE: /run/secrets/notifier_token
       CLAWFORGE_EVENTS_TOKEN_FILE: /run/secrets/events_token
       CLAWFORGE_OPERATIONS_TOKEN_FILE: /run/secrets/operations_token
@@ -149,6 +150,7 @@ services:
       - notifier_token
       - events_token
       - operations_token
+      - analyzer_ip_hmac_key
     networks:
       - backend
       - frontend
@@ -280,6 +282,8 @@ services:
       DATABASE_URL_FILE: /run/secrets/database_correlation_url
       CLAWFORGE_CORRELATION_POLL_SECONDS: ${CLAWFORGE_CORRELATION_POLL_SECONDS:-5}
       CLAWFORGE_CORRELATION_WINDOW_SECONDS: ${CLAWFORGE_CORRELATION_WINDOW_SECONDS:-900}
+      CLAWFORGE_ANALYZER_ANONYMIZE_IPS: ${CLAWFORGE_ANALYZER_ANONYMIZE_IPS:-true}
+      CLAWFORGE_ANALYZER_IP_HMAC_KEY_FILE: /run/secrets/analyzer_ip_hmac_key
       RUST_LOG: ${RUST_LOG:-info}
     read_only: true
     tmpfs:
@@ -293,6 +297,7 @@ services:
         condition: service_completed_successfully
     secrets:
       - database_correlation_url
+      - analyzer_ip_hmac_key
     networks:
       - backend
     healthcheck:
@@ -311,6 +316,8 @@ services:
     environment:
       DATABASE_URL_FILE: /run/secrets/database_incidents_url
       CLAWFORGE_INCIDENT_POLL_SECONDS: ${CLAWFORGE_INCIDENT_POLL_SECONDS:-5}
+      CLAWFORGE_ANALYZER_ANONYMIZE_IPS: ${CLAWFORGE_ANALYZER_ANONYMIZE_IPS:-true}
+      CLAWFORGE_ANALYZER_IP_HMAC_KEY_FILE: /run/secrets/analyzer_ip_hmac_key
       RUST_LOG: ${RUST_LOG:-info}
     read_only: true
     tmpfs:
@@ -324,6 +331,7 @@ services:
         condition: service_completed_successfully
     secrets:
       - database_incidents_url
+      - analyzer_ip_hmac_key
     networks:
       - backend
     healthcheck:
@@ -396,6 +404,8 @@ services:
       CLAWFORGE_EXECUTOR_POLL_SECONDS: ${CLAWFORGE_EXECUTOR_POLL_SECONDS:-10}
       CLAWFORGE_EXECUTOR_WORKER_NAME: ${CLAWFORGE_EXECUTOR_WORKER_NAME:-executor-primary}
       CLAWFORGE_EXECUTOR_WORKER_CAPACITY: ${CLAWFORGE_EXECUTOR_WORKER_CAPACITY:-1}
+      CLAWFORGE_ANALYZER_ANONYMIZE_IPS: ${CLAWFORGE_ANALYZER_ANONYMIZE_IPS:-true}
+      CLAWFORGE_ANALYZER_IP_HMAC_KEY_FILE: /run/secrets/analyzer_ip_hmac_key
       RUST_LOG: ${RUST_LOG:-info}
     read_only: true
     tmpfs:
@@ -409,6 +419,7 @@ services:
         condition: service_completed_successfully
     secrets:
       - database_executor_url
+      - analyzer_ip_hmac_key
     networks:
       - backend
     healthcheck:
@@ -464,6 +475,8 @@ services:
       THREATFOX_AUTH_KEY_FILE: /run/secrets/threatfox_auth_key
       URLHAUS_AUTH_KEY_FILE: /run/secrets/urlhaus_auth_key
       MALWAREBAZAAR_AUTH_KEY_FILE: /run/secrets/malwarebazaar_auth_key
+      CLAWFORGE_ANALYZER_ANONYMIZE_IPS: ${CLAWFORGE_ANALYZER_ANONYMIZE_IPS:-true}
+      CLAWFORGE_ANALYZER_IP_HMAC_KEY_FILE: /run/secrets/analyzer_ip_hmac_key
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=64m
@@ -479,6 +492,7 @@ services:
       - threatfox_auth_key
       - urlhaus_auth_key
       - malwarebazaar_auth_key
+      - analyzer_ip_hmac_key
     networks:
       - backend
     healthcheck:
@@ -627,6 +641,8 @@ secrets:
     file: ${CLAWFORGE_MCP_AGENT_TOKEN_FILE:?set CLAWFORGE_MCP_AGENT_TOKEN_FILE to a private secret file}
   mcp_auth_token:
     file: ${CLAWFORGE_MCP_AUTH_TOKEN_FILE:?set CLAWFORGE_MCP_AUTH_TOKEN_FILE to a private secret file}
+  analyzer_ip_hmac_key:
+    file: ${CLAWFORGE_ANALYZER_IP_HMAC_KEY_SECRET_FILE:?set CLAWFORGE_ANALYZER_IP_HMAC_KEY_SECRET_FILE to a private secret file}
   github_token:
     file: ${CLAWFORGE_GITHUB_TOKEN_FILE:?set CLAWFORGE_GITHUB_TOKEN_FILE to a private secret file}
   proxmox_token:
