@@ -137,7 +137,14 @@ fn parse_haproxy_message(message: &str) -> Option<HaproxyRequest> {
     if tokens.len() < 6 {
         return None;
     }
-    let source_ip = tokens[0].split(':').next()?.trim();
+    // tokens[0] is "<client-ip>:<port>". Splitting on the FIRST colon breaks
+    // for an IPv6 (or IPv4-mapped-IPv6, e.g. "::ffff:1.2.3.4:5678" - what a
+    // dual-stack `bind ::: ... v4v6` frontend actually logs for an IPv4
+    // client, unbracketed, found live against a real HAProxy on that bind
+    // shape) address: the part before the first colon is empty ("::ffff:...")
+    // or just one hextet, not the whole address. The port is always the last
+    // colon-separated segment, so split on the LAST colon instead.
+    let source_ip = tokens[0].rsplit_once(':').map(|(ip, _port)| ip)?.trim();
     if source_ip.is_empty() {
         return None;
     }
@@ -541,6 +548,20 @@ mod tests {
         let message = r#"203.0.113.7:51234 [23/Sep/2026:04:00:00.123] www~ backend/server 0/0/-1/-1/1 -1 0 - - CC-- 1/1/0/0/0 0/0 "GET /slow HTTP/1.1""#;
         let parsed = parse_haproxy_message(message).unwrap();
         assert_eq!(parsed.status_code, -1);
+    }
+
+    #[test]
+    fn parses_an_ipv4_mapped_ipv6_client_address_from_a_dual_stack_bind() {
+        // `bind ::: ... v4v6` (what plex/korbklar_https actually use) makes
+        // HAProxy log an IPv4 client as unbracketed "::ffff:<ipv4>:<port>" -
+        // found live against a real dual-stack frontend, not assumed.
+        // Splitting on the FIRST colon (the original bug) yields an empty
+        // string, since the address itself starts with "::"; the port is
+        // always the LAST colon-separated segment instead.
+        let message = r#"::ffff:143.20.154.16:50438 [23/Sep/2026:16:57:52.631] korbklar_https~ korbklar_backend/korbklar 0/0/27/26/53 404 153 - - ---- 2/1/0/0/0 0/0 "GET /probe HTTP/1.1""#;
+        let parsed = parse_haproxy_message(message).unwrap();
+        assert_eq!(parsed.source_ip, "::ffff:143.20.154.16");
+        assert_eq!(parsed.status_code, 404);
     }
 
     #[test]

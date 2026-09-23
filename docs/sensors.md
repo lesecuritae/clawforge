@@ -112,6 +112,15 @@ line, matching HAProxy's default `httplog` format; any `{...}`-captured
 header HAProxy might be configured to log is present in the log line but is
 never extracted into the evidence sent onward.
 
+A dual-stack frontend (`bind ::: ... v4v6`, needed to accept both IPv4 and
+IPv6 clients on one socket) makes HAProxy log an IPv4 client as an
+unbracketed IPv4-mapped-IPv6 address, `::ffff:<ipv4>:<port>` - found live
+against a real frontend built this way, not assumed. The client-address
+field is parsed by splitting on the *last* colon (the port), not the
+first: splitting on the first colon breaks for any address that itself
+starts with `:`, silently discarding every request from such a client
+before it ever reached the anomaly check.
+
 Reads the same host journal as the Linux sensor, filtered to
 `SYSLOG_IDENTIFIER=haproxy` (requires HAProxy to actually log there - the
 common case on a systemd host with syslog forwarded to journald). The rest
