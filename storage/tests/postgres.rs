@@ -44,6 +44,51 @@ async fn runtime_roles_enforce_service_boundaries() -> anyhow::Result<()> {
             .await
             .is_err()
     );
+    // claim_event_deliveries's row-locking clause joins event_delivery and
+    // events - a real, previously undiscovered bug had it lock both
+    // (a bare FOR UPDATE on a join locks every table involved), which
+    // requires UPDATE privilege on events that no consumer role has by
+    // design (a consumer may only ever touch its own delivery bookkeeping,
+    // never the canonical event bus itself). Every earlier real-Postgres
+    // test of the correlation/security-engine processing path called
+    // process_event/evaluate_rule directly, never actually exercising this
+    // method under a least-privilege role - this is the one that does, and
+    // must never again just call it and ignore a permission error. Claiming
+    // once first (before anything is published) registers "correlation" as
+    // an enabled consumer, so the event published next actually fans out a
+    // delivery row for it - a claim against zero rows would never even
+    // reach the row-locking clause and prove nothing.
+    correlation
+        .claim_event_deliveries("correlation", 10)
+        .await?;
+    // Published via `api` (broad grants, INSERT on events included) -
+    // clawforge_correlation itself only ever has SELECT there, matching
+    // production: correlation consumes the event bus, it never writes to it.
+    api.publish_event(
+        "claim-event-deliveries-permission-check",
+        "test",
+        "low",
+        Utc::now(),
+        None,
+        json!({}),
+        json!({}),
+        "claim-event-deliveries-permission-check-1",
+    )
+    .await?;
+    let claimed = correlation
+        .claim_event_deliveries("correlation", 10)
+        .await
+        .expect(
+            "claim_event_deliveries must succeed under the correlation role's own grants, \
+             not just SELECT-only access to events",
+        );
+    assert!(
+        claimed
+            .iter()
+            .any(|value| value["event_type"] == "claim-event-deliveries-permission-check"),
+        "the published event must actually have been claimable, not just an empty, \
+         untested result"
+    );
 
     let incidents = PostgresStore::connect_runtime(&runtime_url("incidents")?).await?;
     incidents

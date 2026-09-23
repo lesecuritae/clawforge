@@ -770,7 +770,19 @@ impl PostgresStore {
     ) -> Result<Vec<serde_json::Value>> {
         let consumer_id = self.ensure_event_consumer(consumer).await?;
         let mut tx = self.pool.begin().await?;
-        let rows = sqlx::query("SELECT d.id,e.event_id,e.event_type,e.source,e.severity,e.occurred_at,e.correlation_id,e.payload,e.metadata,d.attempts FROM event_delivery d JOIN events e ON e.event_id=d.event_id WHERE d.consumer_id=$1 AND d.available_at <= NOW() AND d.attempts < 5 AND (d.status IN ('pending','failed') OR (d.status='processing' AND d.processing_started_at < NOW()-INTERVAL '10 minutes')) ORDER BY d.created_at FOR UPDATE SKIP LOCKED LIMIT $2")
+        // `FOR UPDATE OF d`, not a bare `FOR UPDATE`: an unqualified
+        // row-locking clause on a join locks every table it touches, which
+        // requires UPDATE privilege on `events` too - a real, previously
+        // undiscovered bug found live (clawforge_correlation only ever had
+        // SELECT on `events`, by design: a consumer must never be able to
+        // modify the canonical event bus, only its own delivery bookkeeping
+        // in `event_delivery`). Every prior real-Postgres test of this path
+        // called process_event directly rather than through this method, so
+        // it never actually exercised claim_event_deliveries under a
+        // least-privilege role and never caught this - clawforge-correlation
+        // has likely never successfully claimed a delivery in production
+        // through its normal poll loop until this fix.
+        let rows = sqlx::query("SELECT d.id,e.event_id,e.event_type,e.source,e.severity,e.occurred_at,e.correlation_id,e.payload,e.metadata,d.attempts FROM event_delivery d JOIN events e ON e.event_id=d.event_id WHERE d.consumer_id=$1 AND d.available_at <= NOW() AND d.attempts < 5 AND (d.status IN ('pending','failed') OR (d.status='processing' AND d.processing_started_at < NOW()-INTERVAL '10 minutes')) ORDER BY d.created_at FOR UPDATE OF d SKIP LOCKED LIMIT $2")
             .bind(consumer_id).bind(limit.clamp(1, 100)).fetch_all(&mut *tx).await?;
         let mut result = Vec::with_capacity(rows.len());
         for row in rows {
