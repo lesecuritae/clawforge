@@ -440,6 +440,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "clawforge-security-events"
+version = "1.0.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "clawforge-storage"
 version = "1.0.0"
 dependencies = [

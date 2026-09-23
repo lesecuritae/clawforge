@@ -315,8 +315,14 @@ Dateneigentümerschaft und zwei-Personen-Freigabe.
    geheimes HMAC-Pseudonym (`CLAWFORGE_ANALYZER_IP_HMAC_KEY`) statt des
    alten, IPs kollabierenden Platzhalters, fail-closed ohne konfigurierten
    Schlüssel.
-6. `security-events-domain`: Event-Katalog, Envelope, Validatoren, Fixtures und
-   Dokumentation ohne API- oder Datenbankänderung.
+6. `security-events-domain` (umgesetzt): neues, eigenständiges Crate
+   `clawforge-security-events` - elf Eventtypen (Firewall/Auth/SSH je als
+   Vorkommnis und Anomalie, HTTP-/DNS-Anomalie, Port-Scan,
+   Container-Anomalie/-Escape), geschlossene `Severity`-Skala,
+   validierter `SensorEnvelope` (ein flaches JSON-Objekt, intern getaggt
+   durch `event_type`) und ein Fixture je Typ; siehe `docs/security-events.md`.
+   Bewusst ohne API- oder Datenbankänderung - nichts im Repo hängt bisher
+   davon ab.
 7. `security-events-storage`: additive Migration, persistente Sensoridentitäten
    und PostgreSQL-Integrationstest in CI.
 8. `security-events-ingress`: interner Batch-Endpunkt, Auth/Rate Limit/Audit,
