@@ -32,6 +32,7 @@ declare -A paths=(
   [operations_token]="${CLAWFORGE_OPERATIONS_SECRET_FILE:-./secrets/operations_token}"
   [mcp_agent_api_token]="${CLAWFORGE_MCP_AGENT_TOKEN_FILE:-./secrets/mcp_agent_api_token}"
   [mcp_auth_token]="${CLAWFORGE_MCP_AUTH_TOKEN_FILE:-./secrets/mcp_auth_token}"
+  [analyzer_ip_hmac_key]="${CLAWFORGE_ANALYZER_IP_HMAC_KEY_SECRET_FILE:-./secrets/analyzer_ip_hmac_key}"
   [github_token]="${CLAWFORGE_GITHUB_TOKEN_FILE:-./secrets/github_token}"
   [proxmox_token]="${CLAWFORGE_PROXMOX_TOKEN_FILE:-./secrets/proxmox_token}"
   [threatfox_auth_key]="${CLAWFORGE_THREATFOX_SECRET_FILE:-./secrets/threatfox_auth_key}"
@@ -130,7 +131,7 @@ for ((left = 0; left < ${#database_password_names[@]}; left++)); do
   done
 done
 
-token_names=(analyzer_token notifier_token events_token operations_token mcp_agent_api_token mcp_auth_token)
+token_names=(analyzer_token notifier_token events_token operations_token mcp_agent_api_token mcp_auth_token analyzer_ip_hmac_key)
 if [ "$require_bootstrap" = true ]; then
   token_names+=(admin_bootstrap_token)
 fi

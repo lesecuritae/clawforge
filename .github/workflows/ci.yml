@@ -108,6 +108,7 @@ jobs:
             CLAWFORGE_OPERATIONS_SECRET_FILE=operations_token \
             CLAWFORGE_MCP_AGENT_TOKEN_FILE=mcp_agent_api_token \
             CLAWFORGE_MCP_AUTH_TOKEN_FILE=mcp_auth_token \
+            CLAWFORGE_ANALYZER_IP_HMAC_KEY_SECRET_FILE=analyzer_ip_hmac_key \
             CLAWFORGE_GITHUB_TOKEN_FILE=github_token \
             CLAWFORGE_PROXMOX_TOKEN_FILE=proxmox_token \
             CLAWFORGE_THREATFOX_SECRET_FILE=threatfox_auth_key \
