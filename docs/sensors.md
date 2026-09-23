@@ -34,12 +34,17 @@ resolving that (an optional field, or a distinct local-auth evidence shape)
 is a separate, later decision. Broader "system events" are likewise left for
 a later increment.
 
-Reads systemd-journald through a `journalctl` subprocess
-(`SYSLOG_IDENTIFIER=sshd`), recognizing the standard failed-authentication
-message shapes (`Failed password for ...`, `Failed password for invalid
-user ...`, `Failed none for ...`, `Failed publickey for ...`, `Invalid user
-... from ...`). A successful login, a session open/close notice, or any
-other sshd line is deliberately not matched - this sensor only reports
+Reads systemd-journald through a `journalctl` subprocess, filtered to
+`SYSLOG_IDENTIFIER=sshd` **or** `sshd-session` - a live soak test against a
+real OpenSSH 9.8+ host (Ubuntu 26.04) found that modern OpenSSH logs
+authentication from a per-connection re-exec under `sshd-session`, not the
+listener process's own `sshd` identifier; matching only `sshd` silently saw
+nothing on such a host despite real failed logins happening. Recognizes the
+standard failed-authentication message shapes (`Failed password for ...`,
+`Failed password for invalid user ...`, `Failed none for ...`, `Failed
+publickey for ...`, `Invalid user ... from ...`). A successful login, a
+session open/close notice, or any other sshd line is deliberately not
+matched - this sensor only reports
 failed authentications.
 
 - **Checkpoint/cursor**: the journald cursor of the last event in a

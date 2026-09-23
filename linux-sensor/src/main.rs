@@ -9,8 +9,11 @@
 //! for a later increment.
 //!
 //! Reads systemd-journald through a `journalctl` subprocess
-//! (`SYSLOG_IDENTIFIER=sshd`), resuming from a persisted cursor so a
-//! restart neither re-sends nor silently drops events. Batches events and
+//! (`SYSLOG_IDENTIFIER=sshd` or `sshd-session` - OpenSSH 9.8+ logs
+//! authentication from a per-connection re-exec under the latter, not the
+//! listener process's own identifier; found live against a real OpenSSH
+//! 9.8+ host, not assumed), resuming from a persisted cursor so a restart
+//! neither re-sends nor silently drops events. Batches events and
 //! sends them to the security event ingress endpoint
 //! (`security-events-ingress`); the journald cursor doubles as this
 //! sensor's `dedupe_key`, so a crash between "ingress accepted a batch" and
@@ -191,7 +194,13 @@ async fn journal_reader_task(
             .arg("--output=json")
             .arg("--no-pager")
             .arg("--follow")
-            .arg("SYSLOG_IDENTIFIER=sshd");
+            // OpenSSH 9.8+ (e.g. Ubuntu 24.04+) splits the listener (sshd)
+            // from a per-connection re-exec that does the actual
+            // authentication logging under its own identifier,
+            // sshd-session - consecutive matches on the same journald
+            // field are ORed together, so this matches either.
+            .arg("SYSLOG_IDENTIFIER=sshd")
+            .arg("SYSLOG_IDENTIFIER=sshd-session");
         match &cursor {
             Some(cursor) => {
                 command.arg(format!("--after-cursor={cursor}"));

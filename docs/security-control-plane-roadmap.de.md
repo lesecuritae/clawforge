@@ -113,7 +113,12 @@ Reihenfolge:
 
 1. Linux-Sensor für SSH-/Auth- und Systemereignisse (**dieser Umfang
    erledigt**: `clawforge-linux-sensor` deckt `ssh_login_failure` per
-   `journalctl`/`SYSLOG_IDENTIFIER=sshd` ab - Cursor/Checkpoint, begrenzter
+   `journalctl`/`SYSLOG_IDENTIFIER=sshd` **oder** `sshd-session` ab (ein
+   Live-Soaktest gegen einen echten OpenSSH-9.8+-Host, Ubuntu 26.04, zeigte,
+   dass moderne OpenSSH-Versionen Authentifizierung aus einem
+   Pro-Verbindungs-Re-Exec unter `sshd-session` loggen, nicht unter der
+   Listener-Identität `sshd` - ein reines `sshd`-Filter sah dort trotz
+   echter Fehlanmeldungen nichts) - Cursor/Checkpoint, begrenzter
    Puffer mit Backpressure, Dedupe über den Journal-Cursor als
    `dedupe_key`, Health-/Lag-/Drop-Metriken auf `GET /health`, läuft ohne
    root per `group_add`. PAM/sudo-Auth und breitere System-Ereignisse sind
