@@ -454,10 +454,10 @@ services:
     # a non-root container (UID 10001, matching every other service) with
     # that one supplementary group added, per the roadmap's "Linux benötigt
     # kein root". Verify the actual GID with `getent group systemd-journal`
-    # on the host and override CLAWFORGE_LINUX_SENSOR_JOURNAL_GID if it
+    # on the host and override CLAWFORGE_JOURNAL_GID if it
     # differs from the common Debian/Ubuntu default assumed here.
     group_add:
-      - "${CLAWFORGE_LINUX_SENSOR_JOURNAL_GID:-101}"
+      - "${CLAWFORGE_JOURNAL_GID:-101}"
     volumes:
       - /var/log/journal:/var/log/journal:ro
       - /run/log/journal:/run/log/journal:ro
@@ -469,6 +469,47 @@ services:
       - backend
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8095/health >/dev/null"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  clawforge-haproxy-sensor:
+    profiles: [sensors]
+    image: ${CLAWFORGE_IMAGE_REGISTRY:-ghcr.io/lesecuritae}/clawforge-api:${CLAWFORGE_IMAGE_TAG:-v1.0.0}
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    command: ["/usr/local/bin/clawforge-haproxy-sensor"]
+    environment:
+      CLAWFORGE_SECURITY_EVENTS_URL: ${CLAWFORGE_SECURITY_EVENTS_URL:-http://clawforge-api:8080}
+      CLAWFORGE_HAPROXY_SENSOR_CREDENTIAL_FILE: /run/secrets/haproxy_sensor_credential
+      CLAWFORGE_HAPROXY_SENSOR_CHECKPOINT_PATH: /var/lib/clawforge/haproxy-sensor/cursor
+      CLAWFORGE_HAPROXY_SENSOR_BIND: 0.0.0.0:8096
+      RUST_LOG: ${RUST_LOG:-info}
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    # Same reasoning as clawforge-linux-sensor above: reads the same host
+    # journal (SYSLOG_IDENTIFIER=haproxy instead of sshd), so it needs the
+    # same supplementary group and read-only journal mounts, not root.
+    group_add:
+      - "${CLAWFORGE_JOURNAL_GID:-101}"
+    volumes:
+      - /var/log/journal:/var/log/journal:ro
+      - /run/log/journal:/run/log/journal:ro
+      - /etc/machine-id:/etc/machine-id:ro
+      - clawforge-haproxy-sensor-state:/var/lib/clawforge/haproxy-sensor
+    secrets:
+      - haproxy_sensor_credential
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8096/health >/dev/null"]
       interval: 15s
       timeout: 5s
       retries: 5
@@ -625,6 +666,7 @@ volumes:
   clawforge-prometheus:
   clawforge-grafana:
   clawforge-linux-sensor-state:
+  clawforge-haproxy-sensor-state:
 
 networks:
   frontend:
@@ -695,3 +737,5 @@ secrets:
     file: ${CLAWFORGE_PROXMOX_TOKEN_FILE:?set CLAWFORGE_PROXMOX_TOKEN_FILE to a private secret file}
   linux_sensor_credential:
     file: ${CLAWFORGE_LINUX_SENSOR_CREDENTIAL_SECRET_FILE:?set CLAWFORGE_LINUX_SENSOR_CREDENTIAL_SECRET_FILE to a private secret file}
+  haproxy_sensor_credential:
+    file: ${CLAWFORGE_HAPROXY_SENSOR_CREDENTIAL_SECRET_FILE:?set CLAWFORGE_HAPROXY_SENSOR_CREDENTIAL_SECRET_FILE to a private secret file}

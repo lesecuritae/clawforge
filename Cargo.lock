@@ -345,6 +345,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "clawforge-haproxy-sensor"
+version = "1.0.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "chrono",
+ "clawforge-secret",
+ "clawforge-security-events",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "clawforge-incidents"
 version = "1.0.0"
 dependencies = [

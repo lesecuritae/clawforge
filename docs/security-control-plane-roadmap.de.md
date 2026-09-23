@@ -111,19 +111,27 @@ Ziel: drei minimal privilegierte, beobachtbare Sensoren.
 
 Reihenfolge:
 
-1. Linux-Sensor für SSH-/Auth- und Systemereignisse (**begonnen**:
-   `clawforge-linux-sensor` deckt `ssh_login_failure` per
+1. Linux-Sensor für SSH-/Auth- und Systemereignisse (**dieser Umfang
+   erledigt**: `clawforge-linux-sensor` deckt `ssh_login_failure` per
    `journalctl`/`SYSLOG_IDENTIFIER=sshd` ab - Cursor/Checkpoint, begrenzter
    Puffer mit Backpressure, Dedupe über den Journal-Cursor als
    `dedupe_key`, Health-/Lag-/Drop-Metriken auf `GET /health`, läuft ohne
    root per `group_add`. PAM/sudo-Auth und breitere System-Ereignisse sind
-   bewusst noch nicht abgedeckt, siehe `docs/sensors.md`. Opt-in
-   `sensors`-Compose-Profil; Sensor-Credential wird über
-   `register-security-sensor` einmalig ausgegeben, noch kein Admin-Endpunkt
-   dafür.).
+   bewusst noch nicht abgedeckt, siehe `docs/sensors.md`.).
 2. HAProxy-Sensor für Request-Metadaten, Fehlercodes, Rate-Limit- und
-   Anomaliesignale.
+   Anomaliesignale (**dieser Umfang erledigt**: `clawforge-haproxy-sensor`
+   deckt `http_anomaly` für Fehlerstatus (>=400 sowie -1/keine Antwort) per
+   `journalctl`/`SYSLOG_IDENTIFIER=haproxy` ab, gleiche Cursor-/Dedupe-/
+   Puffer-/Health-Bauweise wie der Linux-Sensor. Payloads enthalten nie
+   Bodies/Cookies/Authorization-Header - nur Client-IP, Methode, Pfad,
+   Status werden geparst. Dediziertes Rate-Limit-/Stick-Table-Signal (statt
+   nur generischer Fehlerstatus) noch nicht abgedeckt, siehe
+   `docs/sensors.md`.).
 3. Docker-Sensor für Lifecycle, Image-, Port- und Netzänderungen.
+
+Beide fertigen Sensoren nutzen dasselbe Registrierungs-Tool
+(`register-security-sensor`, kein Admin-Endpunkt dafür) und dasselbe
+opt-in `sensors`-Compose-Profil.
 
 Jeder Sensor besitzt Parser-Fixtures, Cursor/Checkpoint, begrenzten Puffer,
 Backpressure, Dedupe, Health, Lag- und Drop-Metriken. Docker-Zugriff erfolgt nur

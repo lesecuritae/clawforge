@@ -32,6 +32,7 @@ export CLAWFORGE_ANALYZER_IP_HMAC_KEY_SECRET_FILE="$test_dir/secrets/analyzer_ip
 export CLAWFORGE_GITHUB_TOKEN_FILE="$test_dir/secrets/github_token"
 export CLAWFORGE_PROXMOX_TOKEN_FILE="$test_dir/secrets/proxmox_token"
 export CLAWFORGE_LINUX_SENSOR_CREDENTIAL_SECRET_FILE="$test_dir/secrets/linux_sensor_credential"
+export CLAWFORGE_HAPROXY_SENSOR_CREDENTIAL_SECRET_FILE="$test_dir/secrets/haproxy_sensor_credential"
 export CLAWFORGE_THREATFOX_SECRET_FILE="$test_dir/secrets/threatfox_auth_key"
 export CLAWFORGE_URLHAUS_SECRET_FILE="$test_dir/secrets/urlhaus_auth_key"
 export CLAWFORGE_MALWAREBAZAAR_SECRET_FILE="$test_dir/secrets/malwarebazaar_auth_key"
