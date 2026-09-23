@@ -2,7 +2,7 @@
 //! `security-events-domain`).
 //!
 //! This crate is deliberately self-contained: no HTTP, no database, no
-//! dependency on any other Clawforge crate. It defines the eleven security
+//! dependency on any other Clawforge crate. It defines the twelve security
 //! event types the architecture note anticipates (firewall, auth, ssh, http,
 //! dns, scan and container signals - some split into a plain occurrence and
 //! an anomaly variant where that distinction is meaningful), a validated
@@ -13,6 +13,13 @@
 //! storage and an authenticated ingress endpoint is separate, later work
 //! (`security-events-storage`, `security-events-ingress`), on purpose: this
 //! step only fixes the contract.
+//!
+//! `container_lifecycle_changed` (added for the Docker sensor, roadmap phase
+//! 3 item 3) is intentionally a separate event type from
+//! `container_anomaly`/`container_escape_attempt`: a container starting,
+//! stopping or attaching to a network is a routine configuration change, not
+//! a runtime behavioral anomaly, and folding the two together would drown
+//! the anomaly signal in routine noise.
 
 use std::{fmt, net::IpAddr, str::FromStr};
 
@@ -48,10 +55,11 @@ pub enum SecurityEventType {
     PortScanDetected,
     ContainerAnomaly,
     ContainerEscapeAttempt,
+    ContainerLifecycleChanged,
 }
 
 impl SecurityEventType {
-    pub const ALL: [SecurityEventType; 11] = [
+    pub const ALL: [SecurityEventType; 12] = [
         SecurityEventType::FirewallBlock,
         SecurityEventType::FirewallRuleChanged,
         SecurityEventType::AuthFailure,
@@ -63,6 +71,7 @@ impl SecurityEventType {
         SecurityEventType::PortScanDetected,
         SecurityEventType::ContainerAnomaly,
         SecurityEventType::ContainerEscapeAttempt,
+        SecurityEventType::ContainerLifecycleChanged,
     ];
 
     pub fn as_str(&self) -> &'static str {
@@ -78,6 +87,7 @@ impl SecurityEventType {
             SecurityEventType::PortScanDetected => "port_scan_detected",
             SecurityEventType::ContainerAnomaly => "container_anomaly",
             SecurityEventType::ContainerEscapeAttempt => "container_escape_attempt",
+            SecurityEventType::ContainerLifecycleChanged => "container_lifecycle_changed",
         }
     }
 }
@@ -383,6 +393,49 @@ impl ContainerEscapeAttemptEvidence {
     }
 }
 
+/// A closed set of the lifecycle points the Docker sensor reports. Port
+/// changes specifically (beyond what `Created`/`Started` naturally coincide
+/// with) would need a follow-up container-inspect call the sensor
+/// deliberately does not make yet, keeping its read-only proxy allowlist to
+/// exactly the events stream - see `docs/sensors.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContainerLifecycleAction {
+    Created,
+    Started,
+    Stopped,
+    Destroyed,
+    Restarted,
+    NetworkConnected,
+    NetworkDisconnected,
+    ImagePulled,
+    ImageRemoved,
+}
+
+/// A container lifecycle, image or network attachment change - a routine
+/// configuration change, not a runtime behavioral anomaly (see
+/// `ContainerAnomalyEvidence` for that). `container_id`/`container_name`
+/// are absent for an image-level event (a pull is not tied to one specific
+/// container); `image` is absent for a network event (a connect/disconnect
+/// has no image of its own).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContainerLifecycleChangedEvidence {
+    pub container_id: Option<String>,
+    pub container_name: Option<String>,
+    pub image: Option<String>,
+    pub action: ContainerLifecycleAction,
+    pub detail: String,
+}
+
+impl ContainerLifecycleChangedEvidence {
+    fn validate(&self) -> Result<(), ValidationError> {
+        validate_optional_text("container_id", &self.container_id, SHORT_FIELD_MAX)?;
+        validate_optional_text("container_name", &self.container_name, SHORT_FIELD_MAX)?;
+        validate_optional_text("image", &self.image, LONG_FIELD_MAX)?;
+        validate_text("detail", &self.detail, LONG_FIELD_MAX)
+    }
+}
+
 /// The type-specific evidence for one security event, internally tagged by
 /// `event_type` so the wire format is one flat JSON object (see
 /// `SensorEnvelope`) rather than a nested nested "evidence" object.
@@ -400,6 +453,7 @@ pub enum SecurityEventEvidence {
     PortScanDetected(PortScanDetectedEvidence),
     ContainerAnomaly(ContainerAnomalyEvidence),
     ContainerEscapeAttempt(ContainerEscapeAttemptEvidence),
+    ContainerLifecycleChanged(ContainerLifecycleChangedEvidence),
 }
 
 impl SecurityEventEvidence {
@@ -418,6 +472,9 @@ impl SecurityEventEvidence {
             SecurityEventEvidence::ContainerEscapeAttempt(_) => {
                 SecurityEventType::ContainerEscapeAttempt
             }
+            SecurityEventEvidence::ContainerLifecycleChanged(_) => {
+                SecurityEventType::ContainerLifecycleChanged
+            }
         }
     }
 
@@ -432,6 +489,7 @@ impl SecurityEventEvidence {
             SecurityEventEvidence::HttpAnomaly(evidence) => evidence.validate(),
             SecurityEventEvidence::DnsAnomaly(evidence) => evidence.validate(),
             SecurityEventEvidence::PortScanDetected(evidence) => evidence.validate(),
+            SecurityEventEvidence::ContainerLifecycleChanged(evidence) => evidence.validate(),
             SecurityEventEvidence::ContainerAnomaly(evidence) => evidence.validate(),
             SecurityEventEvidence::ContainerEscapeAttempt(evidence) => evidence.validate(),
         }
@@ -697,6 +755,24 @@ pub mod fixtures {
         .expect("container_escape_attempt fixture is valid")
     }
 
+    pub fn container_lifecycle_changed() -> SensorEnvelope {
+        SensorEnvelope::new(
+            at(1_700_000_011),
+            "docker:homeserver",
+            Severity::Info,
+            "clawforge-worker",
+            "docker:homeserver:lifecycle:1",
+            SecurityEventEvidence::ContainerLifecycleChanged(ContainerLifecycleChangedEvidence {
+                container_id: Some("clawforge-worker".into()),
+                container_name: Some("clawforge-worker".into()),
+                image: Some("ghcr.io/lesecuritae/clawforge-worker:v1.0.0".into()),
+                action: ContainerLifecycleAction::Started,
+                detail: "started".into(),
+            }),
+        )
+        .expect("container_lifecycle_changed fixture is valid")
+    }
+
     /// One valid envelope per `SecurityEventType::ALL`, in the same order.
     pub fn all() -> Vec<SensorEnvelope> {
         vec![
@@ -711,6 +787,7 @@ pub mod fixtures {
             port_scan_detected(),
             container_anomaly(),
             container_escape_attempt(),
+            container_lifecycle_changed(),
         ]
     }
 }

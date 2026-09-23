@@ -127,11 +127,25 @@ Reihenfolge:
    Status werden geparst. Dediziertes Rate-Limit-/Stick-Table-Signal (statt
    nur generischer Fehlerstatus) noch nicht abgedeckt, siehe
    `docs/sensors.md`.).
-3. Docker-Sensor für Lifecycle, Image-, Port- und Netzänderungen.
+3. Docker-Sensor für Lifecycle, Image-, Port- und Netzänderungen (**dieser
+   Umfang erledigt**: `clawforge-docker-sensor` deckt Container-
+   Lifecycle (create/start/die/destroy/restart), Netzwerk-Connect/
+   Disconnect und Image-Pull/-Delete über den Docker-Events-Stream ab, als
+   neuer, eigenständiger Eventtyp `container_lifecycle_changed` (Migration
+   `0032`) statt die Anomalie-Typen zu verbiegen. Kein direkter
+   Socket-Zugriff: nur über `docker-socket-proxy`
+   (Tecnativa/docker-socket-proxy) mit Allowlist ausschließlich `EVENTS`/
+   `PING`/`VERSION`, `POST=0` (kein Schreibzugriff). Port-spezifisches
+   Tracking (bräuchte einen zusätzlichen Container-Inspect-Aufruf) noch
+   nicht abgedeckt, siehe `docs/sensors.md`.).
 
-Beide fertigen Sensoren nutzen dasselbe Registrierungs-Tool
+Alle drei Sensoren nutzen dasselbe Registrierungs-Tool
 (`register-security-sensor`, kein Admin-Endpunkt dafür) und dasselbe
-opt-in `sensors`-Compose-Profil.
+opt-in `sensors`-Compose-Profil. **Damit ist Phase 3 in ihrem hier
+umgesetzten Umfang abgeschlossen**; offen bleibt laut Exit-Gate ein
+24-Stunden-Soak-Test mit vorab festgelegter Burst-Last, Neustart,
+Netzunterbrechung und Logrotation auf einem echten Host - das ist ein
+Deployment-Schritt, kein Code-Schritt, und noch nicht durchgeführt.
 
 Jeder Sensor besitzt Parser-Fixtures, Cursor/Checkpoint, begrenzten Puffer,
 Backpressure, Dedupe, Health, Lag- und Drop-Metriken. Docker-Zugriff erfolgt nur

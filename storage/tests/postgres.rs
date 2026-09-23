@@ -871,6 +871,23 @@ async fn security_events_register_sensor_and_record_event() -> anyhow::Result<()
     // A field with no IP semantics passes through unchanged.
     assert_eq!(evidence["protocol"], "tcp");
 
+    // container_lifecycle_changed (migration 0032): proves the event_type
+    // CHECK constraint actually accepts it, not just that the Rust enum
+    // compiles - no other test exercises this event type against a real
+    // database.
+    let lifecycle_event_id = store
+        .record_security_event(sensor_id, &fixtures::container_lifecycle_changed())
+        .await?;
+    let stored_lifecycle = store
+        .get_security_event(lifecycle_event_id)
+        .await?
+        .expect("event exists");
+    assert_eq!(
+        stored_lifecycle["event_type"],
+        "container_lifecycle_changed"
+    );
+    assert_eq!(stored_lifecycle["evidence"]["action"], "started");
+
     let sensor = store
         .get_security_sensor(sensor_id)
         .await?

@@ -86,10 +86,12 @@ Firewall-Aktion.
 1. **Behoben** (`security-events-domain`/`-storage`, siehe Roadmap): Die
    Eventtabelle akzeptierte freie Texte für Typ, Quelle und Severity ohne
    versionierten Katalog. Das neue Crate `clawforge-security-events` liefert
-   elf typisierte Eventtypen mit typspezifischer Evidence, geschlossener
-   `Severity`-Skala und Validierung (`SensorEnvelope::validate`); Migration
-   `0031` persistiert sie getrennt von der bestehenden Eventtabelle
-   (`security_events`, `schema_version`-Spalte).
+   zwölf typisierte Eventtypen (elf ursprünglich, `container_lifecycle_changed`
+   fuer den Docker-Sensor per Migration `0032` ergänzt) mit typspezifischer
+   Evidence, geschlossener `Severity`-Skala und Validierung
+   (`SensorEnvelope::validate`); Migration `0031` persistiert sie getrennt
+   von der bestehenden Eventtabelle (`security_events`, `schema_version`-
+   Spalte).
 2. **Behoben** (`security-events-ingress`, siehe Roadmap): Es gab keinen
    authentifizierten Sensor-Ingress; der interne Operational-Event-Endpunkt
    akzeptierte nur `backup_error`/`system_health_error`. Neuer Endpunkt
@@ -101,8 +103,15 @@ Firewall-Aktion.
 3. `is_correlatable` kennt nur Threat-, BGP-, RPKI-, ASN-, Trust- und Provider-
    Ereignisse. Die geplanten Firewall-, Auth-, SSH-, HTTP-, DNS-, Scan- und
    Containerereignisse werden noch nicht verarbeitet.
-4. HAProxy-, Linux- und Docker-Sensoren existieren nicht als laufende Adapter.
-   Der Docker-Connector normalisiert nur Read-Modelle.
+4. **Behoben** (Roadmap Phase 3 "Sensor Layer", alle drei begonnenen Umfänge
+   umgesetzt): HAProxy-, Linux- und Docker-Sensoren existierten nicht als
+   laufende Adapter. `clawforge-linux-sensor`/`-haproxy-sensor` (journald)
+   und `clawforge-docker-sensor` (Docker-Events-Stream über
+   `docker-socket-proxy`, kein direkter Socket-Zugriff) sind eigenständige
+   Dienste, die in die neue `security_events`-Pipeline schreiben - der
+   separate, unveränderte `connector`-Crate ("Docker, GitHub und Proxmox
+   als bereinigte Read-Modelle") normalisiert weiterhin nur Read-Modelle
+   für die Agent-API und ist davon unberührt.
 5. Risk und Policy sind Bibliotheken mit statischen Regeln. Es fehlen ein
    persistiertes Assessment-Modell, Regelversionen, Simulation und
    entscheidungsfeste Evidence-Snapshots.

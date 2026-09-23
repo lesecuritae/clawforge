@@ -22,6 +22,7 @@ RUN apt-get update \
 COPY --from=builder /src/target/release/clawforge-api /usr/local/bin/clawforge-api
 COPY --from=builder /src/target/release/clawforge-linux-sensor /usr/local/bin/clawforge-linux-sensor
 COPY --from=builder /src/target/release/clawforge-haproxy-sensor /usr/local/bin/clawforge-haproxy-sensor
+COPY --from=builder /src/target/release/clawforge-docker-sensor /usr/local/bin/clawforge-docker-sensor
 COPY --from=builder /src/target/release/clawforge-worker /usr/local/bin/clawforge-worker
 COPY --from=builder /src/target/release/clawforge-analyzer /usr/local/bin/clawforge-analyzer
 COPY --from=builder /src/target/release/clawforge-notifier /usr/local/bin/clawforge-notifier

@@ -133,6 +133,10 @@ fn pseudonymize_evidence(evidence: &SecurityEventEvidence) -> Result<SecurityEve
         SecurityEventEvidence::ContainerEscapeAttempt(e) => {
             SecurityEventEvidence::ContainerEscapeAttempt(e)
         }
+        // No IP field: container/image identifiers only.
+        SecurityEventEvidence::ContainerLifecycleChanged(e) => {
+            SecurityEventEvidence::ContainerLifecycleChanged(e)
+        }
     })
 }
 

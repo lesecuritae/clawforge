@@ -119,3 +119,54 @@ shape: non-root with the `systemd-journal` supplementary group
 (`CLAWFORGE_JOURNAL_GID`, shared with the Linux sensor - both read the same
 host journal), the same three read-only journal bind mounts, and its own
 persistent checkpoint volume.
+
+## Docker sensor (`clawforge-docker-sensor`)
+
+Phase 3's third sensor ("Docker-Sensor für Lifecycle, Image-, Port- und
+Netzänderungen"). Reports `container_lifecycle_changed` - a new event type
+(`clawforge-security-events`, migration `0032`), deliberately separate from
+`container_anomaly`/`container_escape_attempt`: a container starting,
+stopping or attaching to a network is a routine configuration change, not a
+runtime behavioral anomaly, and folding the two together would drown the
+anomaly signal in routine noise. Covers container create/start/die/destroy/
+restart, network connect/disconnect, and image pull/delete, straight from
+the Docker Engine events stream. Port-specific tracking (which would need a
+follow-up container-inspect call this sensor deliberately does not make,
+keeping its access to exactly the events stream) is a later increment.
+
+**Architecturally different from the other two sensors**: no journald, and
+Docker access is restricted per the roadmap's explicit "nur über eine
+read-only Proxy-Allowlist". This sensor never touches
+`/var/run/docker.sock` directly - it only speaks plain HTTP to
+`docker-socket-proxy` ([Tecnativa/docker-socket-proxy](https://github.com/Tecnativa/docker-socket-proxy),
+`ghcr.io/tecnativa/docker-socket-proxy:0.5.0`), the one container that
+mounts the socket (read-only) and whose own allowlist grants only `EVENTS`/
+`PING`/`VERSION` (already that image's defaults - `compose.yml` sets them
+explicitly for auditability anyway), not `CONTAINERS`, `IMAGES`,
+`NETWORKS`, or any `POST` (write) access of any kind. Because it never
+touches the socket, `clawforge-docker-sensor` itself needs no socket
+access, no extra capabilities and no special group at all - unlike the two
+journald sensors, its container is otherwise as locked down as any other
+first-party Clawforge service.
+
+Upstream's own docs mention `--privileged` as sometimes required to bind
+the socket under enforcing SELinux/AppArmor policies. `compose.yml` leaves
+it off by default: granting it would undermine the entire point of
+proxying the socket through a minimal, read-only allowlist in the first
+place. If `docker-socket-proxy` fails to start on a hardened host, that is
+a trade-off to weigh explicitly on that host, not something granted by
+default for everyone.
+
+Checkpoint/dedupe differ from the journald sensors since Docker's events
+API has no equivalent to a journald cursor: the checkpoint is the
+Unix-seconds timestamp of the last processed event (Docker's `since` query
+parameter is second-granular, passed on reconnect the same way
+`--after-cursor` is for journald - and with none yet, the very first
+connection naturally starts from "now", the events endpoint's own default
+with no `since` at all), and `dedupe_key` is built from the event's own
+action/actor-id/timestamp instead of an opaque cursor. Bounded buffer/
+backpressure, batching, retry with an explicit drop budget, and
+`GET /health` (port 8097) all otherwise match the other two sensors.
+Docker's events carry no hostname field, unlike journald's `_HOSTNAME` -
+set `CLAWFORGE_DOCKER_SENSOR_HOST_LABEL` if more than one host's Docker
+daemon feeds the same Clawforge instance.

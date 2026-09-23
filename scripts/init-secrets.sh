@@ -62,11 +62,12 @@ done
 # before the optional MCP profile is enabled.
 write_new mcp_agent_api_token "$(generate_secret)"
 
-# linux_sensor_credential/haproxy_sensor_credential are not generated here:
-# each must come from `register-security-sensor`'s output (the raw
-# credential it prints once), not an independently random value - a value
-# placed here would not correspond to any row in security_sensors.
-for name in analyzer_api_key notifier_webhook_auth notifier_matrix_auth notifier_smtp_password threatfox_auth_key urlhaus_auth_key malwarebazaar_auth_key github_token proxmox_token linux_sensor_credential haproxy_sensor_credential; do
+# linux_sensor_credential/haproxy_sensor_credential/docker_sensor_credential
+# are not generated here: each must come from `register-security-sensor`'s
+# output (the raw credential it prints once), not an independently random
+# value - a value placed here would not correspond to any row in
+# security_sensors.
+for name in analyzer_api_key notifier_webhook_auth notifier_matrix_auth notifier_smtp_password threatfox_auth_key urlhaus_auth_key malwarebazaar_auth_key github_token proxmox_token linux_sensor_credential haproxy_sensor_credential docker_sensor_credential; do
   write_new "$name" ""
 done
 

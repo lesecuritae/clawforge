@@ -515,6 +515,76 @@ services:
       retries: 5
     restart: unless-stopped
 
+  docker-socket-proxy:
+    profiles: [sensors]
+    image: ghcr.io/tecnativa/docker-socket-proxy:0.5.0
+    environment:
+      # Explicit despite matching the image's own defaults, per the
+      # roadmap's "nur über eine read-only Proxy-Allowlist": EVENTS is all
+      # clawforge-docker-sensor needs (the events stream already carries
+      # image/name/network attributes inline); POST=0 is what makes this
+      # read-only - no create/start/stop/exec/write access of any kind.
+      EVENTS: 1
+      PING: 1
+      VERSION: 1
+      POST: 0
+      CONTAINERS: 0
+      IMAGES: 0
+      NETWORKS: 0
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    # Upstream documents --privileged as sometimes required to bind the
+    # socket under enforcing SELinux/AppArmor policies. Left off by
+    # default - granting it would undermine the entire point of proxying
+    # the socket through a minimal, read-only allowlist in the first
+    # place. If this container fails to start on a hardened host, that is
+    # the trade-off to weigh explicitly, not something to grant by default.
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - backend
+    restart: unless-stopped
+
+  clawforge-docker-sensor:
+    profiles: [sensors]
+    image: ${CLAWFORGE_IMAGE_REGISTRY:-ghcr.io/lesecuritae}/clawforge-api:${CLAWFORGE_IMAGE_TAG:-v1.0.0}
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    command: ["/usr/local/bin/clawforge-docker-sensor"]
+    environment:
+      CLAWFORGE_DOCKER_SENSOR_API_URL: http://docker-socket-proxy:2375
+      CLAWFORGE_DOCKER_SENSOR_HOST_LABEL: ${CLAWFORGE_DOCKER_SENSOR_HOST_LABEL:-unknown-host}
+      CLAWFORGE_SECURITY_EVENTS_URL: ${CLAWFORGE_SECURITY_EVENTS_URL:-http://clawforge-api:8080}
+      CLAWFORGE_DOCKER_SENSOR_CREDENTIAL_FILE: /run/secrets/docker_sensor_credential
+      CLAWFORGE_DOCKER_SENSOR_CHECKPOINT_PATH: /var/lib/clawforge/docker-sensor/cursor
+      CLAWFORGE_DOCKER_SENSOR_BIND: 0.0.0.0:8097
+      RUST_LOG: ${RUST_LOG:-info}
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    # No socket access, no supplementary group: unlike the journald
+    # sensors, this one only ever speaks plain HTTP to docker-socket-proxy
+    # over the backend network.
+    volumes:
+      - clawforge-docker-sensor-state:/var/lib/clawforge/docker-sensor
+    secrets:
+      - docker_sensor_credential
+    depends_on:
+      - docker-socket-proxy
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8097/health >/dev/null"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
   clawforge-frontend:
     image: ${CLAWFORGE_IMAGE_REGISTRY:-ghcr.io/lesecuritae}/clawforge-frontend:${CLAWFORGE_IMAGE_TAG:-v1.0.0}
     build:
@@ -667,6 +737,7 @@ volumes:
   clawforge-grafana:
   clawforge-linux-sensor-state:
   clawforge-haproxy-sensor-state:
+  clawforge-docker-sensor-state:
 
 networks:
   frontend:
@@ -739,3 +810,5 @@ secrets:
     file: ${CLAWFORGE_LINUX_SENSOR_CREDENTIAL_SECRET_FILE:?set CLAWFORGE_LINUX_SENSOR_CREDENTIAL_SECRET_FILE to a private secret file}
   haproxy_sensor_credential:
     file: ${CLAWFORGE_HAPROXY_SENSOR_CREDENTIAL_SECRET_FILE:?set CLAWFORGE_HAPROXY_SENSOR_CREDENTIAL_SECRET_FILE to a private secret file}
+  docker_sensor_credential:
+    file: ${CLAWFORGE_DOCKER_SENSOR_CREDENTIAL_SECRET_FILE:?set CLAWFORGE_DOCKER_SENSOR_CREDENTIAL_SECRET_FILE to a private secret file}

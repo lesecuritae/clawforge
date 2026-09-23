@@ -118,7 +118,7 @@ docker compose --profile analysis up -d
 docker compose --profile cache up -d
 docker compose --profile observability up -d
 docker compose --profile agent up -d clawforge-mcp
-docker compose --profile sensors up -d clawforge-linux-sensor clawforge-haproxy-sensor
+docker compose --profile sensors up -d clawforge-linux-sensor clawforge-haproxy-sensor clawforge-docker-sensor
 ```
 
 The analyzer remains isolated and receives only sanitized incident context.
