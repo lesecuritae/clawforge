@@ -2,11 +2,13 @@
 
 `clawforge-security-events` defines the contract for the Security Event
 Layer the roadmap's phase 2 builds toward (`docs/security-control-plane-roadmap.de.md`,
-"Empfohlene erste Pull Requests" #6-8). This step (`security-events-domain`)
-is the domain crate only: types, validation, and fixtures. It makes no API or
-database change, and nothing else in the codebase depends on it yet. Wiring a
-validated event into storage and an authenticated ingress endpoint is
-separate, later work (`security-events-storage`, `security-events-ingress`).
+"Empfohlene erste Pull Requests" #6-8): types, validation, and fixtures
+(`security-events-domain`), storage (`security-events-storage`, below), and
+- not yet built - an authenticated ingress endpoint (`security-events-ingress`).
+Nothing writes to storage in production yet: no service holds credentials
+for a `security_sensors` row, and no HTTP endpoint calls
+`PostgresStore::record_security_event`. That is what `security-events-ingress`
+adds.
 
 It is unrelated to `clawforge-events` (the internal consumer of the existing,
 free-text event backbone described in `docs/events.md`) and to
@@ -99,3 +101,48 @@ than panicking or silently truncating.
 per event type (`fixtures::all()`, in `SecurityEventType::ALL` order), for
 this crate's own tests and for a future ingress endpoint's contract tests and
 fixture sender to reuse directly rather than re-inventing example payloads.
+
+## Storage (`security-events-storage`)
+
+Migration `0031_security_events.sql` adds three tables, additive only -
+existing `events`/`event_delivery`/`audit_events` are untouched:
+
+- `security_sensors`: a persistent sensor identity (`name`,
+  `credential_hash`, `credential_prefix`, `enabled`, `rotated_at`,
+  `revoked_at`, `last_seen_at`), the same shape `agent_tokens`/`api_tokens`
+  already use elsewhere - storage only ever sees an already-hashed
+  credential (argon2, hashed by the caller) and a short, non-secret prefix
+  for display, never a credential in the clear. Revocation is terminal: a
+  revoked sensor cannot be re-enabled.
+- `security_sensor_audit`: one row per `registered`/`credential_rotated`/
+  `enabled`/`revoked` action, with an actor and an optional reason.
+- `security_events`: one row per accepted `SensorEnvelope`, keyed by a
+  server-assigned `id`. `occurred_at` (the sensor's clock) and `received_at`
+  (this server's clock, defaulted at insert) are kept distinct so a future
+  ingress endpoint's clock-skew check has both to compare. `resource` and
+  every IP-shaped evidence field are pseudonymized before the row is ever
+  written - the same `CLAWFORGE_ANALYZER_IP_HMAC_KEY` machinery
+  `events.correlation_id`/payload already use (`incident-correlation-convergence`),
+  applied here as an explicit match over each evidence type's known fields
+  rather than the generic key-name heuristic `sanitize_analysis_value` uses
+  for free-text JSON, since this evidence is already strongly typed. A
+  resubmission of a `(sensor_id, dedupe_key)` pair already stored is
+  idempotent only if every reported field (`event_type`, `severity`,
+  `occurred_at`, `resource`, `evidence`) is unchanged; a resubmission that
+  changes any of them is rejected outright, per the roadmap's
+  `security-events-ingress` dedupe requirement.
+
+`PostgresStore` methods: `register_security_sensor`,
+`rotate_security_sensor_credential`, `set_security_sensor_enabled`,
+`authenticate_security_sensor` (looks up an enabled, non-revoked sensor by
+credential hash and bumps `last_seen_at`), `get_security_sensor`,
+`list_security_sensors`, `record_security_event`, `get_security_event`,
+`list_security_events`.
+
+No runtime database role is granted access to these tables yet: no service
+writes to them until `security-events-ingress` exists, and the grant belongs
+with whichever service that turns out to be (`scripts/provision-db-roles.sh`).
+The real-Postgres integration test (`storage/tests/postgres.rs`,
+`security_events_register_sensor_and_record_event`, part of
+`scripts/test-postgres.sh`) therefore uses the owner connection, the same as
+`migrations_and_restart_persist`.

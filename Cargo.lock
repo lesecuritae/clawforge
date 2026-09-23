@@ -459,6 +459,7 @@ dependencies = [
  "clawforge-intelligence",
  "clawforge-risk",
  "clawforge-secret",
+ "clawforge-security-events",
  "hmac",
  "serde_json",
  "sha2",

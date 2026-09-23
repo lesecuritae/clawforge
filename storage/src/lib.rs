@@ -17,6 +17,9 @@ use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 use std::env;
 use uuid::Uuid;
 
+mod security_events;
+pub use security_events::SecuritySensor;
+
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../migrations");
 
 #[derive(Clone)]

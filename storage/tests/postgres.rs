@@ -808,3 +808,126 @@ async fn migrations_and_restart_persist() -> anyhow::Result<()> {
     assert_eq!(request_status, "pending");
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "requires an isolated PostgreSQL test container"]
+async fn security_events_register_sensor_and_record_event() -> anyhow::Result<()> {
+    use clawforge_security_events::{fixtures, SecurityEventType, Severity};
+
+    let url =
+        std::env::var("CLAWFORGE_TEST_DATABASE_URL").or_else(|_| std::env::var("DATABASE_URL"))?;
+    // connect(), not connect_runtime(): this test must not depend on
+    // migrations_and_restart_persist (which applies migration 0031) having
+    // already run first in this binary.
+    let store = PostgresStore::connect(&url).await?;
+
+    let sensor_id = store
+        .register_security_sensor(
+            "nftables:homeserver-test",
+            "test-credential-hash-1",
+            "abcd1234",
+            None,
+            "integration-test",
+        )
+        .await?;
+
+    let envelope = fixtures::firewall_block();
+    let event_id = store.record_security_event(sensor_id, &envelope).await?;
+
+    // Idempotent resubmission with identical content returns the same id.
+    assert_eq!(
+        store.record_security_event(sensor_id, &envelope).await?,
+        event_id
+    );
+
+    // A resubmission of the same dedupe_key with different content is
+    // rejected outright, not silently accepted or overwritten.
+    let mut different = envelope.clone();
+    different.severity = Severity::Critical;
+    assert!(store
+        .record_security_event(sensor_id, &different)
+        .await
+        .is_err());
+
+    let stored = store
+        .get_security_event(event_id)
+        .await?
+        .expect("event exists");
+    assert_eq!(stored["event_type"], "firewall_block");
+    // The fixture's resource and evidence source_ip/destination_ip
+    // ("203.0.113.7"/"198.51.100.10") must never be stored raw.
+    assert_ne!(stored["resource"], "203.0.113.7");
+    assert!(stored["resource"]
+        .as_str()
+        .unwrap()
+        .starts_with("ip-pseudonym:"));
+    let evidence = &stored["evidence"];
+    assert_ne!(evidence["source_ip"], "203.0.113.7");
+    assert!(evidence["source_ip"]
+        .as_str()
+        .unwrap()
+        .starts_with("ip-pseudonym:"));
+    assert_ne!(evidence["destination_ip"], "198.51.100.10");
+    // A field with no IP semantics passes through unchanged.
+    assert_eq!(evidence["protocol"], "tcp");
+
+    let sensor = store
+        .get_security_sensor(sensor_id)
+        .await?
+        .expect("sensor exists");
+    assert!(sensor.enabled);
+    assert!(sensor.last_seen_at.is_some());
+
+    let authenticated = store
+        .authenticate_security_sensor("test-credential-hash-1")
+        .await?;
+    assert_eq!(authenticated.map(|value| value.id), Some(sensor_id));
+
+    store
+        .rotate_security_sensor_credential(
+            sensor_id,
+            "test-credential-hash-2",
+            "efgh5678",
+            "integration-test",
+        )
+        .await?;
+    assert!(store
+        .authenticate_security_sensor("test-credential-hash-1")
+        .await?
+        .is_none());
+    assert!(store
+        .authenticate_security_sensor("test-credential-hash-2")
+        .await?
+        .is_some());
+
+    store
+        .set_security_sensor_enabled(sensor_id, false, "integration-test", "test revoke")
+        .await?;
+    assert!(store
+        .authenticate_security_sensor("test-credential-hash-2")
+        .await?
+        .is_none());
+    // A revoked sensor is terminal: re-enabling it is refused.
+    assert!(store
+        .set_security_sensor_enabled(sensor_id, true, "integration-test", "")
+        .await
+        .is_err());
+
+    let listed = store
+        .list_security_events(Some(SecurityEventType::FirewallBlock), 10)
+        .await?;
+    assert!(listed.iter().any(|value| value["id"] == json!(event_id)));
+
+    let audit_actions: Vec<String> = sqlx::query_scalar(
+        "SELECT action FROM security_sensor_audit WHERE sensor_id=$1 ORDER BY id ASC",
+    )
+    .bind(sensor_id)
+    .fetch_all(store.pool())
+    .await?;
+    assert_eq!(
+        audit_actions,
+        vec!["registered", "credential_rotated", "revoked"]
+    );
+
+    Ok(())
+}

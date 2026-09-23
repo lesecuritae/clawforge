@@ -323,8 +323,16 @@ Dateneigentümerschaft und zwei-Personen-Freigabe.
    durch `event_type`) und ein Fixture je Typ; siehe `docs/security-events.md`.
    Bewusst ohne API- oder Datenbankänderung - nichts im Repo hängt bisher
    davon ab.
-7. `security-events-storage`: additive Migration, persistente Sensoridentitäten
-   und PostgreSQL-Integrationstest in CI.
+7. `security-events-storage` (umgesetzt): additive Migration `0031` (
+   `security_sensors`, `security_sensor_audit`, `security_events` -
+   bestehende `events`/`event_delivery`/`audit_events` unverändert),
+   persistente Sensoridentitäten (gehashtes Credential + Prefix, Rotation,
+   terminaler Widerruf, Audit-Trail) und Speicherung eines validierten
+   `SensorEnvelope` mit `occurred_at`/`received_at` getrennt und
+   IP-Pseudonymisierung (`resource` + typisierte Evidence-Felder) vor dem
+   Schreiben. Noch keine DB-Rolle erhält Zugriff - das übernimmt der Dienst,
+   den `security-events-ingress` einführt. PostgreSQL-Integrationstest in
+   `scripts/test-postgres.sh`; siehe `docs/security-events.md`.
 8. `security-events-ingress`: interner Batch-Endpunkt, Auth/Rate Limit/Audit,
    Contract- und Negativtests sowie ein Fixture-Sender.
 
