@@ -83,12 +83,21 @@ Firewall-Aktion.
 
 ## Festgestellte Lücken
 
-1. Die Eventtabelle akzeptiert freie Texte für Typ, Quelle und Severity. Es
-   existiert kein versionierter Security-Event-Katalog mit typspezifischer
-   Validierung.
-2. Es gibt keinen authentifizierten Sensor-Ingress. Der vorhandene interne
-   Operational-Event-Endpunkt akzeptiert nur `backup_error` und
-   `system_health_error`.
+1. **Behoben** (`security-events-domain`/`-storage`, siehe Roadmap): Die
+   Eventtabelle akzeptierte freie Texte für Typ, Quelle und Severity ohne
+   versionierten Katalog. Das neue Crate `clawforge-security-events` liefert
+   elf typisierte Eventtypen mit typspezifischer Evidence, geschlossener
+   `Severity`-Skala und Validierung (`SensorEnvelope::validate`); Migration
+   `0031` persistiert sie getrennt von der bestehenden Eventtabelle
+   (`security_events`, `schema_version`-Spalte).
+2. **Behoben** (`security-events-ingress`, siehe Roadmap): Es gab keinen
+   authentifizierten Sensor-Ingress; der interne Operational-Event-Endpunkt
+   akzeptierte nur `backup_error`/`system_health_error`. Neuer Endpunkt
+   `POST /internal/security-events/batch` auf `clawforge-api`,
+   authentifiziert über individuelle, widerrufbare `security_sensors`-
+   Credentials (nicht die festen Service-Tokens), mit Größenlimit,
+   Clock-Skew-Prüfung, Dedupe/Idempotenz, Audit und eindeutiger
+   Teilfehlerantwort je Batch-Item.
 3. `is_correlatable` kennt nur Threat-, BGP-, RPKI-, ASN-, Trust- und Provider-
    Ereignisse. Die geplanten Firewall-, Auth-, SSH-, HTTP-, DNS-, Scan- und
    Containerereignisse werden noch nicht verarbeitet.

@@ -139,10 +139,108 @@ credential hash and bumps `last_seen_at`), `get_security_sensor`,
 `list_security_sensors`, `record_security_event`, `get_security_event`,
 `list_security_events`.
 
-No runtime database role is granted access to these tables yet: no service
-writes to them until `security-events-ingress` exists, and the grant belongs
-with whichever service that turns out to be (`scripts/provision-db-roles.sh`).
-The real-Postgres integration test (`storage/tests/postgres.rs`,
-`security_events_register_sensor_and_record_event`, part of
-`scripts/test-postgres.sh`) therefore uses the owner connection, the same as
-`migrations_and_restart_persist`.
+No new grant was needed for `clawforge-api` (below) to use these tables:
+`clawforge_api`'s role already holds `SELECT, INSERT, UPDATE, DELETE ON ALL
+TABLES IN SCHEMA public` (`scripts/provision-db-roles.sh` - "the
+authenticated administrative boundary", unlike the narrower per-service
+roles), which covers any table a migration adds as long as
+`clawforge-db-roles` runs after that migration is applied. On a fresh
+deployment this happens automatically (`clawforge-db-roles` depends on
+`clawforge-migrate` completing first); **upgrading an existing deployment
+past migration `0031` requires re-running `clawforge-db-roles` once**, or
+`security_sensors`/`security_events` stay inaccessible to `clawforge-api`
+until it does. The real-Postgres integration test for the storage layer
+itself (`storage/tests/postgres.rs`, `security_events_register_sensor_and_record_event`,
+part of `scripts/test-postgres.sh`) uses the owner connection regardless, the
+same as `migrations_and_restart_persist`.
+
+## Ingress (`security-events-ingress`)
+
+`POST /internal/security-events/batch` on `clawforge-api`, authenticated by
+a `security_sensors` credential (`Authorization: Bearer <raw credential>`,
+looked up by its SHA-256 digest via `authenticate_security_sensor` - the
+same digest-lookup pattern `agent_tokens`/`api_tokens` already use, not the
+fixed per-service tokens `InternalIdentity` checks for `clawforge-api`'s
+other internal endpoints, since a sensor is a dynamic, individually
+revocable identity rather than a first-party Clawforge service). A sensor is
+registered with `PostgresStore::register_security_sensor` directly (no admin
+HTTP endpoint for that exists yet - out of scope here); the caller hashes
+the raw credential (SHA-256 digest, matching `agent_tokens`) before handing
+it to storage, which never sees a credential in the clear.
+
+The request body is a JSON array of envelopes (any shape `SensorEnvelope`
+serializes to - `security_events::fixtures` is representative). Each item is
+handled independently and reported in its own result, so one bad item never
+fails the rest of the batch:
+
+```json
+{
+  "status": "ok",
+  "data": {
+    "accepted": 1,
+    "rejected": 1,
+    "results": [
+      {"index": 0, "status": "accepted", "event_id": "..."},
+      {"index": 1, "status": "rejected", "error": "occurred_at is 172801 second(s) old, beyond the 86400-second limit"}
+    ]
+  }
+}
+```
+
+Per Phase 2's ingress requirements:
+
+- **Auth**: see above; a missing or unrecognized/disabled/revoked
+  credential is `401` before any item is looked at.
+- **Größenlimit (size limit)**: at most `SECURITY_EVENT_BATCH_MAX_ITEMS`
+  (100) items per batch (`400` if exceeded, without processing any item),
+  and the route carries its own `DefaultBodyLimit`
+  (`SECURITY_EVENT_BATCH_MAX_BODY_BYTES`, 512KB) tighter than axum's global
+  2MB default.
+- **Idempotenz (idempotency) / dedupe**: `record_security_event`
+  (`security-events-storage`) makes a resubmission of an unchanged
+  `(sensor_id, dedupe_key)` pair return the same `event_id`; a resubmission
+  that changes any reported field is rejected as that item's own error.
+- **Clock-Skew-Prüfung**: `occurred_at` must be within
+  `CLAWFORGE_SECURITY_EVENTS_MAX_FUTURE_SKEW_SECONDS` (default 300) ahead of
+  the server clock and within `CLAWFORGE_SECURITY_EVENTS_MAX_PAST_AGE_SECONDS`
+  (default 86400) behind it, checked per item
+  (`check_security_event_clock_skew`); a non-positive override falls back to
+  the default rather than disabling the check.
+- **Nonce/Sequenz**: fulfilled by `dedupe_key` itself (sensor-scoped,
+  content-locked as above) rather than a separate sequence field - the
+  wire format already shipped in `security-events-domain` was kept as is
+  rather than revised for a mechanism `dedupe_key` already provides.
+- **Audit**: every batch call writes one `security_event_batch_ingested`
+  audit event (`audit_events`, actor = the sensor's name) with the batch's
+  accepted/rejected counts.
+- **Rate limit**: inherited from `clawforge-api`'s existing global
+  `rate_limit_middleware` (a POST route defaults to the "write" class),
+  keyed by the bearer token's digest - no bespoke limiter was added for this
+  one route.
+
+`SensorEnvelope::validate()` (added alongside this endpoint) matters here
+specifically: `#[derive(Deserialize)]` fills `SensorEnvelope`'s `pub` fields
+directly from JSON and never runs through the `new()` constructor's checks,
+so deserializing a batch item is not enough on its own - the ingress handler
+calls `.validate()` immediately after, and a structurally well-formed but
+semantically invalid envelope (a blank `source`, an unparseable IP, an
+unknown `event_type`) is rejected the same as malformed JSON.
+
+`api/src/bin/send-security-event-fixtures.rs` (`cargo run -p clawforge-api
+--bin send-security-event-fixtures`, `CLAWFORGE_SECURITY_EVENTS_URL` and
+`CLAWFORGE_SECURITY_EVENTS_SENSOR_CREDENTIAL` env vars) is the roadmap's
+"Fixture-Sender": it posts `fixtures::all()` (with `occurred_at` brought to
+now, since the fixtures' own fixed timestamp would otherwise fail the
+clock-skew check) as one batch against a running ingress endpoint, for
+manually verifying a deployment or a sensor integration being built against
+it.
+
+Contract and negative tests: `api/src/main.rs`,
+`security_events_batch_ingress_contract` (real-Postgres, part of
+`scripts/test-postgres.sh`) - missing/unknown bearer token, empty batch,
+over-limit batch, one malformed item alongside one valid item in the same
+batch, a stale `occurred_at`, and resubmission idempotency, all driven
+through `build_router` (the same router `main` serves) via `tower::oneshot`.
+`check_security_event_clock_skew` and the
+`CLAWFORGE_SECURITY_EVENTS_MAX_*_SECONDS` env parsing also have plain,
+storeless unit tests.

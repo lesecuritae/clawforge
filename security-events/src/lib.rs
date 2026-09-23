@@ -470,25 +470,33 @@ impl SensorEnvelope {
         dedupe_key: impl Into<String>,
         evidence: SecurityEventEvidence,
     ) -> Result<Self, ValidationError> {
-        let source = source.into();
-        let resource = resource.into();
-        let dedupe_key = dedupe_key.into();
-        validate_text("source", &source, SHORT_FIELD_MAX)?;
-        validate_text("resource", &resource, RESOURCE_MAX)?;
-        validate_text("dedupe_key", &dedupe_key, DEDUPE_KEY_MAX)?;
-        evidence.validate()?;
-        Ok(Self {
+        let envelope = Self {
             occurred_at,
-            source,
+            source: source.into(),
             severity,
-            resource,
-            dedupe_key,
+            resource: resource.into(),
+            dedupe_key: dedupe_key.into(),
             evidence,
-        })
+        };
+        envelope.validate()?;
+        Ok(envelope)
     }
 
     pub fn event_type(&self) -> SecurityEventType {
         self.evidence.event_type()
+    }
+
+    /// Re-validate an envelope that was not built through `new` - the
+    /// common case being one deserialized straight from untrusted JSON
+    /// (`#[derive(Deserialize)]` fills `pub` fields directly and does not
+    /// go through `new`, so a caller that deserializes a `SensorEnvelope`
+    /// from external input, such as a future ingress endpoint, must call
+    /// this before trusting it).
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        validate_text("source", &self.source, SHORT_FIELD_MAX)?;
+        validate_text("resource", &self.resource, RESOURCE_MAX)?;
+        validate_text("dedupe_key", &self.dedupe_key, DEDUPE_KEY_MAX)?;
+        self.evidence.validate()
     }
 }
 
@@ -752,6 +760,26 @@ mod tests {
         );
         let raw = r#"{"event_type":"not_a_real_event_type","occurred_at":"2024-01-01T00:00:00Z","source":"s","severity":"low","resource":"r","dedupe_key":"d"}"#;
         assert!(serde_json::from_str::<SensorEnvelope>(raw).is_err());
+    }
+
+    /// `#[derive(Deserialize)]` fills `SensorEnvelope`'s `pub` fields
+    /// directly and never runs through `new`'s checks - an ingress endpoint
+    /// deserializing untrusted JSON must call `.validate()` itself. This
+    /// proves that a structurally well-formed but semantically invalid
+    /// envelope (an empty `source`) parses successfully and only
+    /// `.validate()` catches it.
+    #[test]
+    fn deserializing_untrusted_json_bypasses_new_and_requires_an_explicit_validate_call() {
+        let raw = r#"{"event_type":"auth_failure","occurred_at":"2024-01-01T00:00:00Z","source":"","severity":"low","resource":"r","dedupe_key":"d","username":"u","source_ip":"203.0.113.7","method":"password","attempt_count":1}"#;
+        let envelope: SensorEnvelope =
+            serde_json::from_str(raw).expect("structurally valid JSON deserializes");
+        assert_eq!(
+            envelope.validate(),
+            Err(ValidationError::InvalidField {
+                field: "source",
+                max: SHORT_FIELD_MAX
+            })
+        );
     }
 
     #[test]

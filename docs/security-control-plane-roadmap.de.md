@@ -333,8 +333,22 @@ Dateneigentümerschaft und zwei-Personen-Freigabe.
    Schreiben. Noch keine DB-Rolle erhält Zugriff - das übernimmt der Dienst,
    den `security-events-ingress` einführt. PostgreSQL-Integrationstest in
    `scripts/test-postgres.sh`; siehe `docs/security-events.md`.
-8. `security-events-ingress`: interner Batch-Endpunkt, Auth/Rate Limit/Audit,
-   Contract- und Negativtests sowie ein Fixture-Sender.
+8. `security-events-ingress` (umgesetzt): `POST /internal/security-events/batch`
+   auf `clawforge-api`, authentifiziert über eine `security_sensors`-
+   Credential (SHA-256-Digest-Lookup wie bei `agent_tokens`, nicht die
+   festen `InternalIdentity`-Tokens). Größenlimit (100 Items,
+   eigenes `DefaultBodyLimit`), Clock-Skew-Prüfung
+   (`CLAWFORGE_SECURITY_EVENTS_MAX_FUTURE_SKEW_SECONDS`/
+   `..._MAX_PAST_AGE_SECONDS`), Nonce/Sequenz über `dedupe_key` erfüllt,
+   Audit-Event pro Batch, Rate-Limit über die bestehende globale
+   `rate_limit_middleware`. Eindeutige Teilfehlerantwort: jedes Item wird
+   unabhängig verarbeitet und einzeln gemeldet, ein fehlerhaftes Item lässt
+   den Rest des Batches nicht scheitern. Dabei eine echte Lücke im Domain-
+   Crate gefunden und geschlossen: `#[derive(Deserialize)]` umging die
+   Validierung aus `new()` komplett - `SensorEnvelope::validate()` schließt
+   das. Fixture-Sender: `api/src/bin/send-security-event-fixtures.rs`.
+   Contract-/Negativtests real gegen Postgres in `scripts/test-postgres.sh`.
+   Siehe `docs/security-events.md`.
 
 Erst danach beginnen Sensorimplementierungen. So bleibt jede Änderung klein,
 reviewbar und rückrollbar.

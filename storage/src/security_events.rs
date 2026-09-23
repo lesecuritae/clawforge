@@ -364,9 +364,16 @@ impl PostgresStore {
             .fetch_one(&mut *tx)
             .await?;
             tx.commit().await?;
+            // occurred_at is compared at microsecond precision, matching
+            // what TIMESTAMPTZ actually stores: chrono's DateTime<Utc>
+            // (Utc::now(), or a value round-tripped through JSON) carries
+            // nanoseconds, so a byte-for-byte comparison against the value
+            // read back from Postgres would see a false mismatch on the
+            // sub-microsecond remainder alone, wrongly rejecting a genuinely
+            // identical resubmission.
             let unchanged = existing.1 == event_type
                 && existing.2 == envelope.severity.as_str()
-                && existing.3 == envelope.occurred_at
+                && existing.3.timestamp_micros() == envelope.occurred_at.timestamp_micros()
                 && existing.4 == resource
                 && existing.5 == evidence_json;
             if !unchanged {

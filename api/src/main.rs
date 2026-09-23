@@ -15,7 +15,7 @@ use argon2::{
 };
 use axum::{
     body::{to_bytes, Body},
-    extract::{ConnectInfo, Path, Query, Request, State},
+    extract::{ConnectInfo, DefaultBodyLimit, Path, Query, Request, State},
     http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -27,6 +27,7 @@ use clawforge_intelligence::{NetworkType, TrustedNetwork, VerificationStatus};
 use clawforge_notification::{allowed_hosts, validate_channel};
 use clawforge_policy::authorize_action;
 use clawforge_secret::{ensure_distinct, load_optional, load_required_token, validate_token};
+use clawforge_security_events::SensorEnvelope;
 use clawforge_storage::{
     database_url_from_env, AdminPrincipal, AgentPrincipal, AuditEventFilter, MigrationStatus,
     PostgresStore,
@@ -7098,6 +7099,198 @@ async fn internal_operational_event(
     Ok(envelope(serde_json::json!({"event_id": id}), None))
 }
 
+/// A batch never contains more items than this - Phase 2's "Größenlimit"
+/// requirement, together with the DefaultBodyLimit layered on this route
+/// and the per-field bounds SensorEnvelope::validate already enforces on
+/// each item.
+const SECURITY_EVENT_BATCH_MAX_ITEMS: usize = 100;
+/// DefaultBodyLimit layered on the batch route itself, tighter than axum's
+/// global default (2MB): a full batch of the largest possible envelopes is
+/// nowhere near this.
+const SECURITY_EVENT_BATCH_MAX_BODY_BYTES: usize = 512 * 1024;
+
+fn security_event_max_future_skew() -> Duration {
+    Duration::seconds(
+        env::var("CLAWFORGE_SECURITY_EVENTS_MAX_FUTURE_SKEW_SECONDS")
+            .ok()
+            .and_then(|value| value.parse::<i64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(300),
+    )
+}
+
+fn security_event_max_past_age() -> Duration {
+    Duration::seconds(
+        env::var("CLAWFORGE_SECURITY_EVENTS_MAX_PAST_AGE_SECONDS")
+            .ok()
+            .and_then(|value| value.parse::<i64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(86_400),
+    )
+}
+
+#[derive(Serialize)]
+struct SecurityEventBatchItemResult {
+    index: usize,
+    status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    event_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+/// Validate and persist one batch item, translating every failure mode
+/// (malformed JSON for this item, a validation error, clock skew beyond the
+/// configured tolerance, or a storage-layer rejection such as a dedupe_key
+/// reused with different content) into a message for that item's own
+/// result entry - one bad item must never fail the rest of the batch.
+/// Pure clock-skew check, kept separate from `process_security_event_item`
+/// so it is unit-testable without a live store.
+fn check_security_event_clock_skew(
+    occurred_at: DateTime<Utc>,
+    now: DateTime<Utc>,
+    max_future_skew: Duration,
+    max_past_age: Duration,
+) -> Result<(), String> {
+    let skew = occurred_at - now;
+    if skew > max_future_skew {
+        return Err(format!(
+            "occurred_at is {} second(s) ahead of the server clock, beyond the {}-second limit",
+            skew.num_seconds(),
+            max_future_skew.num_seconds()
+        ));
+    }
+    if -skew > max_past_age {
+        return Err(format!(
+            "occurred_at is {} second(s) old, beyond the {}-second limit",
+            (-skew).num_seconds(),
+            max_past_age.num_seconds()
+        ));
+    }
+    Ok(())
+}
+
+async fn process_security_event_item(
+    store: &PostgresStore,
+    sensor_id: Uuid,
+    now: DateTime<Utc>,
+    max_future_skew: Duration,
+    max_past_age: Duration,
+    raw: serde_json::Value,
+) -> Result<Uuid, String> {
+    let envelope: SensorEnvelope =
+        serde_json::from_value(raw).map_err(|error| format!("invalid envelope: {error}"))?;
+    envelope.validate().map_err(|error| error.to_string())?;
+    check_security_event_clock_skew(envelope.occurred_at, now, max_future_skew, max_past_age)?;
+    store
+        .record_security_event(sensor_id, &envelope)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// Authenticated internal batch ingress for the Security Event Layer
+/// (roadmap phase 2, `security-events-ingress`). Authenticates the sensor
+/// itself (a `security_sensors` credential - distinct from the fixed
+/// per-service `internal_identity` tokens `InternalIdentity` checks, since a
+/// sensor is a dynamic, individually revocable identity, not a first-party
+/// Clawforge service), then validates and persists each item independently,
+/// returning one result per item rather than failing the whole batch for
+/// one bad entry.
+async fn internal_security_events_batch(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(items): Json<Vec<serde_json::Value>>,
+) -> ApiResult<Json<ApiEnvelope<serde_json::Value>>> {
+    let token = bearer(&headers).ok_or_else(|| {
+        API_AUTH_FAILURES.fetch_add(1, Ordering::Relaxed);
+        api_error(StatusCode::UNAUTHORIZED, "sensor bearer token required")
+    })?;
+    let sensor = state
+        .store
+        .authenticate_security_sensor(&digest(token))
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "sensor authentication unavailable",
+            )
+        })?
+        .ok_or_else(|| {
+            API_AUTH_FAILURES.fetch_add(1, Ordering::Relaxed);
+            api_error(
+                StatusCode::UNAUTHORIZED,
+                "invalid, disabled or revoked sensor credential",
+            )
+        })?;
+
+    if items.is_empty() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "batch must not be empty",
+        ));
+    }
+    if items.len() > SECURITY_EVENT_BATCH_MAX_ITEMS {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            format!("batch exceeds the {SECURITY_EVENT_BATCH_MAX_ITEMS}-item limit"),
+        ));
+    }
+
+    let now = Utc::now();
+    let max_future_skew = security_event_max_future_skew();
+    let max_past_age = security_event_max_past_age();
+    let mut results = Vec::with_capacity(items.len());
+    let mut accepted = 0usize;
+    for (index, raw) in items.into_iter().enumerate() {
+        match process_security_event_item(
+            &state.store,
+            sensor.id,
+            now,
+            max_future_skew,
+            max_past_age,
+            raw,
+        )
+        .await
+        {
+            Ok(event_id) => {
+                accepted += 1;
+                results.push(SecurityEventBatchItemResult {
+                    index,
+                    status: "accepted",
+                    event_id: Some(event_id),
+                    error: None,
+                });
+            }
+            Err(error) => {
+                results.push(SecurityEventBatchItemResult {
+                    index,
+                    status: "rejected",
+                    event_id: None,
+                    error: Some(error),
+                });
+            }
+        }
+    }
+    let rejected = results.len() - accepted;
+    let _ = state
+        .store
+        .record_audit_event(
+            &sensor.name,
+            "security_event_batch_ingested",
+            &sensor.id.to_string(),
+            serde_json::json!({
+                "batch_size": results.len(),
+                "accepted": accepted,
+                "rejected": rejected,
+            }),
+        )
+        .await;
+    Ok(envelope(
+        serde_json::json!({"results": results, "accepted": accepted, "rejected": rejected}),
+        None,
+    ))
+}
+
 async fn internal_events_consume(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -7233,57 +7426,11 @@ fn is_framework_rejection(message: &str) -> bool {
         || message.starts_with("Failed to parse")
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .init();
-    let database_url = database_url_from_env()?;
-    let analyzer_token = configured_analyzer_token()?;
-    let notifier_token = configured_notifier_token()?;
-    let events_token = configured_events_token()?;
-    let operations_token = configured_operations_token()?;
-    let notification_hosts =
-        allowed_hosts(&env::var("CLAWFORGE_NOTIFIER_ALLOWED_HOSTS").unwrap_or_default())?;
-    ensure_distinct(&[
-        ("analyzer token", &analyzer_token),
-        ("notifier token", &notifier_token),
-        ("events token", &events_token),
-        ("operations token", &operations_token),
-    ])?;
-    let bind = env::var("CLAWFORGE_API_BIND").unwrap_or_else(|_| "0.0.0.0:8080".into());
-    let address: SocketAddr = bind
-        .parse()
-        .map_err(|error| anyhow::anyhow!("invalid CLAWFORGE_API_BIND: {error}"))?;
-    let store = PostgresStore::connect_runtime(&database_url).await?;
-    // Register internal consumers before accepting events. Consumers remain
-    // independent; disabled services can simply leave their delivery rows
-    // pending until they are started.
-    store.ensure_event_consumer("notifier").await?;
-    store.ensure_event_consumer("events").await?;
-    store.ensure_event_consumer("analyzer").await?;
-    let runtime_store = store.clone();
-    let listener = tokio::net::TcpListener::bind(address).await?;
-    runtime_store
-        .set_runtime_status("api", "running", None)
-        .await?;
-    let app_state = AppState {
-        store,
-        config: RuntimeConfig {
-            bind: address,
-            database_configured: true,
-            analyzer_url: env::var("CLAWFORGE_ANALYZER_URL")
-                .ok()
-                .filter(|value| !value.trim().is_empty()),
-            analyzer_token: Some(analyzer_token),
-            notifier_token: Some(notifier_token),
-            events_token: Some(events_token),
-            operations_token: Some(operations_token),
-            notification_hosts,
-        },
-        rate_limiter: RateLimiter::default(),
-    };
-    let app = Router::new()
+/// The full route table, factored out of main() so integration tests can
+/// build the same router against a real store without also binding a port
+/// or running the process's own startup sequence.
+fn build_router(app_state: AppState) -> Router {
+    Router::new()
         .route("/health", get(health))
         .route("/ready", get(ready))
         .route("/version", get(version))
@@ -7415,6 +7562,11 @@ async fn main() -> anyhow::Result<()> {
             "/internal/notifier/operational-events",
             post(internal_operational_event),
         )
+        .route(
+            "/internal/security-events/batch",
+            post(internal_security_events_batch)
+                .layer(DefaultBodyLimit::max(SECURITY_EVENT_BATCH_MAX_BODY_BYTES)),
+        )
         .route("/incidents/export", get(export_incidents))
         .route("/intelligence/indicators/export", get(export_indicators))
         .route("/audit/events/export", get(export_audit_events))
@@ -7475,7 +7627,60 @@ async fn main() -> anyhow::Result<()> {
             rate_limit_middleware,
         ))
         .layer(middleware::from_fn(sanitize_framework_errors))
-        .with_state(app_state);
+        .with_state(app_state)
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .init();
+    let database_url = database_url_from_env()?;
+    let analyzer_token = configured_analyzer_token()?;
+    let notifier_token = configured_notifier_token()?;
+    let events_token = configured_events_token()?;
+    let operations_token = configured_operations_token()?;
+    let notification_hosts =
+        allowed_hosts(&env::var("CLAWFORGE_NOTIFIER_ALLOWED_HOSTS").unwrap_or_default())?;
+    ensure_distinct(&[
+        ("analyzer token", &analyzer_token),
+        ("notifier token", &notifier_token),
+        ("events token", &events_token),
+        ("operations token", &operations_token),
+    ])?;
+    let bind = env::var("CLAWFORGE_API_BIND").unwrap_or_else(|_| "0.0.0.0:8080".into());
+    let address: SocketAddr = bind
+        .parse()
+        .map_err(|error| anyhow::anyhow!("invalid CLAWFORGE_API_BIND: {error}"))?;
+    let store = PostgresStore::connect_runtime(&database_url).await?;
+    // Register internal consumers before accepting events. Consumers remain
+    // independent; disabled services can simply leave their delivery rows
+    // pending until they are started.
+    store.ensure_event_consumer("notifier").await?;
+    store.ensure_event_consumer("events").await?;
+    store.ensure_event_consumer("analyzer").await?;
+    let runtime_store = store.clone();
+    let listener = tokio::net::TcpListener::bind(address).await?;
+    runtime_store
+        .set_runtime_status("api", "running", None)
+        .await?;
+    let app_state = AppState {
+        store,
+        config: RuntimeConfig {
+            bind: address,
+            database_configured: true,
+            analyzer_url: env::var("CLAWFORGE_ANALYZER_URL")
+                .ok()
+                .filter(|value| !value.trim().is_empty()),
+            analyzer_token: Some(analyzer_token),
+            notifier_token: Some(notifier_token),
+            events_token: Some(events_token),
+            operations_token: Some(operations_token),
+            notification_hosts,
+        },
+        rate_limiter: RateLimiter::default(),
+    };
+    let app = build_router(app_state);
     tracing::info!(%address, "Clawforge API listening");
     axum::serve(
         listener,
@@ -8195,5 +8400,256 @@ mod tests {
         assert!(!serialized.contains("secret socket"));
         assert!(!serialized.contains("secret_ref"));
         assert!(validate_agent_scopes(&[AGENT_SCOPE_CONNECTOR_READ.into()]));
+    }
+
+    #[test]
+    fn security_event_clock_skew_accepts_values_inside_the_window() {
+        let now = Utc::now();
+        assert!(check_security_event_clock_skew(
+            now,
+            now,
+            Duration::seconds(300),
+            Duration::seconds(86_400)
+        )
+        .is_ok());
+        assert!(check_security_event_clock_skew(
+            now + Duration::seconds(299),
+            now,
+            Duration::seconds(300),
+            Duration::seconds(86_400)
+        )
+        .is_ok());
+        assert!(check_security_event_clock_skew(
+            now - Duration::seconds(86_399),
+            now,
+            Duration::seconds(300),
+            Duration::seconds(86_400)
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn security_event_clock_skew_rejects_a_sensor_clock_too_far_ahead() {
+        let now = Utc::now();
+        let error = check_security_event_clock_skew(
+            now + Duration::seconds(301),
+            now,
+            Duration::seconds(300),
+            Duration::seconds(86_400),
+        )
+        .unwrap_err();
+        assert!(error.contains("ahead of the server clock"));
+    }
+
+    #[test]
+    fn security_event_clock_skew_rejects_a_stale_event() {
+        let now = Utc::now();
+        let error = check_security_event_clock_skew(
+            now - Duration::seconds(86_401),
+            now,
+            Duration::seconds(300),
+            Duration::seconds(86_400),
+        )
+        .unwrap_err();
+        assert!(error.contains("second(s) old"));
+    }
+
+    // security_event_max_future_skew/security_event_max_past_age read
+    // process-wide env vars, so these tests must not run concurrently with
+    // each other.
+    static SECURITY_EVENT_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn security_event_skew_limits_default_when_unset_and_honor_a_configured_override() {
+        let _guard = SECURITY_EVENT_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        env::remove_var("CLAWFORGE_SECURITY_EVENTS_MAX_FUTURE_SKEW_SECONDS");
+        env::remove_var("CLAWFORGE_SECURITY_EVENTS_MAX_PAST_AGE_SECONDS");
+        assert_eq!(security_event_max_future_skew(), Duration::seconds(300));
+        assert_eq!(security_event_max_past_age(), Duration::seconds(86_400));
+
+        env::set_var("CLAWFORGE_SECURITY_EVENTS_MAX_FUTURE_SKEW_SECONDS", "60");
+        env::set_var("CLAWFORGE_SECURITY_EVENTS_MAX_PAST_AGE_SECONDS", "3600");
+        assert_eq!(security_event_max_future_skew(), Duration::seconds(60));
+        assert_eq!(security_event_max_past_age(), Duration::seconds(3600));
+
+        // A non-positive override is nonsensical and falls back to the
+        // default rather than disabling the check.
+        env::set_var("CLAWFORGE_SECURITY_EVENTS_MAX_FUTURE_SKEW_SECONDS", "0");
+        assert_eq!(security_event_max_future_skew(), Duration::seconds(300));
+
+        env::remove_var("CLAWFORGE_SECURITY_EVENTS_MAX_FUTURE_SKEW_SECONDS");
+        env::remove_var("CLAWFORGE_SECURITY_EVENTS_MAX_PAST_AGE_SECONDS");
+    }
+
+    #[test]
+    fn a_batch_item_with_invalid_json_shape_is_a_string_error_not_a_panic() {
+        // process_security_event_item needs a live store past this point,
+        // but the deserialization failure this proves returns before ever
+        // touching one - exercised here as a plain, storeless assertion on
+        // the error message shape a batch result would carry.
+        let raw = serde_json::json!({"event_type": "firewall_block"});
+        let result: Result<SensorEnvelope, _> = serde_json::from_value(raw);
+        assert!(result.is_err());
+    }
+
+    fn test_app_state(store: PostgresStore) -> AppState {
+        AppState {
+            store,
+            config: RuntimeConfig {
+                bind: "127.0.0.1:0".parse().unwrap(),
+                database_configured: true,
+                analyzer_url: None,
+                analyzer_token: Some("analyzer-token-test-only-0123456789".into()),
+                notifier_token: Some("notifier-token-test-only-0123456789".into()),
+                events_token: Some("events-token-test-only-0123456789".into()),
+                operations_token: Some("operations-token-test-only-0123456789".into()),
+                notification_hosts: HashSet::new(),
+            },
+            rate_limiter: RateLimiter::default(),
+        }
+    }
+
+    async fn post_security_event_batch(
+        app: &Router,
+        bearer_token: Option<&str>,
+        body: Vec<u8>,
+    ) -> (StatusCode, serde_json::Value) {
+        use tower::ServiceExt;
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/internal/security-events/batch")
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(token) = bearer_token {
+            builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        let request = builder.body(Body::from(body)).unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value = if bytes.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap()
+        };
+        (status, value)
+    }
+
+    /// Contract and negative tests for the security event batch ingress
+    /// (roadmap `security-events-ingress`): sensor authentication, size
+    /// limits, per-item partial failure, the clock-skew check, and dedupe
+    /// idempotency - end to end through `build_router`, the same router
+    /// `main` serves, against a real database.
+    #[tokio::test]
+    #[ignore = "requires an isolated PostgreSQL test container"]
+    async fn security_events_batch_ingress_contract() -> anyhow::Result<()> {
+        use clawforge_security_events::fixtures;
+
+        let url = std::env::var("CLAWFORGE_TEST_DATABASE_URL")
+            .or_else(|_| std::env::var("DATABASE_URL"))?;
+        let store = PostgresStore::connect(&url).await?;
+
+        let raw_credential = new_secret();
+        store
+            .register_security_sensor(
+                &format!("test-sensor-ingress-{}", Uuid::new_v4()),
+                &digest(&raw_credential),
+                &raw_credential[..8],
+                None,
+                "integration-test",
+            )
+            .await?;
+        let app = build_router(test_app_state(store.clone()));
+
+        // No bearer token at all is rejected.
+        let (status, _) =
+            post_security_event_batch(&app, None, serde_json::to_vec(&fixtures::all())?).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        // A bearer token that matches no registered sensor is rejected.
+        let (status, _) = post_security_event_batch(
+            &app,
+            Some("not-a-registered-sensor-credential"),
+            serde_json::to_vec(&vec![fixtures::firewall_block()])?,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        // An empty batch is rejected outright.
+        let (status, _) =
+            post_security_event_batch(&app, Some(&raw_credential), b"[]".to_vec()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // A batch over the item limit is rejected without processing any
+        // item (distinct from a per-item rejection inside an accepted
+        // batch).
+        let too_many: Vec<_> = std::iter::repeat_n(
+            fixtures::firewall_block(),
+            SECURITY_EVENT_BATCH_MAX_ITEMS + 1,
+        )
+        .collect();
+        let (status, _) =
+            post_security_event_batch(&app, Some(&raw_credential), serde_json::to_vec(&too_many)?)
+                .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // One valid item alongside one structurally malformed item: the
+        // request itself succeeds, but the batch reports one accepted and
+        // one rejected result rather than failing the whole request.
+        // occurred_at is set to now: the fixtures otherwise carry a fixed,
+        // long-past timestamp that the clock-skew check below would itself
+        // reject, which is not what this assertion is about.
+        let mut valid = fixtures::firewall_block();
+        valid.occurred_at = Utc::now();
+        let malformed = serde_json::json!({"event_type": "firewall_block"});
+        let body = serde_json::to_vec(&serde_json::json!([valid, malformed]))?;
+        let (status, value) = post_security_event_batch(&app, Some(&raw_credential), body).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value["data"]["accepted"], 1);
+        assert_eq!(value["data"]["rejected"], 1);
+        let results = value["data"]["results"].as_array().unwrap();
+        assert_eq!(results[0]["status"], "accepted");
+        assert!(results[0]["event_id"].is_string());
+        assert_eq!(results[1]["status"], "rejected");
+        assert!(results[1]["error"].is_string());
+
+        // A stale occurred_at is rejected by the clock-skew check.
+        let mut stale = fixtures::ssh_login_failure();
+        stale.occurred_at = Utc::now() - Duration::days(2);
+        let (status, value) = post_security_event_batch(
+            &app,
+            Some(&raw_credential),
+            serde_json::to_vec(&vec![stale])?,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value["data"]["rejected"], 1);
+        assert!(value["data"]["results"][0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("old"));
+
+        // Resubmitting the exact same item twice is idempotent: same
+        // event_id both times.
+        let mut repeatable = fixtures::dns_anomaly();
+        repeatable.occurred_at = Utc::now();
+        let body = serde_json::to_vec(&vec![repeatable])?;
+        let (_, first) = post_security_event_batch(&app, Some(&raw_credential), body.clone()).await;
+        let (_, second) = post_security_event_batch(&app, Some(&raw_credential), body).await;
+        assert_eq!(
+            first["data"]["results"][0]["event_id"],
+            second["data"]["results"][0]["event_id"]
+        );
+
+        // Every batch request is audited.
+        let audit_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_events WHERE action='security_event_batch_ingested'",
+        )
+        .fetch_one(store.pool())
+        .await?;
+        assert!(audit_count >= 1);
+
+        Ok(())
     }
 }

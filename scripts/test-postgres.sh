@@ -94,3 +94,7 @@ CLAWFORGE_TEST_CORRELATION_DATABASE_URL="$(cat "$secret_dir/database_correlation
 CLAWFORGE_TEST_INCIDENTS_DATABASE_URL="$(cat "$secret_dir/database_incidents_url")" \
 CLAWFORGE_ANALYZER_IP_HMAC_KEY="test-only-ip-hmac-key-0123456789-not-for-production" \
   run_cargo test -p clawforge-correlation --bin clawforge-correlation -- --ignored --test-threads=1
+
+CLAWFORGE_TEST_DATABASE_URL="$owner_url" \
+CLAWFORGE_ANALYZER_IP_HMAC_KEY="test-only-ip-hmac-key-0123456789-not-for-production" \
+  run_cargo test -p clawforge-api --bin clawforge-api -- --ignored --test-threads=1
