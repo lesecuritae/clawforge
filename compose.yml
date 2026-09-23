@@ -56,6 +56,7 @@ services:
       - database_api_password
       - database_worker_password
       - database_correlation_password
+      - database_security_engine_password
       - database_incidents_password
       - database_executor_password
       - database_backup_password
@@ -298,6 +299,37 @@ services:
     secrets:
       - database_correlation_url
       - analyzer_ip_hmac_key
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "kill -0 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  clawforge-security-engine:
+    image: ${CLAWFORGE_IMAGE_REGISTRY:-ghcr.io/lesecuritae}/clawforge-security-engine:${CLAWFORGE_IMAGE_TAG:-v1.0.0}
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    command: ["/usr/local/bin/clawforge-security-engine"]
+    environment:
+      DATABASE_URL_FILE: /run/secrets/database_security_engine_url
+      CLAWFORGE_SECURITY_ENGINE_POLL_SECONDS: ${CLAWFORGE_SECURITY_ENGINE_POLL_SECONDS:-5}
+      RUST_LOG: ${RUST_LOG:-info}
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=32m
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    depends_on:
+      clawforge-db-roles:
+        condition: service_completed_successfully
+    secrets:
+      - database_security_engine_url
     networks:
       - backend
     healthcheck:
@@ -764,6 +796,10 @@ secrets:
     file: ${CLAWFORGE_DATABASE_CORRELATION_PASSWORD_SECRET_FILE:?set CLAWFORGE_DATABASE_CORRELATION_PASSWORD_SECRET_FILE to a private secret file}
   database_correlation_url:
     file: ${CLAWFORGE_DATABASE_CORRELATION_URL_SECRET_FILE:?set CLAWFORGE_DATABASE_CORRELATION_URL_SECRET_FILE to a private secret file}
+  database_security_engine_password:
+    file: ${CLAWFORGE_DATABASE_SECURITY_ENGINE_PASSWORD_SECRET_FILE:?set CLAWFORGE_DATABASE_SECURITY_ENGINE_PASSWORD_SECRET_FILE to a private secret file}
+  database_security_engine_url:
+    file: ${CLAWFORGE_DATABASE_SECURITY_ENGINE_URL_SECRET_FILE:?set CLAWFORGE_DATABASE_SECURITY_ENGINE_URL_SECRET_FILE to a private secret file}
   database_incidents_password:
     file: ${CLAWFORGE_DATABASE_INCIDENTS_PASSWORD_SECRET_FILE:?set CLAWFORGE_DATABASE_INCIDENTS_PASSWORD_SECRET_FILE to a private secret file}
   database_incidents_url:

@@ -170,16 +170,31 @@ Arbeitspakete:
 
 - den heutigen Correlation-Service zu `clawforge-security-engine` migrieren
   oder durch ihn ersetzen; genau ein Service korreliert kanonische Events und
-  bestehende Correlation-/Risk-Crates werden wiederverwendet.
+  bestehende Correlation-/Risk-Crates werden wiederverwendet. (**begonnen**:
+  `clawforge-security-engine` ist ein neuer, eigenständiger Consumer neben
+  `clawforge-correlation` - nicht dessen Ersatz, siehe `docs/security-engine.md`
+  für die Begründung -, der dessen bereits idempotente/eskalationssichere
+  `persist_correlation`/`incident_candidates`-Pfad wiederverwendet statt
+  einen zweiten zu bauen.)
 - Assessments, Evidence-Referenzen und Engine-/Regelversion persistieren.
+  (**erledigt**: Migration `0033`, `security_assessments`/
+  `security_assessment_events`, `dedupe_key` aus rule_id/rule_version/
+  resource/bucket_start.)
 - Regeln für SSH-Bruteforce, Scans, Multi-Target-Angriffe, HTTP-Anomalien sowie
-  Threat-Intel-plus-Verhalten implementieren.
+  Threat-Intel-plus-Verhalten implementieren. (**teilweise**: `ssh_bruteforce`
+  und `http_anomaly_burst` als deterministische Zähl-Schwellwert-Regeln über
+  ein festes Tumbling-Window implementiert und mit echtem Postgres getestet.
+  Scan-/Multi-Target-/Threat-Intel-plus-Verhalten-Regeln noch offen.)
 - minimale Provenance-, Freshness-, Confidence- und Konfliktregeln für alle
   verwendeten Threat-Intel-Signale implementieren; stale/unklare Daten dürfen
-  keine automatische Klasse erreichen.
+  keine automatische Klasse erreichen. (noch offen)
 - Incident-Erzeugung und Score-Änderungen idempotent und replay-fähig machen.
+  (**erledigt für die beiden implementierten Regeln**: durch Wiederverwendung
+  von `persist_correlation` plus die deterministische Bucket-Zuordnung;
+  echter Postgres-Test beweist below-threshold/at-threshold/same-bucket-
+  Wiederholung/Replay.)
 - Goldene Angriffsszenarien sowie False-positive-/False-negative-Fixtures
-  aufnehmen.
+  aufnehmen. (noch offen)
 
 Exit-Gate: gleiche Events und Regelversion erzeugen deterministisch dasselbe
 Assessment; Backfill/Replay erzeugt keine Notifications, Actions oder doppelten

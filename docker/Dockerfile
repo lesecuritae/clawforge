@@ -29,6 +29,7 @@ COPY --from=builder /src/target/release/clawforge-notifier /usr/local/bin/clawfo
 COPY --from=builder /src/target/release/clawforge-events /usr/local/bin/clawforge-events
 COPY --from=builder /src/target/release/clawforge-mcp /usr/local/bin/clawforge-mcp
 COPY --from=builder /src/target/release/clawforge-correlation /usr/local/bin/clawforge-correlation
+COPY --from=builder /src/target/release/clawforge-security-engine /usr/local/bin/clawforge-security-engine
 COPY --from=builder /src/target/release/clawforge-incidents /usr/local/bin/clawforge-incidents
 COPY --from=builder /src/target/release/clawforge-executor /usr/local/bin/clawforge-executor
 COPY --from=builder /src/target/release/clawforge-migrate /usr/local/bin/clawforge-migrate

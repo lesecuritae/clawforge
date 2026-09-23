@@ -393,6 +393,26 @@ impl PostgresStore {
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
+        // Fan this out onto the canonical event bus - exactly once, only for
+        // a genuinely new row (the ON CONFLICT/dedupe-hit path above already
+        // returned early with the existing id, never reaching here) - so a
+        // sensor's own at-least-once retry never republishes the same
+        // security event a second time. clawforge-security-engine (Phase 4)
+        // is the one service that consumes it from there; the resource is
+        // already pseudonymized above, so using it as correlation_id lets
+        // rules group events (e.g. repeated ssh_login_failure) by the same
+        // pseudonymous source without ever seeing a raw IP.
+        self.publish_event(
+            event_type,
+            &format!("sensor:{sensor_id}"),
+            envelope.severity.as_str(),
+            envelope.occurred_at,
+            Some(&resource),
+            evidence_json,
+            serde_json::json!({"security_event_id": id, "sensor_id": sensor_id}),
+            &format!("security-event:{id}"),
+        )
+        .await?;
         Ok(id)
     }
 
