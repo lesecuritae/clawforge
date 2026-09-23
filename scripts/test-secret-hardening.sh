@@ -31,6 +31,7 @@ export CLAWFORGE_MCP_AUTH_TOKEN_FILE="$test_dir/secrets/mcp_auth_token"
 export CLAWFORGE_ANALYZER_IP_HMAC_KEY_SECRET_FILE="$test_dir/secrets/analyzer_ip_hmac_key"
 export CLAWFORGE_GITHUB_TOKEN_FILE="$test_dir/secrets/github_token"
 export CLAWFORGE_PROXMOX_TOKEN_FILE="$test_dir/secrets/proxmox_token"
+export CLAWFORGE_LINUX_SENSOR_CREDENTIAL_SECRET_FILE="$test_dir/secrets/linux_sensor_credential"
 export CLAWFORGE_THREATFOX_SECRET_FILE="$test_dir/secrets/threatfox_auth_key"
 export CLAWFORGE_URLHAUS_SECRET_FILE="$test_dir/secrets/urlhaus_auth_key"
 export CLAWFORGE_MALWAREBAZAAR_SECRET_FILE="$test_dir/secrets/malwarebazaar_auth_key"
@@ -40,6 +41,7 @@ export CLAWFORGE_MALWAREBAZAAR_SECRET_FILE="$test_dir/secrets/malwarebazaar_auth
 docker compose --env-file /dev/null -f "$repo_dir/compose.yml" config --quiet
 docker compose --env-file /dev/null -f "$repo_dir/compose.yml" --profile observability config --quiet
 docker compose --env-file /dev/null -f "$repo_dir/compose.yml" --profile agent config --quiet
+docker compose --env-file /dev/null -f "$repo_dir/compose.yml" --profile sensors config --quiet
 docker compose --env-file /dev/null -f "$repo_dir/compose.yml" -f "$repo_dir/compose.bootstrap.yml" config --quiet
 
 chmod 0644 "$CLAWFORGE_EVENTS_SECRET_FILE"

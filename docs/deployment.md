@@ -118,7 +118,10 @@ docker compose --profile analysis up -d
 docker compose --profile cache up -d
 docker compose --profile observability up -d
 docker compose --profile agent up -d clawforge-mcp
+docker compose --profile sensors up -d clawforge-linux-sensor
 ```
 
 The analyzer remains isolated and receives only sanitized incident context.
 Redis is a lock/cache helper; PostgreSQL remains the source of truth.
+`sensors` needs its sensor registered and its credential in place first -
+see [sensors.md](sensors.md).

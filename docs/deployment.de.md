@@ -116,6 +116,10 @@ docker compose --profile analysis up -d
 docker compose --profile cache up -d
 docker compose --profile observability up -d
 docker compose --profile agent up -d clawforge-mcp
+docker compose --profile sensors up -d clawforge-linux-sensor
 ```
+
+`sensors` braucht zuerst einen registrierten Sensor mit hinterlegtem
+Credential - siehe [sensors.md](sensors.md).
 
 Die englische Referenz ist [deployment.md](deployment.md).

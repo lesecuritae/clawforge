@@ -111,7 +111,16 @@ Ziel: drei minimal privilegierte, beobachtbare Sensoren.
 
 Reihenfolge:
 
-1. Linux-Sensor für SSH-/Auth- und Systemereignisse.
+1. Linux-Sensor für SSH-/Auth- und Systemereignisse (**begonnen**:
+   `clawforge-linux-sensor` deckt `ssh_login_failure` per
+   `journalctl`/`SYSLOG_IDENTIFIER=sshd` ab - Cursor/Checkpoint, begrenzter
+   Puffer mit Backpressure, Dedupe über den Journal-Cursor als
+   `dedupe_key`, Health-/Lag-/Drop-Metriken auf `GET /health`, läuft ohne
+   root per `group_add`. PAM/sudo-Auth und breitere System-Ereignisse sind
+   bewusst noch nicht abgedeckt, siehe `docs/sensors.md`. Opt-in
+   `sensors`-Compose-Profil; Sensor-Credential wird über
+   `register-security-sensor` einmalig ausgegeben, noch kein Admin-Endpunkt
+   dafür.).
 2. HAProxy-Sensor für Request-Metadaten, Fehlercodes, Rate-Limit- und
    Anomaliesignale.
 3. Docker-Sensor für Lifecycle, Image-, Port- und Netzänderungen.

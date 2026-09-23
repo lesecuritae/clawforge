@@ -13,10 +13,14 @@ LABEL org.opencontainers.image.source="https://github.com/lesecuritae/clawforge"
       org.opencontainers.image.version="$RELEASE_VERSION" \
       org.opencontainers.image.revision="$VCS_REF" \
       org.opencontainers.image.licenses="Apache-2.0"
+# systemd (for journalctl) is only actually used by clawforge-linux-sensor,
+# but every service shares this one runtime image, so it lands here rather
+# than in a second Dockerfile stage.
 RUN apt-get update \
-    && apt-get install --no-install-recommends -y ca-certificates curl \
+    && apt-get install --no-install-recommends -y ca-certificates curl systemd \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /src/target/release/clawforge-api /usr/local/bin/clawforge-api
+COPY --from=builder /src/target/release/clawforge-linux-sensor /usr/local/bin/clawforge-linux-sensor
 COPY --from=builder /src/target/release/clawforge-worker /usr/local/bin/clawforge-worker
 COPY --from=builder /src/target/release/clawforge-analyzer /usr/local/bin/clawforge-analyzer
 COPY --from=builder /src/target/release/clawforge-notifier /usr/local/bin/clawforge-notifier

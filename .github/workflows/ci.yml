@@ -111,6 +111,7 @@ jobs:
             CLAWFORGE_ANALYZER_IP_HMAC_KEY_SECRET_FILE=analyzer_ip_hmac_key \
             CLAWFORGE_GITHUB_TOKEN_FILE=github_token \
             CLAWFORGE_PROXMOX_TOKEN_FILE=proxmox_token \
+            CLAWFORGE_LINUX_SENSOR_CREDENTIAL_SECRET_FILE=linux_sensor_credential \
             CLAWFORGE_THREATFOX_SECRET_FILE=threatfox_auth_key \
             CLAWFORGE_URLHAUS_SECRET_FILE=urlhaus_auth_key \
             CLAWFORGE_MALWAREBAZAAR_SECRET_FILE=malwarebazaar_auth_key; do
@@ -120,6 +121,7 @@ jobs:
       - run: docker compose config --quiet
       - run: docker compose --profile observability config --quiet
       - run: docker compose --profile agent config --quiet
+      - run: docker compose --profile sensors config --quiet
       - run: docker compose build
 
   release-images:

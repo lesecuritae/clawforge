@@ -429,6 +429,51 @@ services:
       retries: 5
     restart: unless-stopped
 
+  clawforge-linux-sensor:
+    profiles: [sensors]
+    image: ${CLAWFORGE_IMAGE_REGISTRY:-ghcr.io/lesecuritae}/clawforge-api:${CLAWFORGE_IMAGE_TAG:-v1.0.0}
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    command: ["/usr/local/bin/clawforge-linux-sensor"]
+    environment:
+      CLAWFORGE_SECURITY_EVENTS_URL: ${CLAWFORGE_SECURITY_EVENTS_URL:-http://clawforge-api:8080}
+      CLAWFORGE_LINUX_SENSOR_CREDENTIAL_FILE: /run/secrets/linux_sensor_credential
+      CLAWFORGE_LINUX_SENSOR_CHECKPOINT_PATH: /var/lib/clawforge/linux-sensor/cursor
+      CLAWFORGE_LINUX_SENSOR_BIND: 0.0.0.0:8095
+      RUST_LOG: ${RUST_LOG:-info}
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    # journalctl needs group-read access to the host's journal files, which
+    # are group-owned by systemd-journal on the host, not root: this stays
+    # a non-root container (UID 10001, matching every other service) with
+    # that one supplementary group added, per the roadmap's "Linux benötigt
+    # kein root". Verify the actual GID with `getent group systemd-journal`
+    # on the host and override CLAWFORGE_LINUX_SENSOR_JOURNAL_GID if it
+    # differs from the common Debian/Ubuntu default assumed here.
+    group_add:
+      - "${CLAWFORGE_LINUX_SENSOR_JOURNAL_GID:-101}"
+    volumes:
+      - /var/log/journal:/var/log/journal:ro
+      - /run/log/journal:/run/log/journal:ro
+      - /etc/machine-id:/etc/machine-id:ro
+      - clawforge-linux-sensor-state:/var/lib/clawforge/linux-sensor
+    secrets:
+      - linux_sensor_credential
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8095/health >/dev/null"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
   clawforge-frontend:
     image: ${CLAWFORGE_IMAGE_REGISTRY:-ghcr.io/lesecuritae}/clawforge-frontend:${CLAWFORGE_IMAGE_TAG:-v1.0.0}
     build:
@@ -579,6 +624,7 @@ volumes:
   clawforge-backups:
   clawforge-prometheus:
   clawforge-grafana:
+  clawforge-linux-sensor-state:
 
 networks:
   frontend:
@@ -647,3 +693,5 @@ secrets:
     file: ${CLAWFORGE_GITHUB_TOKEN_FILE:?set CLAWFORGE_GITHUB_TOKEN_FILE to a private secret file}
   proxmox_token:
     file: ${CLAWFORGE_PROXMOX_TOKEN_FILE:?set CLAWFORGE_PROXMOX_TOKEN_FILE to a private secret file}
+  linux_sensor_credential:
+    file: ${CLAWFORGE_LINUX_SENSOR_CREDENTIAL_SECRET_FILE:?set CLAWFORGE_LINUX_SENSOR_CREDENTIAL_SECRET_FILE to a private secret file}

@@ -35,6 +35,7 @@ declare -A paths=(
   [analyzer_ip_hmac_key]="${CLAWFORGE_ANALYZER_IP_HMAC_KEY_SECRET_FILE:-./secrets/analyzer_ip_hmac_key}"
   [github_token]="${CLAWFORGE_GITHUB_TOKEN_FILE:-./secrets/github_token}"
   [proxmox_token]="${CLAWFORGE_PROXMOX_TOKEN_FILE:-./secrets/proxmox_token}"
+  [linux_sensor_credential]="${CLAWFORGE_LINUX_SENSOR_CREDENTIAL_SECRET_FILE:-./secrets/linux_sensor_credential}"
   [threatfox_auth_key]="${CLAWFORGE_THREATFOX_SECRET_FILE:-./secrets/threatfox_auth_key}"
   [urlhaus_auth_key]="${CLAWFORGE_URLHAUS_SECRET_FILE:-./secrets/urlhaus_auth_key}"
   [malwarebazaar_auth_key]="${CLAWFORGE_MALWAREBAZAAR_SECRET_FILE:-./secrets/malwarebazaar_auth_key}"
