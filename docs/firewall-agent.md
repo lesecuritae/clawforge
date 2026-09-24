@@ -118,6 +118,25 @@ explicit `Vec<String>` of arguments passed to `tokio::process::Command`,
 never a shell string, so there is no shell to inject into in the first
 place. `FirewallTarget::validate` rejects a malformed target before it is
 ever used to build a command, as defense in depth on top of that.
+HAProxy's own commands go over a `tokio::net::UnixStream` write, never a
+subprocess at all - no shell there either, but its line-oriented Runtime
+API protocol has its own equivalent risk (an embedded newline in a `key`
+value could smuggle in a second, arbitrary command).
+
+**Now proven with `proptest`, not just asserted**: `firewall-agent/src/
+lib.rs`'s `tests::fuzz` module runs several hundred generated adversarial
+inputs (shell metacharacters, embedded newlines/NUL bytes, unicode,
+extreme lengths) per test through `FirewallTarget::try_from`/
+`parse_ip_or_cidr` (must never panic for any input - the actual external
+boundary an `execution_request.target` arrives through) and through
+`element_reference`'s reformatted output whenever `parse_ip_or_cidr`
+*does* accept a value (must never contain whitespace, a newline, or a NUL
+byte, and must always be exactly one line - the property that makes both
+the argv construction above and the HAProxy line-protocol safe). This
+holds by construction, since the reformatted output is rebuilt from a
+parsed, strongly-typed `IpAddr`/prefix rather than echoing the original
+input text back - but the fuzz tests are what actually prove it rather
+than leaving it as a comment's claim.
 
 ## Address normalization
 

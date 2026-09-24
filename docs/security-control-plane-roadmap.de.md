@@ -459,12 +459,29 @@ Pflichtgates vor der ersten verändernden Lab-Testaktion:
   Tests, die einen Prozessabbruch *waehrend* eines laufenden Dispatch
   simulieren, existieren noch nicht.)
 - Action API und Adapter bestehen Fuzz-/Negativtests und Command-Injection-
-  Review; es existiert keine freie Shell (**teilweise**: Negativtests fuer
+  Review; es existiert keine freie Shell (**erledigt**: Negativtests fuer
   `NftablesAdapter` vorhanden (ungueltige CIDR, leere Quelle, Shell-Metazeichen
   als Zieltext, unaufgeloester Pseudonym-Apply), jede Kommandokonstruktion -
   inklusive der jetzt echten apply/verify/rollback-Aufrufe - nutzt
   `tokio::process::Command` mit explizitem Argv statt Shell-String.
-  Systematisches Fuzzing noch offen.)
+  **Systematisches Fuzzing jetzt ebenfalls erledigt**: neues `proptest`-
+  Dev-Dependency, 8 Property-Tests in `firewall-agent/src/lib.rs`s
+  `tests::fuzz`-Modul (je Testlauf mehrere hundert generierte
+  Adversarial-Eingaben - Shell-Metazeichen, eingebettete Newlines/
+  Null-Bytes, Unicode, Extremlaengen). Zwei Invarianten bewiesen: (1)
+  `FirewallTarget::try_from` (die tatsaechliche externe Eingabegrenze -
+  `execution_requests.approval_context->>'target'`) und `parse_ip_or_cidr`
+  duerfen fuer BELIEBIGE Eingabe nie paniken; (2) sobald ein Wert
+  `parse_ip_or_cidr` erfolgreich durchlaeuft, enthaelt `element_reference`s
+  neu zusammengesetzte Ausgabe (das, was tatsaechlich als `nft`-Argv-Element
+  oder HAProxy-Runtime-API-`key` ankommt) garantiert kein Whitespace, keinen
+  Newline, kein Null-Byte und ist immer genau eine Zeile - insbesondere
+  fuer die HAProxy-Befehle relevant, deren Protokoll zeilenbasiert ueber
+  `UnixStream::write_all` laeuft: ein eingebetteter Newline in `key` haette
+  dort einen zweiten, frei waehlbaren Runtime-API-Befehl einschmuggeln
+  koennen. Diese Eigenschaft galt vorher nur als Kommentar-Behauptung ("kann
+  nie Whitespace/Newline enthalten, weil aus einem typisierten `IpAddr`
+  neu formatiert") - jetzt ist sie bewiesen, nicht nur behauptet.)
 - isoliertes Netzwerk-Lab bestätigt, dass Allowlist und Managementzugang nicht
   gesperrt werden können (**teilweise**: `scripts/test-firewall-lab.sh`
   betreibt einen disposablen Container (NET_ADMIN/NET_RAW, nie

@@ -15,6 +15,7 @@ argon2 = "0.5"
 chrono = { version = "0.4", features = ["serde"] }
 hmac = "0.12"
 ipnet = "2"
+proptest = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 redis = { version = "0.32", default-features = false, features = ["tokio-comp"] }
 serde = { version = "1", features = ["derive"] }

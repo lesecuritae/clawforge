@@ -100,12 +100,17 @@
 //! `a_worker_that_dies_after_claiming_is_reclaimed_by_a_different_worker`).
 //! A break-glass drill (`break_glass_removes_every_trace_of_the_clawforge_table`),
 //! manual-drift detection (`verify_detects_manual_drift_after_an_out_of_band_removal`),
-//! and a DB-backed mass-block rate budget also exist now. Still open: the
+//! TTL-driven auto-rollback, a kill-switch per target, and both a
+//! DB-backed mass-block rate budget and a per-adapter concurrency budget
+//! (both bounding multiple `clawforge-executor` replicas sharing this
+//! database, not just one process) also exist now - see
+//! `docs/firewall-agent.md`'s "Kill-switch per target" and "Concurrency
+//! budget per adapter" sections. Property-based fuzz tests
+//! (`proptest_never_panics_on_arbitrary_input` and friends, below) prove
+//! the "no shell to inject into" claim above holds for adversarial input,
+//! not just the hand-picked negative-test cases. Still open: the
 //! roadmap's remaining mandatory gates beyond what this crate's own tests
-//! cover (failure injection beyond lease loss/manual drift, a concurrency
-//! budget bounding multiple replicas targeting the *same* host, TTL-driven
-//! auto-rollback of an expired block) - see `docs/firewall-agent.md`'s own
-//! remaining list.
+//! cover - see `docs/firewall-agent.md`'s own remaining list.
 
 use async_trait::async_trait;
 use std::net::IpAddr;
@@ -3192,5 +3197,169 @@ mod tests {
             result.is_err(),
             "loopback must be refused even in dry_run mode, not only for a real apply"
         );
+    }
+
+    // Systematic fuzz/negative tests (roadmap: "Action API und Adapter
+    // bestehen Fuzz-/Negativtests und Command-Injection-Review") -
+    // `proptest` generates thousands of adversarial inputs per run
+    // (shell metacharacters, embedded newlines/nulls, unicode, extreme
+    // lengths, ...) rather than relying only on the hand-picked cases
+    // above. Two invariants matter here, both about the Action API
+    // boundary (`FirewallTarget::try_from`, the literal shape
+    // `execution_requests.approval_context->>'target'` arrives in) and
+    // the adapters' own command construction:
+    //
+    // 1. Parsing/validating arbitrary input must never panic - a
+    //    malformed `execution_request.target` must become a clean `Err`,
+    //    never a crashed executor.
+    // 2. Whenever a value *does* pass validation and becomes part of a
+    //    real command, it can never contain whitespace, a newline, or any
+    //    other character that could inject a second command - into
+    //    `tokio::process::Command`'s argv (no shell to inject into at
+    //    all, but proven anyway for defense in depth) or, more
+    //    concretely exploitable in principle, into HAProxy's
+    //    line-oriented Runtime API protocol (`UnixStream::write_all`,
+    //    literally one line per command - an embedded `\n` in a "key"
+    //    value would let an attacker smuggle in a second, arbitrary
+    //    Runtime API command).
+    mod fuzz {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            /// `FirewallTarget::try_from` must never panic for *any* JSON
+            /// value shape, not just the two recognized `kind`s - this is
+            /// the actual external input boundary (an `execution_request`'s
+            /// `target` column), fully attacker/operator-controlled JSON.
+            #[test]
+            fn try_from_json_never_panics(
+                kind in ".*",
+                cidr in ".*",
+                source in ".*",
+                pseudonym in ".*",
+            ) {
+                let value = serde_json::json!({
+                    "kind": kind,
+                    "cidr": cidr,
+                    "source": source,
+                    "pseudonym": pseudonym,
+                });
+                // Only the outcome matters here (Ok or Err, never a
+                // panic) - the specific variant is already covered by
+                // the targeted tests above.
+                let _ = FirewallTarget::try_from(&value);
+            }
+
+            /// Same invariant, but against arbitrary (non-object) JSON
+            /// shapes too - a number, a string, an array, null - since
+            /// nothing about the JSON contract is enforced by a schema
+            /// before this function sees it.
+            #[test]
+            fn try_from_json_never_panics_on_non_object_shapes(
+                text in ".*",
+                n in any::<i64>(),
+                b in any::<bool>(),
+            ) {
+                for value in [
+                    serde_json::json!(text),
+                    serde_json::json!(n),
+                    serde_json::json!(b),
+                    serde_json::Value::Null,
+                    serde_json::json!([text.clone(), n]),
+                ] {
+                    let _ = FirewallTarget::try_from(&value);
+                }
+            }
+
+            /// `parse_ip_or_cidr` must never panic for arbitrary text -
+            /// it is the sole gate every `cidr`/`raw_ip` string passes
+            /// through before becoming part of a real command.
+            #[test]
+            fn parse_ip_or_cidr_never_panics(value in ".*") {
+                let _ = parse_ip_or_cidr(&value);
+            }
+
+            /// The core command-injection proof: whenever
+            /// `parse_ip_or_cidr` accepts a string, `element_reference`'s
+            /// reformatted output (what actually reaches an `nft` argv
+            /// element or a HAProxy Runtime API `key`) contains none of
+            /// whitespace, a newline, or a NUL byte - regardless of what
+            /// the *original* input string looked like. This holds by
+            /// construction (the output is rebuilt from a parsed,
+            /// strongly-typed `IpAddr`/prefix, never the raw input text -
+            /// see `element_reference`'s own doc comment), but this test
+            /// is what actually proves it rather than just asserting it
+            /// in a comment.
+            #[test]
+            fn a_validated_indicator_element_reference_is_always_a_single_safe_token(
+                raw in ".*",
+            ) {
+                if parse_ip_or_cidr(&raw).is_some() {
+                    let target = indicator(&raw);
+                    let reference = element_reference(&target).expect("already validated");
+                    prop_assert!(!reference.contains(char::is_whitespace));
+                    prop_assert!(!reference.contains('\0'));
+                    prop_assert_eq!(reference.lines().count(), 1);
+                }
+            }
+
+            /// Same proof, one level up: every HAProxy Runtime API command
+            /// string this crate builds from a validated indicator is
+            /// exactly one line - an embedded newline in `key` would let
+            /// an attacker smuggle a second, arbitrary command past
+            /// `UnixStream::write_all`'s single `\n` terminator.
+            #[test]
+            fn haproxy_commands_built_from_a_validated_indicator_are_always_one_line(
+                raw in ".*",
+                acl_file in ".*",
+                table in ".*",
+            ) {
+                if parse_ip_or_cidr(&raw).is_some() {
+                    let target = indicator(&raw);
+                    let key = element_reference(&target).expect("already validated");
+                    for command in [
+                        haproxy_add_acl_command(&acl_file, &key),
+                        haproxy_del_acl_command(&acl_file, &key),
+                        haproxy_set_table_gpc0_command(&table, &key),
+                        haproxy_clear_table_command(&table, &key),
+                    ] {
+                        prop_assert_eq!(command.lines().count(), 1);
+                    }
+                }
+            }
+
+            /// `render` (pure, synchronous, never touches a real adapter)
+            /// must never panic for an arbitrary `ThreatIntelIndicator`,
+            /// valid or not - it is the first thing called on any
+            /// operator/attacker-controlled target.
+            #[test]
+            fn nftables_render_never_panics_on_arbitrary_indicator(
+                cidr in ".*",
+                source in ".*",
+            ) {
+                let adapter = NftablesAdapter::new();
+                let target = FirewallTarget::ThreatIntelIndicator { cidr, source };
+                let action = action_for(target);
+                let _ = adapter.render(&action);
+            }
+
+            #[test]
+            fn haproxy_render_never_panics_on_arbitrary_indicator(
+                cidr in ".*",
+                source in ".*",
+            ) {
+                let adapter = HaproxyAdapter::new();
+                let target = FirewallTarget::ThreatIntelIndicator { cidr, source };
+                let action = action_for(target);
+                let _ = adapter.render(&action);
+            }
+
+            /// `validate_pseudonym` (the `IncidentSource` gate) must never
+            /// panic for arbitrary text either.
+            #[test]
+            fn validate_pseudonym_never_panics(value in ".*") {
+                let _ = validate_pseudonym(&value);
+            }
+        }
     }
 }
