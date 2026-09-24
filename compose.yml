@@ -715,6 +715,7 @@ services:
       - analyzer_ip_hmac_key
     networks:
       - backend
+      - egress
     healthcheck:
       test: ["CMD-SHELL", "kill -0 1"]
       interval: 10s
@@ -810,6 +811,14 @@ networks:
     ipam:
       config:
         - subnet: ${CLAWFORGE_BACKEND_SUBNET:-10.77.77.0/24}
+  # Not internal - the one path out to the real internet, for
+  # clawforge-worker's threat-intel providers (Spamhaus, RIPEstat, BGPView,
+  # ...) alone. Every other service stays on `backend` only, with no route
+  # out at all; this network exists so that stays true even once one
+  # service legitimately needs egress, rather than loosening `backend`
+  # itself (which would give every service on it a path out, not just the
+  # one that needs it).
+  egress:
 
 secrets:
   postgres_password:

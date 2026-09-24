@@ -78,11 +78,17 @@ REVOKE INSERT, UPDATE, DELETE ON TABLE _sqlx_migrations FROM clawforge_api;
 REVOKE UPDATE, DELETE ON TABLE audit_events FROM clawforge_api;
 REVOKE DELETE ON TABLE audit_outbox FROM clawforge_api;
 
+-- incident_relations: list_incidents (called from evaluate_decisions on
+-- every worker tick) joins it to compute each incident's event_sources/
+-- event_count - a real gap found live (never caught before because
+-- clawforge-worker had never actually been run against a least-privilege
+-- role in this deployment; no existing real-Postgres test exercised this
+-- read path under the worker role either, only negative privilege checks).
 GRANT SELECT ON TABLE _sqlx_migrations,
-  alerts, incidents, providers, provider_status, runtime_status,
-  knowledge_entries, events, rules, decisions, workflows, workflow_steps,
-  workflow_runs, approvals, notification_rules, notification_channels,
-  event_consumers
+  alerts, incidents, incident_relations, providers, provider_status,
+  runtime_status, knowledge_entries, events, rules, decisions, workflows,
+  workflow_steps, workflow_runs, approvals, notification_rules,
+  notification_channels, event_consumers
   TO clawforge_worker;
 GRANT SELECT, INSERT, UPDATE ON TABLE
   providers, provider_status, provider_history, provider_sync_requests,

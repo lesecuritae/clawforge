@@ -33,6 +33,15 @@ async fn runtime_roles_enforce_service_boundaries() -> anyhow::Result<()> {
         .fetch_optional(worker.pool())
         .await
         .is_err());
+    // list_incidents (called from evaluate_decisions on every worker tick)
+    // joins incident_relations - a real gap found live (clawforge-worker
+    // had never actually been run against its least-privilege role in the
+    // deployment this was found in; only negative privilege checks existed
+    // here before, nothing proving the role can do what it actually needs).
+    worker
+        .list_incidents(None, 10)
+        .await
+        .expect("list_incidents must succeed under the worker role's own grants");
 
     let correlation = PostgresStore::connect_runtime(&runtime_url("correlation")?).await?;
     correlation
