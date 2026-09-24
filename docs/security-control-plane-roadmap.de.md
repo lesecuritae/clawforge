@@ -402,12 +402,21 @@ Pflichtgates vor der ersten verändernden Lab-Testaktion:
   manuelle Drift erledigt - `verify_detects_manual_drift_after_an_out_of_
   band_removal` entfernt ein Element echt per `nft` ausserhalb des
   Adapters und beweist, dass `verify` das erkennt, nicht veraltete
-  Zustaende meldet. Noch offen: Prozess-/Host-/DB-Ausfall zwischen den
-  Schritten selbst, Reboot, Uhrsprung, konkurrierende Actions auf
-  demselben Ziel, abgelaufene TTL (kein automatischer Rollback bei
-  TTL-Ablauf existiert bisher - `ttl_seconds` wird im Receipt persistiert,
-  aber nichts wertet `expires_at` periodisch aus), fehlgeschlagenes
-  Read-back.)
+  Zustaende meldet. **Abgelaufene TTL jetzt erledigt**: `clawforge-executor`
+  rollt jeden Tick echte Blocks zurueck, deren `expires_at` verstrichen ist
+  und die noch keinen spaeteren Rollback-Receipt haben (`firewall_action_
+  receipts` bleibt dabei Append-only - ein Rollback ist eine NEUE Zeile,
+  kein `UPDATE`). Dabei einen echten, sicherheitsrelevanten Bug gefunden
+  und behoben: `apply()`s eigener Receipt (anders als `render()`, das
+  `ResolvedIncidentSource` komplett verweigert) baute `rendered_commands`/
+  `rollback_commands` bisher aus derselben unredigierten Referenz wie der
+  echte Befehl - die rohe aufgeloeste IP waere damit in `firewall_action_
+  receipts` persistiert worden, sobald ein Aufrufer je einen `Resolved
+  IncidentSource` konstruiert (noch keiner tut das). Gefixt mit einer
+  redigierten Receipt-Referenz (`redacted_element_reference`), die real
+  ausgefuehrte Befehl bleibt unveraendert real. Noch offen: Prozess-/Host-/
+  DB-Ausfall zwischen den Schritten selbst, Reboot, Uhrsprung, konkurrierende
+  Actions auf demselben Ziel, fehlgeschlagenes Read-back.)
 - vor `apply` existiert immer ein persistierter Intent und ein lokales
   Recovery-Journal
 - Desired/Actual State, TTL, Drift, Kill-Switch und vollständige Audit-Lineage

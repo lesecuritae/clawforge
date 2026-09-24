@@ -103,6 +103,40 @@ pub struct FirewallActionReceiptInput<'a> {
     pub ttl_seconds: u32,
     pub rollback_plan: serde_json::Value,
     pub is_dry_run: bool,
+    /// `"apply"` or `"rollback"` - see migration `0039`'s own comment for
+    /// why a rollback is a new row, never an `UPDATE` of the apply row it
+    /// undoes.
+    pub receipt_kind: &'a str,
+    /// The adapter's own already-redacted, safe-to-persist element
+    /// reference (`FirewallActionReceipt::target_fingerprint`) - `None`
+    /// only for a receipt kind this sweep doesn't need to match against
+    /// anything (there is none today; always `Some` in practice).
+    pub target_fingerprint: Option<&'a str>,
+    /// The same `{"kind":...}` JSON contract
+    /// `execution_requests.approval_context->>'target'` already carries -
+    /// lets `expired_unrolled_back_firewall_targets` reconstruct a
+    /// `FirewallTarget` without re-deriving one from `rendered_commands`
+    /// text. `None` for a rollback row (nothing needs to reconstruct a
+    /// target from a rollback receipt itself - the apply row it undoes
+    /// already carried one).
+    pub target_json: Option<serde_json::Value>,
+}
+
+/// One row `expired_unrolled_back_firewall_targets` found - a real block
+/// whose TTL has passed with no later rollback receipt.
+#[derive(Debug, Clone)]
+pub struct ExpiredFirewallTarget {
+    /// The `firewall_action_receipts` row id of the *apply* receipt this
+    /// is about - purely informational (e.g. for a log line), not looked
+    /// up again.
+    pub receipt_id: Uuid,
+    pub adapter: String,
+    pub target_fingerprint: String,
+    /// The `{"kind":...}` JSON contract - a caller parses this via
+    /// `clawforge_firewall_agent::FirewallTarget::try_from` the same way
+    /// `clawforge-executor`'s own `parse_firewall_action` already does
+    /// for a freshly claimed `execution_request`.
+    pub target_json: serde_json::Value,
 }
 
 const DEFAULT_EXECUTION_MAX_RETRIES: i32 = 3;
@@ -3138,12 +3172,17 @@ impl PostgresStore {
         if input.ttl_seconds == 0 {
             anyhow::bail!("ttl_seconds must be greater than zero");
         }
+        if !matches!(input.receipt_kind, "apply" | "rollback") {
+            anyhow::bail!("invalid receipt kind");
+        }
         let id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO firewall_action_receipts \
              (id,execution_id,adapter,action_name,preflight_state,rendered_commands, \
-              observed_state,verification_result,ttl_seconds,rollback_plan,is_dry_run,expires_at) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW() + ($9 * INTERVAL '1 second'))",
+              observed_state,verification_result,ttl_seconds,rollback_plan,is_dry_run,expires_at, \
+              receipt_kind,target_fingerprint,target_json) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW() + ($9 * INTERVAL '1 second'), \
+                     $12,$13,$14)",
         )
         .bind(id)
         .bind(input.execution_id)
@@ -3156,9 +3195,46 @@ impl PostgresStore {
         .bind(i32::try_from(input.ttl_seconds).unwrap_or(i32::MAX))
         .bind(input.rollback_plan)
         .bind(input.is_dry_run)
+        .bind(input.receipt_kind)
+        .bind(input.target_fingerprint)
+        .bind(input.target_json)
         .execute(&self.pool)
         .await?;
         Ok(id)
+    }
+
+    /// One real, still-in-effect block whose TTL has passed and that has
+    /// no later rollback receipt for the same `adapter`/`target_fingerprint` -
+    /// what `clawforge-executor`'s TTL sweep
+    /// (`sweep_expired_firewall_targets`) rolls back.
+    pub async fn expired_unrolled_back_firewall_targets(
+        &self,
+    ) -> Result<Vec<ExpiredFirewallTarget>> {
+        let rows = sqlx::query(
+            "SELECT a.id, a.adapter, a.target_fingerprint, a.target_json \
+             FROM firewall_action_receipts a \
+             WHERE a.receipt_kind = 'apply' AND a.is_dry_run = FALSE \
+               AND a.target_fingerprint IS NOT NULL AND a.target_json IS NOT NULL \
+               AND a.expires_at < NOW() \
+               AND NOT EXISTS ( \
+                 SELECT 1 FROM firewall_action_receipts r \
+                 WHERE r.receipt_kind = 'rollback' AND r.adapter = a.adapter \
+                   AND r.target_fingerprint = a.target_fingerprint \
+                   AND r.created_at > a.created_at \
+               ) \
+             ORDER BY a.expires_at",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| ExpiredFirewallTarget {
+                receipt_id: row.get("id"),
+                adapter: row.get("adapter"),
+                target_fingerprint: row.get("target_fingerprint"),
+                target_json: row.get("target_json"),
+            })
+            .collect())
     }
 
     /// How many real (non-dry-run) firewall applies have been recorded in

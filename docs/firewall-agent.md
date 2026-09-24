@@ -45,26 +45,54 @@ anything, which no disposable container can stand in for).
 ## Mass-block budget
 
 `clawforge-executor` refuses to dispatch a real (non-dry-run) `nftables.*`
-apply once `CLAWFORGE_FIREWALL_MAX_APPLIES_PER_WINDOW` (default 20) real
-applies have already been recorded within the trailing
+or `haproxy.*` apply once `CLAWFORGE_FIREWALL_MAX_APPLIES_PER_WINDOW`
+(default 20) real applies have already been recorded within the trailing
 `CLAWFORGE_FIREWALL_RATE_WINDOW_SECONDS` (default 300) - a runaway policy
 engine or a config mistake must not be able to block hundreds of
-addresses in a burst. The count comes from `firewall_action_receipts`
-itself (`PostgresStore::recent_real_firewall_apply_count`), not an
-in-memory counter, so the budget holds across a process restart and
-across multiple executor replicas sharing the same database. A refused
-dispatch never calls `dispatch()`/the adapter at all - the
-`execution_request` is completed as failed with a clear
-`"mass-block budget exceeded"` `error_summary`, and no `nft` command is
-built or run. If the budget check itself fails (a database error), the
-same request also fails closed rather than proceeding unchecked. Dry
-runs and non-`nftables.`-prefixed actions are never gated - there is
-nothing to bound. Concurrency (more than one real apply in flight at
-once) is not a separate counter: the executor's poll loop claims and
-dispatches one request per tick, sequentially, so within a single
-process it is already 1 by construction; bounding it across multiple
-replicas targeting the *same* host remains open (see "What's
-deliberately not built yet" below).
+addresses in a burst. One counter shared across both adapters, not one
+each. The count comes from `firewall_action_receipts` itself
+(`PostgresStore::recent_real_firewall_apply_count`), not an in-memory
+counter, so the budget holds across a process restart and across
+multiple executor replicas sharing the same database. A refused dispatch
+never calls `dispatch()`/the adapter at all - the `execution_request` is
+completed as failed with a clear `"mass-block budget exceeded"`
+`error_summary`, and no `nft`/Runtime API command is built or run. If
+the budget check itself fails (a database error), the same request also
+fails closed rather than proceeding unchecked. Dry runs and non-firewall
+actions are never gated - there is nothing to bound. Concurrency (more
+than one real apply in flight at once) is not a separate counter: the
+executor's poll loop claims and dispatches one request per tick,
+sequentially, so within a single process it is already 1 by
+construction; bounding it across multiple replicas targeting the *same*
+host remains open (see "What's deliberately not built yet" below).
+
+## TTL-driven auto-rollback
+
+A real (non-dry-run) block does not stay in effect forever just because
+nothing else removes it. Every tick, `sweep_expired_firewall_targets`
+asks `PostgresStore::expired_unrolled_back_firewall_targets` for every
+real apply receipt whose `expires_at` has passed with no later rollback
+receipt for the same `adapter`/`target_fingerprint`, reconstructs a
+`FirewallTarget` from the receipt's own `target_json` (the same
+`{"kind":...}` JSON contract used everywhere else), picks the adapter via
+the shared `adapter_for` (also used by `dispatch()`, so the two can never
+disagree on which adapter a name means), and calls its `rollback`. A
+successful rollback is recorded as a new `receipt_kind: "rollback"` row
+(never an `UPDATE` of the apply row - the table stays append-only) so the
+same target is not swept again. A failed rollback is logged and left for
+the next tick to retry - it is not recorded, so the sweep picks the same
+target up again. If persisting the rollback receipt itself fails after
+an otherwise-successful rollback, the target (already genuinely
+unblocked) gets retried next tick too, which
+`rolling_back_an_element_that_was_never_applied_fails_cleanly` proves
+fails (not silently succeeds) - a recurring warning log, not a security
+problem, until an operator clears the stuck row by hand.
+
+`target_fingerprint` (`FirewallActionReceipt`'s own field, set by both
+adapters) is what matches an apply receipt to its rollback - and it is
+built from `redacted_element_reference`, never the real resolved element,
+so a `ResolvedIncidentSource`'s raw IP never ends up in it either (see
+"Three target kinds" above).
 
 ## One exclusive table, two pre-provisioned typed sets - never a free-form rule
 
@@ -360,11 +388,6 @@ on this).
   `NotPresent` rather than stale `Verified`). Still missing: process/
   host/DB failure between intent/apply/receipt/audit, reboot, clock skew,
   concurrent actions on the same target, failed read-back.
-- **No TTL-driven auto-rollback.** `ttl_seconds` is recorded on every
-  receipt (`expires_at`), but nothing periodically reads it back and
-  calls `rollback` once it passes - a real (non-dry-run) block currently
-  stays in effect until something else removes it (a later explicit
-  rollback, or break-glass). This is a real, open gap, not yet built.
 - **No concurrency budget across multiple executor replicas targeting the
   same host** - the mass-block *rate* budget (above) is DB-backed and
   already holds across replicas; a *concurrency* ceiling (at most N real

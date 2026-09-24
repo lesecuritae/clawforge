@@ -67,6 +67,21 @@ fn is_firewall_action(action_name: &str) -> bool {
     action_name.starts_with("nftables.") || action_name.starts_with("haproxy.")
 }
 
+/// Picks the adapter an `nftables.`/`haproxy.`-prefixed action name (or,
+/// for the TTL sweep, an `adapter` column value - `"nftables"`/
+/// `"haproxy"`, no trailing dot) routes to. Shared by `dispatch()` and
+/// `sweep_expired_firewall_targets()` so the two can never pick a
+/// different adapter for the same name.
+fn adapter_for(name: &str) -> Option<Box<dyn FirewallAdapter>> {
+    if name.starts_with("nftables") {
+        Some(Box::new(NftablesAdapter::new()))
+    } else if name.starts_with("haproxy") {
+        Some(Box::new(HaproxyAdapter::new()))
+    } else {
+        None
+    }
+}
+
 /// The mass-block budget: how many *real* (non-dry-run) firewall applies
 /// (`nftables.*` or `haproxy.*` - one shared counter across both adapters,
 /// not one per adapter) this database has recorded in the trailing rate
@@ -116,6 +131,7 @@ struct FirewallDispatchReceipt {
     ttl_seconds: u32,
     rollback_plan: serde_json::Value,
     is_dry_run: bool,
+    target_fingerprint: String,
 }
 
 /// An adapter's raw preflight/observed-state text (`nft -j list set`'s
@@ -162,6 +178,91 @@ fn parse_firewall_action(
     })
 }
 
+/// TTL-driven auto-rollback: rolls back every real (non-dry-run) block
+/// whose TTL has passed and that has no later rollback receipt yet (see
+/// `PostgresStore::expired_unrolled_back_firewall_targets`'s own query).
+/// Called once per poll tick, same cadence as normal dispatch - simple,
+/// and expiry is not time-critical enough to need its own faster
+/// interval. Never panics; a single target's rollback failure is logged
+/// and left for the next tick to retry (no receipt is recorded for it,
+/// so the same target is returned again next time) rather than aborting
+/// the whole sweep.
+async fn sweep_expired_firewall_targets(store: &PostgresStore) {
+    let expired = match store.expired_unrolled_back_firewall_targets().await {
+        Ok(expired) => expired,
+        Err(error) => {
+            tracing::warn!(%error, "could not check for expired firewall targets");
+            return;
+        }
+    };
+    for target in expired {
+        let Some(adapter) = adapter_for(&target.adapter) else {
+            tracing::warn!(
+                receipt_id = %target.receipt_id,
+                adapter = %target.adapter,
+                "expired firewall target has an unrecognized adapter - skipping"
+            );
+            continue;
+        };
+        let firewall_target = match FirewallTarget::try_from(&target.target_json) {
+            Ok(firewall_target) => firewall_target,
+            Err(error) => {
+                tracing::warn!(
+                    %error, receipt_id = %target.receipt_id,
+                    "expired firewall target has an unparseable target_json - skipping"
+                );
+                continue;
+            }
+        };
+        let action = FirewallAction {
+            target: firewall_target,
+            ttl_seconds: DEFAULT_FIREWALL_ACTION_TTL_SECONDS,
+            reason: format!("ttl expired auto-rollback (receipt {})", target.receipt_id),
+        };
+        if let Err(error) = adapter.rollback(&action).await {
+            tracing::warn!(
+                %error, receipt_id = %target.receipt_id, adapter = %target.adapter,
+                "auto-rollback of an expired firewall target failed - will retry next tick"
+            );
+            continue;
+        }
+        tracing::info!(
+            receipt_id = %target.receipt_id, adapter = %target.adapter,
+            target_fingerprint = %target.target_fingerprint,
+            "auto-rolled-back an expired firewall target"
+        );
+        if let Err(error) = store
+            .record_firewall_action_receipt(FirewallActionReceiptInput {
+                execution_id: None,
+                adapter: &target.adapter,
+                action_name: "ttl-expired-auto-rollback",
+                preflight_state: serde_json::json!({}),
+                rendered_commands: serde_json::json!([]),
+                observed_state: None,
+                verification_result: None,
+                ttl_seconds: DEFAULT_FIREWALL_ACTION_TTL_SECONDS,
+                rollback_plan: serde_json::json!({}),
+                is_dry_run: false,
+                receipt_kind: "rollback",
+                target_fingerprint: Some(&target.target_fingerprint),
+                target_json: None,
+            })
+            .await
+        {
+            // The rollback itself already succeeded against the real
+            // adapter, so the target is genuinely no longer blocked - but
+            // losing this receipt means the sweep will pick the same
+            // (already-gone) target up again next tick and retry a
+            // rollback that has nothing left to undo, which
+            // `rolling_back_an_element_that_was_never_applied_fails_cleanly`
+            // proves fails (not silently succeeds), becoming a recurring
+            // warning every tick rather than a security problem, until an
+            // operator notices and clears the stuck row by hand.
+            tracing::warn!(%error, receipt_id = %target.receipt_id, "could not persist the auto-rollback receipt - this target will be retried (and fail) every tick until fixed by hand");
+        }
+    }
+}
+
 /// Dispatches one claimed request. Returns `(success, result_summary,
 /// error_summary, receipt)` for the caller to persist via
 /// `complete_execution_dispatch` (always) and `record_firewall_action_receipt`
@@ -176,11 +277,7 @@ async fn dispatch(
     Option<String>,
     Option<FirewallDispatchReceipt>,
 ) {
-    let adapter: Box<dyn FirewallAdapter> = if claimed.action_name.starts_with("nftables.") {
-        Box::new(NftablesAdapter::new())
-    } else if claimed.action_name.starts_with("haproxy.") {
-        Box::new(HaproxyAdapter::new())
-    } else {
+    let Some(adapter) = adapter_for(&claimed.action_name) else {
         return (
             true,
             Some("dry_run: no external operation executed".to_string()),
@@ -236,6 +333,7 @@ async fn dispatch(
                 ttl_seconds: result.receipt.ttl_seconds,
                 rollback_plan: serde_json::json!({"commands": result.receipt.rollback_commands}),
                 is_dry_run: result.receipt.is_dry_run,
+                target_fingerprint: result.receipt.target_fingerprint,
             };
             (true, Some(summary), None, Some(receipt))
         }
@@ -279,6 +377,7 @@ async fn main() -> anyhow::Result<()> {
             _ = ticks.tick() => {
                 if let Err(error) = store.set_runtime_status("executor", "running", None).await { tracing::warn!(%error, "executor heartbeat failed"); }
                 if let Err(error) = store.heartbeat_execution_worker(worker_id, "healthy", 0, None).await { tracing::warn!(%error, "executor worker heartbeat failed"); }
+                sweep_expired_firewall_targets(&store).await;
                 let started = std::time::Instant::now();
                 match store.claim_execution_request_for_dispatch(Some(worker_id)).await {
                     Ok(Some(claimed)) => {
@@ -320,6 +419,9 @@ async fn main() -> anyhow::Result<()> {
                                     ttl_seconds: receipt.ttl_seconds,
                                     rollback_plan: receipt.rollback_plan,
                                     is_dry_run: receipt.is_dry_run,
+                                    receipt_kind: "apply",
+                                    target_fingerprint: Some(&receipt.target_fingerprint),
+                                    target_json: claimed.target.clone(),
                                 })
                                 .await
                             {
@@ -409,6 +511,19 @@ mod tests {
             !firewall_budget_applies("tailscale.quarantine_device", false),
             "tailscale.* has no apply capability to bound in the first place"
         );
+    }
+
+    #[test]
+    fn adapter_for_picks_the_right_adapter_for_both_action_names_and_bare_adapter_column_values() {
+        assert!(adapter_for("nftables.block_indicator").is_some());
+        assert!(adapter_for("haproxy.block_indicator").is_some());
+        // The TTL sweep looks adapters up by the bare `adapter` column
+        // value (no trailing dot), not an action name - must resolve the
+        // same way.
+        assert!(adapter_for("nftables").is_some());
+        assert!(adapter_for("haproxy").is_some());
+        assert!(adapter_for("tailscale.quarantine_device").is_none());
+        assert!(adapter_for("docker.restart_container").is_none());
     }
 
     #[tokio::test]

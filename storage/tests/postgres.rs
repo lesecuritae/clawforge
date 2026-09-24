@@ -136,6 +136,9 @@ async fn runtime_roles_enforce_service_boundaries() -> anyhow::Result<()> {
             ttl_seconds: 60,
             rollback_plan: json!({}),
             is_dry_run: true,
+            receipt_kind: "apply",
+            target_fingerprint: Some("least-privilege-test-fingerprint"),
+            target_json: None,
         })
         .await?;
     assert!(
@@ -1497,6 +1500,9 @@ async fn recent_real_firewall_apply_count_only_counts_real_applies_in_the_window
         ttl_seconds: 60,
         rollback_plan: json!({}),
         is_dry_run,
+        receipt_kind: "apply",
+        target_fingerprint: Some("test-mass-block-budget-fingerprint"),
+        target_json: None,
     };
 
     // A dry run must never count towards the budget.
@@ -1554,6 +1560,92 @@ async fn recent_real_firewall_apply_count_only_counts_real_applies_in_the_window
 
     sqlx::query("DELETE FROM firewall_action_receipts WHERE action_name=$1")
         .bind("test.mass-block-budget")
+        .execute(store.pool())
+        .await?;
+
+    Ok(())
+}
+
+/// `expired_unrolled_back_firewall_targets` backs `clawforge-executor`'s
+/// TTL-driven auto-rollback sweep - proves an expired, real apply with no
+/// later rollback shows up, and that recording a matching rollback
+/// receipt makes it stop showing up.
+#[tokio::test]
+#[ignore = "requires an isolated PostgreSQL test container"]
+async fn expired_unrolled_back_firewall_targets_reflects_rollback_receipts() -> anyhow::Result<()> {
+    let url =
+        std::env::var("CLAWFORGE_TEST_DATABASE_URL").or_else(|_| std::env::var("DATABASE_URL"))?;
+    let store = PostgresStore::connect(&url).await?;
+
+    let fingerprint = format!("test-ttl-sweep-{}", uuid::Uuid::new_v4());
+    let target_json = json!({
+        "kind": "threat_intel_indicator",
+        "cidr": "203.0.113.240",
+        "source": "spamhaus_drop",
+    });
+    let apply_id = store
+        .record_firewall_action_receipt(clawforge_storage::FirewallActionReceiptInput {
+            execution_id: None,
+            adapter: "nftables",
+            action_name: "test.ttl-sweep",
+            preflight_state: json!({}),
+            rendered_commands: json!([]),
+            observed_state: None,
+            verification_result: Some("verified"),
+            ttl_seconds: 1,
+            rollback_plan: json!({}),
+            is_dry_run: false,
+            receipt_kind: "apply",
+            target_fingerprint: Some(&fingerprint),
+            target_json: Some(target_json.clone()),
+        })
+        .await?;
+    // Backdate expires_at into the past - the real 1s TTL would work too,
+    // but this is deterministic and needs no sleep.
+    sqlx::query(
+        "UPDATE firewall_action_receipts SET expires_at=NOW()-INTERVAL '1 second' WHERE id=$1",
+    )
+    .bind(apply_id)
+    .execute(store.pool())
+    .await?;
+
+    let expired = store.expired_unrolled_back_firewall_targets().await?;
+    let found = expired
+        .iter()
+        .find(|target| target.target_fingerprint == fingerprint)
+        .expect("the expired, unrolled-back apply must be found by the sweep");
+    assert_eq!(found.adapter, "nftables");
+    assert_eq!(found.target_json, target_json);
+
+    // Record the rollback the sweep itself would - it must then stop
+    // showing up.
+    store
+        .record_firewall_action_receipt(clawforge_storage::FirewallActionReceiptInput {
+            execution_id: None,
+            adapter: "nftables",
+            action_name: "ttl-expired-auto-rollback",
+            preflight_state: json!({}),
+            rendered_commands: json!([]),
+            observed_state: None,
+            verification_result: None,
+            ttl_seconds: 60,
+            rollback_plan: json!({}),
+            is_dry_run: false,
+            receipt_kind: "rollback",
+            target_fingerprint: Some(&fingerprint),
+            target_json: None,
+        })
+        .await?;
+    let expired_after_rollback = store.expired_unrolled_back_firewall_targets().await?;
+    assert!(
+        !expired_after_rollback
+            .iter()
+            .any(|target| target.target_fingerprint == fingerprint),
+        "a target with a later rollback receipt must not be swept again"
+    );
+
+    sqlx::query("DELETE FROM firewall_action_receipts WHERE target_fingerprint=$1")
+        .bind(&fingerprint)
         .execute(store.pool())
         .await?;
 
