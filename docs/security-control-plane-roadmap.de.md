@@ -520,12 +520,27 @@ Pflichtgates vor der ersten verändernden Lab-Testaktion:
   Recovery-Journal
 - Desired/Actual State, TTL, Drift, Kill-Switch und vollständige Audit-Lineage
   sind vor einem Produktionspilot über ein geprüftes Admin-Werkzeug sichtbar
-  (**teilweise**: `GET /firewall/receipts` (Filter nach Adapter/Ziel) und
+  (**erledigt**: `GET /firewall/receipts` (Filter nach Adapter/Ziel) und
   `GET /firewall/expired` (Drift - nutzt exakt dieselbe Abfrage wie der
-  TTL-Sweep selbst, kann also nie abweichen) existieren jetzt, rollen-
-  gebunden wie jede andere Admin-Liste, jedes Feld bereits unbedenklich
-  (nie eine rohe IP). Noch offen: Kill-Switch pro Ziel (heute nur
-  Break-glass, alles-oder-nichts pro Host).)
+  TTL-Sweep selbst, kann also nie abweichen) existieren, rollen-gebunden
+  wie jede andere Admin-Liste, jedes Feld bereits unbedenklich (nie eine
+  rohe IP). **Kill-Switch pro Ziel jetzt ebenfalls erledigt** (Migration
+  `0042`): anders als Break-glass (alles-oder-nichts pro Host) zielt er
+  auf genau EIN bereits blockiertes Element. `clawforge-api` darf nie
+  selbst einen echten Adapter aufrufen - `POST /firewall/kill-switch`
+  (nur Administrator/Operator, echte Schreibaktion) zeichnet daher nur die
+  Absicht in einer neuen `firewall_kill_switch_requests`-Tabelle auf;
+  `clawforge-executor`s `sweep_kill_switch_requests` (derselbe Poll-Tick
+  wie der TTL-Sweep) fuehrt den eigentlichen Rollback aus - ueber denselben
+  `rollback_target`-Helper, den der TTL-Sweep nutzt (aus dem vormaligen
+  `rollback_expired_target` herausgeloest, jetzt parametrisiert statt an
+  `ExpiredFirewallTarget` gebunden, damit beide Sweeps nie unterschiedlich
+  ausfuehren, nur unterschiedlich AUSLOESEN). Eine Anfrage gilt erst als
+  verarbeitet, wenn sowohl der echte Rollback als auch sein Receipt
+  persistiert sind - schlaegt eines fehl, bleibt sie offen und wird naechsten
+  Tick erneut versucht, gefahrlos dank bewiesener Rollback-Idempotenz.
+  `GET /firewall/kill-switch` zeigt sowohl offene als auch bereits
+  verarbeitete Anfragen.)
 - pro Adapter/Ziel gelten getestete Rate-, Concurrency- und Mass-block-Budgets
   (**teilweise**: `clawforge-executor` verweigert einen echten (nicht
   Dry-Run) `nftables.*`-Apply, sobald `CLAWFORGE_FIREWALL_MAX_APPLIES_PER_WINDOW`

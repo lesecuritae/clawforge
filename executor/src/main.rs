@@ -26,8 +26,7 @@ use clawforge_firewall_agent::{
     NftablesAdapter, TailscaleAction, TailscaleAdapter, TailscaleTarget, VerificationResult,
 };
 use clawforge_storage::{
-    database_url_from_env, ClaimedExecutionRequest, ExpiredFirewallTarget,
-    FirewallActionReceiptInput, PostgresStore,
+    database_url_from_env, ClaimedExecutionRequest, FirewallActionReceiptInput, PostgresStore,
 };
 use std::{env, time::Duration};
 use tokio::time::{interval, MissedTickBehavior};
@@ -246,20 +245,29 @@ fn parse_firewall_action(
     })
 }
 
-/// Rolls back one expired target, dispatching to the right adapter shape
-/// for its `adapter` column - `tailscale` has its own `target_json`
-/// contract (`{"device_id":...}`, not `FirewallTarget`'s `{"kind":...}`)
-/// and its own rollback method (not a `FirewallAdapter` implementation -
-/// see `TailscaleAdapter`'s own doc comment), so it cannot go through
+/// Rolls back one target, dispatching to the right adapter shape for
+/// `adapter_name` - `"tailscale"` has its own `target_json` contract
+/// (`{"device_id":...}`, not `FirewallTarget`'s `{"kind":...}`) and its
+/// own rollback method (not a `FirewallAdapter` implementation - see
+/// `TailscaleAdapter`'s own doc comment), so it cannot go through
 /// `adapter_for`/`FirewallTarget::try_from` the way the other three do.
 /// `TailscaleAdapter::rollback` already treats "tag not present" as
-/// idempotent success (not an error) specifically so this sweep can
-/// converge once a device has been manually reauth'd - see that method's
-/// own doc comment.
-async fn rollback_expired_target(target: &ExpiredFirewallTarget) -> anyhow::Result<()> {
-    if target.adapter == "tailscale" {
-        let device_id = target
-            .target_json
+/// idempotent success (not an error) specifically so a sweep calling this
+/// can converge once a device has been manually reauth'd - see that
+/// method's own doc comment.
+///
+/// Shared by both `sweep_expired_firewall_targets` (TTL-driven) and
+/// `sweep_kill_switch_requests` (operator-triggered, on demand) - the two
+/// only differ in *why* a target is being rolled back, never *how*, so
+/// `context` (used purely for the adapter's own `reason` field, e.g. an
+/// audit log line) is the only thing that varies between call sites.
+async fn rollback_target(
+    adapter_name: &str,
+    target_json: &serde_json::Value,
+    context: String,
+) -> anyhow::Result<()> {
+    if adapter_name == "tailscale" {
+        let device_id = target_json
             .get("device_id")
             .and_then(|value| value.as_str())
             .ok_or_else(|| anyhow::anyhow!("tailscale target_json is missing device_id"))?;
@@ -267,22 +275,22 @@ async fn rollback_expired_target(target: &ExpiredFirewallTarget) -> anyhow::Resu
             target: TailscaleTarget {
                 device_id: device_id.to_string(),
             },
-            reason: format!("ttl expired auto-rollback (receipt {})", target.receipt_id),
+            reason: context,
         };
         return TailscaleAdapter::new()
             .rollback(&action)
             .await
             .map_err(|error| anyhow::anyhow!(error.to_string()));
     }
-    let Some(adapter) = adapter_for(&target.adapter) else {
-        anyhow::bail!("unrecognized adapter {:?}", target.adapter);
+    let Some(adapter) = adapter_for(adapter_name) else {
+        anyhow::bail!("unrecognized adapter {:?}", adapter_name);
     };
-    let firewall_target = FirewallTarget::try_from(&target.target_json)
+    let firewall_target = FirewallTarget::try_from(target_json)
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     let action = FirewallAction {
         target: firewall_target,
         ttl_seconds: DEFAULT_FIREWALL_ACTION_TTL_SECONDS,
-        reason: format!("ttl expired auto-rollback (receipt {})", target.receipt_id),
+        reason: context,
     };
     adapter
         .rollback(&action)
@@ -308,7 +316,8 @@ async fn sweep_expired_firewall_targets(store: &PostgresStore) {
         }
     };
     for target in expired {
-        if let Err(error) = rollback_expired_target(&target).await {
+        let context = format!("ttl expired auto-rollback (receipt {})", target.receipt_id);
+        if let Err(error) = rollback_target(&target.adapter, &target.target_json, context).await {
             tracing::warn!(
                 %error, receipt_id = %target.receipt_id, adapter = %target.adapter,
                 "auto-rollback of an expired firewall target failed - will retry next tick"
@@ -348,6 +357,76 @@ async fn sweep_expired_firewall_targets(store: &PostgresStore) {
             // warning every tick rather than a security problem, until an
             // operator notices and clears the stuck row by hand.
             tracing::warn!(%error, receipt_id = %target.receipt_id, "could not persist the auto-rollback receipt - this target will be retried (and fail) every tick until fixed by hand");
+        }
+    }
+}
+
+/// Kill-switch: rolls back every target an operator has explicitly
+/// requested an immediate rollback for, independent of its TTL - the
+/// roadmap's "Kill-Switch pro Ziel" gate. `clawforge-api` only ever
+/// records the *intent* (`create_firewall_kill_switch_request` - it is
+/// never allowed to call a real adapter itself); this sweep, called once
+/// per poll tick right alongside `sweep_expired_firewall_targets`, is
+/// what actually performs it, using the exact same `rollback_target` path
+/// the TTL sweep uses. A request is only marked processed once BOTH the
+/// real rollback AND its receipt have been persisted - if either fails,
+/// the request stays pending and is retried next tick, which is safe
+/// because `rollback_target` is idempotent (see
+/// `rolling_back_an_element_that_was_never_applied_fails_cleanly`/
+/// `TailscaleAdapter::rollback`'s own "tag not present" case): retrying an
+/// already-completed rollback just re-confirms nothing is left to undo.
+async fn sweep_kill_switch_requests(store: &PostgresStore) {
+    let pending = match store.pending_firewall_kill_switch_requests().await {
+        Ok(pending) => pending,
+        Err(error) => {
+            tracing::warn!(%error, "could not check for pending kill-switch requests");
+            return;
+        }
+    };
+    for request in pending {
+        let context = format!(
+            "kill-switch request {} ({})",
+            request.request_id,
+            request.reason.as_deref().unwrap_or("no reason given")
+        );
+        if let Err(error) = rollback_target(&request.adapter, &request.target_json, context).await {
+            tracing::warn!(
+                %error, request_id = %request.request_id, adapter = %request.adapter,
+                "kill-switch rollback failed - will retry next tick"
+            );
+            continue;
+        }
+        tracing::info!(
+            request_id = %request.request_id, adapter = %request.adapter,
+            target_fingerprint = %request.target_fingerprint,
+            "kill-switch rolled back a target on demand"
+        );
+        if let Err(error) = store
+            .record_firewall_action_receipt(FirewallActionReceiptInput {
+                execution_id: None,
+                adapter: &request.adapter,
+                action_name: "kill-switch-rollback",
+                preflight_state: serde_json::json!({}),
+                rendered_commands: serde_json::json!([]),
+                observed_state: None,
+                verification_result: None,
+                ttl_seconds: DEFAULT_FIREWALL_ACTION_TTL_SECONDS,
+                rollback_plan: serde_json::json!({}),
+                is_dry_run: false,
+                receipt_kind: "rollback",
+                target_fingerprint: Some(&request.target_fingerprint),
+                target_json: None,
+            })
+            .await
+        {
+            tracing::warn!(%error, request_id = %request.request_id, "could not persist the kill-switch rollback receipt - this request stays pending and will be retried (and re-succeed harmlessly) next tick");
+            continue;
+        }
+        if let Err(error) = store
+            .mark_firewall_kill_switch_request_processed(request.request_id)
+            .await
+        {
+            tracing::warn!(%error, request_id = %request.request_id, "could not mark the kill-switch request processed - it will be retried (and re-succeed harmlessly) next tick");
         }
     }
 }
@@ -491,7 +570,7 @@ const DEFAULT_TAILSCALE_ACTION_TTL_SECONDS: u32 = 3600;
 /// **Deliberately not part of the TTL sweep's auto-expiry the way
 /// nftables/HAProxy targets are**: nothing prevents a tailscale receipt
 /// from getting an `expires_at` (the storage layer doesn't distinguish),
-/// but `rollback_expired_target` handles it via `TailscaleAdapter::
+/// but `rollback_target` handles it via `TailscaleAdapter::
 /// rollback` the same as any other manual rollback - the real constraint
 /// is that rollback for a previously-untagged device cannot complete via
 /// the API at all (see `TailscaleAdapter::rollback`'s own doc comment),
@@ -661,6 +740,7 @@ async fn main() -> anyhow::Result<()> {
                 if let Err(error) = store.set_runtime_status("executor", "running", None).await { tracing::warn!(%error, "executor heartbeat failed"); }
                 if let Err(error) = store.heartbeat_execution_worker(worker_id, "healthy", 0, None).await { tracing::warn!(%error, "executor worker heartbeat failed"); }
                 sweep_expired_firewall_targets(&store).await;
+                sweep_kill_switch_requests(&store).await;
                 let started = std::time::Instant::now();
                 match store.claim_execution_request_for_dispatch(Some(worker_id)).await {
                     Ok(Some(claimed)) => {

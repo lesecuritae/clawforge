@@ -173,6 +173,11 @@ GRANT INSERT, UPDATE ON TABLE execution_requests, execution_leases,
 -- query (recent_real_firewall_apply_count) - that is a count, never a
 -- row-by-row read-back of past receipts.
 GRANT INSERT, SELECT ON TABLE firewall_action_receipts TO clawforge_executor;
+-- Kill-switch intent queue (migration 0042): the executor's sweep reads
+-- pending rows and marks them processed once rolled back - it never
+-- inserts one itself (clawforge-api does that, via its own blanket
+-- grant), so no INSERT here.
+GRANT SELECT, UPDATE ON TABLE firewall_kill_switch_requests TO clawforge_executor;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO clawforge_executor;
 REVOKE UPDATE ON TABLE audit_events FROM clawforge_executor;
 

@@ -139,6 +139,21 @@ pub struct ExpiredFirewallTarget {
     pub target_json: serde_json::Value,
 }
 
+/// One unprocessed row `pending_firewall_kill_switch_requests` found - an
+/// operator-requested, on-demand rollback of one specific target,
+/// independent of its TTL. Same shape as `ExpiredFirewallTarget` plus the
+/// request's own `id` (needed to mark it processed once handled - an
+/// expired-target row has nothing to mark, since expiry itself is the
+/// only state that matters there).
+#[derive(Debug, Clone)]
+pub struct PendingKillSwitchRequest {
+    pub request_id: Uuid,
+    pub adapter: String,
+    pub target_fingerprint: String,
+    pub target_json: serde_json::Value,
+    pub reason: Option<String>,
+}
+
 const DEFAULT_EXECUTION_MAX_RETRIES: i32 = 3;
 const DEFAULT_EXECUTION_TIMEOUT_SECONDS: i32 = 60;
 
@@ -3307,6 +3322,124 @@ impl PostgresStore {
         .fetch_one(&self.pool)
         .await?;
         Ok(count)
+    }
+
+    /// Records an operator's intent to immediately roll back one specific
+    /// target, independent of its TTL - the roadmap's "Kill-Switch pro
+    /// Ziel" gate. Only records the request; `clawforge-executor`'s sweep
+    /// (same poll tick as the TTL sweep) performs the actual rollback and
+    /// calls `mark_firewall_kill_switch_request_processed` once done, since
+    /// `clawforge-api` itself is never allowed to call a real adapter.
+    pub async fn create_firewall_kill_switch_request(
+        &self,
+        adapter: &str,
+        target_fingerprint: &str,
+        target_json: &serde_json::Value,
+        reason: Option<&str>,
+        requested_by: &str,
+        requested_by_id: Option<Uuid>,
+    ) -> Result<Uuid> {
+        if adapter.trim().is_empty() {
+            anyhow::bail!("adapter must not be empty");
+        }
+        if target_fingerprint.trim().is_empty() {
+            anyhow::bail!("target_fingerprint must not be empty");
+        }
+        let id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO firewall_kill_switch_requests \
+             (id,adapter,target_fingerprint,target_json,reason,requested_by,requested_by_id) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7)",
+        )
+        .bind(id)
+        .bind(adapter)
+        .bind(target_fingerprint)
+        .bind(target_json)
+        .bind(reason)
+        .bind(requested_by)
+        .bind(requested_by_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(id)
+    }
+
+    /// Every kill-switch request the sweep has not rolled back yet, oldest
+    /// first - what `clawforge-executor`'s sweep processes each tick.
+    pub async fn pending_firewall_kill_switch_requests(
+        &self,
+    ) -> Result<Vec<PendingKillSwitchRequest>> {
+        let rows = sqlx::query(
+            "SELECT id, adapter, target_fingerprint, target_json, reason \
+             FROM firewall_kill_switch_requests \
+             WHERE processed_at IS NULL \
+             ORDER BY created_at",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| PendingKillSwitchRequest {
+                request_id: row.get("id"),
+                adapter: row.get("adapter"),
+                target_fingerprint: row.get("target_fingerprint"),
+                target_json: row.get("target_json"),
+                reason: row.get("reason"),
+            })
+            .collect())
+    }
+
+    /// Marks one kill-switch request processed once its rollback has
+    /// actually succeeded. Idempotent by construction (a plain `UPDATE ...
+    /// WHERE processed_at IS NULL` - calling it twice for the same id just
+    /// updates zero rows the second time, never an error), since a sweep
+    /// tick that dies after the real rollback but before this call must be
+    /// safe to retry: the rollback itself is already idempotent (see
+    /// `NftablesAdapter`/`HaproxyAdapter`'s own "applying twice" tests), so
+    /// re-processing the same request only re-confirms nothing is left to
+    /// undo.
+    pub async fn mark_firewall_kill_switch_request_processed(&self, id: Uuid) -> Result<()> {
+        sqlx::query(
+            "UPDATE firewall_kill_switch_requests SET processed_at = NOW() \
+             WHERE id = $1 AND processed_at IS NULL",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Read-only listing for the same admin surface as
+    /// `list_firewall_action_receipts` - visibility into pending AND
+    /// already-processed kill-switch requests (not just pending ones), so
+    /// an operator can confirm a past kill-switch actually completed.
+    pub async fn list_firewall_kill_switch_requests(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<serde_json::Value>> {
+        let rows = sqlx::query(
+            "SELECT id, adapter, target_fingerprint, target_json, reason, requested_by, \
+                    created_at, processed_at \
+             FROM firewall_kill_switch_requests \
+             ORDER BY created_at DESC LIMIT $1",
+        )
+        .bind(limit.clamp(1, 500))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                serde_json::json!({
+                    "id": r.get::<Uuid, _>("id"),
+                    "adapter": r.get::<String, _>("adapter"),
+                    "target_fingerprint": r.get::<String, _>("target_fingerprint"),
+                    "target_json": r.get::<serde_json::Value, _>("target_json"),
+                    "reason": r.get::<Option<String>, _>("reason"),
+                    "requested_by": r.get::<String, _>("requested_by"),
+                    "created_at": r.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
+                    "processed_at": r.get::<Option<chrono::DateTime<chrono::Utc>>, _>("processed_at"),
+                })
+            })
+            .collect())
     }
 
     pub async fn record_connector_health(

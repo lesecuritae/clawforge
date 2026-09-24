@@ -551,19 +551,54 @@ role-gated like every other `/executions`-style admin listing:
   so this view and the sweep's actual behavior can never disagree about
   what still needs rolling back. This is the "Drift" visibility: any
   target that would show up here has not yet been reconciled.
+- `GET /firewall/kill-switch?limit=` / `POST /firewall/kill-switch` - see
+  the dedicated section below.
 
-No kill-switch surface exists yet (there is nothing to disable
-per-target - the closest equivalent today is break-glass, which is
-all-or-nothing for a host, not a single target).
+## Kill-switch per target (migration `0042`)
+
+Closes the last open half of the roadmap's admin-tool Pflichtgate. Until
+now the only way to force a real block off on demand was
+`scripts/nftables-clawforge-break-glass.sh` - all-or-nothing for a host
+(removes the *entire* exclusive table), not something an operator can
+reach for for a single false positive without also dropping every other
+active block on that host.
+
+**`clawforge-api` never calls a real adapter itself** (see
+`clawforge-firewall-agent`'s own design - only `clawforge-executor` is
+allowed to), so a kill-switch triggered through the API is necessarily
+asynchronous: it can only record the *intent*, in a new
+`firewall_kill_switch_requests` table (`adapter`, `target_fingerprint`,
+`target_json`, `reason`, `requested_by`, `created_at`, `processed_at`).
+`clawforge-executor`'s `sweep_kill_switch_requests` - called every poll
+tick, right alongside the TTL sweep - picks up every row with
+`processed_at IS NULL`, performs the actual rollback via the exact same
+`rollback_target` helper the TTL sweep uses (refactored out of what was
+previously `rollback_expired_target`, now parameterized by
+adapter/target_json/context instead of tied to `ExpiredFirewallTarget`
+specifically, so the TTL sweep and the kill-switch sweep can never
+diverge on *how* a rollback happens, only *why*), and marks the request
+processed only once both the real rollback **and** its receipt have been
+persisted. If either fails, the request stays pending and is retried
+next tick - safe, because `rollback_target` is already proven idempotent
+(`rolling_back_an_element_that_was_never_applied_fails_cleanly` /
+`TailscaleAdapter::rollback`'s own "tag not present" case): re-processing
+an already-completed rollback just re-confirms nothing is left to undo.
+
+Admin surface:
+
+- `POST /firewall/kill-switch` (`{"adapter","target_fingerprint",
+  "target_json","reason"}`) - `Administrator`/`Operator` only (a write
+  action, unlike the read-only receipt/expired/kill-switch-listing
+  endpoints, which stay `Viewer`-accessible too). Returns the request id
+  immediately with `status: "pending"` - the caller does not wait for the
+  executor's next tick.
+- `GET /firewall/kill-switch?limit=` - lists both pending **and**
+  already-processed requests (not just pending ones), so an operator can
+  confirm a past kill-switch actually completed, not just fire-and-forget
+  it.
 
 ## What's deliberately not built yet
 
-- **No HAProxy rate-limiting (stick-tables)** - only the "Maps/ACLs" half
-  of the HAProxy adapter is built (see above); rate-limiting is a
-  materially different mechanism (a counter/threshold, not a membership
-  set).
-- **No real Tailscale integration** - `TailscaleAdapter` is prepared
-  (see above) but has no `apply` capability at all, on purpose.
 - **No failure-injection tests** beyond lease loss/worker death (proven
   by `a_worker_that_dies_after_claiming_is_reclaimed_by_a_different_worker`),
   manual drift (proven by

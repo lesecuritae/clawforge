@@ -1712,3 +1712,118 @@ async fn list_firewall_action_receipts_filters_by_adapter_and_target_fingerprint
 
     Ok(())
 }
+
+/// `create_firewall_kill_switch_request`/`pending_firewall_kill_switch_requests`/
+/// `mark_firewall_kill_switch_request_processed` back the "Kill-Switch pro
+/// Ziel" roadmap gate - proves a freshly created request shows up as
+/// pending, and that marking it processed makes it stop showing up
+/// (without deleting it - list_firewall_kill_switch_requests must still
+/// find it, with a `processed_at` now set).
+#[tokio::test]
+#[ignore = "requires an isolated PostgreSQL test container"]
+async fn kill_switch_request_lifecycle_from_pending_to_processed() -> anyhow::Result<()> {
+    let url =
+        std::env::var("CLAWFORGE_TEST_DATABASE_URL").or_else(|_| std::env::var("DATABASE_URL"))?;
+    let store = PostgresStore::connect(&url).await?;
+
+    let fingerprint = format!("test-kill-switch-{}", uuid::Uuid::new_v4());
+    let target_json = json!({
+        "kind": "threat_intel_indicator",
+        "cidr": "203.0.113.241",
+        "source": "spamhaus_drop",
+    });
+    let request_id = store
+        .create_firewall_kill_switch_request(
+            "nftables",
+            &fingerprint,
+            &target_json,
+            Some("false positive, operator requested immediate unblock"),
+            "test-operator",
+            None,
+        )
+        .await?;
+
+    let pending = store.pending_firewall_kill_switch_requests().await?;
+    let found = pending
+        .iter()
+        .find(|request| request.request_id == request_id)
+        .expect("a freshly created request must be pending");
+    assert_eq!(found.adapter, "nftables");
+    assert_eq!(found.target_fingerprint, fingerprint);
+    assert_eq!(found.target_json, target_json);
+    assert_eq!(
+        found.reason.as_deref(),
+        Some("false positive, operator requested immediate unblock")
+    );
+
+    store
+        .mark_firewall_kill_switch_request_processed(request_id)
+        .await?;
+    let pending_after = store.pending_firewall_kill_switch_requests().await?;
+    assert!(
+        !pending_after
+            .iter()
+            .any(|request| request.request_id == request_id),
+        "a processed request must no longer be pending"
+    );
+
+    // Idempotent: marking an already-processed request processed again
+    // must not error (a sweep tick that dies after the real rollback but
+    // before this call must be safe to retry).
+    store
+        .mark_firewall_kill_switch_request_processed(request_id)
+        .await?;
+
+    let listed = store.list_firewall_kill_switch_requests(500).await?;
+    let listed_row = listed
+        .iter()
+        .find(|row| row["id"] == request_id.to_string())
+        .expect("a processed request must still be visible in the full listing");
+    assert!(
+        !listed_row["processed_at"].is_null(),
+        "the listing must show the processed timestamp"
+    );
+
+    sqlx::query("DELETE FROM firewall_kill_switch_requests WHERE id=$1")
+        .bind(request_id)
+        .execute(store.pool())
+        .await?;
+
+    Ok(())
+}
+
+/// Empty/whitespace `adapter`/`target_fingerprint` must be rejected up
+/// front - the same fail-closed-on-malformed-input discipline every other
+/// firewall-layer write path in this crate follows.
+#[tokio::test]
+#[ignore = "requires an isolated PostgreSQL test container"]
+async fn kill_switch_request_rejects_empty_adapter_or_fingerprint() -> anyhow::Result<()> {
+    let url =
+        std::env::var("CLAWFORGE_TEST_DATABASE_URL").or_else(|_| std::env::var("DATABASE_URL"))?;
+    let store = PostgresStore::connect(&url).await?;
+
+    assert!(store
+        .create_firewall_kill_switch_request(
+            "",
+            "some-fingerprint",
+            &json!({}),
+            None,
+            "test-operator",
+            None,
+        )
+        .await
+        .is_err());
+    assert!(store
+        .create_firewall_kill_switch_request(
+            "nftables",
+            "  ",
+            &json!({}),
+            None,
+            "test-operator",
+            None,
+        )
+        .await
+        .is_err());
+
+    Ok(())
+}

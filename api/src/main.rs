@@ -4043,6 +4043,100 @@ async fn admin_firewall_expired(
     Ok(envelope(values, None))
 }
 
+#[derive(Debug, Deserialize)]
+struct FirewallKillSwitchBody {
+    adapter: String,
+    target_fingerprint: String,
+    target_json: serde_json::Value,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+/// The roadmap's "Kill-Switch pro Ziel" gate: an immediate, on-demand
+/// rollback of one specific target, independent of its TTL - unlike
+/// `scripts/nftables-clawforge-break-glass.sh` (all-or-nothing per host),
+/// this targets exactly one already-blocked element. `clawforge-api` is
+/// never allowed to call a real adapter itself (see
+/// `clawforge-firewall-agent`'s own design), so this only records the
+/// *intent* - `clawforge-executor`'s `sweep_kill_switch_requests` (same
+/// poll tick as the TTL sweep) performs the actual rollback. A write
+/// action, so gated to Administrator/Operator, not Viewer (unlike the two
+/// read-only endpoints above).
+async fn admin_firewall_kill_switch_create(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<FirewallKillSwitchBody>,
+) -> ApiResult<Json<ApiEnvelope<serde_json::Value>>> {
+    let principal = authenticate(&state, &headers).await?;
+    require_role(&principal, &["Administrator", "Operator"])?;
+    let id = state
+        .store
+        .create_firewall_kill_switch_request(
+            &body.adapter,
+            &body.target_fingerprint,
+            &body.target_json,
+            body.reason.as_deref(),
+            &principal.username,
+            Some(principal.id),
+        )
+        .await
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "kill-switch request rejected"))?;
+    audit(
+        &state,
+        &principal,
+        "firewall_kill_switch_requested",
+        "firewall_kill_switch_requests",
+        serde_json::json!({
+            "id": id,
+            "adapter": body.adapter,
+            "target_fingerprint": body.target_fingerprint,
+            "reason": body.reason,
+        }),
+    )
+    .await;
+    Ok(envelope(
+        serde_json::json!({"id": id, "status": "pending"}),
+        None,
+    ))
+}
+
+#[derive(Deserialize, Default)]
+struct FirewallKillSwitchListQuery {
+    limit: Option<i64>,
+}
+
+/// Visibility into pending AND already-processed kill-switch requests -
+/// the same admin surface as `admin_firewall_receipts`/
+/// `admin_firewall_expired`, so an operator can confirm a past kill-switch
+/// actually completed, not just fire-and-forget it.
+async fn admin_firewall_kill_switch_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<FirewallKillSwitchListQuery>,
+) -> ApiResult<Json<ApiEnvelope<Vec<serde_json::Value>>>> {
+    let principal = authenticate(&state, &headers).await?;
+    require_role(&principal, &["Administrator", "Operator", "Viewer"])?;
+    let values = state
+        .store
+        .list_firewall_kill_switch_requests(query.limit.unwrap_or(100))
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "firewall kill-switch requests unavailable",
+            )
+        })?;
+    audit(
+        &state,
+        &principal,
+        "firewall_kill_switch_read",
+        "firewall_kill_switch_requests",
+        serde_json::json!({}),
+    )
+    .await;
+    Ok(envelope(values, None))
+}
+
 async fn agent_actions(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -7588,6 +7682,10 @@ fn build_router(app_state: AppState) -> Router {
         .route("/firewall/receipts", get(admin_firewall_receipts))
         .route("/firewall/expired", get(admin_firewall_expired))
         .route(
+            "/firewall/kill-switch",
+            get(admin_firewall_kill_switch_list).post(admin_firewall_kill_switch_create),
+        )
+        .route(
             "/admin/executions/{id}/approve",
             post(admin_approve_execution),
         )
@@ -8767,7 +8865,11 @@ mod tests {
         let store = PostgresStore::connect(&url).await?;
         let app = build_router(test_app_state(store));
 
-        for path in ["/firewall/receipts", "/firewall/expired"] {
+        for path in [
+            "/firewall/receipts",
+            "/firewall/expired",
+            "/firewall/kill-switch",
+        ] {
             let request = Request::builder()
                 .method("GET")
                 .uri(path)
@@ -8780,6 +8882,29 @@ mod tests {
                 "{path} must require authentication"
             );
         }
+
+        // A syntactically valid body (so the JSON extractor itself
+        // succeeds and `authenticate` is what actually runs first) still
+        // must not be enough without a bearer token.
+        let request = Request::builder()
+            .method("POST")
+            .uri("/firewall/kill-switch")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "adapter": "nftables",
+                    "target_fingerprint": "test",
+                    "target_json": {"kind": "threat_intel_indicator", "cidr": "203.0.113.0/24", "source": "test"},
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "POST /firewall/kill-switch must require authentication"
+        );
 
         Ok(())
     }
