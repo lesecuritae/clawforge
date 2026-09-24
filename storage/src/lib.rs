@@ -63,6 +63,24 @@ pub struct ExecutionRequestInput {
     pub requested_by: String,
     pub requested_by_id: Option<Uuid>,
     pub idempotency_key: Option<String>,
+    /// What the action would apply to (e.g. a firewall action's CIDR/
+    /// pseudonym target) - folded into `approval_context` below, not a
+    /// separate column, so it is covered by the same immutable
+    /// `approval_context_hash` binding every other field there already
+    /// gets: changing the target after approval invalidates the approval
+    /// the same way changing the risk level or requester would. `None`
+    /// for an action that takes no target (every action registered before
+    /// this field existed).
+    pub target: Option<serde_json::Value>,
+}
+
+/// A request claimed via `claim_execution_request_for_dispatch` - see that
+/// method's own doc comment.
+#[derive(Debug, Clone)]
+pub struct ClaimedExecutionRequest {
+    pub id: Uuid,
+    pub action_name: String,
+    pub target: Option<serde_json::Value>,
 }
 
 const DEFAULT_EXECUTION_MAX_RETRIES: i32 = 3;
@@ -2575,6 +2593,7 @@ impl PostgresStore {
             "requested_by": input.requested_by.trim(),
             "requested_by_id": input.requested_by_id,
             "idempotency_key": idempotency_key,
+            "target": input.target,
         });
         let context_hash = execution_context_hash(&approval_context)?;
         if let Some(key) = idempotency_key.as_deref() {
@@ -2874,13 +2893,12 @@ impl PostgresStore {
         self.process_one_dry_run_for_worker(None).await
     }
 
-    /// Process at most one request in dry-run mode. A lease is created before
-    /// the state transition, which makes worker recovery and duplicate
-    /// prevention observable without permitting external connector actions.
-    pub async fn process_one_dry_run_for_worker(&self, worker_id: Option<Uuid>) -> Result<()> {
-        let started = std::time::Instant::now();
-        // Reclaim leases from workers that stopped heartbeating. The request
-        // is queued again only when it was still in a non-terminal state.
+    /// Reclaim expired leases, time out overrunning requests, and requeue
+    /// failed-but-retryable ones - the maintenance sweep every claim path
+    /// runs first, factored out so `process_one_dry_run_for_worker` and
+    /// `claim_execution_request_for_dispatch` share exactly one copy of it
+    /// rather than two that could drift apart.
+    async fn run_execution_maintenance(&self) -> Result<()> {
         let mut maintenance_tx = self.pool.begin().await?;
         sqlx::query("UPDATE execution_leases SET status='expired',updated_at=NOW() WHERE status='active' AND expires_at<=NOW()")
             .execute(&mut *maintenance_tx)
@@ -2893,11 +2911,11 @@ impl PostgresStore {
                 "executor",
                 "execution_request_reclaimed",
                 &id.to_string(),
-                &serde_json::json!({"mode":"dry_run","reason":"lease_expired"}),
+                &serde_json::json!({"reason":"lease_expired"}),
             )
             .await?;
         }
-        let timed_out: Vec<Uuid> = sqlx::query_scalar("UPDATE execution_requests SET status='timeout',finished_at=NOW(),error_summary='dry-run execution timeout' WHERE status IN ('starting','running') AND started_at IS NOT NULL AND started_at < NOW() - (timeout_seconds * INTERVAL '1 second') RETURNING id")
+        let timed_out: Vec<Uuid> = sqlx::query_scalar("UPDATE execution_requests SET status='timeout',finished_at=NOW(),error_summary='execution timeout' WHERE status IN ('starting','running') AND started_at IS NOT NULL AND started_at < NOW() - (timeout_seconds * INTERVAL '1 second') RETURNING id")
             .fetch_all(&mut *maintenance_tx)
             .await?;
         for id in &timed_out {
@@ -2906,7 +2924,7 @@ impl PostgresStore {
                 "executor",
                 "execution_request_timeout",
                 &id.to_string(),
-                &serde_json::json!({"mode":"dry_run"}),
+                &serde_json::json!({}),
             )
             .await?;
         }
@@ -2919,11 +2937,20 @@ impl PostgresStore {
                 "executor",
                 "execution_request_requeued",
                 &id.to_string(),
-                &serde_json::json!({"mode":"dry_run"}),
+                &serde_json::json!({}),
             )
             .await?;
         }
         maintenance_tx.commit().await?;
+        Ok(())
+    }
+
+    /// Process at most one request in dry-run mode. A lease is created before
+    /// the state transition, which makes worker recovery and duplicate
+    /// prevention observable without permitting external connector actions.
+    pub async fn process_one_dry_run_for_worker(&self, worker_id: Option<Uuid>) -> Result<()> {
+        let started = std::time::Instant::now();
+        self.run_execution_maintenance().await?;
 
         let mut claim_tx = self.pool.begin().await?;
         let id: Option<Uuid> = sqlx::query_scalar("UPDATE execution_requests SET status='starting',started_at=NOW() WHERE id=(SELECT id FROM execution_requests WHERE status IN ('approved','pending','queued') ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1) RETURNING id").fetch_optional(&mut *claim_tx).await?;
@@ -2967,6 +2994,108 @@ impl PostgresStore {
         } else {
             claim_tx.commit().await?;
             let _ = self.flush_audit_outbox(100).await;
+        }
+        Ok(())
+    }
+
+    /// Claims at most one request the same way `process_one_dry_run_for_worker`
+    /// does (same maintenance sweep, same lease, same `starting` transition -
+    /// `run_execution_maintenance` is the one shared copy of that), but does
+    /// **not** auto-complete it - returns the action name and its `target`
+    /// (from `approval_context->>'target'`, present only for actions created
+    /// with one, e.g. a firewall action's CIDR/pseudonym) for a caller
+    /// (`clawforge-executor`) to actually dispatch. Pair with
+    /// `complete_execution_dispatch` once dispatch finishes, success or not -
+    /// a claimed request that is never completed stays `starting` until the
+    /// same lease-expiry reclaim path used by every other stuck request picks
+    /// it back up.
+    pub async fn claim_execution_request_for_dispatch(
+        &self,
+        worker_id: Option<Uuid>,
+    ) -> Result<Option<ClaimedExecutionRequest>> {
+        self.run_execution_maintenance().await?;
+
+        let mut claim_tx = self.pool.begin().await?;
+        let id: Option<Uuid> = sqlx::query_scalar("UPDATE execution_requests SET status='starting',started_at=NOW() WHERE id=(SELECT id FROM execution_requests WHERE status IN ('approved','pending','queued') ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1) RETURNING id").fetch_optional(&mut *claim_tx).await?;
+        let Some(id) = id else {
+            claim_tx.commit().await?;
+            let _ = self.flush_audit_outbox(100).await;
+            return Ok(None);
+        };
+        if let Some(worker_id) = worker_id {
+            sqlx::query("INSERT INTO execution_leases (id,execution_id,worker_id,expires_at) VALUES ($1,$2,$3,NOW()+INTERVAL '2 minutes') ON CONFLICT (execution_id) DO UPDATE SET worker_id=$3,status='active',expires_at=NOW()+INTERVAL '2 minutes',updated_at=NOW()")
+                .bind(Uuid::new_v4()).bind(id).bind(worker_id).execute(&mut *claim_tx).await?;
+        }
+        let row = sqlx::query(
+            "SELECT a.name,e.approval_context FROM execution_requests e \
+             JOIN actions a ON a.id=e.action_id WHERE e.id=$1",
+        )
+        .bind(id)
+        .fetch_one(&mut *claim_tx)
+        .await?;
+        let action_name: String = row.get("name");
+        let approval_context: serde_json::Value = row.get("approval_context");
+        Self::insert_audit_outbox(
+            &mut claim_tx,
+            "executor",
+            "execution_request_starting",
+            &id.to_string(),
+            &serde_json::json!({"mode":"dispatch","action_name":action_name}),
+        )
+        .await?;
+        claim_tx.commit().await?;
+        let _ = self.flush_audit_outbox(100).await;
+        Ok(Some(ClaimedExecutionRequest {
+            id,
+            action_name,
+            target: approval_context.get("target").cloned(),
+        }))
+    }
+
+    /// Completes a request claimed via `claim_execution_request_for_dispatch` -
+    /// marks its terminal status, releases its lease, and records the
+    /// dispatch metric, mirroring exactly what
+    /// `process_one_dry_run_for_worker`'s own tail does for its synthetic
+    /// dry-run completion.
+    pub async fn complete_execution_dispatch(
+        &self,
+        id: Uuid,
+        worker_id: Option<Uuid>,
+        started: std::time::Instant,
+        success: bool,
+        result_summary: Option<&str>,
+        error_summary: Option<&str>,
+    ) -> Result<()> {
+        // The claim left the request in `starting` (see
+        // `claim_execution_request_for_dispatch`) - the transition table only
+        // allows a terminal status from `running`, so this mirrors the same
+        // `starting` -> `running` -> terminal path `process_one_dry_run_for_worker`
+        // already uses for its synthetic completion.
+        self.update_execution_status(id, "running", "executor", None, None)
+            .await?;
+        self.update_execution_status(
+            id,
+            if success { "success" } else { "failed" },
+            "executor",
+            result_summary,
+            error_summary,
+        )
+        .await?;
+        if let Some(worker_id) = worker_id {
+            sqlx::query(
+                "UPDATE execution_leases SET status='released',updated_at=NOW() WHERE execution_id=$1",
+            )
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+            self.record_execution_metric(
+                Some(id),
+                Some(worker_id),
+                if success { "success" } else { "failed" },
+                Some(started.elapsed().as_millis() as i64),
+                i32::from(!success),
+            )
+            .await?;
         }
         Ok(())
     }

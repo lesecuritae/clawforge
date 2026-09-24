@@ -1,18 +1,103 @@
-use clawforge_storage::{database_url_from_env, PostgresStore};
+//! `clawforge-executor` - claims `execution_requests` and dispatches them.
+//!
+//! `CLAWFORGE_EXECUTOR_DRY_RUN` must remain `true` (the binary refuses to
+//! start otherwise) - the process-level gate. This module's own dispatch
+//! logic re-checks the same value at the point it would actually call an
+//! adapter's `apply` (see `dry_run_from_env`) as a second, independent
+//! check: if some future change ever relaxed the startup gate without
+//! this call site being updated too, dispatch would still default to
+//! `dry_run: true` rather than silently start applying for real.
+//!
+//! Any action whose name is not a recognized firewall action (`nftables.`
+//! prefix) keeps the exact prior behavior: claimed, marked `running`, then
+//! immediately completed with `"dry_run: no external operation executed"`
+//! - this module changes nothing about docker/github/proxmox actions.
+
+use clawforge_firewall_agent::{FirewallAction, FirewallAdapter, FirewallTarget, NftablesAdapter};
+use clawforge_storage::{database_url_from_env, ClaimedExecutionRequest, PostgresStore};
 use std::{env, time::Duration};
 use tokio::time::{interval, MissedTickBehavior};
 use tracing_subscriber::EnvFilter;
+use uuid::Uuid;
+
+const DEFAULT_FIREWALL_ACTION_TTL_SECONDS: u32 = 3600;
+
+fn dry_run_from_env() -> bool {
+    env::var("CLAWFORGE_EXECUTOR_DRY_RUN")
+        .map(|value| value.eq_ignore_ascii_case("true") || value == "1")
+        .unwrap_or(true)
+}
+
+/// `target` (`{"kind":"threat_intel_indicator",...}` /
+/// `{"kind":"incident_source",...}`) plus an optional `ttl_seconds` -
+/// carried alongside the target rather than as a `FirewallTarget` field,
+/// since TTL is a property of the *action*, not of what it targets.
+fn parse_firewall_action(
+    request_id: Uuid,
+    target: &serde_json::Value,
+) -> anyhow::Result<FirewallAction> {
+    let firewall_target = FirewallTarget::try_from(target)
+        .map_err(|error| anyhow::anyhow!("invalid firewall target: {error}"))?;
+    let ttl_seconds = target
+        .get("ttl_seconds")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_FIREWALL_ACTION_TTL_SECONDS);
+    Ok(FirewallAction {
+        target: firewall_target,
+        ttl_seconds,
+        reason: format!("execution_request {request_id}"),
+    })
+}
+
+/// Dispatches one claimed request. Returns `(success, result_summary,
+/// error_summary)` for the caller to persist via `complete_execution_dispatch` -
+/// never panics, every adapter/parse error becomes a failed completion with
+/// a clear `error_summary` instead.
+async fn dispatch(claimed: &ClaimedExecutionRequest) -> (bool, Option<String>, Option<String>) {
+    if !claimed.action_name.starts_with("nftables.") {
+        return (
+            true,
+            Some("dry_run: no external operation executed".to_string()),
+            None,
+        );
+    }
+    let Some(target) = claimed.target.as_ref() else {
+        return (
+            false,
+            None,
+            Some(format!(
+                "firewall action {:?} has no target",
+                claimed.action_name
+            )),
+        );
+    };
+    let action = match parse_firewall_action(claimed.id, target) {
+        Ok(action) => action,
+        Err(error) => return (false, None, Some(error.to_string())),
+    };
+    let adapter = NftablesAdapter::new();
+    let dry_run = dry_run_from_env();
+    match adapter.apply(&action, dry_run).await {
+        Ok(result) => (
+            true,
+            Some(format!(
+                "adapter={} dry_run={} commands={:?}",
+                result.receipt.adapter, result.receipt.is_dry_run, result.receipt.rendered_commands
+            )),
+            None,
+        ),
+        Err(error) => (false, None, Some(error.to_string())),
+    }
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .init();
-    if env::var("CLAWFORGE_EXECUTOR_DRY_RUN")
-        .unwrap_or_else(|_| "true".into())
-        .to_lowercase()
-        != "true"
-    {
+    if !dry_run_from_env() {
         anyhow::bail!(
             "productive execution is disabled; CLAWFORGE_EXECUTOR_DRY_RUN must remain true"
         );
@@ -43,9 +128,32 @@ async fn main() -> anyhow::Result<()> {
             _ = ticks.tick() => {
                 if let Err(error) = store.set_runtime_status("executor", "running", None).await { tracing::warn!(%error, "executor heartbeat failed"); }
                 if let Err(error) = store.heartbeat_execution_worker(worker_id, "healthy", 0, None).await { tracing::warn!(%error, "executor worker heartbeat failed"); }
-                if let Err(error) = store.process_one_dry_run_for_worker(Some(worker_id)).await {
-                    tracing::warn!(%error, "dry-run request processing failed");
-                    let _ = store.heartbeat_execution_worker(worker_id, "degraded", 0, Some(&error.to_string())).await;
+                let started = std::time::Instant::now();
+                match store.claim_execution_request_for_dispatch(Some(worker_id)).await {
+                    Ok(Some(claimed)) => {
+                        let (success, result_summary, error_summary) = dispatch(&claimed).await;
+                        if let Err(error) = store
+                            .complete_execution_dispatch(
+                                claimed.id,
+                                Some(worker_id),
+                                started,
+                                success,
+                                result_summary.as_deref(),
+                                error_summary.as_deref(),
+                            )
+                            .await
+                        {
+                            tracing::warn!(%error, execution_id = %claimed.id, "could not persist dispatch completion");
+                            let _ = store.heartbeat_execution_worker(worker_id, "degraded", 0, Some(&error.to_string())).await;
+                        } else if !success {
+                            tracing::warn!(execution_id = %claimed.id, action = %claimed.action_name, error = ?error_summary, "dispatch failed");
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(%error, "claiming an execution request failed");
+                        let _ = store.heartbeat_execution_worker(worker_id, "degraded", 0, Some(&error.to_string())).await;
+                    }
                 }
             }
             _ = shutdown_signal() => { let _ = store.heartbeat_execution_worker(worker_id, "stopped", 0, None).await; let _ = store.set_runtime_status("executor", "stopped", None).await; break; }
@@ -64,5 +172,98 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn claimed(action_name: &str, target: Option<serde_json::Value>) -> ClaimedExecutionRequest {
+        ClaimedExecutionRequest {
+            id: Uuid::new_v4(),
+            action_name: action_name.to_string(),
+            target,
+        }
+    }
+
+    #[test]
+    fn dry_run_from_env_defaults_to_true_when_unset() {
+        // SAFETY: single-threaded test process, no other test in this
+        // binary reads/writes this specific env var.
+        std::env::remove_var("CLAWFORGE_EXECUTOR_DRY_RUN");
+        assert!(dry_run_from_env());
+    }
+
+    #[tokio::test]
+    async fn non_firewall_actions_keep_the_original_dry_run_success_behavior() {
+        let request = claimed("docker.restart_container", None);
+        let (success, summary, error) = dispatch(&request).await;
+        assert!(success);
+        assert_eq!(
+            summary.as_deref(),
+            Some("dry_run: no external operation executed")
+        );
+        assert!(error.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_firewall_action_without_a_target_fails_with_a_clear_error() {
+        let request = claimed("nftables.block_indicator", None);
+        let (success, _summary, error) = dispatch(&request).await;
+        assert!(!success);
+        assert!(error.unwrap().contains("no target"));
+    }
+
+    #[tokio::test]
+    async fn a_firewall_action_with_a_malformed_target_fails_with_a_clear_error() {
+        let request = claimed(
+            "nftables.block_indicator",
+            Some(serde_json::json!({"kind": "not-a-real-kind"})),
+        );
+        let (success, _summary, error) = dispatch(&request).await;
+        assert!(!success);
+        assert!(error.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_valid_firewall_action_dispatches_in_dry_run_by_default() {
+        // No CLAWFORGE_EXECUTOR_DRY_RUN set - defaults to true, so this
+        // exercises render-only apply, needing no real nft/NET_ADMIN.
+        std::env::remove_var("CLAWFORGE_EXECUTOR_DRY_RUN");
+        let request = claimed(
+            "nftables.block_indicator",
+            Some(serde_json::json!({
+                "kind": "threat_intel_indicator",
+                "cidr": "203.0.113.0/24",
+                "source": "spamhaus_drop",
+            })),
+        );
+        let (success, summary, error) = dispatch(&request).await;
+        assert!(success, "dispatch failed: {error:?}");
+        let summary = summary.unwrap();
+        assert!(summary.contains("dry_run=true"));
+        assert!(summary.contains("203.0.113.0/24"));
+    }
+
+    #[test]
+    fn parse_firewall_action_uses_the_default_ttl_when_absent_and_respects_an_explicit_one() {
+        let id = Uuid::new_v4();
+        let default_target = serde_json::json!({
+            "kind": "threat_intel_indicator",
+            "cidr": "203.0.113.7",
+            "source": "spamhaus_drop",
+        });
+        let action = parse_firewall_action(id, &default_target).unwrap();
+        assert_eq!(action.ttl_seconds, DEFAULT_FIREWALL_ACTION_TTL_SECONDS);
+
+        let explicit_target = serde_json::json!({
+            "kind": "threat_intel_indicator",
+            "cidr": "203.0.113.7",
+            "source": "spamhaus_drop",
+            "ttl_seconds": 120,
+        });
+        let action = parse_firewall_action(id, &explicit_target).unwrap();
+        assert_eq!(action.ttl_seconds, 120);
     }
 }

@@ -355,10 +355,13 @@ name = "clawforge-executor"
 version = "1.0.0"
 dependencies = [
  "anyhow",
+ "clawforge-firewall-agent",
  "clawforge-storage",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

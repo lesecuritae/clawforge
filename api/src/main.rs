@@ -4096,6 +4096,14 @@ struct ExecutionRequestBody {
     workflow_run_id: Option<Uuid>,
     decision_id: Option<Uuid>,
     idempotency_key: Option<String>,
+    /// What the action would apply to (e.g. a firewall action's
+    /// `{"kind":"threat_intel_indicator","cidr":"...","source":"..."}` or
+    /// `{"kind":"incident_source","pseudonym":"ip-pseudonym:..."}` - see
+    /// `clawforge-executor`'s own request-to-`FirewallTarget` mapping).
+    /// Folded into `approval_context`, so it is covered by the same
+    /// immutable approval-hash binding every other field there gets.
+    #[serde(default)]
+    target: Option<serde_json::Value>,
 }
 
 async fn admin_create_execution(
@@ -4131,6 +4139,7 @@ async fn admin_create_execution(
             requested_by: principal.username.clone(),
             requested_by_id: Some(principal.id),
             idempotency_key: body.idempotency_key,
+            target: body.target,
         })
         .await
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "execution request rejected"))?;

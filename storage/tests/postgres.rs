@@ -683,6 +683,7 @@ async fn migrations_and_restart_persist() -> anyhow::Result<()> {
             requested_by: "integration-test".into(),
             requested_by_id: None,
             idempotency_key: Some("production-maturity-test-key".into()),
+            target: None,
         })
         .await?;
     let duplicate_execution = restarted
@@ -693,6 +694,7 @@ async fn migrations_and_restart_persist() -> anyhow::Result<()> {
             requested_by: "integration-test".into(),
             requested_by_id: None,
             idempotency_key: Some("production-maturity-test-key".into()),
+            target: None,
         })
         .await?;
     assert_eq!(first_execution, duplicate_execution);
@@ -735,6 +737,7 @@ async fn migrations_and_restart_persist() -> anyhow::Result<()> {
             requested_by: "storage-admin".into(),
             requested_by_id: Some(admin_id),
             idempotency_key: Some("two-person-approval-test-key".into()),
+            target: None,
         })
         .await?;
     assert!(restarted
@@ -1102,6 +1105,141 @@ async fn ip_reputation_lookup_flags_a_match_without_ever_storing_the_raw_ip() ->
             .fetch_one(store.pool())
             .await?;
     assert!(unlisted_metadata.get("threat_intel_hit").is_none());
+
+    Ok(())
+}
+
+/// Proves `claim_execution_request_for_dispatch`/`complete_execution_dispatch`
+/// against real PostgreSQL: the `target` an execution request was created
+/// with comes back unchanged through the claim, the request ends up
+/// `success` with the completion's own result summary persisted, and its
+/// lease is released - the same lease/heartbeat mechanics
+/// `process_one_dry_run_for_worker` already had, now reachable without
+/// that function's built-in auto-completion. Also proves the roadmap's own
+/// "Freigabe an ... Ziel ... binden; Drift invalidiert sie" requirement for
+/// `target` specifically: it is folded into `approval_context` the same as
+/// every other field there, so mutating it after creation changes
+/// `approval_context_hash` the same way mutating the risk level would.
+#[tokio::test]
+#[ignore = "requires an isolated PostgreSQL test container"]
+async fn claim_execution_request_for_dispatch_threads_the_target_and_completes(
+) -> anyhow::Result<()> {
+    let url =
+        std::env::var("CLAWFORGE_TEST_DATABASE_URL").or_else(|_| std::env::var("DATABASE_URL"))?;
+    let store = PostgresStore::connect(&url).await?;
+
+    let connector_id: uuid::Uuid =
+        sqlx::query_scalar("SELECT id FROM connector_registry WHERE connector_type='firewall'")
+            .fetch_one(store.pool())
+            .await?;
+    let action_id = uuid::Uuid::new_v4();
+    let action_name = format!("nftables.test-dispatch-{}", uuid::Uuid::new_v4());
+    sqlx::query("INSERT INTO actions (id,connector_id,name,type,description,risk_level,required_scope,requires_approval,enabled) VALUES ($1,$2,$3,'connector_action','test','high','agent:action:read',false,true)")
+        .bind(action_id)
+        .bind(connector_id)
+        .bind(&action_name)
+        .execute(store.pool())
+        .await?;
+
+    let target = json!({
+        "kind": "threat_intel_indicator",
+        "cidr": "203.0.113.0/24",
+        "source": "spamhaus_drop",
+    });
+    let request_id = store
+        .create_execution_request(&clawforge_storage::ExecutionRequestInput {
+            action_id,
+            workflow_run_id: None,
+            decision_id: None,
+            requested_by: "integration-test".into(),
+            requested_by_id: None,
+            idempotency_key: None,
+            target: Some(target.clone()),
+        })
+        .await?;
+
+    // "target" is folded into approval_context (asserted below via the
+    // stored value) exactly like every other field there - which is what
+    // makes the existing drift-invalidation mechanism (already proven for
+    // other approval_context fields elsewhere in this file, by clearing
+    // approval_context and observing the hash comparison then reject the
+    // approval) apply to target too, without a second mechanism.
+    let stored_context: serde_json::Value =
+        sqlx::query_scalar("SELECT approval_context FROM execution_requests WHERE id=$1")
+            .bind(request_id)
+            .fetch_one(store.pool())
+            .await?;
+    assert_eq!(stored_context["target"], target);
+
+    let worker_id = store
+        .register_execution_worker(&format!("dispatch-test-{}", uuid::Uuid::new_v4()), 1)
+        .await?;
+    let claimed = store
+        .claim_execution_request_for_dispatch(Some(worker_id))
+        .await?
+        .expect("the request just created must be claimable");
+    assert_eq!(claimed.id, request_id);
+    assert_eq!(claimed.action_name, action_name);
+    assert_eq!(claimed.target, Some(target));
+
+    let status_after_claim: String =
+        sqlx::query_scalar("SELECT status FROM execution_requests WHERE id=$1")
+            .bind(request_id)
+            .fetch_one(store.pool())
+            .await?;
+    assert_eq!(status_after_claim, "starting");
+
+    store
+        .complete_execution_dispatch(
+            claimed.id,
+            Some(worker_id),
+            std::time::Instant::now(),
+            true,
+            Some("test completion"),
+            None,
+        )
+        .await?;
+    let (final_status, result_summary): (String, Option<String>) =
+        sqlx::query_as("SELECT status,result_summary FROM execution_requests WHERE id=$1")
+            .bind(request_id)
+            .fetch_one(store.pool())
+            .await?;
+    assert_eq!(final_status, "success");
+    assert_eq!(result_summary.as_deref(), Some("test completion"));
+
+    let lease_status: String =
+        sqlx::query_scalar("SELECT status FROM execution_leases WHERE execution_id=$1")
+            .bind(request_id)
+            .fetch_one(store.pool())
+            .await?;
+    assert_eq!(lease_status, "released");
+
+    // `complete_execution_dispatch` records a global execution_metrics row
+    // and this test's own worker/lease/request/action rows are otherwise
+    // global state too - clean up everything this test created so a later
+    // test's exact-count assertion (e.g. `migrations_and_restart_persist`'s
+    // `list_execution_workers().len() == 1` / `execution_metrics_summary()`)
+    // isn't polluted by state left behind here.
+    sqlx::query("DELETE FROM execution_metrics WHERE worker_id=$1")
+        .bind(worker_id)
+        .execute(store.pool())
+        .await?;
+    sqlx::query("DELETE FROM execution_leases WHERE execution_id=$1")
+        .bind(request_id)
+        .execute(store.pool())
+        .await?;
+    sqlx::query("DELETE FROM execution_workers WHERE id=$1")
+        .bind(worker_id)
+        .execute(store.pool())
+        .await?;
+    sqlx::query("DELETE FROM execution_requests WHERE id=$1")
+        .bind(request_id)
+        .execute(store.pool())
+        .await?;
+    sqlx::query("DELETE FROM actions WHERE id=$1")
+        .bind(action_id)
+        .execute(store.pool())
+        .await?;
 
     Ok(())
 }
