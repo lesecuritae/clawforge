@@ -158,14 +158,17 @@ async fn persist_assessment_and_incident(
         "{rule_id}:v{rule_version}:{correlation_id}:{}",
         bucket.timestamp()
     );
-    // Whether any event in this bucket also matched a threat-intel
-    // indicator at ingest time (record_security_event/lookup_ip_reputation
-    // - never the raw IP itself, see that method's own doc comment). This
-    // is the second, independent evidence source that makes Block
-    // reachable in clawforge-policy-engine's decide() call for the first
-    // time - still only in Shadow Mode, no action layer exists to run one.
-    let threat_intel_corroborated = store
-        .bucket_has_threat_intel_hit(event_type, correlation_id, bucket, bucket_end)
+    // The best threat-intel hit (if any) among this bucket's events at
+    // ingest time (record_security_event/lookup_ip_reputation - never the
+    // raw IP itself, see that method's own doc comment). A hit is the
+    // second, independent evidence source that makes Block reachable in
+    // clawforge-policy-engine's decide() call for the first time - still
+    // only in Shadow Mode, no action layer exists to run one. Carrying the
+    // full detail (not just a boolean) is what roadmap phase 8 asks for -
+    // clawforge-policy-engine discounts a stale/low-confidence hit rather
+    // than trusting a bare "corroborated=true".
+    let threat_intel = store
+        .bucket_threat_intel_hit_details(event_type, correlation_id, bucket, bucket_end)
         .await?;
     let assessment_id = store
         .persist_security_assessment(SecurityAssessmentUpsert {
@@ -183,7 +186,7 @@ async fn persist_assessment_and_incident(
             first_seen,
             last_seen,
             event_ids,
-            threat_intel_corroborated,
+            threat_intel,
         })
         .await?;
     // Reuse the existing, already-idempotent/escalation-aware incident
@@ -491,6 +494,7 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::Row;
 
     #[test]
     fn bucket_start_floors_to_the_window_boundary() {
@@ -856,7 +860,12 @@ mod tests {
                 fifth_at,
                 Some(&resource),
                 serde_json::json!({"test": true}),
-                serde_json::json!({"threat_intel_hit": true, "threat_intel_source": "spamhaus_drop_test"}),
+                serde_json::json!({
+                    "threat_intel_hit": true,
+                    "threat_intel_source": "spamhaus_drop_test",
+                    "threat_intel_confidence": 80,
+                    "threat_intel_last_seen": fifth_at,
+                }),
                 &format!("test:ssh_login_failure:{resource}:threat-intel-hit"),
             )
             .await?;
@@ -868,16 +877,23 @@ mod tests {
         evaluate_rule(&engine, &SSH_BRUTEFORCE, &fifth_event).await?;
 
         let dedupe_key = format!("ssh_bruteforce:v1:{resource}:{}", bucket.timestamp());
-        let corroborated: bool = sqlx::query_scalar(
-            "SELECT threat_intel_corroborated FROM security_assessments WHERE dedupe_key=$1",
+        let row = sqlx::query(
+            "SELECT threat_intel_corroborated, threat_intel_source, threat_intel_confidence \
+             FROM security_assessments WHERE dedupe_key=$1",
         )
         .bind(&dedupe_key)
         .fetch_one(owner.pool())
         .await?;
         assert!(
-            corroborated,
+            row.get::<bool, _>("threat_intel_corroborated"),
             "one threat-intel hit anywhere in the bucket must corroborate the whole assessment"
         );
+        assert_eq!(
+            row.get::<String, _>("threat_intel_source"),
+            "spamhaus_drop_test",
+            "the assessment must carry which provider actually hit, not just a boolean"
+        );
+        assert_eq!(row.get::<i16, _>("threat_intel_confidence"), 80);
 
         assert_eq!(incidents.promote_incident_candidates(10).await?, 1);
 

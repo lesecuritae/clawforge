@@ -57,13 +57,59 @@ use tracing::{info, warn};
 /// not a second, unrelated constant that could drift from it).
 const CROSS_RULE_CORROBORATION_WINDOW: chrono::Duration = chrono::Duration::hours(1);
 
+const DEFAULT_THREAT_INTEL_MAX_STALENESS_SECONDS: i64 = 7 * 24 * 3600;
+const DEFAULT_THREAT_INTEL_MIN_CONFIDENCE: i16 = 50;
+
+fn threat_intel_max_staleness_seconds() -> i64 {
+    env::var("CLAWFORGE_THREAT_INTEL_MAX_STALENESS_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_THREAT_INTEL_MAX_STALENESS_SECONDS)
+}
+
+fn threat_intel_min_confidence() -> i16 {
+    env::var("CLAWFORGE_THREAT_INTEL_MIN_CONFIDENCE")
+        .ok()
+        .and_then(|value| value.parse::<i16>().ok())
+        .filter(|value| (0..=100).contains(value))
+        .unwrap_or(DEFAULT_THREAT_INTEL_MIN_CONFIDENCE)
+}
+
+/// Whether a threat-intel hit is fresh and confident enough to count as
+/// independent corroborating evidence at all - roadmap phase 8's own exit
+/// gate: "Offline- oder veraltete ... Feeds reduzieren Confidence und
+/// loesen keine automatische Eskalation aus". A hit whose indicator has
+/// not been reconfirmed recently (`last_seen` older than
+/// `CLAWFORGE_THREAT_INTEL_MAX_STALENESS_SECONDS`, default 7 days) or
+/// whose provider's own confidence is below
+/// `CLAWFORGE_THREAT_INTEL_MIN_CONFIDENCE` (default 50) does not count -
+/// the assessment stays at `evidence_sources=1` (its own behavioral
+/// signal alone), never silently escalated toward `Block` on the strength
+/// of stale or low-confidence external data. Every input this decides on
+/// (`confidence`, `last_seen`, the two thresholds) is already visible on
+/// the persisted assessment/in this service's own env config - nothing
+/// about the discount is a black box.
+fn threat_intel_hit_is_corroborating(hit: &clawforge_storage::IpReputationHit) -> bool {
+    if hit.confidence < threat_intel_min_confidence() {
+        return false;
+    }
+    let age_seconds = (chrono::Utc::now() - hit.last_seen).num_seconds();
+    age_seconds >= 0 && age_seconds <= threat_intel_max_staleness_seconds()
+}
+
 /// Every assessment has at least one evidence source: the behavioral rule
 /// that produced it. A second, independent one raises this to 2, which is
 /// what `clawforge_policy::decide` requires before it will ever return
 /// `Block` - two different shapes of it exist:
 ///
 /// - **Threat-intel corroboration**: the source is independently listed by
-///   an external reputation feed (`threat_intel_corroborated`).
+///   an external reputation feed, and that listing is itself fresh and
+///   confident enough to trust (`threat_intel_hit_is_corroborating`) - a
+///   stale or low-confidence hit does not count, even though
+///   `security_assessments.threat_intel_corroborated` itself is still
+///   `true` for it (that flag only records "some indicator matched at
+///   ingest time", not "and it was good enough to corroborate on").
 /// - **Cross-rule corroboration**: a *different* rule has also produced an
 ///   assessment for the same resource recently - a source that first
 ///   tripped `ssh_bruteforce` and later, separately, `http_scan` is
@@ -78,8 +124,10 @@ async fn evidence_sources_for(
     store: &PostgresStore,
     assessment: &clawforge_storage::SecurityAssessment,
 ) -> Result<i16> {
-    if assessment.threat_intel_corroborated {
-        return Ok(2);
+    if let Some(hit) = &assessment.threat_intel {
+        if threat_intel_hit_is_corroborating(hit) {
+            return Ok(2);
+        }
     }
     let since = chrono::Utc::now() - CROSS_RULE_CORROBORATION_WINDOW;
     if store
@@ -311,9 +359,9 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires provisioned roles in an isolated PostgreSQL test container"]
     async fn evidence_sources_for_reflects_threat_intel_corroboration() -> Result<()> {
-        // threat_intel_corroborated=true returns before ever touching the
-        // store, but the function's signature still needs a real one to
-        // call it at all - connect once and reuse it for both cases.
+        // A fresh, confident hit returns before ever touching the store,
+        // but the function's signature still needs a real one to call it
+        // at all - connect once and reuse it for every case.
         let store =
             PostgresStore::connect_runtime(&env::var("CLAWFORGE_TEST_POLICY_ENGINE_DATABASE_URL")?)
                 .await?;
@@ -329,14 +377,97 @@ mod tests {
             bucket_start: chrono::Utc::now(),
             incident_id: None,
             threat_intel_corroborated: false,
+            threat_intel: None,
         };
-        assert_eq!(evidence_sources_for(&store, &base).await?, 1);
-        let corroborated = clawforge_storage::SecurityAssessment {
+        assert_eq!(
+            evidence_sources_for(&store, &base).await?,
+            1,
+            "no hit at all must not corroborate"
+        );
+
+        let fresh_confident = clawforge_storage::SecurityAssessment {
             threat_intel_corroborated: true,
+            threat_intel: Some(clawforge_storage::IpReputationHit {
+                source: "spamhaus_drop".to_string(),
+                confidence: 90,
+                last_seen: chrono::Utc::now(),
+            }),
+            ..base.clone()
+        };
+        assert_eq!(
+            evidence_sources_for(&store, &fresh_confident).await?,
+            2,
+            "a fresh, high-confidence hit must corroborate"
+        );
+
+        let stale = clawforge_storage::SecurityAssessment {
+            threat_intel_corroborated: true,
+            threat_intel: Some(clawforge_storage::IpReputationHit {
+                source: "spamhaus_drop".to_string(),
+                confidence: 90,
+                last_seen: chrono::Utc::now() - chrono::Duration::days(30),
+            }),
+            ..base.clone()
+        };
+        assert_eq!(
+            evidence_sources_for(&store, &stale).await?,
+            1,
+            "a stale hit (older than the default 7-day staleness window) must not corroborate, \
+             even though security_assessments.threat_intel_corroborated is still true for it"
+        );
+
+        let low_confidence = clawforge_storage::SecurityAssessment {
+            threat_intel_corroborated: true,
+            threat_intel: Some(clawforge_storage::IpReputationHit {
+                source: "some_low_quality_feed".to_string(),
+                confidence: 10,
+                last_seen: chrono::Utc::now(),
+            }),
             ..base
         };
-        assert_eq!(evidence_sources_for(&store, &corroborated).await?, 2);
+        assert_eq!(
+            evidence_sources_for(&store, &low_confidence).await?,
+            1,
+            "a fresh but low-confidence hit (below the default minimum of 50) must not corroborate"
+        );
         Ok(())
+    }
+
+    #[test]
+    fn threat_intel_hit_is_corroborating_applies_both_thresholds() {
+        // SAFETY: single-threaded test process, no other test in this
+        // binary reads/writes these specific env vars.
+        std::env::remove_var("CLAWFORGE_THREAT_INTEL_MAX_STALENESS_SECONDS");
+        std::env::remove_var("CLAWFORGE_THREAT_INTEL_MIN_CONFIDENCE");
+
+        let fresh_and_confident = clawforge_storage::IpReputationHit {
+            source: "spamhaus_drop".to_string(),
+            confidence: 100,
+            last_seen: chrono::Utc::now(),
+        };
+        assert!(threat_intel_hit_is_corroborating(&fresh_and_confident));
+
+        let stale = clawforge_storage::IpReputationHit {
+            last_seen: chrono::Utc::now() - chrono::Duration::days(8),
+            ..fresh_and_confident.clone()
+        };
+        assert!(!threat_intel_hit_is_corroborating(&stale));
+
+        let low_confidence = clawforge_storage::IpReputationHit {
+            confidence: 49,
+            ..fresh_and_confident.clone()
+        };
+        assert!(!threat_intel_hit_is_corroborating(&low_confidence));
+
+        // A future last_seen (clock skew, or a bug elsewhere) must not be
+        // treated as infinitely fresh - the age_seconds >= 0 guard in
+        // threat_intel_hit_is_corroborating rejects it explicitly rather
+        // than silently accepting a negative age.
+        let from_the_future = clawforge_storage::IpReputationHit {
+            last_seen: chrono::Utc::now() + chrono::Duration::hours(1),
+            ..fresh_and_confident
+        };
+        assert!(!threat_intel_hit_is_corroborating(&from_the_future));
     }
 
     /// Proves the second, non-threat-intel corroboration path against real
@@ -380,7 +511,7 @@ mod tests {
                     first_seen: now,
                     last_seen: now,
                     event_ids: &[],
-                    threat_intel_corroborated: false,
+                    threat_intel: None,
                 })
                 .await?;
             Ok(())
@@ -401,6 +532,7 @@ mod tests {
             bucket_start: now,
             incident_id: None,
             threat_intel_corroborated: false,
+            threat_intel: None,
         };
         assert_eq!(
             evidence_sources_for(&store, &ssh_only).await?,
@@ -493,7 +625,7 @@ mod tests {
                 first_seen: now,
                 last_seen: now,
                 event_ids: &[event_id],
-                threat_intel_corroborated: false,
+                threat_intel: None,
             })
             .await?;
 

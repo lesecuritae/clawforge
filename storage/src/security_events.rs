@@ -19,13 +19,19 @@ use uuid::Uuid;
 
 use crate::{pseudonymize_correlation_id, PostgresStore};
 
-/// A raw IP matched a threat-intel indicator - which one, never anything
-/// about the IP itself. Deliberately the smallest possible shape: a
-/// category flag a caller can pass onward, not a copy of the indicator
-/// row.
+/// A raw IP matched a threat-intel indicator - which provider, how
+/// confident that provider's own feed was, and how recently it last
+/// confirmed the indicator. Never anything about the IP itself - this is
+/// deliberately still the smallest shape that carries the indicator's
+/// own metadata, not a copy of the indicator row (no raw value/CIDR).
+/// The three fields together are what makes a downstream corroboration
+/// decision explainable (roadmap phase 8's own exit gate) instead of a
+/// bare "some indicator matched".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IpReputationHit {
     pub source: String,
+    pub confidence: i16,
+    pub last_seen: DateTime<Utc>,
 }
 
 /// A registered sensor identity, without its credential hash - callers that
@@ -330,14 +336,30 @@ impl PostgresStore {
     /// different content is rejected rather than silently accepted or
     /// silently overwriting the original, per the roadmap's
     /// `security-events-ingress` dedupe requirement.
-    /// A raw IP's reputation from Spamhaus's DROP/EDROP feeds
-    /// (`indicators.source LIKE 'spamhaus%'`) - checked **before** a
-    /// resource is pseudonymized, since indicators are stored as raw CIDR
-    /// prefixes (`indicator_type='Prefix'`) and a pseudonym could never be
-    /// checked against them. Only the result - which feed, never the IP
-    /// itself - is what a caller may persist further (see
-    /// `record_security_event`, the only caller today, which writes just a
-    /// category flag onto the canonical event's `metadata`, never the IP).
+    /// A raw IP's reputation against *every* ingested threat-intel
+    /// provider's indicators (`spamhaus_drop`/`spamhaus_edrop`/
+    /// `spamhaus_asn`/`threatfox`/`urlhaus`/`feodo_tracker`/
+    /// `malwarebazaar`, not just Spamhaus - roadmap phase 8's "vorhandene
+    /// Provider ... ergaenzen" is about *all* of them, and non-IP
+    /// indicator types from the non-Spamhaus providers - URLs, hashes,
+    /// domains - simply never match the `indicator_type IN ('Ip',
+    /// 'Prefix')` shape below, so widening the source filter is safe by
+    /// construction, not something that needs its own type-specific
+    /// exclusion list). Checked **before** a resource is pseudonymized,
+    /// since indicators are stored as raw CIDR prefixes
+    /// (`indicator_type='Prefix'`) and a pseudonym could never be checked
+    /// against them. Only the result - which feed, its confidence, how
+    /// recently it last confirmed the indicator, never the IP itself - is
+    /// what a caller may persist further (see `record_security_event`,
+    /// the only caller today, which writes a category flag plus this
+    /// detail onto the canonical event's `metadata`, never the IP).
+    ///
+    /// When more than one indicator matches (e.g. both a Spamhaus prefix
+    /// and a ThreatFox single-IP entry), the highest-confidence one wins,
+    /// ties broken by the most recently confirmed (`last_seen DESC`) -
+    /// deterministic, and the more informative of the two dimensions
+    /// (confidence) takes priority so a caller is never handed the
+    /// *lesser* corroborating evidence when better evidence exists.
     ///
     /// Deliberately the opposite of the pseudonymization path's
     /// fail-closed design: pseudonymization protects a privacy guarantee
@@ -351,18 +373,21 @@ impl PostgresStore {
             return Ok(None);
         }
         let row = sqlx::query(
-            "SELECT source FROM indicators \
-             WHERE source LIKE 'spamhaus%' AND expires_at > NOW() \
+            "SELECT source, confidence, last_seen FROM indicators \
+             WHERE expires_at > NOW() \
              AND ( \
                (indicator_type='Ip' AND value=$1) OR \
                (indicator_type='Prefix' AND $1::inet <<= value::cidr) \
-             ) LIMIT 1",
+             ) \
+             ORDER BY confidence DESC, last_seen DESC LIMIT 1",
         )
         .bind(ip)
         .fetch_optional(self.pool())
         .await?;
         Ok(row.map(|row| IpReputationHit {
             source: row.get("source"),
+            confidence: row.get("confidence"),
+            last_seen: row.get("last_seen"),
         }))
     }
 
@@ -492,8 +517,14 @@ impl PostgresStore {
             // than payload (the sensor's own observation) - never the IP,
             // matching the same boundary pseudonymize_evidence already
             // draws between what a rule may group by and what it may see.
+            // confidence/last_seen ride along here too - the roadmap
+            // phase 8 detail (freshness/provenance/confidence) an
+            // assessment needs, not just a bare hit flag - see
+            // `bucket_threat_intel_hit_details`, which reads these back.
             metadata["threat_intel_hit"] = serde_json::json!(true);
             metadata["threat_intel_source"] = serde_json::json!(hit.source);
+            metadata["threat_intel_confidence"] = serde_json::json!(hit.confidence);
+            metadata["threat_intel_last_seen"] = serde_json::json!(hit.last_seen);
         }
         // The one, deliberately narrow exception to "never persist a raw
         // IP" in this codebase - see security_ip_resolutions's own

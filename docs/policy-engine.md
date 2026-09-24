@@ -55,12 +55,14 @@ Two real constraints shaped how this is wired in, both explained in
    design, since a reputation check is an enrichment, not a privacy
    boundary that must never be silently bypassed.
 2. `clawforge-security-engine` reads that flag back per bucket
-   (`bucket_has_threat_intel_hit`) when it persists an assessment - one hit
-   anywhere in the bucket is enough to set
+   (`bucket_threat_intel_hit_details`) when it persists an assessment - one
+   hit anywhere in the bucket is enough to set
    `security_assessments.threat_intel_corroborated` (migration `0035`),
    not a majority. `clawforge-policy-engine` then computes
    `evidence_sources` as `2` instead of the previous hardcoded `1` whenever
-   that flag is set (`evidence_sources_for`), which is what actually lets
+   that flag is set *and* the hit is still fresh/confident enough to trust
+   (see "Freshness, provenance and confidence" below -
+   `evidence_sources_for`), which is what actually lets
    `clawforge_policy::decide()` reach `Block` for a high-confidence,
    corroborated assessment - proven by a dedicated unit test
    (`threat_intel_corroboration_is_what_makes_block_reachable_at_all`) and
@@ -69,6 +71,46 @@ Two real constraints shaped how this is wired in, both explained in
    (`a_single_threat_intel_hit_in_the_bucket_corroborates_the_whole_assessment`).
    **Still only ever recorded as a shadow decision** - no action layer
    exists to execute a `Block` on.
+
+## Freshness, provenance and confidence (migration `0044`, roadmap phase 8)
+
+`lookup_ip_reputation` originally only checked `indicators.source LIKE
+'spamhaus%'` and returned nothing but which feed hit - roadmap phase 8's
+"vorhandene Provider um Freshness, Provenance und Confidence ergaenzen"
+closed both gaps at once:
+
+- **Every provider, not just Spamhaus.** The query now matches any
+  ingested indicator (`threatfox`/`urlhaus`/`feodo_tracker`/
+  `malwarebazaar`/every Spamhaus feed) whose `indicator_type` is `Ip` or
+  `Prefix` - the non-IP indicator types the other providers also produce
+  (hashes, URLs, domains) simply never match this shape, so widening the
+  source filter needed no separate exclusion list. When more than one
+  indicator matches, the highest-confidence one wins (ties broken by most
+  recently confirmed) - deterministic, and a caller is never handed the
+  *lesser* of two matching hits.
+- **`security_assessments` now carries the actual hit**, not just a
+  boolean: `threat_intel_source`, `threat_intel_confidence`,
+  `threat_intel_indicator_last_seen` (all-or-nothing together, enforced by
+  a `CHECK` constraint). `threat_intel_corroborated` stays exactly what it
+  always meant - "some indicator matched at ingest time" - the new columns
+  are what make that explainable instead of a bare `true`.
+- **A stale or low-confidence hit does not corroborate.** This is the
+  literal roadmap phase 8 exit gate: "Offline- oder veraltete ... Feeds
+  reduzieren Confidence und loesen keine automatische Eskalation aus."
+  `evidence_sources_for` only counts a threat-intel hit toward
+  `evidence_sources=2` if `threat_intel_hit_is_corroborating` accepts it -
+  `confidence >= CLAWFORGE_THREAT_INTEL_MIN_CONFIDENCE` (default 50) *and*
+  `last_seen` no older than `CLAWFORGE_THREAT_INTEL_MAX_STALENESS_SECONDS`
+  (default 7 days, and never a *negative* age either - a `last_seen` from
+  the future, e.g. from clock skew, is rejected rather than treated as
+  infinitely fresh). A stale/low-confidence hit still leaves
+  `threat_intel_corroborated=true` on the assessment (it is an honest
+  record of what happened at ingest time) but the assessment itself stays
+  at `evidence_sources=1` - it can still reach `Block` via cross-rule
+  corroboration, just not on the strength of that one external hit alone.
+  Both thresholds, and every value they compare, are already visible on
+  the persisted assessment or in this service's own env config - "jede
+  Score-Komponente bleibt erklaerbar" by construction, not by convention.
 
 ## Schema (migration `0034`)
 

@@ -30,12 +30,20 @@ pub struct SecurityAssessmentUpsert<'a> {
     pub first_seen: DateTime<Utc>,
     pub last_seen: DateTime<Utc>,
     pub event_ids: &'a [Uuid],
-    /// Whether any event in this bucket also matched a threat-intel
-    /// indicator (see `lookup_ip_reputation`) - a second, independent
+    /// The best threat-intel hit (highest confidence, ties broken by most
+    /// recently confirmed - see `lookup_ip_reputation`'s own doc comment)
+    /// among this bucket's events, if any - a second, independent
     /// evidence source alongside the behavioral rule itself. See migration
-    /// `0035`'s own comment for why this is what makes `Block` reachable
-    /// for the first time in `clawforge-policy-engine`.
-    pub threat_intel_corroborated: bool,
+    /// `0035`'s own comment for why a hit is what makes `Block` reachable
+    /// for the first time in `clawforge-policy-engine`, and migration
+    /// `0044`'s comment for why the detail (not just a boolean) matters:
+    /// roadmap phase 8's exit gate needs the actual source/confidence/age
+    /// to judge staleness, not a bare "true".
+    /// `persist_security_assessment` derives the stored
+    /// `threat_intel_corroborated` boolean from this directly (`is_some`),
+    /// so a caller never passes the two separately and they can never
+    /// disagree.
+    pub threat_intel: Option<crate::IpReputationHit>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -51,6 +59,7 @@ pub struct SecurityAssessment {
     pub bucket_start: DateTime<Utc>,
     pub incident_id: Option<Uuid>,
     pub threat_intel_corroborated: bool,
+    pub threat_intel: Option<crate::IpReputationHit>,
 }
 
 impl PostgresStore {
@@ -85,31 +94,48 @@ impl PostgresStore {
             .collect())
     }
 
-    /// Whether any event of `event_type` sharing `correlation_id` within
-    /// `[from, to)` also matched a threat-intel indicator at ingest time
-    /// (`events.metadata->>'threat_intel_hit'`, set by
+    /// The best threat-intel hit (highest confidence, ties broken by most
+    /// recently confirmed - same ordering `lookup_ip_reputation` itself
+    /// uses, so a bucket spanning several events never picks a *worse*
+    /// hit than the single-IP lookup would have) among any event of
+    /// `event_type` sharing `correlation_id` within `[from, to)`
+    /// (`events.metadata->>'threat_intel_hit'`/`threat_intel_source'`/
+    /// `threat_intel_confidence'`/`threat_intel_last_seen'`, set by
     /// `record_security_event`/`lookup_ip_reputation` - never the raw IP
-    /// itself). A rule calls this once per bucket alongside
-    /// `list_events_for_bucket`(`_with_field`) to decide
-    /// `threat_intel_corroborated` for the assessment it persists.
-    pub async fn bucket_has_threat_intel_hit(
+    /// itself). `None` if no event in the bucket had a hit. A rule calls
+    /// this once per bucket alongside `list_events_for_bucket`(`_with_field`)
+    /// to build the assessment's `threat_intel` detail (roadmap phase 8:
+    /// this is what makes the corroboration explainable, not just a bare
+    /// boolean).
+    pub async fn bucket_threat_intel_hit_details(
         &self,
         event_type: &str,
         correlation_id: &str,
         from: DateTime<Utc>,
         to: DateTime<Utc>,
-    ) -> Result<bool> {
-        Ok(sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM events \
+    ) -> Result<Option<crate::IpReputationHit>> {
+        let row = sqlx::query(
+            "SELECT metadata->>'threat_intel_source' AS source, \
+                    (metadata->>'threat_intel_confidence')::smallint AS confidence, \
+                    (metadata->>'threat_intel_last_seen')::timestamptz AS last_seen \
+             FROM events \
              WHERE event_type=$1 AND correlation_id=$2 AND occurred_at >= $3 AND occurred_at < $4 \
-             AND metadata->>'threat_intel_hit'='true')",
+               AND metadata->>'threat_intel_hit'='true' \
+             ORDER BY (metadata->>'threat_intel_confidence')::smallint DESC, \
+                      (metadata->>'threat_intel_last_seen')::timestamptz DESC \
+             LIMIT 1",
         )
         .bind(event_type)
         .bind(correlation_id)
         .bind(from)
         .bind(to)
-        .fetch_one(self.pool())
-        .await?)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(row.map(|row| crate::IpReputationHit {
+            source: row.get("source"),
+            confidence: row.get("confidence"),
+            last_seen: row.get("last_seen"),
+        }))
     }
 
     /// Whether some *other* rule (a different `rule_id`) has also produced
@@ -186,18 +212,27 @@ impl PostgresStore {
         &self,
         request: SecurityAssessmentUpsert<'_>,
     ) -> Result<Uuid> {
+        let threat_intel_corroborated = request.threat_intel.is_some();
+        let threat_intel_source = request.threat_intel.as_ref().map(|hit| hit.source.as_str());
+        let threat_intel_confidence = request.threat_intel.as_ref().map(|hit| hit.confidence);
+        let threat_intel_indicator_last_seen =
+            request.threat_intel.as_ref().map(|hit| hit.last_seen);
         let mut tx = self.pool().begin().await?;
         let id: Uuid = sqlx::query_scalar(
             "INSERT INTO security_assessments \
              (id,rule_id,rule_version,engine_version,dedupe_key,resource,severity,confidence,\
               summary,event_count,window_seconds,bucket_start,first_seen,last_seen,\
-              threat_intel_corroborated) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) \
+              threat_intel_corroborated,threat_intel_source,threat_intel_confidence,\
+              threat_intel_indicator_last_seen) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) \
              ON CONFLICT (dedupe_key) DO UPDATE SET \
                severity=EXCLUDED.severity, confidence=EXCLUDED.confidence, \
                summary=EXCLUDED.summary, event_count=EXCLUDED.event_count, \
                last_seen=EXCLUDED.last_seen, \
                threat_intel_corroborated=EXCLUDED.threat_intel_corroborated, \
+               threat_intel_source=EXCLUDED.threat_intel_source, \
+               threat_intel_confidence=EXCLUDED.threat_intel_confidence, \
+               threat_intel_indicator_last_seen=EXCLUDED.threat_intel_indicator_last_seen, \
                updated_at=NOW() \
              RETURNING id",
         )
@@ -215,7 +250,10 @@ impl PostgresStore {
         .bind(request.bucket_start)
         .bind(request.first_seen)
         .bind(request.last_seen)
-        .bind(request.threat_intel_corroborated)
+        .bind(threat_intel_corroborated)
+        .bind(threat_intel_source)
+        .bind(threat_intel_confidence)
+        .bind(threat_intel_indicator_last_seen)
         .fetch_one(&mut *tx)
         .await?;
         for event_id in request.event_ids {
@@ -268,25 +306,10 @@ impl PostgresStore {
     }
 
     pub async fn list_security_assessments(&self, limit: i64) -> Result<Vec<SecurityAssessment>> {
-        #[allow(clippy::type_complexity)]
-        let rows = sqlx::query_as::<
-            _,
-            (
-                Uuid,
-                String,
-                String,
-                String,
-                i16,
-                String,
-                String,
-                i32,
-                DateTime<Utc>,
-                Option<Uuid>,
-                bool,
-            ),
-        >(
+        let rows = sqlx::query(
             "SELECT id,rule_id,rule_version,resource,confidence,severity,summary,event_count,\
-             bucket_start,incident_id,threat_intel_corroborated FROM security_assessments \
+             bucket_start,incident_id,threat_intel_corroborated,threat_intel_source,\
+             threat_intel_confidence,threat_intel_indicator_last_seen FROM security_assessments \
              ORDER BY bucket_start DESC LIMIT $1",
         )
         .bind(limit.clamp(1, 500))
@@ -294,33 +317,28 @@ impl PostgresStore {
         .await?;
         Ok(rows
             .into_iter()
-            .map(
-                |(
-                    id,
-                    rule_id,
-                    rule_version,
-                    resource,
-                    confidence,
-                    severity,
-                    summary,
-                    event_count,
-                    bucket_start,
-                    incident_id,
-                    threat_intel_corroborated,
-                )| SecurityAssessment {
-                    id,
-                    rule_id,
-                    rule_version,
-                    resource,
-                    severity,
-                    confidence,
-                    summary,
-                    event_count,
-                    bucket_start,
-                    incident_id,
-                    threat_intel_corroborated,
-                },
-            )
+            .map(|row| {
+                let threat_intel_source: Option<String> = row.get("threat_intel_source");
+                let threat_intel = threat_intel_source.map(|source| crate::IpReputationHit {
+                    source,
+                    confidence: row.get("threat_intel_confidence"),
+                    last_seen: row.get("threat_intel_indicator_last_seen"),
+                });
+                SecurityAssessment {
+                    id: row.get("id"),
+                    rule_id: row.get("rule_id"),
+                    rule_version: row.get("rule_version"),
+                    resource: row.get("resource"),
+                    severity: row.get("severity"),
+                    confidence: row.get("confidence"),
+                    summary: row.get("summary"),
+                    event_count: row.get("event_count"),
+                    bucket_start: row.get("bucket_start"),
+                    incident_id: row.get("incident_id"),
+                    threat_intel_corroborated: row.get("threat_intel_corroborated"),
+                    threat_intel,
+                }
+            })
             .collect())
     }
 }

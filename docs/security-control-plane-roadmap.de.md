@@ -686,7 +686,21 @@ Ziel: die vor Gate 7C verpflichtenden Mindestprüfungen vertiefen und externe
 Reputation, lokales Verhalten und Historie nachvollziehbar zusammenführen.
 
 - vorhandene Provider um Freshness, Provenance und Confidence pro Assessment
-  ergänzen
+  ergänzen (**erledigt, Migration `0044`**: `lookup_ip_reputation` prüft
+  jetzt ALLE ingestierten Provider statt nur Spamhaus (Nicht-IP-Indikator-
+  Typen der anderen Provider matchen die IP/Prefix-Form ohnehin nie, daher
+  ungefährlich zu verbreitern); bei mehreren Treffern gewinnt der mit der
+  höchsten Confidence (Tie-Break: zuletzt bestätigt). `security_assessments`
+  trägt jetzt `threat_intel_source`/`threat_intel_confidence`/
+  `threat_intel_indicator_last_seen` (alle-oder-keiner per CHECK-Constraint)
+  statt nur eines bool'schen Flags. `clawforge-policy-engine` zählt einen
+  Treffer nur noch als echte zweite Evidence-Quelle, wenn er frisch UND
+  hinreichend confident ist (`threat_intel_hit_is_corroborating`,
+  Standard-Schwellen 7 Tage/Confidence 50, beide per Env konfigurierbar,
+  ein `last_seen` aus der Zukunft wird explizit abgelehnt statt als
+  unendlich frisch behandelt) - das ist die konkrete Umsetzung des
+  Exit-Gates dieser Phase. Siehe `docs/policy-engine.md`s "Freshness,
+  provenance and confidence"-Abschnitt.)
 - lokale IP-/ASN-/Angriffshistorie als zeitlich abklingendes Signal verwenden
 - Konflikte, Ausfälle und veraltete Feeds sichtbar machen
 - Datenschutz und Aufbewahrung für Identifikatoren festlegen
