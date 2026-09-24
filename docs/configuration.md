@@ -39,7 +39,7 @@
 | `CLAWFORGE_EVENTS_POLL_SECONDS` | `5` | Event-backbone polling interval |
 | `CLAWFORGE_INCIDENT_POLL_SECONDS` | `5` | Candidate-to-incident promotion interval |
 | `CLAWFORGE_RIPESTAT_RESOURCE` | `AS3333` | ASN resource for RIPEstat |
-| `CLAWFORGE_BGPVIEW_RESOURCE` | `3333` | ASN resource for BGPView |
+| `CLAWFORGE_HACKERTARGET_RESOURCE` | `3333` | ASN resource for HackerTarget ASlookup (replaced BGPView - `api.bgpview.io` stopped resolving entirely) |
 | `CLAWFORGE_PEERINGDB_RESOURCE` | `3333` | ASN resource for PeeringDB |
 | `CLAWFORGE_CAIDA_RESOURCE` | `3333` | ASN resource for CAIDA AS Rank |
 | `CLAWFORGE_TEAM_CYMRU_RESOURCE` | `8.8.8.8` | IP lookup resource for Team Cymru |

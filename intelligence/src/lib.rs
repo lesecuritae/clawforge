@@ -642,6 +642,7 @@ enum NetworkFormat {
     BgpJson,
     RpkiJson,
     CymruText,
+    HackerTargetAsn,
 }
 
 #[derive(Clone)]
@@ -738,7 +739,10 @@ impl NetworkHttpProvider {
                 "network response exceeds 50 MiB".to_string(),
             ));
         }
-        if matches!(self.format, NetworkFormat::CymruText) {
+        if matches!(
+            self.format,
+            NetworkFormat::CymruText | NetworkFormat::HackerTargetAsn
+        ) {
             std::str::from_utf8(&feed.body).map_err(|error| {
                 ProviderError::Validation(format!("invalid text encoding: {error}"))
             })?;
@@ -773,6 +777,9 @@ impl NetworkHttpProvider {
             }
             NetworkFormat::CymruText => {
                 normalize_cymru_text(&feed.body, &self.provider, feed.fetched_at)
+            }
+            NetworkFormat::HackerTargetAsn => {
+                normalize_hackertarget_asn(&feed.body, &self.provider, feed.fetched_at)
             }
         }
     }
@@ -1126,6 +1133,97 @@ fn normalize_cymru_text(
     })
 }
 
+/// A single unquoted, comma-separated line split respecting `"..."` quoted
+/// fields - `hackertarget.com`'s ASlookup response embeds a comma inside
+/// its own quoted name field (`"<asn>","<name>, <country>"`), so a naive
+/// `split(',')` would wrongly cut that field in two.
+fn parse_quoted_csv_line(line: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    for character in line.chars() {
+        match character {
+            '"' => in_quotes = !in_quotes,
+            ',' if !in_quotes => fields.push(std::mem::take(&mut current)),
+            _ => current.push(character),
+        }
+    }
+    fields.push(current);
+    fields
+}
+
+/// `hackertarget.com`'s free ASlookup API - the replacement for the former
+/// `bgpview_asn` provider (`api.bgpview.io` stopped resolving entirely,
+/// found live: not just the `/asn/{id}` endpoint but the bare `bgpview.io`
+/// domain itself has no DNS records at all, an external, unfixable outage,
+/// not a Clawforge-side bug). Chosen over other candidates tried live from
+/// the actual worker container (not a possibly-filtered local resolver):
+/// `ipinfo.io` returned nothing, `bgp.tools`'s REST-looking guesses 404'd
+/// (its documented automatable interface is WHOIS, not HTTP JSON, a
+/// different `NetworkProvider` shape this crate does not have yet);
+/// `hackertarget.com` actually answered, and with more than `bgpview.io`
+/// ever gave - the ASN's real announced prefixes, not just its name.
+///
+/// Response shape (plain text, not JSON - hence `NetworkFormat::CymruText`'s
+/// sibling `HackerTargetAsn`, not `AsnJson`):
+/// ```text
+/// "3333","RIPE-NCC-AS Reseaux IP Europeens Network Coordination Centre RIPE NCC, NL"
+/// 2001:67c:2e8::/48
+/// 193.0.20.0/23
+/// ...
+/// ```
+/// A failed lookup (unknown ASN, or HackerTarget's own free-tier rate limit)
+/// answers with plain, unquoted error text instead - the leading `"` is
+/// what tells the two apart without needing to pattern-match specific
+/// error strings that could change upstream.
+fn normalize_hackertarget_asn(
+    body: &[u8],
+    provider: &Provider,
+    fetched_at: DateTime<Utc>,
+) -> Result<NetworkBatch, ProviderError> {
+    let text = std::str::from_utf8(body).map_err(|error| {
+        ProviderError::Validation(format!("invalid HackerTarget text: {error}"))
+    })?;
+    let mut lines = text.lines().filter(|line| !line.trim().is_empty());
+    let Some(header) = lines.next() else {
+        return Ok(NetworkBatch::default());
+    };
+    if !header.trim_start().starts_with('"') {
+        return Err(ProviderError::Validation(format!(
+            "HackerTarget ASN lookup failed: {}",
+            header.trim()
+        )));
+    }
+    let fields = parse_quoted_csv_line(header);
+    let Some(asn) = fields.first().and_then(|value| normalize_asn(value)) else {
+        return Ok(NetworkBatch::default());
+    };
+    let (name, country) = match fields.get(1) {
+        Some(value) => match value.rsplit_once(", ") {
+            Some((name, country)) => (name.trim().to_string(), country.trim().to_string()),
+            None => (value.trim().to_string(), String::new()),
+        },
+        None => (String::new(), String::new()),
+    };
+    let prefixes: Vec<String> = lines.map(|line| line.trim().to_string()).collect();
+    Ok(NetworkBatch {
+        asn_records: vec![AsnRecord {
+            asn,
+            organisation: name.clone(),
+            name,
+            provider: provider.id.clone(),
+            country,
+            registry: String::new(),
+            prefixes,
+            network_type: "unknown".to_string(),
+            reputation: 0,
+            first_seen: fetched_at,
+            last_seen: fetched_at,
+        }],
+        ..NetworkBatch::default()
+    })
+}
+
 macro_rules! define_network_provider {
     ($name:ident, $id:literal, $display:literal, $source:literal, $template:literal, $resource_env:literal, $default:literal, $interval:expr, $confidence:expr, $format:expr) => {
         pub struct $name(NetworkHttpProvider);
@@ -1183,16 +1281,16 @@ define_network_provider!(
     NetworkFormat::AsnJson
 );
 define_network_provider!(
-    BgpViewProvider,
-    "bgpview_asn",
-    "BGPView ASN",
-    "BGPView",
-    "https://api.bgpview.io/asn/{resource}",
-    "CLAWFORGE_BGPVIEW_RESOURCE",
+    HackerTargetProvider,
+    "hackertarget_asn",
+    "HackerTarget ASN",
+    "HackerTarget",
+    "https://api.hackertarget.com/aslookup/?q=AS{resource}",
+    "CLAWFORGE_HACKERTARGET_RESOURCE",
     "3333",
     3600,
     70,
-    NetworkFormat::AsnJson
+    NetworkFormat::HackerTargetAsn
 );
 define_network_provider!(
     PeeringDbProvider,
@@ -1282,7 +1380,7 @@ define_network_provider!(
 pub fn network_providers() -> Result<Vec<Box<dyn NetworkProvider>>, ProviderError> {
     Ok(vec![
         Box::new(RipeStatProvider::new()?),
-        Box::new(BgpViewProvider::new()?),
+        Box::new(HackerTargetProvider::new()?),
         Box::new(PeeringDbProvider::new()?),
         Box::new(CaidaProvider::new()?),
         Box::new(TeamCymruProvider::new()?),
@@ -1678,7 +1776,7 @@ mod provider_tests {
 
     #[test]
     fn network_provider_rejects_empty_or_malformed_records() {
-        let provider = BgpViewProvider::with_resource("3333").unwrap();
+        let provider = RipeStatProvider::with_resource("AS3333").unwrap();
         let empty = RawFeed {
             body: br#"{"data":[]}"#.to_vec(),
             content_type: Some("application/json".into()),
@@ -1690,6 +1788,43 @@ mod provider_tests {
             ..empty
         };
         assert!(provider.validate(&malformed).is_err());
+    }
+
+    #[test]
+    fn hackertarget_asn_parses_the_quoted_name_and_prefix_list() {
+        let provider = HackerTargetProvider::with_resource("3333").unwrap();
+        let feed = RawFeed {
+            body: b"\"3333\",\"RIPE-NCC-AS Reseaux IP Europeens Network Coordination Centre RIPE NCC, NL\"\n2001:67c:2e8::/48\n193.0.20.0/23\n193.0.0.0/21\n".to_vec(),
+            content_type: Some("text/plain".into()),
+            fetched_at: Utc::now(),
+        };
+        provider.validate(&feed).unwrap();
+        let batch = provider.normalize(&feed).unwrap();
+        assert_eq!(batch.asn_records.len(), 1);
+        let record = &batch.asn_records[0];
+        assert_eq!(record.asn, "AS3333");
+        assert_eq!(
+            record.name,
+            "RIPE-NCC-AS Reseaux IP Europeens Network Coordination Centre RIPE NCC"
+        );
+        assert_eq!(record.country, "NL");
+        assert_eq!(
+            record.prefixes,
+            vec!["2001:67c:2e8::/48", "193.0.20.0/23", "193.0.0.0/21"]
+        );
+    }
+
+    #[test]
+    fn hackertarget_asn_rejects_an_unquoted_error_response() {
+        // HackerTarget answers a bad ASN or its own rate limit with plain,
+        // unquoted error text rather than an HTTP error status.
+        let provider = HackerTargetProvider::with_resource("3333").unwrap();
+        let feed = RawFeed {
+            body: b"error check your search parameter".to_vec(),
+            content_type: Some("text/plain".into()),
+            fetched_at: Utc::now(),
+        };
+        assert!(provider.validate(&feed).is_err());
     }
 
     #[test]
