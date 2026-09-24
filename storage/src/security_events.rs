@@ -14,6 +14,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use clawforge_security_events::{SecurityEventEvidence, SecurityEventType, SensorEnvelope};
 use sqlx::Row;
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::{pseudonymize_correlation_id, PostgresStore};
@@ -365,6 +366,43 @@ impl PostgresStore {
         }))
     }
 
+    /// The one, deliberately narrow exception to this codebase's
+    /// fail-closed "never persist a raw IP" rule - see
+    /// `security_ip_resolutions`'s own migration comment for the full
+    /// reasoning. Only ever called by `record_security_event`, only after
+    /// `lookup_ip_reputation` already found `raw_ip` independently
+    /// known-bad. `pseudonym` is the already-pseudonymized resource (the
+    /// key a future firewall-agent apply step would look this up by,
+    /// never the raw IP itself), and the row expires after a short, fixed
+    /// TTL (`CLAWFORGE_IP_RESOLUTION_TTL_SECONDS`, default 24h) regardless
+    /// of how many times it is refreshed - an upsert extends the TTL
+    /// window but never accumulates history.
+    pub async fn upsert_ip_resolution(
+        &self,
+        pseudonym: &str,
+        raw_ip: &str,
+        source: &str,
+    ) -> Result<()> {
+        let ttl_seconds: i64 = std::env::var("CLAWFORGE_IP_RESOLUTION_TTL_SECONDS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(86_400);
+        sqlx::query(
+            "INSERT INTO security_ip_resolutions (pseudonym,raw_ip,source,expires_at) \
+             VALUES ($1,$2,$3,NOW() + ($4 * INTERVAL '1 second')) \
+             ON CONFLICT (pseudonym) DO UPDATE SET \
+               raw_ip=EXCLUDED.raw_ip, source=EXCLUDED.source, expires_at=EXCLUDED.expires_at",
+        )
+        .bind(pseudonym)
+        .bind(raw_ip)
+        .bind(source)
+        .bind(ttl_seconds)
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
+
     pub async fn record_security_event(
         &self,
         sensor_id: Uuid,
@@ -456,6 +494,34 @@ impl PostgresStore {
             // draws between what a rule may group by and what it may see.
             metadata["threat_intel_hit"] = serde_json::json!(true);
             metadata["threat_intel_source"] = serde_json::json!(hit.source);
+        }
+        // The one, deliberately narrow exception to "never persist a raw
+        // IP" in this codebase - see security_ip_resolutions's own
+        // migration comment. Written for every security event, not only a
+        // reputation hit: corroboration (what makes a block reachable at
+        // all) can also come from two *behavioral* rules firing for the
+        // same source - a plain ssh_bruteforce first, then later the same
+        // source starts an http_scan - with no threat-intel hit involved
+        // at either point individually. By the time that combination is
+        // recognized (clawforge-security-engine, working only from
+        // pseudonyms, never sees a raw IP itself), the resolution has to
+        // already exist or a later block can never be rendered against a
+        // real address. The short, fixed TTL (refreshed on every new event
+        // from the same source, so sustained activity stays resolvable
+        // and a one-off stays short-lived) and the "never appears in a
+        // rendered receipt, only resolved just-in-time by a real apply
+        // step" rule (not built yet) are what keep this from being a
+        // blanket raw-IP log despite covering every event. Best-effort:
+        // a failure here must never fail recording the security event.
+        let resolution_source = reputation
+            .as_ref()
+            .map(|hit| hit.source.as_str())
+            .unwrap_or("sensor_observed");
+        if let Err(error) = self
+            .upsert_ip_resolution(&resource, &envelope.resource, resolution_source)
+            .await
+        {
+            warn!(%error, "could not persist short-TTL IP resolution");
         }
         // Fan this out onto the canonical event bus - exactly once, only for
         // a genuinely new row (the ON CONFLICT/dedupe-hit path above already

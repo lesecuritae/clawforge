@@ -263,23 +263,65 @@ Ziel: sichere Ausführungsplattform, zunächst vollständig im Dry-Run.
 Arbeitspakete:
 
 - `clawforge-firewall-agent` mit typisiertem Adaptervertrag erstellen
+  (**erledigt, als Bibliotheks-Crate ohne laufenden Dienst** - siehe
+  `docs/firewall-agent.md`: `FirewallAdapter`-Trait mit `preflight`/
+  `render`; kein `apply` existiert. Anbindung an den Executor-Dispatch
+  noch offen.)
 - Action Receipt, Preflight, Istzustand, Verification, TTL und konkreten
-  Rollback persistieren
+  Rollback persistieren (**teilweise**: Tabelle `firewall_action_receipts`
+  (Migration `0036`) fuer Preflight/gerenderte Kommandos/TTL/Rollback-Plan
+  angelegt - wird noch nicht befuellt, da kein `apply` existiert, das
+  etwas zu persistieren haette.)
 - Idempotency, Lease, Retry, Timeout und Recovery des vorhandenen Executors
-  integrieren
+  integrieren (**bereits vorhanden**, unveraendert genutzt: `execution_requests`/
+  `execution_leases`/`execution_recovery` mit DB-Trigger-gestuetzten
+  Status-Uebergaengen, Ablaufdatum-gebundener Freigabe-Hash - das war schon
+  vor dieser Phase gebaut, hier nur wiederverwendet, nicht neu erstellt.)
 - nftables-Adapter mit exklusiver Clawforge-Tabelle/-Chain implementieren
   und ausschließlich ein vorprovisioniertes Set verwalten lassen
-- HAProxy-Adapter für Maps/ACLs und Rate-Limits implementieren
-- Tailscale zunächst nur als freigabepflichtigen Adapter vorbereiten
+  (**erledigt fuer Preflight/Render**: `NftablesAdapter` rendert nur
+  `nft add/delete element inet clawforge blocklist {...}` - nie eine neue
+  Regel, nur Mitgliedschaft in einem vorab vom Betreiber angelegten Set.
+  Zwei Zieltypen: `ThreatIntelIndicator` (rohe, bereits oeffentliche
+  CIDR/IP aus `indicators`) und `IncidentSource` (pseudonymisierte
+  Resource - render loest NIE zur echten IP auf, nur ein
+  `<resolved-at-apply-time:...>`-Platzhalter). Registriert, aber
+  deaktiviert (`enabled=FALSE`), wie jede andere Connector-Action seit
+  Migration `0027`.)
+- HAProxy-Adapter für Maps/ACLs und Rate-Limits implementieren (noch offen)
+- Tailscale zunächst nur als freigabepflichtigen Adapter vorbereiten (noch offen)
+
+**Wichtiger Nebenbefund waehrend dieser Phase**: die bestehende
+Fail-closed-Pseudonymisierung (Nutzerentscheidung aus Empfehlung 5) macht
+"sperre die Quelle von Incident X" grundsaetzlich unmoeglich, da die rohe
+IP nirgends mehr auffindbar ist. Nutzerentscheidung dazu (explizit
+gefragt): NEUE, eng begrenzte Tabelle `security_ip_resolutions` (Migration
+`0036`) - kurze, feste TTL (Default 24h), wird bei JEDEM aufgezeichneten
+Security-Event befuellt (nicht nur bei einem Threat-Intel-Treffer, weil
+auch eine Kombination aus zwei unabhaengigen VERHALTENS-Regeln - z. B.
+`ssh_bruteforce` dann spaeter `http_scan` von derselben Quelle -
+korrobieren kann, ganz ohne externen Reputationstreffer; siehe
+`docs/policy-engine.md`s zweiten Korrobierungs-Pfad,
+`resource_has_other_rule_assessment`). Eine aufgeloeste IP wird nie in
+einen Receipt geschrieben, nur just-in-time durch einen echten
+Apply-Schritt (existiert noch nicht) genutzt.
 
 Pflichtgates vor der ersten verändernden Lab-Testaktion:
 
-- PostgreSQL-Migrationstest läuft in CI und ist nicht ignoriert
+- PostgreSQL-Migrationstest läuft in CI und ist nicht ignoriert (**erfuellt**,
+  wie fuer jede Migration in diesem Repo seit Projektbeginn)
 - Executor besitzt Unit-, Crash-/Restart-, Idempotency- und Rollbacktests
+  (**teilweise** - die bestehende Executor-Infrastruktur hat Idempotency-/
+  Freigabe-Tests; Crash-/Restart-/Rollback-Tests speziell fuer einen
+  Adapter-Dispatch existieren noch nicht, da kein Dispatch existiert)
 - Action API und Adapter bestehen Fuzz-/Negativtests und Command-Injection-
-  Review; es existiert keine freie Shell
+  Review; es existiert keine freie Shell (**teilweise**: Negativtests fuer
+  `NftablesAdapter` vorhanden (ungueltige CIDR, leere Quelle, Shell-Metazeichen
+  als Zieltext), jede Kommandokonstruktion nutzt `tokio::process::Command`
+  mit explizitem Argv statt Shell-String. Systematisches Fuzzing noch offen.)
 - isoliertes Netzwerk-Lab bestätigt, dass Allowlist und Managementzugang nicht
-  gesperrt werden können
+  gesperrt werden können (**noch offen** - braucht echte Lab-Infrastruktur,
+  bewusst nicht ohne Nutzerbeteiligung angegangen)
 - Break-glass-Verfahren und manuelles Entfernen aller Clawforge-Regeln sind
   dokumentiert und geprobt
 - Failure-Injection deckt Prozess-/Host-/DB-Ausfall zwischen Intent, Apply,

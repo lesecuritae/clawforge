@@ -112,6 +112,32 @@ impl PostgresStore {
         .await?)
     }
 
+    /// Whether some *other* rule (a different `rule_id`) has also produced
+    /// an assessment for this same `resource` recently (`bucket_start >=
+    /// since`) - independent behavioral corroboration, the second kind
+    /// alongside `threat_intel_corroborated`: a source that first tripped
+    /// `ssh_bruteforce` and later, separately, `http_scan` is corroborated
+    /// by two independent detections even with no external reputation hit
+    /// involved in either one. Used by `clawforge-policy-engine` to decide
+    /// `evidence_sources`, not by `clawforge-security-engine` itself - a
+    /// rule's own assessment never needs to know about a different rule.
+    pub async fn resource_has_other_rule_assessment(
+        &self,
+        resource: &str,
+        exclude_rule_id: &str,
+        since: DateTime<Utc>,
+    ) -> Result<bool> {
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM security_assessments \
+             WHERE resource=$1 AND rule_id<>$2 AND bucket_start>=$3)",
+        )
+        .bind(resource)
+        .bind(exclude_rule_id)
+        .bind(since)
+        .fetch_one(self.pool())
+        .await?)
+    }
+
     /// Same bucket membership as `list_events_for_bucket`, plus one evidence
     /// field's value per event (`payload->>field`) - what a distinct-value
     /// rule (a scan: many different paths probed, not just many hits) needs

@@ -362,6 +362,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "clawforge-firewall-agent"
+version = "1.0.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "serde_json",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "clawforge-haproxy-sensor"
 version = "1.0.0"
 dependencies = [

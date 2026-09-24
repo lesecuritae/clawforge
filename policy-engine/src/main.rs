@@ -49,17 +49,46 @@ use sha2::{Digest, Sha256};
 use std::env;
 use tracing::{info, warn};
 
+/// How far back a *different* rule's assessment for the same resource
+/// still counts as independent corroboration - matches
+/// `clawforge-security-engine`'s own `CANDIDATE_EXTENSION_WINDOW` (an
+/// attacker rarely confines every kind of misbehavior to one detection
+/// window; this is the same "still the same ongoing episode" horizon,
+/// not a second, unrelated constant that could drift from it).
+const CROSS_RULE_CORROBORATION_WINDOW: chrono::Duration = chrono::Duration::hours(1);
+
 /// Every assessment has at least one evidence source: the behavioral rule
-/// that produced it. A second, independent one - threat-intel
-/// corroboration, see the module doc comment - raises this to 2, which is
+/// that produced it. A second, independent one raises this to 2, which is
 /// what `clawforge_policy::decide` requires before it will ever return
-/// `Block`.
-fn evidence_sources_for(assessment: &clawforge_storage::SecurityAssessment) -> i16 {
+/// `Block` - two different shapes of it exist:
+///
+/// - **Threat-intel corroboration**: the source is independently listed by
+///   an external reputation feed (`threat_intel_corroborated`).
+/// - **Cross-rule corroboration**: a *different* rule has also produced an
+///   assessment for the same resource recently - a source that first
+///   tripped `ssh_bruteforce` and later, separately, `http_scan` is
+///   corroborated by two independent detections even with no external
+///   reputation hit involved in either one
+///   (`resource_has_other_rule_assessment`). This is exactly why
+///   `record_security_event` retains a short-TTL raw-IP resolution for
+///   *every* event, not only a reputation hit: this combination has to be
+///   resolvable to a real address later too, and `clawforge-security-engine`
+///   (which only ever sees pseudonyms) cannot be the one to retain it.
+async fn evidence_sources_for(
+    store: &PostgresStore,
+    assessment: &clawforge_storage::SecurityAssessment,
+) -> Result<i16> {
     if assessment.threat_intel_corroborated {
-        2
-    } else {
-        1
+        return Ok(2);
     }
+    let since = chrono::Utc::now() - CROSS_RULE_CORROBORATION_WINDOW;
+    if store
+        .resource_has_other_rule_assessment(&assessment.resource, &assessment.rule_id, since)
+        .await?
+    {
+        return Ok(2);
+    }
+    Ok(1)
 }
 
 /// `security_assessments.confidence` (0-99, `security-engine`'s own scale)
@@ -117,7 +146,7 @@ async fn evaluate_assessment(
     let policies = store
         .list_active_security_policies_for_rule(&assessment.rule_id, chrono::Utc::now())
         .await?;
-    let evidence_sources = evidence_sources_for(assessment);
+    let evidence_sources = evidence_sources_for(store, assessment).await?;
     for policy in policies {
         if !min_severity_met(&assessment.severity, &policy.min_severity) {
             continue;
@@ -279,13 +308,20 @@ mod tests {
         assert!(outcome.corroborated);
     }
 
-    #[test]
-    fn evidence_sources_for_reflects_threat_intel_corroboration() {
+    #[tokio::test]
+    #[ignore = "requires provisioned roles in an isolated PostgreSQL test container"]
+    async fn evidence_sources_for_reflects_threat_intel_corroboration() -> Result<()> {
+        // threat_intel_corroborated=true returns before ever touching the
+        // store, but the function's signature still needs a real one to
+        // call it at all - connect once and reuse it for both cases.
+        let store =
+            PostgresStore::connect_runtime(&env::var("CLAWFORGE_TEST_POLICY_ENGINE_DATABASE_URL")?)
+                .await?;
         let base = clawforge_storage::SecurityAssessment {
             id: uuid::Uuid::new_v4(),
-            rule_id: "ssh_bruteforce".to_string(),
+            rule_id: format!("test-rule-{}", uuid::Uuid::new_v4()),
             rule_version: "1".to_string(),
-            resource: "ip-pseudonym:test".to_string(),
+            resource: format!("ip-pseudonym:test-{}", uuid::Uuid::new_v4()),
             severity: "critical".to_string(),
             confidence: 99,
             summary: String::new(),
@@ -294,12 +330,94 @@ mod tests {
             incident_id: None,
             threat_intel_corroborated: false,
         };
-        assert_eq!(evidence_sources_for(&base), 1);
+        assert_eq!(evidence_sources_for(&store, &base).await?, 1);
         let corroborated = clawforge_storage::SecurityAssessment {
             threat_intel_corroborated: true,
             ..base
         };
-        assert_eq!(evidence_sources_for(&corroborated), 2);
+        assert_eq!(evidence_sources_for(&store, &corroborated).await?, 2);
+        Ok(())
+    }
+
+    /// Proves the second, non-threat-intel corroboration path against real
+    /// PostgreSQL: the exact scenario that motivated it - a source that
+    /// first trips one rule (ssh_bruteforce) and, separately, later trips a
+    /// *different* rule (http_scan) on the same resource is corroborated
+    /// by that combination alone, with no external reputation hit involved
+    /// in either detection.
+    #[tokio::test]
+    #[ignore = "requires provisioned roles in an isolated PostgreSQL test container"]
+    async fn two_different_rules_on_the_same_resource_corroborate_each_other() -> Result<()> {
+        let owner_url = env::var("CLAWFORGE_TEST_DATABASE_URL")?;
+        let owner = PostgresStore::connect_runtime(&owner_url).await?;
+        let store =
+            PostgresStore::connect_runtime(&env::var("CLAWFORGE_TEST_POLICY_ENGINE_DATABASE_URL")?)
+                .await?;
+
+        let resource = format!("ip-pseudonym:test-{}", uuid::Uuid::new_v4());
+        let now = chrono::Utc::now();
+
+        async fn seed_assessment(
+            owner: &PostgresStore,
+            resource: &str,
+            rule_id: &str,
+            now: chrono::DateTime<chrono::Utc>,
+        ) -> Result<()> {
+            let dedupe_key = format!("{rule_id}:v1:{resource}:{}", now.timestamp());
+            owner
+                .persist_security_assessment(clawforge_storage::SecurityAssessmentUpsert {
+                    rule_id,
+                    rule_version: "1",
+                    engine_version: "test",
+                    dedupe_key: &dedupe_key,
+                    resource,
+                    severity: "critical",
+                    confidence: 90,
+                    summary: "test fixture",
+                    event_count: 10,
+                    window_seconds: 300,
+                    bucket_start: now,
+                    first_seen: now,
+                    last_seen: now,
+                    event_ids: &[],
+                    threat_intel_corroborated: false,
+                })
+                .await?;
+            Ok(())
+        }
+
+        // Only ssh_bruteforce has fired so far - one evidence source, no
+        // corroboration yet.
+        seed_assessment(&owner, &resource, "ssh_bruteforce", now).await?;
+        let ssh_only = clawforge_storage::SecurityAssessment {
+            id: uuid::Uuid::new_v4(),
+            rule_id: "ssh_bruteforce".to_string(),
+            rule_version: "1".to_string(),
+            resource: resource.clone(),
+            severity: "critical".to_string(),
+            confidence: 90,
+            summary: String::new(),
+            event_count: 10,
+            bucket_start: now,
+            incident_id: None,
+            threat_intel_corroborated: false,
+        };
+        assert_eq!(
+            evidence_sources_for(&store, &ssh_only).await?,
+            1,
+            "one rule alone must not be corroborated"
+        );
+
+        // The same source separately trips http_scan too, later.
+        let later = now + chrono::Duration::minutes(10);
+        seed_assessment(&owner, &resource, "http_scan", later).await?;
+        assert_eq!(
+            evidence_sources_for(&store, &ssh_only).await?,
+            2,
+            "a second, independent rule on the same resource must corroborate the first"
+        );
+
+        Ok(())
     }
 
     #[test]
