@@ -26,6 +26,7 @@ docker run --rm \
 
     export CLAWFORGE_HAPROXY_ADMIN_SOCKET=/tmp/clawforge-haproxy-admin.sock
     export CLAWFORGE_HAPROXY_BLOCKLIST_ACL_FILE=/tmp/clawforge-blocklist.map
+    export CLAWFORGE_HAPROXY_RATE_LIMIT_TABLE=clawforge_ratelimit
     sh scripts/haproxy-clawforge-provision.sh
 
     cat > /tmp/clawforge-haproxy-test.cfg <<CFG
@@ -38,10 +39,16 @@ defaults
     timeout client 5s
     timeout server 5s
 
+backend ${CLAWFORGE_HAPROXY_RATE_LIMIT_TABLE}
+    stick-table type ip size 100k expire 1h store gpc0
+
 frontend clawforge_test
     bind 127.0.0.1:18080
     acl clawforge_blocked src -f ${CLAWFORGE_HAPROXY_BLOCKLIST_ACL_FILE}
     http-request deny if clawforge_blocked
+    http-request track-sc0 src table ${CLAWFORGE_HAPROXY_RATE_LIMIT_TABLE}
+    acl clawforge_flagged sc_get_gpc0(0) gt 0
+    http-request deny if clawforge_flagged
     default_backend clawforge_test_backend
 
 backend clawforge_test_backend

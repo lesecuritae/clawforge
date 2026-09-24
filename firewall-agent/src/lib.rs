@@ -590,6 +590,47 @@ pub trait FirewallAdapter: Send + Sync {
     async fn rollback(&self, action: &FirewallAction) -> Result<(), AdapterError>;
 }
 
+/// Refuses a target whose network overlaps the never-block exclusion list
+/// (loopback/link-local, plus an operator's own configured management/SSH
+/// range) - shared by every adapter's `render`/`apply` (`NftablesAdapter`,
+/// `HaproxyAdapter`, `HaproxyRateLimitAdapter`), each of which loads its
+/// own `never_block` field the same way via `never_block_list_from_env`
+/// and passes it in here, so the safety net is not something a new
+/// adapter can forget to wire up - called before either builds or runs
+/// anything. Not called by any adapter's `rollback`: removing an element
+/// from a blocklist is the safe direction and must always be allowed,
+/// including for something that should never have been added in the
+/// first place. `IncidentSource` (unresolved) has no address yet to
+/// check - it already fails closed for its own, independent reason
+/// wherever an address would be needed.
+fn check_never_block(
+    never_block: &Result<Vec<(IpAddr, u8)>, String>,
+    target: &FirewallTarget,
+) -> Result<(), AdapterError> {
+    let never_block = never_block.as_ref().map_err(|error| {
+        AdapterError::InvalidTarget(format!(
+            "never-block exclusion list is misconfigured, refusing every target until fixed: \
+             {error}"
+        ))
+    })?;
+    if matches!(target, FirewallTarget::IncidentSource { .. }) {
+        return Ok(());
+    }
+    let (addr, prefix) = target_address(target)?;
+    let prefix = prefix.unwrap_or_else(|| full_prefix(addr));
+    if never_block
+        .iter()
+        .any(|(net_addr, net_prefix)| ranges_overlap(*net_addr, *net_prefix, addr, prefix))
+    {
+        return Err(AdapterError::InvalidTarget(
+            "target overlaps a never-block exclusion (loopback/link-local or \
+             CLAWFORGE_FIREWALL_NEVER_BLOCK_CIDRS)"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 pub struct NftablesAdapter {
     /// `Err` once, at construction, if `CLAWFORGE_FIREWALL_NEVER_BLOCK_CIDRS`
     /// is set but malformed - see `never_block_list_from_env`'s own doc
@@ -603,40 +644,6 @@ impl NftablesAdapter {
         Self {
             never_block: never_block_list_from_env(),
         }
-    }
-
-    /// Refuses a target whose network overlaps the never-block exclusion
-    /// list (loopback/link-local, plus an operator's own configured
-    /// management/SSH range) - called by both `render` and `apply`,
-    /// before either builds or runs anything. Not called by `rollback`:
-    /// removing an element from the blocklist is the safe direction and
-    /// must always be allowed, including for something that should never
-    /// have been added in the first place. `IncidentSource` (unresolved)
-    /// has no address yet to check - it already fails closed for its own,
-    /// independent reason wherever an address would be needed.
-    fn check_never_block(&self, target: &FirewallTarget) -> Result<(), AdapterError> {
-        let never_block = self.never_block.as_ref().map_err(|error| {
-            AdapterError::InvalidTarget(format!(
-                "never-block exclusion list is misconfigured, refusing every target until \
-                 fixed: {error}"
-            ))
-        })?;
-        if matches!(target, FirewallTarget::IncidentSource { .. }) {
-            return Ok(());
-        }
-        let (addr, prefix) = target_address(target)?;
-        let prefix = prefix.unwrap_or_else(|| full_prefix(addr));
-        if never_block
-            .iter()
-            .any(|(net_addr, net_prefix)| ranges_overlap(*net_addr, *net_prefix, addr, prefix))
-        {
-            return Err(AdapterError::InvalidTarget(
-                "target overlaps a never-block exclusion (loopback/link-local or \
-                 CLAWFORGE_FIREWALL_NEVER_BLOCK_CIDRS)"
-                    .into(),
-            ));
-        }
-        Ok(())
     }
 
     /// The read-only command `preflight` runs - a pure function so the
@@ -741,7 +748,7 @@ impl FirewallAdapter for NftablesAdapter {
             ));
         }
         action.target.validate()?;
-        self.check_never_block(&action.target)?;
+        check_never_block(&self.never_block, &action.target)?;
         let element = element_reference(&action.target)?;
         let set_name = action
             .target
@@ -763,7 +770,7 @@ impl FirewallAdapter for NftablesAdapter {
         dry_run: bool,
     ) -> Result<ApplyResult, AdapterError> {
         action.target.validate()?;
-        self.check_never_block(&action.target)?;
+        check_never_block(&self.never_block, &action.target)?;
         let element = element_reference(&action.target)?;
         // Safe to persist - never the raw IP `element` resolves to for a
         // `ResolvedIncidentSource` (see `redacted_element_reference`'s own
@@ -927,6 +934,11 @@ fn haproxy_acl_contains_key(raw_response: &str, key: &str) -> bool {
 pub struct HaproxyAdapter {
     admin_socket: String,
     acl_file: String,
+    /// Same never-block exclusion list as `NftablesAdapter`, loaded the
+    /// same way - see `check_never_block`'s own doc comment for why this
+    /// is a field every adapter carries rather than a check only the
+    /// first adapter built happened to remember.
+    never_block: Result<Vec<(IpAddr, u8)>, String>,
 }
 
 impl HaproxyAdapter {
@@ -936,6 +948,7 @@ impl HaproxyAdapter {
                 .unwrap_or_else(|_| HAPROXY_DEFAULT_ADMIN_SOCKET.to_string()),
             acl_file: std::env::var("CLAWFORGE_HAPROXY_BLOCKLIST_ACL_FILE")
                 .unwrap_or_else(|_| HAPROXY_DEFAULT_BLOCKLIST_ACL_FILE.to_string()),
+            never_block: never_block_list_from_env(),
         }
     }
 
@@ -1008,6 +1021,7 @@ impl FirewallAdapter for HaproxyAdapter {
             ));
         }
         action.target.validate()?;
+        check_never_block(&self.never_block, &action.target)?;
         let element = element_reference(&action.target)?;
         Ok(FirewallActionReceipt {
             adapter: self.name(),
@@ -1026,6 +1040,7 @@ impl FirewallAdapter for HaproxyAdapter {
     ) -> Result<ApplyResult, AdapterError> {
         action.target.validate()?;
         require_resolved_target(&action.target)?;
+        check_never_block(&self.never_block, &action.target)?;
         let element = element_reference(&action.target)?;
         // Safe to persist - never the raw IP `element` resolves to for a
         // `ResolvedIncidentSource` (see `redacted_element_reference`'s own
@@ -1101,6 +1116,246 @@ impl FirewallAdapter for HaproxyAdapter {
         if !response.trim().is_empty() {
             return Err(AdapterError::Rollback(format!(
                 "haproxy runtime API rejected {delete:?}: {}",
+                response.trim()
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// The exclusively Clawforge-owned HAProxy stick-table - the "Rate-Limits"
+/// half of the roadmap's HAProxy adapter, a genuinely different mechanism
+/// from `HaproxyAdapter`'s ACL pattern file: a stick-table keys by
+/// source, storing a general-purpose counter (`gpc0`) per key, and an
+/// operator's own ACL denies traffic once that counter is non-zero. An
+/// operator adds *one* stick-table definition and ACL/action pair to
+/// whichever frontend(s) they want protected, ahead of time, out of band
+/// (see `scripts/haproxy-clawforge-provision.sh`); this adapter only ever
+/// sets or clears one key's `gpc0` via the Runtime API's `set table`/
+/// `clear table` commands, never touches `haproxy.cfg`.
+///
+/// Why `gpc0` and not a real rate counter (`http_req_rate`, ...): HAProxy
+/// computes a rate counter from a real sliding window of observed
+/// traffic - it is not a simple value this adapter could just set to
+/// "blocked" the way it can a general-purpose counter, and doing so
+/// reliably across HAProxy versions is not something this increment
+/// attempts. `gpc0` is the standard, version-stable mechanism for "flag
+/// this key for a policy decision", which is exactly what a
+/// Clawforge-driven block needs.
+pub const HAPROXY_DEFAULT_RATE_LIMIT_TABLE: &str = "clawforge_ratelimit";
+
+fn haproxy_show_table_command(table: &str) -> String {
+    format!("show table {table}")
+}
+
+fn haproxy_set_table_gpc0_command(table: &str, key: &str) -> String {
+    format!("set table {table} key {key} data.gpc0 1")
+}
+
+fn haproxy_clear_table_command(table: &str, key: &str) -> String {
+    format!("clear table {table} key {key}")
+}
+
+/// Whether `key` appears in a `show table <table>` response with a
+/// non-zero `gpc0` - HAProxy's own format is `key=<key> use=... exp=...
+/// gpc0=<n>` per matching line (exact field order/set varies by
+/// configured `store` options, so this scans whitespace-separated
+/// `key=value` tokens rather than assuming fixed positions).
+fn haproxy_table_key_is_flagged(raw_response: &str, key: &str) -> bool {
+    raw_response.lines().any(|line| {
+        let mut matches_key = false;
+        let mut gpc0_is_nonzero = false;
+        for field in line.split_whitespace() {
+            if let Some(value) = field.strip_prefix("key=") {
+                matches_key = value == key;
+            } else if let Some(value) = field.strip_prefix("gpc0=") {
+                gpc0_is_nonzero = value.parse::<u64>().is_ok_and(|n| n > 0);
+            }
+        }
+        matches_key && gpc0_is_nonzero
+    })
+}
+
+/// HAProxy stick-table adapter - the "Rate-Limits" half of
+/// [`FirewallAdapter`], alongside [`HaproxyAdapter`]'s "Maps/ACLs" half.
+/// Same target types, same command-construction safety properties (a
+/// `tokio::net::UnixStream` write, never a subprocess; `key` values are
+/// always already-validated IP/CIDR text, never free-form).
+pub struct HaproxyRateLimitAdapter {
+    admin_socket: String,
+    table: String,
+    /// Same never-block exclusion list as `NftablesAdapter`/
+    /// `HaproxyAdapter` - see `check_never_block`'s own doc comment.
+    never_block: Result<Vec<(IpAddr, u8)>, String>,
+}
+
+impl HaproxyRateLimitAdapter {
+    pub fn new() -> Self {
+        Self {
+            admin_socket: std::env::var("CLAWFORGE_HAPROXY_ADMIN_SOCKET")
+                .unwrap_or_else(|_| HAPROXY_DEFAULT_ADMIN_SOCKET.to_string()),
+            table: std::env::var("CLAWFORGE_HAPROXY_RATE_LIMIT_TABLE")
+                .unwrap_or_else(|_| HAPROXY_DEFAULT_RATE_LIMIT_TABLE.to_string()),
+            never_block: never_block_list_from_env(),
+        }
+    }
+
+    #[cfg(unix)]
+    async fn run_command(&self, command: &str) -> Result<String, String> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::UnixStream;
+        let mut stream = UnixStream::connect(&self.admin_socket)
+            .await
+            .map_err(|error| format!("connecting to {}: {error}", self.admin_socket))?;
+        stream
+            .write_all(command.as_bytes())
+            .await
+            .map_err(|error| error.to_string())?;
+        stream
+            .write_all(b"\n")
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut response = String::new();
+        stream
+            .read_to_string(&mut response)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(response)
+    }
+
+    #[cfg(not(unix))]
+    async fn run_command(&self, _command: &str) -> Result<String, String> {
+        Err("the HAProxy Runtime API requires a Unix domain socket".to_string())
+    }
+}
+
+impl Default for HaproxyRateLimitAdapter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl FirewallAdapter for HaproxyRateLimitAdapter {
+    fn name(&self) -> &'static str {
+        "haproxy_ratelimit"
+    }
+
+    async fn preflight(&self, target: &FirewallTarget) -> Result<Preflight, AdapterError> {
+        target.validate()?;
+        if matches!(target, FirewallTarget::IncidentSource { .. }) {
+            return Ok(Preflight {
+                already_blocked: false,
+                raw_set_json: String::new(),
+            });
+        }
+        let element = element_reference(target)?;
+        let response = self
+            .run_command(&haproxy_show_table_command(&self.table))
+            .await
+            .map_err(AdapterError::Preflight)?;
+        Ok(Preflight {
+            already_blocked: haproxy_table_key_is_flagged(&response, &element),
+            raw_set_json: response,
+        })
+    }
+
+    fn render(&self, action: &FirewallAction) -> Result<FirewallActionReceipt, AdapterError> {
+        if let FirewallTarget::ResolvedIncidentSource { .. } = &action.target {
+            return Err(AdapterError::InvalidTarget(
+                "a resolved incident source must never be rendered into a receipt".into(),
+            ));
+        }
+        action.target.validate()?;
+        check_never_block(&self.never_block, &action.target)?;
+        let element = element_reference(&action.target)?;
+        Ok(FirewallActionReceipt {
+            adapter: self.name(),
+            rendered_commands: vec![vec![haproxy_set_table_gpc0_command(&self.table, &element)]],
+            rollback_commands: vec![vec![haproxy_clear_table_command(&self.table, &element)]],
+            is_dry_run: true,
+            ttl_seconds: action.ttl_seconds,
+            target_fingerprint: element,
+        })
+    }
+
+    async fn apply(
+        &self,
+        action: &FirewallAction,
+        dry_run: bool,
+    ) -> Result<ApplyResult, AdapterError> {
+        action.target.validate()?;
+        require_resolved_target(&action.target)?;
+        check_never_block(&self.never_block, &action.target)?;
+        let element = element_reference(&action.target)?;
+        let receipt_element = redacted_element_reference(&action.target)?;
+        let set = haproxy_set_table_gpc0_command(&self.table, &element);
+        let receipt_set = haproxy_set_table_gpc0_command(&self.table, &receipt_element);
+        let receipt_clear = haproxy_clear_table_command(&self.table, &receipt_element);
+        if dry_run {
+            return Ok(ApplyResult {
+                receipt: FirewallActionReceipt {
+                    adapter: self.name(),
+                    rendered_commands: vec![vec![receipt_set]],
+                    rollback_commands: vec![vec![receipt_clear]],
+                    is_dry_run: true,
+                    ttl_seconds: action.ttl_seconds,
+                    target_fingerprint: receipt_element,
+                },
+                observed_state: None,
+            });
+        }
+        let response = self.run_command(&set).await.map_err(AdapterError::Apply)?;
+        if !response.trim().is_empty() {
+            return Err(AdapterError::Apply(format!(
+                "haproxy runtime API rejected {set:?}: {}",
+                response.trim()
+            )));
+        }
+        let listing = self
+            .run_command(&haproxy_show_table_command(&self.table))
+            .await
+            .map_err(AdapterError::Apply)?;
+        Ok(ApplyResult {
+            receipt: FirewallActionReceipt {
+                adapter: self.name(),
+                rendered_commands: vec![vec![receipt_set]],
+                rollback_commands: vec![vec![receipt_clear]],
+                is_dry_run: false,
+                ttl_seconds: action.ttl_seconds,
+                target_fingerprint: receipt_element,
+            },
+            observed_state: Some(listing),
+        })
+    }
+
+    async fn verify(&self, target: &FirewallTarget) -> Result<VerificationResult, AdapterError> {
+        target.validate()?;
+        require_resolved_target(target)?;
+        let element = element_reference(target)?;
+        let response = self
+            .run_command(&haproxy_show_table_command(&self.table))
+            .await
+            .map_err(AdapterError::Verify)?;
+        if haproxy_table_key_is_flagged(&response, &element) {
+            Ok(VerificationResult::Verified)
+        } else {
+            Ok(VerificationResult::NotPresent)
+        }
+    }
+
+    async fn rollback(&self, action: &FirewallAction) -> Result<(), AdapterError> {
+        action.target.validate()?;
+        require_resolved_target(&action.target)?;
+        let element = element_reference(&action.target)?;
+        let clear = haproxy_clear_table_command(&self.table, &element);
+        let response = self
+            .run_command(&clear)
+            .await
+            .map_err(AdapterError::Rollback)?;
+        if !response.trim().is_empty() {
+            return Err(AdapterError::Rollback(format!(
+                "haproxy runtime API rejected {clear:?}: {}",
                 response.trim()
             )));
         }
@@ -1402,6 +1657,111 @@ mod tests {
             ttl_seconds: 3600,
             reason: "test".into(),
         }
+    }
+
+    #[test]
+    fn haproxy_table_key_is_flagged_matches_a_nonzero_gpc0_for_the_right_key() {
+        let response =
+            "key=203.0.113.5 use=1 exp=59000 gpc0=1\nkey=203.0.113.6 use=1 exp=59000 gpc0=0\n";
+        assert!(haproxy_table_key_is_flagged(response, "203.0.113.5"));
+        assert!(
+            !haproxy_table_key_is_flagged(response, "203.0.113.6"),
+            "a zero gpc0 must not count as flagged"
+        );
+        assert!(
+            !haproxy_table_key_is_flagged(response, "203.0.113.7"),
+            "a key that isn't in the table at all must not count as flagged"
+        );
+    }
+
+    #[test]
+    fn haproxy_table_key_is_flagged_is_false_for_an_empty_response() {
+        assert!(!haproxy_table_key_is_flagged("", "203.0.113.5"));
+    }
+
+    #[test]
+    fn haproxy_ratelimit_render_embeds_the_real_cidr_and_never_resolves_an_incident_source() {
+        let adapter = HaproxyRateLimitAdapter::new();
+        let receipt = adapter
+            .render(&action_for(indicator("203.0.113.10")))
+            .unwrap();
+        assert_eq!(receipt.adapter, "haproxy_ratelimit");
+        let rendered = format!("{:?}", receipt.rendered_commands);
+        assert!(rendered.contains("set table"));
+        assert!(rendered.contains("data.gpc0"));
+        assert!(rendered.contains("203.0.113.10"));
+
+        let incident_receipt = adapter
+            .render(&action_for(FirewallTarget::IncidentSource {
+                pseudonym: "ip-pseudonym:deadbeef".into(),
+            }))
+            .unwrap();
+        let rendered = format!("{:?}", incident_receipt.rendered_commands);
+        assert!(rendered.contains("<resolved-at-apply-time:"));
+        assert!(rendered.contains("ip-pseudonym:deadbeef"));
+    }
+
+    #[test]
+    fn haproxy_ratelimit_render_refuses_a_resolved_incident_source_outright() {
+        let adapter = HaproxyRateLimitAdapter::new();
+        let action = action_for(FirewallTarget::ResolvedIncidentSource {
+            raw_ip: "203.0.113.10".into(),
+            pseudonym: "ip-pseudonym:deadbeef".into(),
+        });
+        assert!(adapter.render(&action).is_err());
+    }
+
+    #[tokio::test]
+    async fn haproxy_ratelimit_apply_verify_rollback_all_refuse_an_unresolved_incident_source() {
+        let adapter = HaproxyRateLimitAdapter::new();
+        let action = action_for(FirewallTarget::IncidentSource {
+            pseudonym: "ip-pseudonym:never-resolved".into(),
+        });
+        assert!(adapter.apply(&action, true).await.is_err());
+        assert!(adapter.verify(&action.target).await.is_err());
+        assert!(adapter.rollback(&action).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn haproxy_ratelimit_apply_with_dry_run_never_touches_the_socket() {
+        // No CLAWFORGE_HAPROXY_ADMIN_SOCKET set, no haproxy running here -
+        // a dry-run apply must still succeed, proving it never actually
+        // connects to the admin socket. No other test in this binary sets
+        // this specific env var.
+        std::env::remove_var("CLAWFORGE_HAPROXY_ADMIN_SOCKET");
+        let adapter = HaproxyRateLimitAdapter::new();
+        let result = adapter
+            .apply(&action_for(indicator("203.0.113.10")), true)
+            .await;
+        assert!(
+            result.is_ok(),
+            "dry-run apply must not need a real socket: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn haproxy_ratelimit_apply_receipt_never_embeds_the_resolved_raw_ip() {
+        let adapter = HaproxyRateLimitAdapter::new();
+        let action = FirewallAction {
+            target: FirewallTarget::ResolvedIncidentSource {
+                raw_ip: "203.0.113.205".into(),
+                pseudonym: "ip-pseudonym:deadbeef".into(),
+            },
+            ttl_seconds: 3600,
+            reason: "test".into(),
+        };
+        let applied = adapter.apply(&action, true).await.unwrap();
+        let rendered = format!(
+            "{:?} {:?} {}",
+            applied.receipt.rendered_commands,
+            applied.receipt.rollback_commands,
+            applied.receipt.target_fingerprint
+        );
+        assert!(
+            !rendered.contains("203.0.113.205"),
+            "the raw resolved IP must never appear in anything apply's receipt returns: {rendered}"
+        );
+        assert!(rendered.contains("ip-pseudonym:deadbeef"));
     }
 
     #[test]
@@ -2132,6 +2492,164 @@ mod tests {
         );
     }
 
+    /// Real-HAProxy stick-table tests below, run via the same
+    /// scripts/test-haproxy-lab.sh - the lab's throwaway config declares
+    /// an explicitly named backend/table (`clawforge_ratelimit`) the same
+    /// way `scripts/haproxy-clawforge-provision.sh` instructs a real
+    /// operator to.
+    fn lab_haproxy_ratelimit_adapter() -> HaproxyRateLimitAdapter {
+        HaproxyRateLimitAdapter::new()
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a real HAProxy Runtime API socket - run via scripts/test-haproxy-lab.sh"]
+    async fn haproxy_ratelimit_apply_verify_rollback_round_trip() {
+        let adapter = lab_haproxy_ratelimit_adapter();
+        let action = action_for(indicator("203.0.113.240"));
+        let applied = adapter
+            .apply(&action, false)
+            .await
+            .expect("apply must succeed");
+        assert!(!applied.receipt.is_dry_run);
+        assert_eq!(
+            adapter.verify(&action.target).await.unwrap(),
+            VerificationResult::Verified
+        );
+        adapter
+            .rollback(&action)
+            .await
+            .expect("rollback must succeed");
+        assert_eq!(
+            adapter.verify(&action.target).await.unwrap(),
+            VerificationResult::NotPresent
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a real HAProxy Runtime API socket - run via scripts/test-haproxy-lab.sh"]
+    async fn haproxy_ratelimit_apply_with_dry_run_true_never_touches_the_real_table() {
+        let adapter = lab_haproxy_ratelimit_adapter();
+        let action = action_for(indicator("203.0.113.241"));
+        let applied = adapter
+            .apply(&action, true)
+            .await
+            .expect("a dry-run apply must not need the real table");
+        assert!(applied.receipt.is_dry_run);
+        assert_eq!(
+            adapter.verify(&action.target).await.unwrap(),
+            VerificationResult::NotPresent,
+            "a dry run must never actually touch the real stick-table"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a real HAProxy Runtime API socket - run via scripts/test-haproxy-lab.sh"]
+    async fn haproxy_ratelimit_applying_the_same_element_twice_is_idempotent() {
+        // "set table ... data.gpc0 1" overwrites, unlike "add acl" -
+        // verified here rather than assumed, the same discipline used
+        // for the other two adapters.
+        let adapter = lab_haproxy_ratelimit_adapter();
+        let action = action_for(indicator("203.0.113.242"));
+        adapter
+            .apply(&action, false)
+            .await
+            .expect("first apply must succeed");
+        let second = adapter.apply(&action, false).await;
+        assert!(second.is_ok(), "a repeat apply must not error: {second:?}");
+        assert_eq!(
+            adapter.verify(&action.target).await.unwrap(),
+            VerificationResult::Verified
+        );
+        adapter
+            .rollback(&action)
+            .await
+            .expect("rollback must succeed");
+        assert_eq!(
+            adapter.verify(&action.target).await.unwrap(),
+            VerificationResult::NotPresent,
+            "one rollback must be enough - set/clear semantics are not additive the way HAProxy's own acl entries are"
+        );
+    }
+
+    /// Unlike `del acl` (`haproxy_rolling_back_an_element_that_was_never_
+    /// applied_fails_cleanly`, above), HAProxy's `clear table ... key ...`
+    /// is idempotent - clearing a key that was never set (or already
+    /// cleared) succeeds with an empty response rather than erroring.
+    /// Confirmed live against the real Runtime API, not assumed: an
+    /// earlier version of this test asserted the opposite (mirroring the
+    /// ACL adapter's own behavior) and failed here, which is what caught
+    /// the real semantic difference between the two HAProxy mechanisms.
+    #[tokio::test]
+    #[ignore = "requires a real HAProxy Runtime API socket - run via scripts/test-haproxy-lab.sh"]
+    async fn haproxy_ratelimit_rolling_back_an_element_that_was_never_applied_is_idempotent() {
+        let adapter = lab_haproxy_ratelimit_adapter();
+        let action = action_for(indicator("203.0.113.243"));
+        let result = adapter.rollback(&action).await;
+        assert!(
+            result.is_ok(),
+            "clear table on an absent key must succeed, not error: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a real HAProxy Runtime API socket - run via scripts/test-haproxy-lab.sh"]
+    async fn haproxy_ratelimit_a_resolved_incident_source_applies_and_rolls_back_correctly() {
+        let adapter = lab_haproxy_ratelimit_adapter();
+        let action = action_for(FirewallTarget::ResolvedIncidentSource {
+            raw_ip: "203.0.113.244".into(),
+            pseudonym: "ip-pseudonym:deadbeef".into(),
+        });
+        let applied = adapter
+            .apply(&action, false)
+            .await
+            .expect("apply on a resolved incident source must succeed");
+        let rendered = format!(
+            "{:?} {:?} {}",
+            applied.receipt.rendered_commands,
+            applied.receipt.rollback_commands,
+            applied.receipt.target_fingerprint
+        );
+        assert!(
+            !rendered.contains("203.0.113.244"),
+            "a real apply's own receipt must never embed the resolved raw IP: {rendered}"
+        );
+        assert_eq!(
+            adapter.verify(&action.target).await.unwrap(),
+            VerificationResult::Verified
+        );
+        adapter
+            .rollback(&action)
+            .await
+            .expect("rollback must succeed");
+        assert_eq!(
+            adapter.verify(&action.target).await.unwrap(),
+            VerificationResult::NotPresent
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a real HAProxy Runtime API socket - run via scripts/test-haproxy-lab.sh"]
+    async fn haproxy_ratelimit_concurrent_applies_of_the_same_target_never_corrupt_or_crash() {
+        let action = action_for(indicator("203.0.113.245"));
+        let adapter_a = lab_haproxy_ratelimit_adapter();
+        let adapter_b = lab_haproxy_ratelimit_adapter();
+        let (result_a, result_b) = tokio::join!(
+            adapter_a.apply(&action, false),
+            adapter_b.apply(&action, false)
+        );
+        assert!(result_a.is_ok(), "{result_a:?}");
+        assert!(result_b.is_ok(), "{result_b:?}");
+        assert_eq!(
+            adapter_a.verify(&action.target).await.unwrap(),
+            VerificationResult::Verified
+        );
+        adapter_a.rollback(&action).await.unwrap();
+        assert_eq!(
+            adapter_a.verify(&action.target).await.unwrap(),
+            VerificationResult::NotPresent
+        );
+    }
+
     #[test]
     fn tailscale_render_describes_the_call_it_would_make() {
         let adapter = TailscaleAdapter::new();
@@ -2238,6 +2756,36 @@ mod tests {
         assert!(
             result.is_ok(),
             "dry-run apply must not need a real socket: {result:?}"
+        );
+    }
+
+    /// Proves the never-block refactor actually closed the gap: before
+    /// it, `check_never_block` was an `NftablesAdapter`-only method never
+    /// called by `HaproxyAdapter`/`HaproxyRateLimitAdapter` at all, so
+    /// nothing protected a HAProxy-driven block from the same loopback/
+    /// link-local/self-lockout targets `NftablesAdapter` already refused.
+    #[tokio::test]
+    async fn haproxy_apply_refuses_a_target_that_overlaps_the_builtin_loopback_exclusion() {
+        let adapter = HaproxyAdapter::new();
+        let result = adapter
+            .apply(&action_for(indicator("127.0.0.1")), true)
+            .await;
+        assert!(
+            result.is_err(),
+            "loopback must be refused even in dry_run mode, not only for a real apply"
+        );
+    }
+
+    #[tokio::test]
+    async fn haproxy_ratelimit_apply_refuses_a_target_that_overlaps_the_builtin_loopback_exclusion()
+    {
+        let adapter = HaproxyRateLimitAdapter::new();
+        let result = adapter
+            .apply(&action_for(indicator("127.0.0.1")), true)
+            .await;
+        assert!(
+            result.is_err(),
+            "loopback must be refused even in dry_run mode, not only for a real apply"
         );
     }
 }

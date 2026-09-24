@@ -290,8 +290,9 @@ pattern file** (`acl ... src -f <file>`, manipulated at runtime with
 mechanism (`map_ip()`/`map_str()` converters, a true key -> value lookup,
 manipulated with `add map`/`show map`), which is a different runtime
 object entirely and not what a membership blocklist needs. Rate-limiting
-(HAProxy stick-tables - a counter/threshold, not a membership set) is
-materially different and **not** built here.
+(HAProxy stick-tables - a genuinely different mechanism, a per-key
+counter rather than a membership set) is a separate adapter,
+`HaproxyRateLimitAdapter` - see its own section below.
 
 Unlike nftables, this adapter cannot own an entire exclusive config file:
 `haproxy.cfg` is a single shared file already serving an operator's real
@@ -333,6 +334,69 @@ and `haproxy.block_incident_source` (risk `critical`), same
 to `HaproxyAdapter` the same way it routes `nftables.`-prefixed ones to
 `NftablesAdapter` - both share the same mass-block budget counter (see
 above), not one each.
+
+## HAProxy rate-limit adapter (stick-tables)
+
+`HaproxyRateLimitAdapter` is the "Rate-Limits" half of the roadmap's
+HAProxy adapter, alongside `HaproxyAdapter`'s "Maps/ACLs" half - same
+`FirewallAdapter` contract, same target types, but a genuinely different
+HAProxy mechanism: a **stick-table**, which stores a per-key
+general-purpose counter (`gpc0`) rather than a membership list. `apply`
+sets a key's `gpc0` to `1` via the Runtime API's `set table <table> key
+<key> data.gpc0 1`; `verify`/`preflight` read it back via `show table
+<table>`, parsing the real `key=... gpc0=...` line format structurally
+(not by position - the field order isn't guaranteed); `rollback` clears
+it via `clear table <table> key <key>`. Why `gpc0` and not a real rate
+counter (`http_req_rate`, ...): HAProxy computes a rate counter from an
+actual sliding window of observed traffic, not a value this adapter
+could simply set to "blocked" - `gpc0` is the standard, version-stable
+mechanism for "flag this key for a policy decision", which is exactly
+what a Clawforge-driven block needs, and is what an operator's own ACL
+(`sc_get_gpc0(0) gt 0`) checks.
+
+An operator adds one explicitly-named `backend`/`stick-table` declaration
+(`set table`/`show table` need to address it by an exact name, which an
+inline per-frontend stick-table does not reliably give) plus a
+`track-sc0`/ACL pair to each frontend they want protected -
+`scripts/haproxy-clawforge-provision.sh` prints the exact snippet, which
+has been verified against a real HAProxy instance. Same as
+`HaproxyAdapter`: never touches `haproxy.cfg` itself, only ever sets or
+clears one key's counter afterwards.
+
+**A real behavioral difference found in the lab, not assumed**: unlike
+`del acl` (which errors when the target pattern isn't present),
+`clear table ... key ...` on a key that was never set (or already
+cleared) succeeds with an empty response - idempotent by design, not by
+convention. An earlier version of
+`haproxy_ratelimit_rolling_back_an_element_that_was_never_applied_*`
+asserted the opposite (mirroring the ACL adapter's own, different,
+verified behavior) and failed against the real Runtime API, which is
+what caught the actual difference between the two mechanisms rather than
+an assumption carrying over incorrectly.
+
+**The never-block exclusion list gap, found and closed while building
+this adapter**: `check_never_block` was originally an `NftablesAdapter`-
+only method, never called by `HaproxyAdapter` at all - meaning nothing
+protected a HAProxy-driven block from loopback/link-local/an operator's
+own configured management range, the exact self-lockout protection
+`NftablesAdapter` already had. Refactored into a free function every
+adapter's `render`/`apply` calls with its own `never_block` field
+(`NftablesAdapter`, `HaproxyAdapter`, and this adapter all load it the
+same way via `never_block_list_from_env`), closing the gap for the
+existing ACL adapter too, not just this new one - proven by new tests for
+both.
+
+Rehearsed in the same isolated HAProxy lab as `HaproxyAdapter` (the lab's
+throwaway config declares the named backend/stick-table
+`scripts/haproxy-clawforge-provision.sh` instructs a real operator to
+add). Registered via migration `0040`:
+`haproxy_ratelimit.block_indicator` (risk `high`) and
+`haproxy_ratelimit.block_incident_source` (risk `critical`), same
+precedent as every other connector action. `dispatch()`'s adapter
+selection checks the `haproxy_ratelimit` prefix *before* the plain
+`haproxy` one - `"haproxy_ratelimit..."` also starts with `"haproxy"`, so
+checking the generic prefix first would silently misroute rate-limit
+actions to the ACL adapter instead.
 
 ## Tailscale adapter (prepared, not operable)
 

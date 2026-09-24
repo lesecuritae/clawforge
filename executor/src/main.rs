@@ -17,8 +17,8 @@
 //! `docs/firewall-agent.md`).
 
 use clawforge_firewall_agent::{
-    FirewallAction, FirewallAdapter, FirewallTarget, HaproxyAdapter, NftablesAdapter,
-    VerificationResult,
+    FirewallAction, FirewallAdapter, FirewallTarget, HaproxyAdapter, HaproxyRateLimitAdapter,
+    NftablesAdapter, VerificationResult,
 };
 use clawforge_storage::{
     database_url_from_env, ClaimedExecutionRequest, FirewallActionReceiptInput, PostgresStore,
@@ -64,17 +64,25 @@ fn firewall_budget_applies(action_name: &str, dry_run: bool) -> bool {
 /// `docs/firewall-agent.md`), so it stays on the same generic dry-run
 /// fallback every other non-firewall action already uses.
 fn is_firewall_action(action_name: &str) -> bool {
-    action_name.starts_with("nftables.") || action_name.starts_with("haproxy.")
+    action_name.starts_with("nftables.")
+        || action_name.starts_with("haproxy_ratelimit.")
+        || action_name.starts_with("haproxy.")
 }
 
-/// Picks the adapter an `nftables.`/`haproxy.`-prefixed action name (or,
-/// for the TTL sweep, an `adapter` column value - `"nftables"`/
-/// `"haproxy"`, no trailing dot) routes to. Shared by `dispatch()` and
-/// `sweep_expired_firewall_targets()` so the two can never pick a
-/// different adapter for the same name.
+/// Picks the adapter an `nftables.`/`haproxy.`/`haproxy_ratelimit.`-prefixed
+/// action name (or, for the TTL sweep, an `adapter` column value -
+/// `"nftables"`/`"haproxy"`/`"haproxy_ratelimit"`, no trailing dot) routes
+/// to. Shared by `dispatch()` and `sweep_expired_firewall_targets()` so
+/// the two can never pick a different adapter for the same name.
+/// `haproxy_ratelimit` is checked *before* the plain `haproxy` prefix -
+/// `"haproxy_ratelimit..."` also starts with `"haproxy"`, so checking the
+/// generic prefix first would silently route rate-limit actions to the
+/// wrong (ACL) adapter.
 fn adapter_for(name: &str) -> Option<Box<dyn FirewallAdapter>> {
     if name.starts_with("nftables") {
         Some(Box::new(NftablesAdapter::new()))
+    } else if name.starts_with("haproxy_ratelimit") {
+        Some(Box::new(HaproxyRateLimitAdapter::new()))
     } else if name.starts_with("haproxy") {
         Some(Box::new(HaproxyAdapter::new()))
     } else {
@@ -499,6 +507,10 @@ mod tests {
     fn the_mass_block_budget_only_applies_to_a_real_firewall_apply() {
         assert!(firewall_budget_applies("nftables.block_indicator", false));
         assert!(firewall_budget_applies("haproxy.block_indicator", false));
+        assert!(firewall_budget_applies(
+            "haproxy_ratelimit.block_indicator",
+            false
+        ));
         assert!(
             !firewall_budget_applies("nftables.block_indicator", true),
             "a dry run has nothing to bound"
@@ -515,13 +527,29 @@ mod tests {
 
     #[test]
     fn adapter_for_picks_the_right_adapter_for_both_action_names_and_bare_adapter_column_values() {
-        assert!(adapter_for("nftables.block_indicator").is_some());
-        assert!(adapter_for("haproxy.block_indicator").is_some());
+        assert_eq!(
+            adapter_for("nftables.block_indicator").map(|a| a.name()),
+            Some("nftables")
+        );
+        assert_eq!(
+            adapter_for("haproxy.block_indicator").map(|a| a.name()),
+            Some("haproxy")
+        );
+        // "haproxy_ratelimit..." also starts with "haproxy" - must not be
+        // misrouted to the plain (ACL) HaproxyAdapter.
+        assert_eq!(
+            adapter_for("haproxy_ratelimit.block_indicator").map(|a| a.name()),
+            Some("haproxy_ratelimit")
+        );
         // The TTL sweep looks adapters up by the bare `adapter` column
         // value (no trailing dot), not an action name - must resolve the
         // same way.
-        assert!(adapter_for("nftables").is_some());
-        assert!(adapter_for("haproxy").is_some());
+        assert_eq!(adapter_for("nftables").map(|a| a.name()), Some("nftables"));
+        assert_eq!(adapter_for("haproxy").map(|a| a.name()), Some("haproxy"));
+        assert_eq!(
+            adapter_for("haproxy_ratelimit").map(|a| a.name()),
+            Some("haproxy_ratelimit")
+        );
         assert!(adapter_for("tailscale.quarantine_device").is_none());
         assert!(adapter_for("docker.restart_container").is_none());
     }
@@ -612,6 +640,30 @@ mod tests {
         assert!(summary.contains("dry_run=true"));
         let receipt = receipt.expect("a successful firewall apply must produce a receipt");
         assert_eq!(receipt.adapter, "haproxy");
+        assert!(receipt.is_dry_run);
+    }
+
+    #[tokio::test]
+    async fn a_haproxy_ratelimit_action_dispatches_in_dry_run_and_is_routed_to_the_ratelimit_adapter(
+    ) {
+        // "haproxy_ratelimit..." also starts with "haproxy" - proves
+        // dispatch() does not misroute it to the plain ACL HaproxyAdapter.
+        std::env::remove_var("CLAWFORGE_EXECUTOR_DRY_RUN");
+        let request = claimed(
+            "haproxy_ratelimit.block_indicator",
+            Some(serde_json::json!({
+                "kind": "threat_intel_indicator",
+                "cidr": "203.0.113.0/24",
+                "source": "spamhaus_drop",
+            })),
+        );
+        let (success, summary, error, receipt) = dispatch(&request).await;
+        assert!(success, "dispatch failed: {error:?}");
+        let summary = summary.unwrap();
+        assert!(summary.contains("adapter=haproxy_ratelimit"));
+        assert!(summary.contains("dry_run=true"));
+        let receipt = receipt.expect("a successful firewall apply must produce a receipt");
+        assert_eq!(receipt.adapter, "haproxy_ratelimit");
         assert!(receipt.is_dry_run);
     }
 

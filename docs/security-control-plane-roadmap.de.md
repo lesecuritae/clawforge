@@ -303,30 +303,48 @@ Arbeitspakete:
   deaktiviert (`enabled=FALSE`), wie jede andere Connector-Action seit
   Migration `0027`.)
 - HAProxy-Adapter für Maps/ACLs und Rate-Limits implementieren
-  (**teilweise, ACL-Haelfte erledigt**: `HaproxyAdapter` implementiert
+  (**erledigt, beide Haelften**: `HaproxyAdapter` (ACLs) implementiert
   denselben `FirewallAdapter`-Vertrag wie `NftablesAdapter` (gleiche
   Zieltypen), ueber die HAProxy-Runtime-API (`add acl`/`del acl`/`show
   acl` gegen eine exklusiv Clawforge gehoerende ACL-Pattern-Datei - NICHT
   die separate `map`-Mechanik, die per `add map`/`show map` ein echtes
   Key-Value-Objekt ist). Da `haproxy.cfg` anders als eine exklusive
   nftables-Tabelle eine einzige, bereits produktiv genutzte Datei ist,
-  kann der Adapter sie nicht exklusiv besitzen - `scripts/haproxy-
+  kann keiner der beiden Adapter sie exklusiv besitzen - `scripts/haproxy-
   clawforge-provision.sh` legt nur die Pattern-Datei an und gibt die
-  zwei Zeilen aus, die ein Betreiber selbst in jedes zu schuetzende
-  Frontend eintraegt. **Echter Bug im isolierten Lab gefunden+behoben**:
-  die erste Version nutzte faelschlich `add map`/`show map` statt `add
+  Zeilen aus, die ein Betreiber selbst in jedes zu schuetzende Frontend
+  eintraegt. **Echter Bug im isolierten Lab gefunden+behoben**: die erste
+  ACL-Adapter-Version nutzte faelschlich `add map`/`show map` statt `add
   acl`/`show acl` - eine `acl ... -f`-Referenz wird gar nicht als "map"-
   Objekt registriert, `show map` lieferte daher immer eine leere Liste,
   vom echten `apply`+`verify`-Rundlauf-Test im Lab sofort aufgedeckt
   (nicht vermutet, sondern live am echten Runtime-API-Protokoll
-  diagnostiziert). Eigenes isoliertes Lab (`scripts/test-haproxy-lab.sh`,
-  disposabler Container, installiert haproxy, keine besonderen
+  diagnostiziert). `HaproxyRateLimitAdapter` (Rate-Limits) nutzt eine
+  andere Mechanik - ein Stick-Table mit Allzweckzaehler (`gpc0`) statt
+  einer Mitgliedschaftsliste, gesetzt/gelesen/geloescht per `set table`/
+  `show table`/`clear table`. **Zweiter echter Unterschied im Lab
+  gefunden**: anders als `del acl` (Fehler bei fehlendem Eintrag) ist
+  `clear table` fuer einen nie gesetzten Key idempotent (kein Fehler) -
+  ein erster Testentwurf nahm faelschlich dasselbe Verhalten wie beim
+  ACL-Adapter an und scheiterte am echten Runtime-API-Verhalten, was den
+  Unterschied aufdeckte. **Dabei zusaetzlich eine echte Sicherheitsluecke
+  gefunden+geschlossen**: die Never-block-Ausschlussliste war bisher NUR
+  in `NftablesAdapter` verdrahtet - `HaproxyAdapter` rief die Pruefung nie
+  auf, der eigene Selbstsperr-Schutz griff fuer HAProxy-Blocks also gar
+  nicht. Auf eine gemeinsame freie Funktion refaktoriert, die jetzt alle
+  drei Adapter aufrufen (schliesst die Luecke rueckwirkend auch fuer den
+  bereits bestehenden ACL-Adapter, nicht nur den neuen). Eigene isolierte
+  Labs (`scripts/test-firewall-lab.sh` fuer nftables, `scripts/test-
+  haproxy-lab.sh` fuer beide HAProxy-Adapter, keine besonderen
   Capabilities noetig). Registriert ueber Migration `0038`
-  (`haproxy.block_indicator`/`haproxy.block_incident_source`,
-  `requires_approval=TRUE, enabled=FALSE`), Executor-Dispatch routet
-  `haproxy.*`-Actions dorthin, teilt sich das Mass-block-Budget mit
-  nftables. Rate-Limits (Stick-Tables) bleiben offen - andere Mechanik
-  (Zaehler/Schwellwert, keine Mitgliedschaftsmenge).)
+  (ACL: `haproxy.block_indicator`/`haproxy.block_incident_source`) und
+  `0040` (Rate-Limit: `haproxy_ratelimit.block_indicator`/`haproxy_
+  ratelimit.block_incident_source`), beide `requires_approval=TRUE,
+  enabled=FALSE`. Executor-Dispatch waehlt den passenden Adapter per
+  Aktionsname-Praefix (die spezifischere `haproxy_ratelimit`-Praefix-
+  Pruefung laeuft VOR der generischen `haproxy`-Pruefung, sonst wuerden
+  Rate-Limit-Actions faelschlich zum ACL-Adapter geroutet), alle drei
+  HAProxy/nftables-Adapter teilen sich ein Mass-block-Budget.)
 - Tailscale zunächst nur als freigabepflichtigen Adapter vorbereiten
   (**erledigt**: `TailscaleAdapter` hat bewusst KEINE `apply`/`verify`/
   `rollback`-Methode ueberhaupt - nicht "ein apply, das immer fehlschlaegt",
