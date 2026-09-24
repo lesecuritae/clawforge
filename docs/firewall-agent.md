@@ -115,9 +115,30 @@ nftables` pins this down against real `nft`.
 - **`ResolvedIncidentSource`** - only ever constructed by a caller that
   has already resolved the pseudonym via `security_ip_resolutions`
   (migration `0036`), and only for `apply`/`verify`/`rollback`. `render`
-  returns `Err` if given this variant - a raw IP can never reach a
-  persisted receipt through `render`, a hard guardrail enforced in the
-  type, not a rule callers have to remember to follow.
+  returns `Err` if given this variant. `apply` cannot refuse it outright
+  (that would make a resolved incident source entirely unappliable) but
+  still must not let its own returned receipt carry the raw IP: it builds
+  the *real* `nft`/HAProxy command from the real resolved address (that
+  part is unavoidable - it has to actually block the right address), but
+  builds `rendered_commands`/`rollback_commands`/`target_fingerprint` for
+  the receipt it returns from a *redacted* reference
+  (`redacted_element_reference`) that uses the same
+  `<resolved-at-apply-time:...>` placeholder `render` uses for an
+  unresolved `IncidentSource`, never the raw IP. A raw IP can never reach
+  anything a caller might persist, through either `render` or `apply`.
+  **Found and fixed as a real bug this session**: `apply`'s own receipt
+  originally used the same (unredacted) reference the real command used -
+  harmless while nothing persisted `apply`'s receipt, but
+  `record_firewall_action_receipt` (added later the same session, before
+  `ResolvedIncidentSource` had a live caller) would have persisted the
+  raw IP straight into Postgres the moment one existed. Caught by
+  reasoning through a later feature (TTL-driven auto-rollback) that
+  needed a stable, safe-to-store `target_fingerprint`, not by a report;
+  fixed with the redaction described above and pinned down by
+  `nftables_apply_receipt_never_embeds_the_resolved_raw_ip`/
+  `haproxy_apply_receipt_never_embeds_the_resolved_raw_ip` (fast, no lab
+  needed) plus both real lab round-trip tests now also asserting on the
+  receipt they get back.
 
 ### `security_ip_resolutions`: the one narrow exception to "never persist a raw IP"
 

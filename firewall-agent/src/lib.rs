@@ -331,6 +331,32 @@ fn element_reference(target: &FirewallTarget) -> Result<String, AdapterError> {
     })
 }
 
+/// The safe-to-**persist** reference for a receipt - unlike
+/// `element_reference` (used to build the real command that actually
+/// runs), this never returns a raw IP for `ResolvedIncidentSource`, only
+/// its pseudonym's placeholder, the same shape `element_reference` itself
+/// already uses for an unresolved `IncidentSource`.
+///
+/// A resolved raw IP must reach the real `nft`/HAProxy command
+/// (`element_reference`) - it must never reach anything that might be
+/// persisted (`rendered_commands`/`rollback_commands`/
+/// `target_fingerprint` in a `FirewallActionReceipt`), which is exactly
+/// the property `render`'s own outright refusal of `ResolvedIncidentSource`
+/// already protects. `render` can simply refuse the variant outright
+/// because it never needs to build a real command; `apply` cannot refuse
+/// it (that would make a resolved incident source entirely unappliable)
+/// but still must not let the receipt it returns carry the raw IP - this
+/// is what makes both possible at once. Found and fixed the same session
+/// `record_firewall_action_receipt` started persisting every `apply`
+/// receipt (not just `render`'s): before that, `apply`'s own receipt was
+/// never written anywhere a raw IP leaking into it would matter.
+fn redacted_element_reference(target: &FirewallTarget) -> Result<String, AdapterError> {
+    if let FirewallTarget::ResolvedIncidentSource { pseudonym, .. } = target {
+        return Ok(format!("<resolved-at-apply-time:{pseudonym}>"));
+    }
+    element_reference(target)
+}
+
 /// Rejects an unresolved `IncidentSource` - shared guard for any adapter's
 /// `apply`/`verify`/`rollback` that (unlike `NftablesAdapter`, which gets
 /// this for free from `set_name`'s own `Ok(None)` case) has no per-family
@@ -507,6 +533,17 @@ pub struct FirewallActionReceipt {
     pub rollback_commands: Vec<Vec<String>>,
     pub is_dry_run: bool,
     pub ttl_seconds: u32,
+    /// The normalized element (`element_reference`'s output) this receipt
+    /// is about, paired with `adapter` by a caller to recognize "the same
+    /// block, applied again" or "the rollback that undoes this apply"
+    /// across separate receipt rows - e.g. for a TTL-driven auto-rollback
+    /// sweep matching an expired apply receipt to whether a later
+    /// rollback receipt for the same target already exists. Never a
+    /// resolved raw IP for an `IncidentSource` (the unresolved
+    /// placeholder, or the resolved element only for
+    /// `ResolvedIncidentSource`, following the exact same rules
+    /// `element_reference` itself already follows).
+    pub target_fingerprint: String,
 }
 
 /// The outcome of a real `apply` call - the receipt, plus (only when
@@ -716,6 +753,7 @@ impl FirewallAdapter for NftablesAdapter {
             rollback_commands: vec![Self::delete_command(set_name, &element)],
             is_dry_run: true,
             ttl_seconds: action.ttl_seconds,
+            target_fingerprint: element,
         })
     }
 
@@ -727,6 +765,11 @@ impl FirewallAdapter for NftablesAdapter {
         action.target.validate()?;
         self.check_never_block(&action.target)?;
         let element = element_reference(&action.target)?;
+        // Safe to persist - never the raw IP `element` resolves to for a
+        // `ResolvedIncidentSource` (see `redacted_element_reference`'s own
+        // doc comment). Only used to build the receipt, never the real
+        // command below.
+        let receipt_element = redacted_element_reference(&action.target)?;
         let set_name = action.target.set_name()?.ok_or_else(|| {
             AdapterError::Apply(
                 "an unresolved IncidentSource cannot be applied - resolve it to a \
@@ -735,15 +778,17 @@ impl FirewallAdapter for NftablesAdapter {
             )
         })?;
         let add = Self::add_command(set_name, &element);
-        let delete = Self::delete_command(set_name, &element);
+        let receipt_add = Self::add_command(set_name, &receipt_element);
+        let receipt_delete = Self::delete_command(set_name, &receipt_element);
         if dry_run {
             return Ok(ApplyResult {
                 receipt: FirewallActionReceipt {
                     adapter: self.name(),
-                    rendered_commands: vec![add],
-                    rollback_commands: vec![delete],
+                    rendered_commands: vec![receipt_add],
+                    rollback_commands: vec![receipt_delete],
                     is_dry_run: true,
                     ttl_seconds: action.ttl_seconds,
+                    target_fingerprint: receipt_element,
                 },
                 observed_state: None,
             });
@@ -763,10 +808,11 @@ impl FirewallAdapter for NftablesAdapter {
         Ok(ApplyResult {
             receipt: FirewallActionReceipt {
                 adapter: self.name(),
-                rendered_commands: vec![add],
-                rollback_commands: vec![delete],
+                rendered_commands: vec![receipt_add],
+                rollback_commands: vec![receipt_delete],
                 is_dry_run: false,
                 ttl_seconds: action.ttl_seconds,
+                target_fingerprint: receipt_element,
             },
             observed_state: Some(observed_state),
         })
@@ -969,6 +1015,7 @@ impl FirewallAdapter for HaproxyAdapter {
             rollback_commands: vec![vec![haproxy_del_acl_command(&self.acl_file, &element)]],
             is_dry_run: true,
             ttl_seconds: action.ttl_seconds,
+            target_fingerprint: element,
         })
     }
 
@@ -980,16 +1027,23 @@ impl FirewallAdapter for HaproxyAdapter {
         action.target.validate()?;
         require_resolved_target(&action.target)?;
         let element = element_reference(&action.target)?;
+        // Safe to persist - never the raw IP `element` resolves to for a
+        // `ResolvedIncidentSource` (see `redacted_element_reference`'s own
+        // doc comment). Only used to build the receipt, never the real
+        // command below.
+        let receipt_element = redacted_element_reference(&action.target)?;
         let add = haproxy_add_acl_command(&self.acl_file, &element);
-        let delete = haproxy_del_acl_command(&self.acl_file, &element);
+        let receipt_add = haproxy_add_acl_command(&self.acl_file, &receipt_element);
+        let receipt_delete = haproxy_del_acl_command(&self.acl_file, &receipt_element);
         if dry_run {
             return Ok(ApplyResult {
                 receipt: FirewallActionReceipt {
                     adapter: self.name(),
-                    rendered_commands: vec![vec![add]],
-                    rollback_commands: vec![vec![delete]],
+                    rendered_commands: vec![vec![receipt_add]],
+                    rollback_commands: vec![vec![receipt_delete]],
                     is_dry_run: true,
                     ttl_seconds: action.ttl_seconds,
+                    target_fingerprint: receipt_element,
                 },
                 observed_state: None,
             });
@@ -1010,10 +1064,11 @@ impl FirewallAdapter for HaproxyAdapter {
         Ok(ApplyResult {
             receipt: FirewallActionReceipt {
                 adapter: self.name(),
-                rendered_commands: vec![vec![add]],
-                rollback_commands: vec![vec![delete]],
+                rendered_commands: vec![vec![receipt_add]],
+                rollback_commands: vec![vec![receipt_delete]],
                 is_dry_run: false,
                 ttl_seconds: action.ttl_seconds,
+                target_fingerprint: receipt_element,
             },
             observed_state: Some(listing),
         })
@@ -1279,6 +1334,66 @@ mod tests {
         assert!(rendered.contains("ip-pseudonym:deadbeef"));
         assert!(rendered.contains("<resolved-at-apply-time:"));
         assert!(receipt.is_dry_run);
+    }
+
+    /// The bug this pins down: `apply`'s own receipt (unlike `render`,
+    /// which outright refuses `ResolvedIncidentSource`) used to embed the
+    /// real resolved IP in `rendered_commands`/`rollback_commands` -
+    /// exactly what `record_firewall_action_receipt` (added later the
+    /// same session) then persisted straight into Postgres, defeating the
+    /// whole point of `render`'s own refusal. Uses `dry_run: true` so no
+    /// real nft/haproxy is needed - the redaction happens before the
+    /// dry-run/real branch, so this exercises the same code path a real
+    /// apply's receipt construction does.
+    #[tokio::test]
+    async fn nftables_apply_receipt_never_embeds_the_resolved_raw_ip() {
+        let adapter = NftablesAdapter::new();
+        let action = FirewallAction {
+            target: FirewallTarget::ResolvedIncidentSource {
+                raw_ip: "203.0.113.205".into(),
+                pseudonym: "ip-pseudonym:deadbeef".into(),
+            },
+            ttl_seconds: 3600,
+            reason: "test".into(),
+        };
+        let applied = adapter.apply(&action, true).await.unwrap();
+        let rendered = format!(
+            "{:?} {:?} {}",
+            applied.receipt.rendered_commands,
+            applied.receipt.rollback_commands,
+            applied.receipt.target_fingerprint
+        );
+        assert!(
+            !rendered.contains("203.0.113.205"),
+            "the raw resolved IP must never appear in anything apply's receipt returns: {rendered}"
+        );
+        assert!(rendered.contains("ip-pseudonym:deadbeef"));
+        assert!(rendered.contains("<resolved-at-apply-time:"));
+    }
+
+    #[tokio::test]
+    async fn haproxy_apply_receipt_never_embeds_the_resolved_raw_ip() {
+        let adapter = HaproxyAdapter::new();
+        let action = FirewallAction {
+            target: FirewallTarget::ResolvedIncidentSource {
+                raw_ip: "203.0.113.205".into(),
+                pseudonym: "ip-pseudonym:deadbeef".into(),
+            },
+            ttl_seconds: 3600,
+            reason: "test".into(),
+        };
+        let applied = adapter.apply(&action, true).await.unwrap();
+        let rendered = format!(
+            "{:?} {:?} {}",
+            applied.receipt.rendered_commands,
+            applied.receipt.rollback_commands,
+            applied.receipt.target_fingerprint
+        );
+        assert!(
+            !rendered.contains("203.0.113.205"),
+            "the raw resolved IP must never appear in anything apply's receipt returns: {rendered}"
+        );
+        assert!(rendered.contains("ip-pseudonym:deadbeef"));
     }
 
     fn action_for(target: FirewallTarget) -> FirewallAction {
@@ -1754,7 +1869,22 @@ mod tests {
             ttl_seconds: 60,
             reason: "lab test".into(),
         };
-        adapter.apply(&action, false).await.unwrap();
+        let applied = adapter.apply(&action, false).await.unwrap();
+        // The real command that ran did use the raw IP (that's the whole
+        // point - see the `verify` assertion right below, which only
+        // passes if the real nftables set genuinely contains it) - but
+        // the *receipt* returned to a caller (and, in production, the one
+        // persisted to firewall_action_receipts) must never carry it.
+        let rendered = format!(
+            "{:?} {:?} {}",
+            applied.receipt.rendered_commands,
+            applied.receipt.rollback_commands,
+            applied.receipt.target_fingerprint
+        );
+        assert!(
+            !rendered.contains("203.0.113.205"),
+            "a real apply's own receipt must never embed the resolved raw IP: {rendered}"
+        );
         assert_eq!(
             adapter.verify(&action.target).await.unwrap(),
             VerificationResult::Verified
@@ -1897,10 +2027,20 @@ mod tests {
             raw_ip: "203.0.113.234".into(),
             pseudonym: "ip-pseudonym:deadbeef".into(),
         });
-        adapter
+        let applied = adapter
             .apply(&action, false)
             .await
             .expect("apply on a resolved incident source must succeed");
+        let rendered = format!(
+            "{:?} {:?} {}",
+            applied.receipt.rendered_commands,
+            applied.receipt.rollback_commands,
+            applied.receipt.target_fingerprint
+        );
+        assert!(
+            !rendered.contains("203.0.113.234"),
+            "a real apply's own receipt must never embed the resolved raw IP: {rendered}"
+        );
         assert_eq!(
             adapter.verify(&action.target).await.unwrap(),
             VerificationResult::Verified
