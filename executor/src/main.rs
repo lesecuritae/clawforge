@@ -25,6 +25,67 @@ use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 const DEFAULT_FIREWALL_ACTION_TTL_SECONDS: u32 = 3600;
+const DEFAULT_FIREWALL_RATE_WINDOW_SECONDS: i64 = 300;
+const DEFAULT_FIREWALL_MAX_APPLIES_PER_WINDOW: i64 = 20;
+
+fn firewall_rate_window_seconds() -> i64 {
+    env::var("CLAWFORGE_FIREWALL_RATE_WINDOW_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_FIREWALL_RATE_WINDOW_SECONDS)
+}
+
+fn firewall_max_applies_per_window() -> i64 {
+    env::var("CLAWFORGE_FIREWALL_MAX_APPLIES_PER_WINDOW")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_FIREWALL_MAX_APPLIES_PER_WINDOW)
+}
+
+/// Whether a claimed request needs a mass-block budget check at all - a
+/// dry run or a non-firewall action never does, so
+/// `firewall_mass_block_budget_exceeded` can skip touching the database
+/// entirely for the common case. Pure and separate from that function so
+/// it can be unit-tested without a real store to hand it.
+fn firewall_budget_applies(action_name: &str, dry_run: bool) -> bool {
+    !dry_run && action_name.starts_with("nftables.")
+}
+
+/// The mass-block budget: how many *real* (non-dry-run) `nftables.*`
+/// applies this database has recorded in the trailing rate window - a
+/// runaway policy engine or a config mistake must not be able to block
+/// hundreds of addresses in a burst. Dry runs and non-firewall actions are
+/// never gated (`Ok(None)`) - there is nothing to bound. DB-backed via
+/// `recent_real_firewall_apply_count` rather than an in-memory counter, so
+/// the budget holds across a process restart and across multiple executor
+/// replicas sharing this database - see that method's own doc comment.
+/// Concurrency (more than one real apply in flight at once) is not a
+/// separate counter here: this loop claims and dispatches one request per
+/// tick, sequentially, so within a single process it is already 1 by
+/// construction; bounding it across multiple replicas targeting the *same*
+/// host is a still-open item (see docs/firewall-agent.md).
+async fn firewall_mass_block_budget_exceeded(
+    store: &PostgresStore,
+    action_name: &str,
+    dry_run: bool,
+) -> anyhow::Result<Option<String>> {
+    if !firewall_budget_applies(action_name, dry_run) {
+        return Ok(None);
+    }
+    let window = firewall_rate_window_seconds();
+    let max = firewall_max_applies_per_window();
+    let count = store.recent_real_firewall_apply_count(window).await?;
+    if count >= max {
+        return Ok(Some(format!(
+            "mass-block budget exceeded: {count} real applies already recorded in the last \
+             {window}s (max {max}, see CLAWFORGE_FIREWALL_MAX_APPLIES_PER_WINDOW/\
+             CLAWFORGE_FIREWALL_RATE_WINDOW_SECONDS)"
+        )));
+    }
+    Ok(None)
+}
 
 /// Everything `dispatch()` gathers for a successful `nftables.*` apply, for
 /// `main()`'s loop (the only place with a `store`) to persist as an Action
@@ -201,7 +262,31 @@ async fn main() -> anyhow::Result<()> {
                 let started = std::time::Instant::now();
                 match store.claim_execution_request_for_dispatch(Some(worker_id)).await {
                     Ok(Some(claimed)) => {
-                        let (success, result_summary, error_summary, receipt) = dispatch(&claimed).await;
+                        let budget = firewall_mass_block_budget_exceeded(
+                            &store,
+                            &claimed.action_name,
+                            dry_run_from_env(),
+                        )
+                        .await;
+                        let refusal = match budget {
+                            Ok(Some(reason)) => Some(reason),
+                            Ok(None) => None,
+                            Err(error) => {
+                                // Fail closed: if the budget itself cannot be
+                                // checked, do not apply - complete as failed
+                                // rather than proceeding unchecked.
+                                tracing::warn!(%error, execution_id = %claimed.id, "could not check the mass-block budget");
+                                let _ = store.heartbeat_execution_worker(worker_id, "degraded", 0, Some(&error.to_string())).await;
+                                Some(format!("could not check mass-block budget: {error}"))
+                            }
+                        };
+                        let (success, result_summary, error_summary, receipt) =
+                            if let Some(reason) = refusal {
+                                tracing::warn!(execution_id = %claimed.id, action = %claimed.action_name, reason = %reason, "refusing dispatch");
+                                (false, None, Some(reason), None)
+                            } else {
+                                dispatch(&claimed).await
+                            };
                         if let Some(receipt) = receipt {
                             if let Err(error) = store
                                 .record_firewall_action_receipt(FirewallActionReceiptInput {
@@ -286,6 +371,19 @@ mod tests {
         // binary reads/writes this specific env var.
         std::env::remove_var("CLAWFORGE_EXECUTOR_DRY_RUN");
         assert!(dry_run_from_env());
+    }
+
+    #[test]
+    fn the_mass_block_budget_only_applies_to_a_real_firewall_apply() {
+        assert!(firewall_budget_applies("nftables.block_indicator", false));
+        assert!(
+            !firewall_budget_applies("nftables.block_indicator", true),
+            "a dry run has nothing to bound"
+        );
+        assert!(
+            !firewall_budget_applies("docker.restart_container", false),
+            "only nftables.*-prefixed actions are bounded"
+        );
     }
 
     #[tokio::test]

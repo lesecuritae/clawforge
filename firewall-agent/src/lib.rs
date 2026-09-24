@@ -90,12 +90,19 @@
 //! host's nftables state when called with `dry_run: false` against a
 //! table that has been provisioned. Tested against a real `nft` binary in
 //! a disposable, isolated container (`scripts/test-firewall-lab.sh`) -
-//! never against any of this deployment's real hosts. Still not built:
-//! `clawforge-executor` dispatch wiring that would let a claimed
-//! `execution_request` reach any of this automatically (see
-//! `docs/firewall-agent.md`), and the roadmap's remaining mandatory gates
-//! beyond what this crate's own tests cover (HA/leader/lease races,
-//! production-scale rate/concurrency/mass-block budgets).
+//! never against any of this deployment's real hosts.
+//! `clawforge-executor` now dispatches a claimed `execution_request`
+//! through this crate for real (see `docs/firewall-agent.md`'s "Executor
+//! dispatch wiring"), gated by a DB-backed mass-block budget
+//! (`docs/firewall-agent.md`'s "Mass-block budget") and proven safe under
+//! concurrent HA workers (see `storage/tests/postgres.rs`'s
+//! `concurrent_workers_never_claim_the_same_execution_request_twice` and
+//! `a_worker_that_dies_after_claiming_is_reclaimed_by_a_different_worker`).
+//! Still open: the roadmap's remaining mandatory gates beyond what this
+//! crate's own tests cover (break-glass drill, failure injection beyond
+//! lease loss, a rate/concurrency budget bounding multiple replicas
+//! targeting the *same* host) - see `docs/firewall-agent.md`'s own
+//! remaining list.
 
 use async_trait::async_trait;
 use std::net::IpAddr;

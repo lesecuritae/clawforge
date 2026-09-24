@@ -3161,6 +3161,26 @@ impl PostgresStore {
         Ok(id)
     }
 
+    /// How many real (non-dry-run) firewall applies have been recorded in
+    /// the last `window_seconds` - the mass-block budget's own counter.
+    /// DB-backed rather than an in-memory counter in `clawforge-executor`
+    /// on purpose: it must stay correct across a process restart and
+    /// across multiple executor replicas sharing this database, not just
+    /// within one process's lifetime.
+    pub async fn recent_real_firewall_apply_count(&self, window_seconds: i64) -> Result<i64> {
+        if window_seconds <= 0 {
+            anyhow::bail!("window_seconds must be positive");
+        }
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM firewall_action_receipts \
+             WHERE is_dry_run = FALSE AND created_at > NOW() - ($1 * INTERVAL '1 second')",
+        )
+        .bind(window_seconds)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count)
+    }
+
     pub async fn record_connector_health(
         &self,
         connector_id: Uuid,

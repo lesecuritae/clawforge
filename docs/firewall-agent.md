@@ -41,9 +41,30 @@ self-lockout that exists today, in place of the isolated network lab's
 own self-lockout confirmation (see "The isolated network lab" below -
 that one still needs a real provisioned host's management path to mean
 anything, which no disposable container can stand in for).
-too, dispatch would still default to `dry_run: true` rather than silently
-start applying for real. Nothing in this increment flips that value
-against any real host - that stays a separate, explicitly reviewed step.
+
+## Mass-block budget
+
+`clawforge-executor` refuses to dispatch a real (non-dry-run) `nftables.*`
+apply once `CLAWFORGE_FIREWALL_MAX_APPLIES_PER_WINDOW` (default 20) real
+applies have already been recorded within the trailing
+`CLAWFORGE_FIREWALL_RATE_WINDOW_SECONDS` (default 300) - a runaway policy
+engine or a config mistake must not be able to block hundreds of
+addresses in a burst. The count comes from `firewall_action_receipts`
+itself (`PostgresStore::recent_real_firewall_apply_count`), not an
+in-memory counter, so the budget holds across a process restart and
+across multiple executor replicas sharing the same database. A refused
+dispatch never calls `dispatch()`/the adapter at all - the
+`execution_request` is completed as failed with a clear
+`"mass-block budget exceeded"` `error_summary`, and no `nft` command is
+built or run. If the budget check itself fails (a database error), the
+same request also fails closed rather than proceeding unchecked. Dry
+runs and non-`nftables.`-prefixed actions are never gated - there is
+nothing to bound. Concurrency (more than one real apply in flight at
+once) is not a separate counter: the executor's poll loop claims and
+dispatches one request per tick, sequentially, so within a single
+process it is already 1 by construction; bounding it across multiple
+replicas targeting the *same* host remains open (see "What's
+deliberately not built yet" below).
 
 ## One exclusive table, two pre-provisioned typed sets - never a free-form rule
 
@@ -181,26 +202,32 @@ one. Two actions, not one, because the two target kinds are genuinely
 different risk shapes, not the same action with two ways to fill in a
 parameter.
 
+## `firewall_action_receipts` is populated, nothing reads it back yet
+
+Populated on every `nftables.*` dispatch (preflight, rendered commands,
+observed state, verification result, TTL, rollback plan) -
+`clawforge_executor` has `INSERT` and `SELECT` (the latter only for the
+mass-block budget's own aggregate `COUNT(*)`, never a row-by-row
+read-back) on the table, never `UPDATE` - append-only, proven by
+`runtime_roles_enforce_service_boundaries`: the role can insert via
+`record_firewall_action_receipt`, but a raw `UPDATE` on the row it just
+wrote fails. No admin surface for desired/actual state, drift, or
+rollback history exists yet (see the roadmap's own remaining Pflichtgate
+on this).
+
 ## What's deliberately not built yet
 
 - **No HAProxy adapter, no Tailscale adapter** (roadmap: Tailscale
   "zunächst nur als freigabepflichtigen Adapter vorbereiten").
 - **No break-glass procedure documentation or drill.**
-- **No failure-injection tests** (process/host/DB failure between
-  intent/apply/receipt/audit, lease loss, reboot, clock skew, concurrent
-  actions, expired TTL, manual drift, failed read-back).
-- **No HA/leader/lease-race tests** proving no double-application under
-  concurrent workers.
-- **No rate/concurrency/mass-block budgets.**
-- **`firewall_action_receipts` is now populated** on every `nftables.*`
-  dispatch (preflight, rendered commands, observed state, verification
-  result, TTL, rollback plan) - `clawforge_executor` has `INSERT` only on
-  the table (append-only, proven by
-  `runtime_roles_enforce_service_boundaries`: the role can insert via
-  `record_firewall_action_receipt`, but a raw `UPDATE` on the row it just
-  wrote fails). Nothing reads the table back yet - no admin surface for
-  desired/actual state, drift, or rollback history exists (see the
-  roadmap's own remaining Pflichtgate on this).
+- **No failure-injection tests** beyond lease loss/worker death (process/
+  host/DB failure between intent/apply/receipt/audit, reboot, clock skew,
+  expired TTL, manual drift, failed read-back).
+- **No concurrency budget across multiple executor replicas targeting the
+  same host** - the mass-block *rate* budget (above) is DB-backed and
+  already holds across replicas; a *concurrency* ceiling (at most N real
+  applies in flight at once, cluster-wide) is a separate, still-open
+  refinement.
 - **Both registered actions stay `enabled=FALSE`** - nothing here changes
   that a reviewed, explicit change is required before any of this can run
   for real, in a lab or otherwise, and `CLAWFORGE_EXECUTOR_DRY_RUN` stays

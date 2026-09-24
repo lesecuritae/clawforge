@@ -1472,3 +1472,90 @@ async fn a_worker_that_dies_after_claiming_is_reclaimed_by_a_different_worker() 
 
     Ok(())
 }
+
+/// `recent_real_firewall_apply_count` backs `clawforge-executor`'s
+/// mass-block budget - proves the three ways a receipt must NOT count
+/// (dry run, outside the window) alongside the one way it must.
+#[tokio::test]
+#[ignore = "requires an isolated PostgreSQL test container"]
+async fn recent_real_firewall_apply_count_only_counts_real_applies_in_the_window(
+) -> anyhow::Result<()> {
+    let url =
+        std::env::var("CLAWFORGE_TEST_DATABASE_URL").or_else(|_| std::env::var("DATABASE_URL"))?;
+    let store = PostgresStore::connect(&url).await?;
+
+    let baseline = store.recent_real_firewall_apply_count(3600).await?;
+
+    let receipt_input = |is_dry_run: bool| clawforge_storage::FirewallActionReceiptInput {
+        execution_id: None,
+        adapter: "nftables",
+        action_name: "test.mass-block-budget",
+        preflight_state: json!({}),
+        rendered_commands: json!([]),
+        observed_state: None,
+        verification_result: None,
+        ttl_seconds: 60,
+        rollback_plan: json!({}),
+        is_dry_run,
+    };
+
+    // A dry run must never count towards the budget.
+    store
+        .record_firewall_action_receipt(receipt_input(true))
+        .await?;
+    assert_eq!(
+        store.recent_real_firewall_apply_count(3600).await?,
+        baseline,
+        "a dry-run receipt must not count towards the mass-block budget"
+    );
+
+    // A real apply backdated 30 minutes - well outside a 60s window, well
+    // inside a 3600s one, with a large enough margin either way to be
+    // immune to normal query-timing jitter.
+    let old_id = store
+        .record_firewall_action_receipt(receipt_input(false))
+        .await?;
+    sqlx::query(
+        "UPDATE firewall_action_receipts SET created_at = NOW() - INTERVAL '30 minutes' WHERE id=$1",
+    )
+    .bind(old_id)
+    .execute(store.pool())
+    .await?;
+    assert_eq!(
+        store.recent_real_firewall_apply_count(60).await?,
+        baseline,
+        "a real apply from 30 minutes ago must not count within a 60s window"
+    );
+    assert_eq!(
+        store.recent_real_firewall_apply_count(3600).await?,
+        baseline + 1,
+        "the same real apply must count within a 3600s window"
+    );
+
+    // A fresh real apply must count in both.
+    store
+        .record_firewall_action_receipt(receipt_input(false))
+        .await?;
+    assert_eq!(
+        store.recent_real_firewall_apply_count(60).await?,
+        baseline + 1,
+        "only the fresh apply counts within the narrow window - the backdated one still doesn't"
+    );
+    assert_eq!(
+        store.recent_real_firewall_apply_count(3600).await?,
+        baseline + 2,
+        "both real applies count within the wide window"
+    );
+
+    assert!(
+        store.recent_real_firewall_apply_count(0).await.is_err(),
+        "window_seconds must be positive"
+    );
+
+    sqlx::query("DELETE FROM firewall_action_receipts WHERE action_name=$1")
+        .bind("test.mass-block-budget")
+        .execute(store.pool())
+        .await?;
+
+    Ok(())
+}

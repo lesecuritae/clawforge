@@ -475,6 +475,12 @@ services:
       # here, on top of the built-in loopback/link-local safety net. See
       # docs/firewall-agent.md's "Never-block exclusion list" section.
       CLAWFORGE_FIREWALL_NEVER_BLOCK_CIDRS: ${CLAWFORGE_FIREWALL_NEVER_BLOCK_CIDRS:-}
+      # Mass-block budget: at most this many real (non-dry-run) nftables
+      # applies within the trailing window before further ones are refused
+      # (recorded as a failed execution_request, nothing applied). See
+      # docs/firewall-agent.md's "Mass-block budget" section.
+      CLAWFORGE_FIREWALL_RATE_WINDOW_SECONDS: ${CLAWFORGE_FIREWALL_RATE_WINDOW_SECONDS:-300}
+      CLAWFORGE_FIREWALL_MAX_APPLIES_PER_WINDOW: ${CLAWFORGE_FIREWALL_MAX_APPLIES_PER_WINDOW:-20}
       RUST_LOG: ${RUST_LOG:-info}
     read_only: true
     tmpfs:

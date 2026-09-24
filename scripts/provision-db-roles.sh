@@ -168,9 +168,11 @@ GRANT INSERT, UPDATE ON TABLE execution_requests, execution_leases,
   execution_workers, execution_metrics, audit_events, audit_outbox, events,
   event_delivery, runtime_status TO clawforge_executor;
 -- Append-only Action Receipt log (see FirewallActionReceiptInput's own doc
--- comment) - insert-only, the executor never updates or reads a receipt
--- back.
-GRANT INSERT ON TABLE firewall_action_receipts TO clawforge_executor;
+-- comment) - insert-only for individual rows (the executor never updates
+-- one), plus SELECT for the mass-block budget's own aggregate COUNT(*)
+-- query (recent_real_firewall_apply_count) - that is a count, never a
+-- row-by-row read-back of past receipts.
+GRANT INSERT, SELECT ON TABLE firewall_action_receipts TO clawforge_executor;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO clawforge_executor;
 REVOKE UPDATE ON TABLE audit_events FROM clawforge_executor;
 

@@ -361,7 +361,15 @@ Pflichtgates vor der ersten verändernden Lab-Testaktion:
 - Desired/Actual State, TTL, Drift, Kill-Switch und vollständige Audit-Lineage
   sind vor einem Produktionspilot über ein geprüftes Admin-Werkzeug sichtbar
 - pro Adapter/Ziel gelten getestete Rate-, Concurrency- und Mass-block-Budgets
-  (**noch offen**); Zielnormalisierung und technische Ausschlusslisten decken
+  (**teilweise**: `clawforge-executor` verweigert einen echten (nicht
+  Dry-Run) `nftables.*`-Apply, sobald `CLAWFORGE_FIREWALL_MAX_APPLIES_PER_WINDOW`
+  (Standard 20) echte Applies innerhalb von `CLAWFORGE_FIREWALL_RATE_WINDOW_SECONDS`
+  (Standard 300) bereits erfasst wurden - DB-gestuetzt ueber
+  `firewall_action_receipts` selbst, nicht ein In-Prozess-Zaehler, haelt
+  also auch ueber einen Prozessneustart und mehrere Executor-Replicas
+  hinweg, echt gegen Postgres getestet. Noch offen: ein Concurrency-Limit
+  ueber mehrere Replicas hinweg, die DASSELBE Zielsystem bedienen.);
+  Zielnormalisierung und technische Ausschlusslisten decken
   IPv4, IPv6, CIDR und IPv4-mapped IPv6 ab (**erledigt fuer die
   Ausschlussliste**: `NftablesAdapter` laedt eine eingebaute Loopback-/
   Link-local-Sicherung plus eine per `CLAWFORGE_FIREWALL_NEVER_BLOCK_CIDRS`
