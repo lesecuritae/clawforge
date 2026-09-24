@@ -245,9 +245,19 @@ on this).
 
 - **No HAProxy adapter, no Tailscale adapter** (roadmap: Tailscale
   "zunächst nur als freigabepflichtigen Adapter vorbereiten").
-- **No failure-injection tests** beyond lease loss/worker death (process/
+- **No failure-injection tests** beyond lease loss/worker death (proven
+  by `a_worker_that_dies_after_claiming_is_reclaimed_by_a_different_worker`)
+  and manual drift (proven by
+  `verify_detects_manual_drift_after_an_out_of_band_removal`: a real
+  out-of-band `nft delete element`, then `verify` correctly reports
+  `NotPresent` rather than stale `Verified`). Still missing: process/
   host/DB failure between intent/apply/receipt/audit, reboot, clock skew,
-  expired TTL, manual drift, failed read-back).
+  concurrent actions on the same target, failed read-back.
+- **No TTL-driven auto-rollback.** `ttl_seconds` is recorded on every
+  receipt (`expires_at`), but nothing periodically reads it back and
+  calls `rollback` once it passes - a real (non-dry-run) block currently
+  stays in effect until something else removes it (a later explicit
+  rollback, or break-glass). This is a real, open gap, not yet built.
 - **No concurrency budget across multiple executor replicas targeting the
   same host** - the mass-block *rate* budget (above) is DB-backed and
   already holds across replicas; a *concurrency* ceiling (at most N real

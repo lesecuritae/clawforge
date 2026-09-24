@@ -98,12 +98,14 @@
 //! concurrent HA workers (see `storage/tests/postgres.rs`'s
 //! `concurrent_workers_never_claim_the_same_execution_request_twice` and
 //! `a_worker_that_dies_after_claiming_is_reclaimed_by_a_different_worker`).
-//! A break-glass drill (`break_glass_removes_every_trace_of_the_clawforge_table`)
+//! A break-glass drill (`break_glass_removes_every_trace_of_the_clawforge_table`),
+//! manual-drift detection (`verify_detects_manual_drift_after_an_out_of_band_removal`),
 //! and a DB-backed mass-block rate budget also exist now. Still open: the
 //! roadmap's remaining mandatory gates beyond what this crate's own tests
-//! cover (failure injection beyond lease loss, a concurrency budget
-//! bounding multiple replicas targeting the *same* host) - see
-//! `docs/firewall-agent.md`'s own remaining list.
+//! cover (failure injection beyond lease loss/manual drift, a concurrency
+//! budget bounding multiple replicas targeting the *same* host, TTL-driven
+//! auto-rollback of an expired block) - see `docs/firewall-agent.md`'s own
+//! remaining list.
 
 use async_trait::async_trait;
 use std::net::IpAddr;
@@ -1325,6 +1327,61 @@ mod tests {
         assert!(
             reprovisioned.success(),
             "reprovisioning after the drill must succeed so later tests find a valid table"
+        );
+    }
+
+    /// Failure-injection scenario "manuelle Drift" (roadmap): an operator
+    /// (or anything else) removes a blocked element directly via `nft`,
+    /// entirely outside Clawforge - the next `verify` call must detect
+    /// that as drift (`NotPresent`), not keep reporting `Verified` from a
+    /// stale in-memory assumption. `verify` re-checks live state every
+    /// time, by design, so this is really a test that the manual removal
+    /// itself worked as intended, proving there is nothing cached to go
+    /// stale in the first place.
+    #[tokio::test]
+    #[ignore = "requires nftables (NET_ADMIN/NET_RAW) - run via scripts/test-firewall-lab.sh"]
+    async fn verify_detects_manual_drift_after_an_out_of_band_removal() {
+        let adapter = lab_adapter().await;
+        let action = FirewallAction {
+            target: indicator("203.0.113.223"),
+            ttl_seconds: 60,
+            reason: "manual drift test".into(),
+        };
+        adapter
+            .apply(&action, false)
+            .await
+            .expect("apply must succeed");
+        assert_eq!(
+            adapter.verify(&action.target).await.unwrap(),
+            VerificationResult::Verified
+        );
+
+        // Remove it directly via `nft`, bypassing the adapter entirely -
+        // simulating an operator (or anything else) touching the set
+        // out of band.
+        let status = tokio::process::Command::new("nft")
+            .args([
+                "delete",
+                "element",
+                NFTABLES_FAMILY,
+                NFTABLES_TABLE,
+                NFTABLES_BLOCKLIST_SET_V4,
+                "{",
+                "203.0.113.223",
+                "}",
+            ])
+            .status()
+            .await
+            .expect("nft must run");
+        assert!(
+            status.success(),
+            "the out-of-band removal itself must succeed"
+        );
+
+        assert_eq!(
+            adapter.verify(&action.target).await.unwrap(),
+            VerificationResult::NotPresent,
+            "verify must detect the drift, not report stale Verified state"
         );
     }
 

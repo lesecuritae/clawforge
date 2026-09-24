@@ -364,6 +364,17 @@ Pflichtgates vor der ersten verändernden Lab-Testaktion:
 - Failure-Injection deckt Prozess-/Host-/DB-Ausfall zwischen Intent, Apply,
   Receipt und Audit, Lease-Verlust, Reboot, Uhrsprung, konkurrierende Actions,
   abgelaufene TTL, manuelle Drift und fehlgeschlagenes Read-back ab
+  (**teilweise**: Lease-Verlust/Worker-Tod erledigt -
+  `a_worker_that_dies_after_claiming_is_reclaimed_by_a_different_worker`;
+  manuelle Drift erledigt - `verify_detects_manual_drift_after_an_out_of_
+  band_removal` entfernt ein Element echt per `nft` ausserhalb des
+  Adapters und beweist, dass `verify` das erkennt, nicht veraltete
+  Zustaende meldet. Noch offen: Prozess-/Host-/DB-Ausfall zwischen den
+  Schritten selbst, Reboot, Uhrsprung, konkurrierende Actions auf
+  demselben Ziel, abgelaufene TTL (kein automatischer Rollback bei
+  TTL-Ablauf existiert bisher - `ttl_seconds` wird im Receipt persistiert,
+  aber nichts wertet `expires_at` periodisch aus), fehlgeschlagenes
+  Read-back.)
 - vor `apply` existiert immer ein persistierter Intent und ein lokales
   Recovery-Journal
 - Desired/Actual State, TTL, Drift, Kill-Switch und vollständige Audit-Lineage
