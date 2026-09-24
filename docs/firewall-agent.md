@@ -398,6 +398,44 @@ selection checks the `haproxy_ratelimit` prefix *before* the plain
 checking the generic prefix first would silently misroute rate-limit
 actions to the ACL adapter instead.
 
+## Multi-adapter dispatch: not just HAProxy
+
+Every adapter so far (`nftables.*`, `haproxy.*`, `haproxy_ratelimit.*`) is
+dispatched to exactly one adapter. That is deliberately not the only
+option: a `firewall.*`-prefixed action fans out to **every** adapter
+`CLAWFORGE_FIREWALL_ADAPTERS` configures (comma-separated, e.g.
+`"nftables,haproxy"`) instead - `nftables` is always included regardless
+of that list, because it is the host-wide, per-source-IP block that
+covers *any* externally-facing service on the host, not only the ones
+fronted by HAProxy. Without this, "block this source" would only ever
+protect whatever happens to sit behind HAProxy - `nftables` closes that
+gap by construction, not by an operator remembering to configure it.
+
+`dispatch_multi_adapter` attempts every configured adapter regardless of
+another one's failure (defense in depth: a HAProxy-layer block succeeding
+is still worth having even if the host-wide one somehow failed, and vice
+versa). Overall success is `true` iff the mandatory `nftables` adapter
+succeeded - that is the actual guarantee a `firewall.*` action exists to
+make. A receipt is persisted for every adapter that *did* succeed,
+independent of overall success, since a real state change happened and
+needs tracking (audit, TTL) regardless of a sibling's outcome. An
+unrecognized name in `CLAWFORGE_FIREWALL_ADAPTERS` is logged and dropped,
+not fatal - unlike the never-block exclusion list (where a silently
+dropped entry is a self-lockout risk), omitting one optional, best-effort
+extra layer is not: `nftables` alone already provides the core guarantee
+regardless of what else was misconfigured.
+
+`nftables.*`/`haproxy.*`/`haproxy_ratelimit.*` single-adapter actions
+still exist and still work exactly as before - `firewall.*` is an
+additional, broader option, not a replacement. Registered via migration
+`0041`: `firewall.block_indicator` (risk `high`) and
+`firewall.block_incident_source` (risk `critical`), same
+`requires_approval=TRUE, enabled=FALSE` precedent as every other
+connector action. The mass-block budget (above) counts every adapter a
+`firewall.*` fan-out actually applies individually, not the fan-out as
+one unit - three successful adapters count as three towards the shared
+budget.
+
 ## Tailscale adapter (prepared, not operable)
 
 The roadmap is explicit that Tailscale should be prepared "zunächst nur

@@ -8,12 +8,14 @@
 //! this call site being updated too, dispatch would still default to
 //! `dry_run: true` rather than silently start applying for real.
 //!
-//! Any action whose name is not a recognized firewall action (`nftables.`
-//! or `haproxy.` prefix) keeps the exact prior behavior: claimed, marked
-//! `running`, then immediately completed with `"dry_run: no external
-//! operation executed"` - this module changes nothing about docker/
-//! github/proxmox actions, or `tailscale.*` ones (`TailscaleAdapter` has
-//! no `apply` capability to dispatch to at all - see
+//! Any action whose name is not a recognized firewall action (`nftables.`/
+//! `haproxy.`/`haproxy_ratelimit.` prefix, one specific adapter each, or
+//! `firewall.`, every configured adapter at once - see
+//! `dispatch_multi_adapter`) keeps the exact prior behavior: claimed,
+//! marked `running`, then immediately completed with `"dry_run: no
+//! external operation executed"` - this module changes nothing about
+//! docker/github/proxmox actions, or `tailscale.*` ones (`TailscaleAdapter`
+//! has no `apply` capability to dispatch to at all - see
 //! `docs/firewall-agent.md`).
 
 use clawforge_firewall_agent::{
@@ -31,6 +33,18 @@ use uuid::Uuid;
 const DEFAULT_FIREWALL_ACTION_TTL_SECONDS: u32 = 3600;
 const DEFAULT_FIREWALL_RATE_WINDOW_SECONDS: i64 = 300;
 const DEFAULT_FIREWALL_MAX_APPLIES_PER_WINDOW: i64 = 20;
+/// A `firewall.*` action (as opposed to `nftables.*`/`haproxy.*`/
+/// `haproxy_ratelimit.*`) fans out to every configured adapter - see
+/// `dispatch_multi_adapter`'s own doc comment.
+const FIREWALL_MULTI_ADAPTER_PREFIX: &str = "firewall.";
+/// The one adapter a `firewall.*` action always includes, regardless of
+/// `CLAWFORGE_FIREWALL_ADAPTERS` - the host-wide, per-source-IP block that
+/// covers *every* service on the host, not just ones fronted by HAProxy.
+/// This is what makes a `firewall.*` action's guarantee "any externally-
+/// facing service, not just HAProxy" rather than depending on what an
+/// operator happened to configure.
+const MANDATORY_MULTI_ADAPTER: &str = "nftables";
+const DEFAULT_FIREWALL_ADAPTERS: &str = "nftables";
 
 fn firewall_rate_window_seconds() -> i64 {
     env::var("CLAWFORGE_FIREWALL_RATE_WINDOW_SECONDS")
@@ -58,15 +72,55 @@ fn firewall_budget_applies(action_name: &str, dry_run: bool) -> bool {
 }
 
 /// Whether `action_name` is one `dispatch()` actually routes to a real
-/// adapter - `nftables.*` (`NftablesAdapter`) or `haproxy.*`
-/// (`HaproxyAdapter`). `tailscale.*` is deliberately excluded: there is
-/// no apply capability to dispatch to at all (see
+/// adapter (or adapters) - `nftables.*`/`haproxy.*`/`haproxy_ratelimit.*`
+/// (one specific adapter each) or `firewall.*` (every configured
+/// adapter - see `dispatch_multi_adapter`). `tailscale.*` is deliberately
+/// excluded: there is no apply capability to dispatch to at all (see
 /// `docs/firewall-agent.md`), so it stays on the same generic dry-run
 /// fallback every other non-firewall action already uses.
 fn is_firewall_action(action_name: &str) -> bool {
     action_name.starts_with("nftables.")
         || action_name.starts_with("haproxy_ratelimit.")
         || action_name.starts_with("haproxy.")
+        || action_name.starts_with(FIREWALL_MULTI_ADAPTER_PREFIX)
+}
+
+/// Which adapters a `firewall.*` action fans out to -
+/// `CLAWFORGE_FIREWALL_ADAPTERS` (comma-separated, e.g.
+/// `"nftables,haproxy"`), defaulting to `nftables` alone so a host with
+/// no HAProxy running is never required to configure anything for the
+/// host-wide guarantee to work. `nftables` is always included even if an
+/// operator's own list omits it - see `MANDATORY_MULTI_ADAPTER`'s own doc
+/// comment for why that guarantee cannot be opted out of. An
+/// unrecognized name is logged and dropped rather than failing the whole
+/// list closed (unlike the never-block exclusion list): omitting one
+/// *optional*, best-effort extra layer is not a self-lockout risk the way
+/// a silently-dropped exclusion entry would be - `nftables` alone already
+/// provides the core guarantee regardless.
+fn configured_multi_adapters() -> Vec<String> {
+    let raw = env::var("CLAWFORGE_FIREWALL_ADAPTERS")
+        .unwrap_or_else(|_| DEFAULT_FIREWALL_ADAPTERS.to_string());
+    let mut names: Vec<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .filter(|name| {
+            let known = matches!(*name, "nftables" | "haproxy" | "haproxy_ratelimit");
+            if !known {
+                tracing::warn!(
+                    adapter = %name,
+                    "CLAWFORGE_FIREWALL_ADAPTERS names an unrecognized adapter - ignoring it"
+                );
+            }
+            known
+        })
+        .map(str::to_string)
+        .collect();
+    if !names.iter().any(|name| name == MANDATORY_MULTI_ADAPTER) {
+        names.insert(0, MANDATORY_MULTI_ADAPTER.to_string());
+    }
+    names.dedup();
+    names
 }
 
 /// Picks the adapter an `nftables.`/`haproxy.`/`haproxy_ratelimit.`-prefixed
@@ -91,11 +145,13 @@ fn adapter_for(name: &str) -> Option<Box<dyn FirewallAdapter>> {
 }
 
 /// The mass-block budget: how many *real* (non-dry-run) firewall applies
-/// (`nftables.*` or `haproxy.*` - one shared counter across both adapters,
-/// not one per adapter) this database has recorded in the trailing rate
-/// window - a runaway policy engine or a config mistake must not be able
-/// to block hundreds of addresses in a burst. Dry runs and non-firewall
-/// actions are never gated (`Ok(None)`) - there is nothing to bound. DB-backed via
+/// (`nftables.*`/`haproxy.*`/`haproxy_ratelimit.*`/`firewall.*` - one
+/// shared counter across every adapter, not one per adapter, and a
+/// `firewall.*` fan-out's several receipts each count individually) this
+/// database has recorded in the trailing rate window - a runaway policy
+/// engine or a config mistake must not be able to block hundreds of
+/// addresses in a burst. Dry runs and non-firewall actions are never
+/// gated (`Ok(None)`) - there is nothing to bound. DB-backed via
 /// `recent_real_firewall_apply_count` rather than an in-memory counter, so
 /// the budget holds across a process restart and across multiple executor
 /// replicas sharing this database - see that method's own doc comment.
@@ -271,26 +327,155 @@ async fn sweep_expired_firewall_targets(store: &PostgresStore) {
     }
 }
 
+/// Runs preflight (best-effort) + apply + (if a real apply) verify against
+/// one adapter, and builds the receipt for it - the single-adapter logic
+/// shared by both `dispatch()`'s plain single-adapter path and
+/// `dispatch_multi_adapter()`'s fan-out, so the two can never build a
+/// receipt differently for the same adapter.
+async fn apply_single_adapter(
+    adapter: &dyn FirewallAdapter,
+    action: &FirewallAction,
+    dry_run: bool,
+) -> Result<(String, FirewallDispatchReceipt), String> {
+    // Best-effort: preflight is read-only enrichment for the receipt, not
+    // a gate - a preflight failure (e.g. no NET_ADMIN/no HAProxy socket in
+    // this environment) is recorded as-is and apply is still attempted,
+    // since apply's own success/failure is what actually determines the
+    // outcome here.
+    let preflight_state = match adapter.preflight(&action.target).await {
+        Ok(preflight) => adapter_state_json(&preflight.raw_set_json),
+        Err(error) => serde_json::json!({"error": error.to_string()}),
+    };
+    let result = adapter
+        .apply(action, dry_run)
+        .await
+        .map_err(|error| error.to_string())?;
+    let verification_result = if dry_run {
+        None
+    } else {
+        match adapter.verify(&action.target).await {
+            Ok(VerificationResult::Verified) => Some("verified"),
+            Ok(VerificationResult::NotPresent) => Some("mismatch"),
+            Err(_) => Some("failed"),
+        }
+    };
+    let summary = format!(
+        "adapter={} dry_run={} commands={:?}",
+        result.receipt.adapter, result.receipt.is_dry_run, result.receipt.rendered_commands
+    );
+    let receipt = FirewallDispatchReceipt {
+        adapter: result.receipt.adapter,
+        preflight_state,
+        rendered_commands: serde_json::json!(result.receipt.rendered_commands),
+        observed_state: result.observed_state.as_deref().map(adapter_state_json),
+        verification_result,
+        ttl_seconds: result.receipt.ttl_seconds,
+        rollback_plan: serde_json::json!({"commands": result.receipt.rollback_commands}),
+        is_dry_run: result.receipt.is_dry_run,
+        target_fingerprint: result.receipt.target_fingerprint,
+    };
+    Ok((summary, receipt))
+}
+
+/// A `firewall.*` action fans out to *every* configured adapter instead of
+/// one - see `configured_multi_adapters`'s own doc comment for which ones
+/// and why `nftables` is always among them. Every adapter is attempted
+/// regardless of another one's failure (defense in depth: a HAProxy-layer
+/// block succeeding is still worth having even if the host-wide one
+/// somehow failed, and vice versa) - overall `success` is `true` iff the
+/// *mandatory* `nftables` adapter succeeded, since that is the "any
+/// external service on this host" guarantee a `firewall.*` action exists
+/// to make. A receipt is persisted for every adapter that succeeded,
+/// regardless of overall success - a real state change happened and must
+/// be tracked (audit, TTL) even if a sibling adapter failed.
+async fn dispatch_multi_adapter(
+    claimed: &ClaimedExecutionRequest,
+) -> (
+    bool,
+    Option<String>,
+    Option<String>,
+    Vec<FirewallDispatchReceipt>,
+) {
+    let Some(target) = claimed.target.as_ref() else {
+        return (
+            false,
+            None,
+            Some(format!(
+                "firewall action {:?} has no target",
+                claimed.action_name
+            )),
+            Vec::new(),
+        );
+    };
+    let action = match parse_firewall_action(claimed.id, target) {
+        Ok(action) => action,
+        Err(error) => return (false, None, Some(error.to_string()), Vec::new()),
+    };
+    let dry_run = dry_run_from_env();
+    let mut receipts = Vec::new();
+    let mut summaries = Vec::new();
+    let mut mandatory_error = None;
+    for name in configured_multi_adapters() {
+        // configured_multi_adapters() only ever returns recognized names,
+        // so this is always Some - the fallback keeps this loop body
+        // total rather than relying on that invariant silently.
+        let Some(adapter) = adapter_for(&name) else {
+            continue;
+        };
+        match apply_single_adapter(adapter.as_ref(), &action, dry_run).await {
+            Ok((summary, receipt)) => {
+                summaries.push(summary);
+                receipts.push(receipt);
+            }
+            Err(error) => {
+                if name == MANDATORY_MULTI_ADAPTER {
+                    mandatory_error = Some(error.clone());
+                }
+                summaries.push(format!("{name}: failed: {error}"));
+            }
+        }
+    }
+    let combined_summary = Some(summaries.join("; "));
+    match mandatory_error {
+        Some(error) => (
+            false,
+            combined_summary,
+            Some(format!(
+                "mandatory {MANDATORY_MULTI_ADAPTER} adapter failed: {error}"
+            )),
+            receipts,
+        ),
+        None => (true, combined_summary, None, receipts),
+    }
+}
+
 /// Dispatches one claimed request. Returns `(success, result_summary,
-/// error_summary, receipt)` for the caller to persist via
+/// error_summary, receipts)` for the caller to persist via
 /// `complete_execution_dispatch` (always) and `record_firewall_action_receipt`
-/// (only when `receipt` is `Some`, i.e. a firewall action actually applied
-/// successfully) - never panics, every adapter/parse error becomes a failed
-/// completion with a clear `error_summary` instead.
+/// (once per entry in `receipts` - empty for anything that isn't a
+/// firewall action, or that failed before any adapter applied) - never
+/// panics, every adapter/parse error becomes a failed completion with a
+/// clear `error_summary` instead.
 async fn dispatch(
     claimed: &ClaimedExecutionRequest,
 ) -> (
     bool,
     Option<String>,
     Option<String>,
-    Option<FirewallDispatchReceipt>,
+    Vec<FirewallDispatchReceipt>,
 ) {
+    if claimed
+        .action_name
+        .starts_with(FIREWALL_MULTI_ADAPTER_PREFIX)
+    {
+        return dispatch_multi_adapter(claimed).await;
+    }
     let Some(adapter) = adapter_for(&claimed.action_name) else {
         return (
             true,
             Some("dry_run: no external operation executed".to_string()),
             None,
-            None,
+            Vec::new(),
         );
     };
     let Some(target) = claimed.target.as_ref() else {
@@ -301,51 +486,17 @@ async fn dispatch(
                 "firewall action {:?} has no target",
                 claimed.action_name
             )),
-            None,
+            Vec::new(),
         );
     };
     let action = match parse_firewall_action(claimed.id, target) {
         Ok(action) => action,
-        Err(error) => return (false, None, Some(error.to_string()), None),
+        Err(error) => return (false, None, Some(error.to_string()), Vec::new()),
     };
     let dry_run = dry_run_from_env();
-    // Best-effort: preflight is read-only enrichment for the receipt, not
-    // a gate - a preflight failure (e.g. no NET_ADMIN in this environment)
-    // is recorded as-is and apply is still attempted, since apply's own
-    // success/failure is what actually determines the outcome here.
-    let preflight_state = match adapter.preflight(&action.target).await {
-        Ok(preflight) => adapter_state_json(&preflight.raw_set_json),
-        Err(error) => serde_json::json!({"error": error.to_string()}),
-    };
-    match adapter.apply(&action, dry_run).await {
-        Ok(result) => {
-            let verification_result = if dry_run {
-                None
-            } else {
-                match adapter.verify(&action.target).await {
-                    Ok(VerificationResult::Verified) => Some("verified"),
-                    Ok(VerificationResult::NotPresent) => Some("mismatch"),
-                    Err(_) => Some("failed"),
-                }
-            };
-            let summary = format!(
-                "adapter={} dry_run={} commands={:?}",
-                result.receipt.adapter, result.receipt.is_dry_run, result.receipt.rendered_commands
-            );
-            let receipt = FirewallDispatchReceipt {
-                adapter: result.receipt.adapter,
-                preflight_state,
-                rendered_commands: serde_json::json!(result.receipt.rendered_commands),
-                observed_state: result.observed_state.as_deref().map(adapter_state_json),
-                verification_result,
-                ttl_seconds: result.receipt.ttl_seconds,
-                rollback_plan: serde_json::json!({"commands": result.receipt.rollback_commands}),
-                is_dry_run: result.receipt.is_dry_run,
-                target_fingerprint: result.receipt.target_fingerprint,
-            };
-            (true, Some(summary), None, Some(receipt))
-        }
-        Err(error) => (false, None, Some(error.to_string()), None),
+    match apply_single_adapter(adapter.as_ref(), &action, dry_run).await {
+        Ok((summary, receipt)) => (true, Some(summary), None, vec![receipt]),
+        Err(error) => (false, None, Some(error), Vec::new()),
     }
 }
 
@@ -407,14 +558,20 @@ async fn main() -> anyhow::Result<()> {
                                 Some(format!("could not check mass-block budget: {error}"))
                             }
                         };
-                        let (success, result_summary, error_summary, receipt) =
+                        let (success, result_summary, error_summary, receipts) =
                             if let Some(reason) = refusal {
                                 tracing::warn!(execution_id = %claimed.id, action = %claimed.action_name, reason = %reason, "refusing dispatch");
-                                (false, None, Some(reason), None)
+                                (false, None, Some(reason), Vec::new())
                             } else {
                                 dispatch(&claimed).await
                             };
-                        if let Some(receipt) = receipt {
+                        // One receipt row per adapter that actually applied -
+                        // a firewall.* fan-out (dispatch_multi_adapter) can
+                        // produce more than one; every other action produces
+                        // at most one. Persisted regardless of overall
+                        // `success` - a sibling adapter's real state change
+                        // still needs tracking even if another one failed.
+                        for receipt in receipts {
                             if let Err(error) = store
                                 .record_firewall_action_receipt(FirewallActionReceiptInput {
                                     execution_id: Some(claimed.id),
@@ -437,7 +594,7 @@ async fn main() -> anyhow::Result<()> {
                                 // an already-decided outcome, not a gate on it
                                 // - losing one must not turn a completed
                                 // dispatch into a failed one.
-                                tracing::warn!(%error, execution_id = %claimed.id, "could not persist firewall action receipt");
+                                tracing::warn!(%error, execution_id = %claimed.id, adapter = receipt.adapter, "could not persist firewall action receipt");
                             }
                         }
                         if let Err(error) = store
@@ -511,6 +668,7 @@ mod tests {
             "haproxy_ratelimit.block_indicator",
             false
         ));
+        assert!(firewall_budget_applies("firewall.block_indicator", false));
         assert!(
             !firewall_budget_applies("nftables.block_indicator", true),
             "a dry run has nothing to bound"
@@ -557,7 +715,7 @@ mod tests {
     #[tokio::test]
     async fn non_firewall_actions_keep_the_original_dry_run_success_behavior() {
         let request = claimed("docker.restart_container", None);
-        let (success, summary, error, receipt) = dispatch(&request).await;
+        let (success, summary, error, receipts) = dispatch(&request).await;
         assert!(success);
         assert_eq!(
             summary.as_deref(),
@@ -565,7 +723,7 @@ mod tests {
         );
         assert!(error.is_none());
         assert!(
-            receipt.is_none(),
+            receipts.is_empty(),
             "a non-firewall action must never produce a receipt to persist"
         );
     }
@@ -573,10 +731,10 @@ mod tests {
     #[tokio::test]
     async fn a_firewall_action_without_a_target_fails_with_a_clear_error() {
         let request = claimed("nftables.block_indicator", None);
-        let (success, _summary, error, receipt) = dispatch(&request).await;
+        let (success, _summary, error, receipts) = dispatch(&request).await;
         assert!(!success);
         assert!(error.unwrap().contains("no target"));
-        assert!(receipt.is_none());
+        assert!(receipts.is_empty());
     }
 
     #[tokio::test]
@@ -585,10 +743,10 @@ mod tests {
             "nftables.block_indicator",
             Some(serde_json::json!({"kind": "not-a-real-kind"})),
         );
-        let (success, _summary, error, receipt) = dispatch(&request).await;
+        let (success, _summary, error, receipts) = dispatch(&request).await;
         assert!(!success);
         assert!(error.is_some());
-        assert!(receipt.is_none());
+        assert!(receipts.is_empty());
     }
 
     #[tokio::test]
@@ -604,12 +762,17 @@ mod tests {
                 "source": "spamhaus_drop",
             })),
         );
-        let (success, summary, error, receipt) = dispatch(&request).await;
+        let (success, summary, error, receipts) = dispatch(&request).await;
         assert!(success, "dispatch failed: {error:?}");
         let summary = summary.unwrap();
         assert!(summary.contains("dry_run=true"));
         assert!(summary.contains("203.0.113.0/24"));
-        let receipt = receipt.expect("a successful firewall apply must produce a receipt");
+        assert_eq!(
+            receipts.len(),
+            1,
+            "a single-adapter action produces exactly one receipt"
+        );
+        let receipt = &receipts[0];
         assert!(receipt.is_dry_run);
         assert!(
             receipt.verification_result.is_none(),
@@ -633,14 +796,14 @@ mod tests {
                 "source": "spamhaus_drop",
             })),
         );
-        let (success, summary, error, receipt) = dispatch(&request).await;
+        let (success, summary, error, receipts) = dispatch(&request).await;
         assert!(success, "dispatch failed: {error:?}");
         let summary = summary.unwrap();
         assert!(summary.contains("adapter=haproxy"));
         assert!(summary.contains("dry_run=true"));
-        let receipt = receipt.expect("a successful firewall apply must produce a receipt");
-        assert_eq!(receipt.adapter, "haproxy");
-        assert!(receipt.is_dry_run);
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].adapter, "haproxy");
+        assert!(receipts[0].is_dry_run);
     }
 
     #[tokio::test]
@@ -657,14 +820,14 @@ mod tests {
                 "source": "spamhaus_drop",
             })),
         );
-        let (success, summary, error, receipt) = dispatch(&request).await;
+        let (success, summary, error, receipts) = dispatch(&request).await;
         assert!(success, "dispatch failed: {error:?}");
         let summary = summary.unwrap();
         assert!(summary.contains("adapter=haproxy_ratelimit"));
         assert!(summary.contains("dry_run=true"));
-        let receipt = receipt.expect("a successful firewall apply must produce a receipt");
-        assert_eq!(receipt.adapter, "haproxy_ratelimit");
-        assert!(receipt.is_dry_run);
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].adapter, "haproxy_ratelimit");
+        assert!(receipts[0].is_dry_run);
     }
 
     #[tokio::test]
@@ -674,14 +837,80 @@ mod tests {
         // all (see docs/firewall-agent.md), so dispatch() must treat it
         // exactly like any other non-firewall action.
         let request = claimed("tailscale.quarantine_device", None);
-        let (success, summary, error, receipt) = dispatch(&request).await;
+        let (success, summary, error, receipts) = dispatch(&request).await;
         assert!(success);
         assert_eq!(
             summary.as_deref(),
             Some("dry_run: no external operation executed")
         );
         assert!(error.is_none());
-        assert!(receipt.is_none());
+        assert!(receipts.is_empty());
+    }
+
+    /// All three `CLAWFORGE_FIREWALL_ADAPTERS` scenarios in one test,
+    /// sequentially - not three separate `#[tokio::test]` functions,
+    /// because they need three different values of the *same* env var and
+    /// cargo test's default parallel execution would otherwise race them
+    /// against each other (unlike a plain set/unset check, three specific
+    /// values genuinely need to not interleave).
+    #[tokio::test]
+    async fn firewall_action_fan_out_honors_configured_multi_adapters() {
+        std::env::remove_var("CLAWFORGE_EXECUTOR_DRY_RUN");
+        let request = || {
+            claimed(
+                "firewall.block_indicator",
+                Some(serde_json::json!({
+                    "kind": "threat_intel_indicator",
+                    "cidr": "203.0.113.0/24",
+                    "source": "spamhaus_drop",
+                })),
+            )
+        };
+
+        // No CLAWFORGE_FIREWALL_ADAPTERS set - defaults to nftables alone.
+        std::env::remove_var("CLAWFORGE_FIREWALL_ADAPTERS");
+        let (success, summary, error, receipts) = dispatch(&request()).await;
+        assert!(success, "dispatch failed: {error:?}");
+        assert_eq!(
+            receipts.len(),
+            1,
+            "with no CLAWFORGE_FIREWALL_ADAPTERS set, only the mandatory nftables adapter runs"
+        );
+        assert_eq!(receipts[0].adapter, "nftables");
+        assert!(summary.unwrap().contains("adapter=nftables"));
+
+        // All three configured explicitly.
+        std::env::set_var(
+            "CLAWFORGE_FIREWALL_ADAPTERS",
+            "nftables,haproxy,haproxy_ratelimit",
+        );
+        let (success, _summary, error, receipts) = dispatch(&request()).await;
+        assert!(success, "dispatch failed: {error:?}");
+        let mut adapters: Vec<&str> = receipts.iter().map(|r| r.adapter).collect();
+        adapters.sort_unstable();
+        assert_eq!(adapters, ["haproxy", "haproxy_ratelimit", "nftables"]);
+
+        // nftables must always run even when an operator's own list omits
+        // it - the host-wide "any external service" guarantee cannot be
+        // configured away.
+        std::env::set_var("CLAWFORGE_FIREWALL_ADAPTERS", "haproxy");
+        let (success, _summary, error, receipts) = dispatch(&request()).await;
+        assert!(success, "dispatch failed: {error:?}");
+        assert!(
+            receipts.iter().any(|r| r.adapter == "nftables"),
+            "nftables must always run, even when an operator's own list omits it: {:?}",
+            receipts.iter().map(|r| r.adapter).collect::<Vec<_>>()
+        );
+
+        // An unrecognized name is dropped, not fatal - nftables (the core
+        // guarantee) still runs regardless.
+        std::env::set_var("CLAWFORGE_FIREWALL_ADAPTERS", "not-a-real-adapter");
+        let (success, _summary, error, receipts) = dispatch(&request()).await;
+        assert!(success, "dispatch failed: {error:?}");
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].adapter, "nftables");
+
+        std::env::remove_var("CLAWFORGE_FIREWALL_ADAPTERS");
     }
 
     #[test]

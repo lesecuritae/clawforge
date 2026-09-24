@@ -481,6 +481,20 @@ services:
       # docs/firewall-agent.md's "Mass-block budget" section.
       CLAWFORGE_FIREWALL_RATE_WINDOW_SECONDS: ${CLAWFORGE_FIREWALL_RATE_WINDOW_SECONDS:-300}
       CLAWFORGE_FIREWALL_MAX_APPLIES_PER_WINDOW: ${CLAWFORGE_FIREWALL_MAX_APPLIES_PER_WINDOW:-20}
+      # Which adapters a firewall.* action fans out to (comma-separated) -
+      # "nftables" (the host-wide, any-external-service guarantee) is
+      # always included regardless of this list. See docs/firewall-agent.md's
+      # "Multi-adapter dispatch" section.
+      CLAWFORGE_FIREWALL_ADAPTERS: ${CLAWFORGE_FIREWALL_ADAPTERS:-nftables}
+      # HaproxyAdapter/HaproxyRateLimitAdapter connection settings - only
+      # matter if CLAWFORGE_FIREWALL_ADAPTERS (or a haproxy./
+      # haproxy_ratelimit.-prefixed action directly) actually uses them.
+      # Defaults match a typical HAProxy install; see
+      # scripts/haproxy-clawforge-provision.sh for the config an operator
+      # adds to make these meaningful.
+      CLAWFORGE_HAPROXY_ADMIN_SOCKET: ${CLAWFORGE_HAPROXY_ADMIN_SOCKET:-/var/run/haproxy/admin.sock}
+      CLAWFORGE_HAPROXY_BLOCKLIST_ACL_FILE: ${CLAWFORGE_HAPROXY_BLOCKLIST_ACL_FILE:-/etc/haproxy/maps/clawforge-blocklist.map}
+      CLAWFORGE_HAPROXY_RATE_LIMIT_TABLE: ${CLAWFORGE_HAPROXY_RATE_LIMIT_TABLE:-clawforge_ratelimit}
       RUST_LOG: ${RUST_LOG:-info}
     read_only: true
     tmpfs:

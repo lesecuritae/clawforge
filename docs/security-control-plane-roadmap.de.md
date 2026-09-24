@@ -355,6 +355,28 @@ Arbeitspakete:
   Migration `0037` registriert Connector + `tailscale.quarantine_device`-
   Action, `requires_approval=TRUE, enabled=FALSE`. Eine echte Admin-API-
   Integration ist separates, noch nicht begonnenes Folgewerk.)
+- Multi-Adapter-Dispatch: eine Block-Entscheidung darf nicht nur Dienste
+  hinter HAProxy schuetzen, sondern jeden nach aussen gehenden Dienst auf
+  dem Host (**erledigt**, Nutzeranstoss: "das jegliche Dienste die nach
+  aussen gehen ueberwacht werden koennen und nicht nur HAProxy" - eine neue
+  `firewall.*`-Action (statt einer einzelnen `nftables.*`/`haproxy.*`/
+  `haproxy_ratelimit.*`) loest ALLE ueber `CLAWFORGE_FIREWALL_ADAPTERS`
+  konfigurierten Adapter gleichzeitig aus, `nftables` (host-weiter,
+  dienst-unabhaengiger IP-Block) ist dabei IMMER dabei, unabhaengig von der
+  Konfiguration - das ist die eigentliche "jeder externe Dienst"-Garantie,
+  nicht etwas, das ein Betreiber konfigurieren muss. Jeder Adapter wird
+  unabhaengig von einem anderen versucht (Verteidigung in der Tiefe);
+  Gesamterfolg haengt nur am PFLICHT-Adapter `nftables`; erfolgreiche
+  Adapter bekommen trotzdem einen Receipt, auch wenn ein anderer
+  fehlschlug. Ein unbekannter Adaptername in der Konfiguration wird nur
+  geloggt und ignoriert (anders als bei der Never-block-Liste - hier ist
+  das Auslassen einer optionalen Zusatzschicht kein Selbstsperr-Risiko,
+  `nftables` traegt die Kern-Garantie allein). Migration `0041`
+  (`firewall.block_indicator`/`firewall.block_incident_source`,
+  `requires_approval=TRUE, enabled=FALSE`). Einzeladapter-Actions
+  (`nftables.*`/`haproxy.*`/`haproxy_ratelimit.*`) bleiben bestehen und
+  funktionieren unveraendert - `firewall.*` ist eine zusaetzliche, breitere
+  Option, kein Ersatz.)
 
 **Wichtiger Nebenbefund waehrend dieser Phase**: die bestehende
 Fail-closed-Pseudonymisierung (Nutzerentscheidung aus Empfehlung 5) macht
