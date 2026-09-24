@@ -3956,6 +3956,127 @@ async fn admin_executions(
     Ok(envelope(data, Some(pagination)))
 }
 
+/// A firewall-shaped target's blast radius, purely from its own JSON - a
+/// single `/32`/`/128` (or a bare IP, no prefix at all) is a canary-sized
+/// single address; anything wider is flagged as such. String-based on
+/// purpose (no need to parse the address itself, or reach into
+/// `clawforge-firewall-agent` internals for it) - this is a hint for a
+/// reviewer, not a safety gate (the adapter's own `validate`/never-block
+/// checks are the real gate, at apply time).
+fn blast_radius_hint(target: &serde_json::Value) -> serde_json::Value {
+    let kind = target.get("kind").and_then(serde_json::Value::as_str);
+    match kind {
+        Some("threat_intel_indicator") => {
+            let cidr = target.get("cidr").and_then(serde_json::Value::as_str);
+            let is_single_address = cidr
+                .map(|cidr| match cidr.split_once('/') {
+                    Some((_, prefix)) => prefix == "32" || prefix == "128",
+                    None => true,
+                })
+                .unwrap_or(false);
+            serde_json::json!({
+                "kind": "threat_intel_indicator",
+                "cidr": cidr,
+                "is_single_address": is_single_address,
+            })
+        }
+        Some("incident_source") => serde_json::json!({
+            "kind": "incident_source",
+            "note": "resolves to exactly one source address at apply time, \
+                     never a range - see FirewallTarget::IncidentSource",
+        }),
+        _ => serde_json::json!({"kind": kind, "note": "unrecognized target shape"}),
+    }
+}
+
+/// The roadmap's phase 7 Pflichtgate: "vor Gate 7A existiert eine
+/// geprueft Approval-Oberflaeche, die unveraenderlichen Action-Diff,
+/// Evidence und Alter, Ziel/Blast Radius, Istzustand, TTL, Rollbackplan
+/// und alle Freigaben zeigt". Assembles `execution_approval_detail`
+/// (target/evidence/age/approvals-so-far) with a live-computed action
+/// preview: `render()` is pure and synchronous (no adapter I/O at all),
+/// so it is always safe to compute here even for a request that has not
+/// been approved or applied yet - this is the actual "diff"/"rollback
+/// plan" a reviewer sees *before* approving, not a description of what
+/// already happened. `adapter_for_action` is the exact same routing
+/// table `clawforge-executor`'s real dispatch uses (shared, not a second
+/// copy), so this preview can never show a reviewer a different adapter
+/// than the one that would actually run.
+async fn admin_execution_detail(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<ApiEnvelope<serde_json::Value>>> {
+    let principal = authenticate(&state, &headers).await?;
+    require_role(&principal, &["Administrator", "Operator", "Viewer"])?;
+    let mut detail = state
+        .store
+        .execution_approval_detail(id)
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "execution detail unavailable",
+            )
+        })?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "execution not found"))?;
+    let approvals = state
+        .store
+        .list_execution_approvals(id)
+        .await
+        .map_err(|_| api_error(StatusCode::SERVICE_UNAVAILABLE, "approvals unavailable"))?;
+    let action_name = detail
+        .get("action_name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let target = detail.get("target").cloned().unwrap_or_default();
+    // Best-effort preview: `None`/an error here (an unrecognized action
+    // name, a target that does not parse, an IncidentSource that
+    // legitimately cannot be previewed further) never fails the whole
+    // detail view - a reviewer still sees everything else.
+    let action_preview =
+        clawforge_firewall_agent::adapter_for_action(&action_name).and_then(|adapter| {
+            let firewall_target =
+                clawforge_firewall_agent::FirewallTarget::try_from(&target).ok()?;
+            let action = clawforge_firewall_agent::FirewallAction {
+                target: firewall_target,
+                ttl_seconds: target
+                    .get("ttl_seconds")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|value| u32::try_from(value).ok())
+                    .filter(|value| *value > 0)
+                    .unwrap_or(3600),
+                reason: format!("preview for execution_request {id}"),
+            };
+            let receipt = adapter.render(&action).ok()?;
+            Some(serde_json::json!({
+                "adapter": receipt.adapter,
+                "rendered_commands": receipt.rendered_commands,
+                "rollback_commands": receipt.rollback_commands,
+                "ttl_seconds": receipt.ttl_seconds,
+            }))
+        });
+    let blast_radius = blast_radius_hint(&target);
+    if let Some(map) = detail.as_object_mut() {
+        map.insert("approvals".to_string(), serde_json::json!(approvals));
+        map.insert(
+            "action_preview".to_string(),
+            serde_json::json!(action_preview),
+        );
+        map.insert("blast_radius".to_string(), blast_radius);
+    }
+    audit(
+        &state,
+        &principal,
+        "execution_detail_read",
+        "executions",
+        serde_json::json!({"id": id}),
+    )
+    .await;
+    Ok(envelope(detail, None))
+}
+
 #[derive(Deserialize, Default)]
 struct FirewallReceiptsQuery {
     adapter: Option<String>,
@@ -7679,6 +7800,7 @@ fn build_router(app_state: AppState) -> Router {
             "/executions",
             get(admin_executions).post(admin_create_execution),
         )
+        .route("/executions/{id}", get(admin_execution_detail))
         .route("/firewall/receipts", get(admin_firewall_receipts))
         .route("/firewall/expired", get(admin_firewall_expired))
         .route(
@@ -8869,6 +8991,7 @@ mod tests {
             "/firewall/receipts",
             "/firewall/expired",
             "/firewall/kill-switch",
+            "/executions/00000000-0000-0000-0000-000000000000",
         ] {
             let request = Request::builder()
                 .method("GET")

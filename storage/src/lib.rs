@@ -2608,6 +2608,118 @@ impl PostgresStore {
         })).collect())
     }
 
+    /// The roadmap's phase 7 Pflichtgate: "vor Gate 7A existiert eine
+    /// geprueft Approval-Oberflaeche, die unveraenderlichen Action-Diff,
+    /// Evidence und Alter, Ziel/Blast Radius, Istzustand, TTL,
+    /// Rollbackplan und alle Freigaben zeigt". This is the single-request
+    /// detail half of that (the "action diff"/rollback plan preview is
+    /// computed by the caller, from `target`, via
+    /// `clawforge_firewall_agent::adapter_for_action(...).render(...)` -
+    /// a pure function, no adapter I/O, so a *preview* is always safe to
+    /// compute for a request that has not been approved or applied yet).
+    /// `target`/`approval_context_hash` make the "unveraenderlich" (immutable)
+    /// half concrete: `target` is exactly what `approval_context_hash`
+    /// was computed over, so a caller can show a reviewer precisely what
+    /// they are approving, bit for bit.
+    ///
+    /// Evidence and its age: `LEFT JOIN`ed from `security_policy_decisions`/
+    /// `security_assessments` via `decision_id` - `None` for a request
+    /// with no linked decision (not every execution originates from the
+    /// policy engine).
+    pub async fn execution_approval_detail(
+        &self,
+        execution_id: Uuid,
+    ) -> Result<Option<serde_json::Value>> {
+        let row = sqlx::query(
+            "SELECT e.id, e.action_id, e.decision_id, e.requested_by, e.status, \
+                    e.created_at, e.approval_context, e.approval_context_hash, \
+                    e.required_approvals, e.approval_expires_at, \
+                    a.name AS action_name, a.risk_level, \
+                    d.decision, d.risk_score, d.evidence_sources, d.corroborated, \
+                    d.rationale, d.evidence_snapshot, d.decided_at, \
+                    s.rule_id, s.severity, s.confidence, s.summary AS assessment_summary, \
+                    s.first_seen, s.last_seen, s.created_at AS assessment_created_at \
+             FROM execution_requests e \
+             JOIN actions a ON a.id = e.action_id \
+             LEFT JOIN security_policy_decisions d ON d.id = e.decision_id \
+             LEFT JOIN security_assessments s ON s.id = d.assessment_id \
+             WHERE e.id = $1",
+        )
+        .bind(execution_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let assessment_created_at =
+            row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("assessment_created_at");
+        let evidence = row.get::<Option<String>, _>("decision").map(|decision| {
+            serde_json::json!({
+                "decision": decision,
+                "risk_score": row.get::<i16, _>("risk_score"),
+                "evidence_sources": row.get::<i16, _>("evidence_sources"),
+                "corroborated": row.get::<bool, _>("corroborated"),
+                "rationale": row.get::<String, _>("rationale"),
+                "evidence_snapshot": row.get::<serde_json::Value, _>("evidence_snapshot"),
+                "decided_at": row.get::<chrono::DateTime<chrono::Utc>, _>("decided_at"),
+                "rule_id": row.get::<Option<String>, _>("rule_id"),
+                "severity": row.get::<Option<String>, _>("severity"),
+                "confidence": row.get::<Option<i16>, _>("confidence"),
+                "assessment_summary": row.get::<Option<String>, _>("assessment_summary"),
+                "first_seen": row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("first_seen"),
+                "last_seen": row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("last_seen"),
+                "assessment_created_at": assessment_created_at,
+                "evidence_age_seconds": assessment_created_at
+                    .map(|created_at| (chrono::Utc::now() - created_at).num_seconds()),
+            })
+        });
+        Ok(Some(serde_json::json!({
+            "id": row.get::<Uuid, _>("id"),
+            "action_id": row.get::<Uuid, _>("action_id"),
+            "action_name": row.get::<String, _>("action_name"),
+            "risk_level": row.get::<String, _>("risk_level"),
+            "decision_id": row.get::<Option<Uuid>, _>("decision_id"),
+            "requested_by": row.get::<String, _>("requested_by"),
+            "status": row.get::<String, _>("status"),
+            "created_at": row.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
+            "target": row.get::<serde_json::Value, _>("approval_context")
+                .get("target")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "approval_context_hash": row.get::<Option<String>, _>("approval_context_hash"),
+            "required_approvals": row.get::<i32, _>("required_approvals"),
+            "approval_expires_at": row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("approval_expires_at"),
+            "evidence": evidence,
+        })))
+    }
+
+    /// All approvals recorded for one execution request, oldest first -
+    /// the "alle Freigaben" half of the phase 7 approval-surface gate.
+    /// `execution_approvals` is already append-only/immutable by DB
+    /// trigger (migration `0029`), so this is a plain, complete read.
+    pub async fn list_execution_approvals(
+        &self,
+        execution_id: Uuid,
+    ) -> Result<Vec<serde_json::Value>> {
+        let rows = sqlx::query(
+            "SELECT approver_id, approver_name, approved_at \
+             FROM execution_approvals WHERE execution_id = $1 ORDER BY approved_at",
+        )
+        .bind(execution_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                serde_json::json!({
+                    "approver_id": r.get::<Uuid, _>("approver_id"),
+                    "approver_name": r.get::<String, _>("approver_name"),
+                    "approved_at": r.get::<chrono::DateTime<chrono::Utc>, _>("approved_at"),
+                })
+            })
+            .collect())
+    }
+
     pub async fn create_execution_request(&self, input: &ExecutionRequestInput) -> Result<Uuid> {
         let action = sqlx::query("SELECT a.name,a.risk_level,a.enabled,a.requires_approval,p.required_approvals,p.approval_timeout FROM actions a LEFT JOIN approval_policies p ON p.risk_level=a.risk_level WHERE a.id=$1")
             .bind(input.action_id)

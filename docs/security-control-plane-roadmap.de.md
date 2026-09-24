@@ -624,13 +624,35 @@ Ziel: begrenzter Pilot mit messbarer Sicherheit und kleinem Blast Radius.
 
 Vor Phasenstart werden Pilotdauer, Canary-Anzahl, False-positive-Budget,
 Rollback-p95, Drift-Erkennungszeit, Lockout-SLO und maximale Blockanzahl
-quantifiziert und durch Security Review genehmigt.
+quantifiziert und durch Security Review genehmigt. **Diese Zahlen sind
+Richtlinien-Entscheidungen des Betreibers und die Review ein
+menschlicher Prozess - beides kann und wird nicht eigenmaechtig
+festgelegt/durchgefuehrt.** Begonnen (2026-09-24), Nutzeranstoss "ja
+dann mach alles" auf die Rueckfrage nach Phase 7: alles im Dry-Run/Lab
+gefahrlos Baubare wurde gebaut (siehe unten und
+`docs/haproxy-nftables-pilot.md`); echte Produktions-Aktionen und das
+Umschalten von `CLAWFORGE_EXECUTOR_DRY_RUN` bleiben explizit ausgeklammert,
+bis der Nutzer dazu separat gefragt wurde und zustimmt.
 
 - vor Gate 7A existiert eine geprüfte Approval-Oberfläche, die unveränderlichen
   Action-Diff, Evidence und Alter, Ziel/Blast Radius, Istzustand, TTL,
-  Rollbackplan und alle Freigaben zeigt
+  Rollbackplan und alle Freigaben zeigt (**erledigt, Commit siehe unten**:
+  `GET /executions/{id}` setzt bestehende Daten (Approvals aus Migration
+  `0029`, verknuepfte `security_policy_decisions`/`security_assessments`
+  fuer Evidence+Alter) mit einer neuen Faehigkeit zusammen: `render()`
+  jedes Adapters ist rein/synchron (keine Adapter-I/O), daher kann
+  `action_preview` schon VOR jeder Freigabe live berechnet werden -
+  genau die "Action-Diff ... Rollbackplan"-Vorschau, die ein Reviewer
+  vor dem Freigeben sehen muss. Nutzt `clawforge_firewall_agent::
+  adapter_for_action` - dieselbe Routing-Tabelle, die `clawforge-executor`s
+  echter Dispatch nutzt (aus dessen vormals privater `adapter_for`
+  herausgeloest), damit die Vorschau nie einen anderen Adapter zeigen
+  kann als den, der tatsaechlich liefe. `blast_radius_hint` markiert
+  Einzeladress-Ziele (`/32`/`/128`/keine Praefix) als Canary-groesse.)
 - Gate 7A: manuell freigegebener Produktions-Canary für `/32`/`/128` mit kurzer
-  TTL; noch keine automatische Sperre
+  TTL; noch keine automatische Sperre (**noch offen - braucht die
+  quantifizierten Zahlen + Security Review + explizite Nutzerfreigabe,
+  bevor `CLAWFORGE_EXECUTOR_DRY_RUN` fuer irgendeinen echten Host faellt**)
 - Gate 7B: definierte Pilotdauer, eingehaltene Rollback-/Lockout-SLOs und
   formale Security-Freigabe
 - Gate 7C: genau eine eng definierte automatische Bruteforce- oder Scanner-

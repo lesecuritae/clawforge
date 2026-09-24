@@ -25,6 +25,7 @@ clawforge-intelligence = { path = "../intelligence" }
 clawforge-policy = { path = "../policy" }
 clawforge-secret = { path = "../secret" }
 clawforge-notification = { path = "../notification" }
+clawforge-firewall-agent = { path = "../firewall-agent" }
 
 [dev-dependencies]
 tower.workspace = true

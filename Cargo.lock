@@ -279,6 +279,7 @@ dependencies = [
  "argon2",
  "axum",
  "chrono",
+ "clawforge-firewall-agent",
  "clawforge-intelligence",
  "clawforge-notification",
  "clawforge-policy",

@@ -1922,3 +1922,92 @@ async fn firewall_inflight_operation_count_rejects_non_positive_staleness_window
 
     Ok(())
 }
+
+/// `execution_approval_detail`/`list_execution_approvals` back the
+/// roadmap's phase 7 approval-surface Pflichtgate - proves the assembled
+/// detail view carries the immutable target/action name, that a request
+/// with no linked policy decision shows `evidence: null` rather than
+/// erroring, that a nonexistent id returns `None` (not an error), and
+/// that recorded approvals show up in order.
+#[tokio::test]
+#[ignore = "requires an isolated PostgreSQL test container"]
+async fn execution_approval_detail_assembles_target_evidence_and_approvals() -> anyhow::Result<()> {
+    let url =
+        std::env::var("CLAWFORGE_TEST_DATABASE_URL").or_else(|_| std::env::var("DATABASE_URL"))?;
+    let store = PostgresStore::connect(&url).await?;
+
+    assert!(store
+        .execution_approval_detail(uuid::Uuid::new_v4())
+        .await?
+        .is_none());
+
+    let connector_id: uuid::Uuid =
+        sqlx::query_scalar("SELECT id FROM connector_registry ORDER BY name LIMIT 1")
+            .fetch_one(store.pool())
+            .await?;
+    let action_id = uuid::Uuid::new_v4();
+    let action_name = format!("test.approval-detail-{}", uuid::Uuid::new_v4());
+    sqlx::query("INSERT INTO actions (id,connector_id,name,type,description,risk_level,required_scope,requires_approval,enabled) VALUES ($1,$2,$3,'connector_action','approval detail test','high','agent:action:read',true,true)")
+        .bind(action_id)
+        .bind(connector_id)
+        .bind(&action_name)
+        .execute(store.pool())
+        .await?;
+    let admin_name = format!("approval-detail-admin-{}", uuid::Uuid::new_v4());
+    let admin_id = store
+        .create_admin_user(&admin_name, "Administrator", "argon2-hash")
+        .await?;
+    let approver_name = format!("approval-detail-approver-{}", uuid::Uuid::new_v4());
+    let approver_id = store
+        .create_admin_user(&approver_name, "Approver", "argon2-hash")
+        .await?;
+    let target = json!({
+        "kind": "threat_intel_indicator",
+        "cidr": "203.0.113.250/32",
+        "source": "spamhaus_drop",
+    });
+    let execution_id = store
+        .create_execution_request(&clawforge_storage::ExecutionRequestInput {
+            action_id,
+            workflow_run_id: None,
+            decision_id: None,
+            requested_by: admin_name.clone(),
+            requested_by_id: Some(admin_id),
+            idempotency_key: Some(format!("approval-detail-{}", uuid::Uuid::new_v4())),
+            target: Some(target.clone()),
+        })
+        .await?;
+
+    let detail = store
+        .execution_approval_detail(execution_id)
+        .await?
+        .expect("a freshly created request must have a detail view");
+    assert_eq!(detail["id"], execution_id.to_string());
+    assert_eq!(detail["action_name"], action_name);
+    assert_eq!(detail["target"], target);
+    assert!(
+        detail["evidence"].is_null(),
+        "a request with no linked policy decision must show null evidence, not error"
+    );
+
+    assert!(store
+        .list_execution_approvals(execution_id)
+        .await?
+        .is_empty());
+    store
+        .approve_execution_request(execution_id, approver_id, &approver_name)
+        .await?;
+    let approvals = store.list_execution_approvals(execution_id).await?;
+    assert_eq!(approvals.len(), 1);
+    assert_eq!(approvals[0]["approver_name"], approver_name);
+
+    // No cleanup here on purpose: `execution_approvals` is permanently
+    // immutable, even via cascade from a parent `execution_requests`
+    // delete (`migrations_and_restart_persist`'s own two-person-approval
+    // scenario proves `DELETE FROM execution_approvals` itself fails) -
+    // this row is deliberately left behind, the same precedent that test
+    // already sets. Fixture names are unique per run (random UUID
+    // suffixes), so leftover rows never collide with a later run.
+
+    Ok(())
+}

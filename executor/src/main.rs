@@ -22,8 +22,8 @@
 //! `clawforge-firewall-agent`).
 
 use clawforge_firewall_agent::{
-    FirewallAction, FirewallAdapter, FirewallTarget, HaproxyAdapter, HaproxyRateLimitAdapter,
-    NftablesAdapter, TailscaleAction, TailscaleAdapter, TailscaleTarget, VerificationResult,
+    FirewallAction, FirewallAdapter, FirewallTarget, TailscaleAction, TailscaleAdapter,
+    TailscaleTarget, VerificationResult,
 };
 use clawforge_storage::{
     database_url_from_env, ClaimedExecutionRequest, FirewallActionReceiptInput, PostgresStore,
@@ -188,22 +188,14 @@ fn adapters_touched_by(action_name: &str) -> Vec<String> {
 /// Picks the adapter an `nftables.`/`haproxy.`/`haproxy_ratelimit.`-prefixed
 /// action name (or, for the TTL sweep, an `adapter` column value -
 /// `"nftables"`/`"haproxy"`/`"haproxy_ratelimit"`, no trailing dot) routes
-/// to. Shared by `dispatch()` and `sweep_expired_firewall_targets()` so
-/// the two can never pick a different adapter for the same name.
-/// `haproxy_ratelimit` is checked *before* the plain `haproxy` prefix -
-/// `"haproxy_ratelimit..."` also starts with `"haproxy"`, so checking the
-/// generic prefix first would silently route rate-limit actions to the
-/// wrong (ACL) adapter.
+/// to. A thin alias for `clawforge_firewall_agent::adapter_for_action` -
+/// moved there (from what used to be this function's own body) so
+/// `clawforge-api`'s pre-approval action preview can share the exact same
+/// routing table rather than risk a second copy drifting from it; kept as
+/// a local `adapter_for` alias so every existing call site here (and its
+/// own unit tests) needs no changes.
 fn adapter_for(name: &str) -> Option<Box<dyn FirewallAdapter>> {
-    if name.starts_with("nftables") {
-        Some(Box::new(NftablesAdapter::new()))
-    } else if name.starts_with("haproxy_ratelimit") {
-        Some(Box::new(HaproxyRateLimitAdapter::new()))
-    } else if name.starts_with("haproxy") {
-        Some(Box::new(HaproxyAdapter::new()))
-    } else {
-        None
-    }
+    clawforge_firewall_agent::adapter_for_action(name)
 }
 
 /// The mass-block budget: how many *real* (non-dry-run) firewall applies

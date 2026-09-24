@@ -1368,6 +1368,34 @@ impl FirewallAdapter for HaproxyRateLimitAdapter {
     }
 }
 
+/// Picks the [`FirewallAdapter`] an `nftables.`/`haproxy.`/
+/// `haproxy_ratelimit.`-prefixed action name (or a bare `adapter` column
+/// value - `"nftables"`/`"haproxy"`/`"haproxy_ratelimit"`, no trailing
+/// dot) routes to. `"haproxy_ratelimit"` is checked *before* the plain
+/// `"haproxy"` prefix - `"haproxy_ratelimit..."` also starts with
+/// `"haproxy"`, so checking the generic prefix first would silently route
+/// rate-limit actions to the wrong (ACL) adapter.
+///
+/// A single shared function (moved here from what was originally
+/// `clawforge-executor`'s own private `adapter_for`) rather than one copy
+/// per caller, specifically so `clawforge-api`'s pre-approval action
+/// preview (`GET /executions/{id}/detail`, see `docs/firewall-agent.md`'s
+/// "Approval surface" section) can never drift from what
+/// `clawforge-executor`'s real dispatch actually routes to - showing a
+/// reviewer a preview from a routing table that could silently diverge
+/// from the one that runs for real would defeat the point of a preview.
+pub fn adapter_for_action(name: &str) -> Option<Box<dyn FirewallAdapter>> {
+    if name.starts_with("nftables") {
+        Some(Box::new(NftablesAdapter::new()))
+    } else if name.starts_with("haproxy_ratelimit") {
+        Some(Box::new(HaproxyRateLimitAdapter::new()))
+    } else if name.starts_with("haproxy") {
+        Some(Box::new(HaproxyAdapter::new()))
+    } else {
+        None
+    }
+}
+
 /// A device on the tailnet, identified the way Tailscale's own Admin API
 /// identifies one - never an IP address (Tailscale addresses are stable
 /// per-device, not the resource being acted on the way an nftables
