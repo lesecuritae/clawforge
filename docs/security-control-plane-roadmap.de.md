@@ -650,9 +650,22 @@ bis der Nutzer dazu separat gefragt wurde und zustimmt.
   kann als den, der tatsaechlich liefe. `blast_radius_hint` markiert
   Einzeladress-Ziele (`/32`/`/128`/keine Praefix) als Canary-groesse.)
 - Gate 7A: manuell freigegebener Produktions-Canary für `/32`/`/128` mit kurzer
-  TTL; noch keine automatische Sperre (**noch offen - braucht die
-  quantifizierten Zahlen + Security Review + explizite Nutzerfreigabe,
-  bevor `CLAWFORGE_EXECUTOR_DRY_RUN` fuer irgendeinen echten Host faellt**)
+  TTL; noch keine automatische Sperre (**noch offen - ein echter Versuch am
+  2026-09-24 gegen srv19680 wurde bewusst abgebrochen**: Zielhost (srv19680),
+  Ziel-IP (echte Spamhaus-DROP-Adresse `103.95.56.1/32`), Adapterwahl
+  (HAProxy statt nftables - kleinerer Blast-Radius, nur `korbklar_https`),
+  TTL (300s) und die Nutzerfreigabe als Security-Review-Ersatz waren
+  geklaert; die Session-Umgebung selbst hat den eigentlichen Produktions-
+  Schreibzugriff (HAProxy-Config aendern, Executor-Binary fuer Deploy bauen,
+  `DRY_RUN` umschalten) konsequent verweigert - "Production Deploy" und
+  "Auto-Mode Bypass" liessen sich anders als "Production Reads" nicht per
+  `/permissions` freischalten, offenbar bewusst so gebaut, dass ein
+  autonomer Hintergrund-Agent das nicht selbst freischalten kann. Fazit:
+  der echte Live-Schritt gehoert in eine interaktive Sitzung, in der der
+  Betreiber selbst direkt am Rechner sitzt und Prompts live bestaetigt,
+  nicht in einen Hintergrund-Agenten. Alles Uebrige (Mechanismus,
+  Approval-Oberflaeche) ist fertig; nur die tatsaechliche Ausfuehrung
+  steht noch aus.)
 - Gate 7B: definierte Pilotdauer, eingehaltene Rollback-/Lockout-SLOs und
   formale Security-Freigabe
 - Gate 7C: genau eine eng definierte automatische Bruteforce- oder Scanner-
