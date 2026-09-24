@@ -14,6 +14,34 @@ at the exact point it would call `NftablesAdapter::apply` and passes it
 as `apply`'s required `dry_run: bool` (never defaulted): if some future
 change ever relaxed the startup gate without this call site being updated
 too, dispatch would still default to `dry_run: true` rather than silently
+start applying for real. On top of both: the executor container's own
+`cap_drop: [ALL]` (see `compose.yml`) means it cannot actually mutate
+nftables state today even if both of the above were somehow bypassed - a
+real apply needs `CAP_NET_ADMIN`, which is deliberately not granted.
+Flipping `CLAWFORGE_EXECUTOR_DRY_RUN` to `false` for a real host requires
+revisiting that capability too, not just the env var.
+
+## Never-block exclusion list
+
+`NftablesAdapter::new` loads a built-in safety net (`127.0.0.0/8`,
+`::1/128`, `169.254.0.0/16`, `fe80::/10`) plus whatever
+`CLAWFORGE_FIREWALL_NEVER_BLOCK_CIDRS` configures (comma-separated
+IPs/CIDRs) - an operator's own management/SSH source range belongs there.
+`render` and `apply` both refuse - before building or running anything -
+a target whose network overlaps any excluded network **in either
+direction**: a broad target CIDR that merely contains an excluded `/32`
+is caught just as a `/32` target inside a broad excluded range would be.
+A malformed configured entry fails the *entire* list closed (every
+subsequent target refused, not just the malformed entry silently
+dropped) - the same fail-closed choice this codebase already made for
+pseudonymization (`CLAWFORGE_ANALYZER_IP_HMAC_KEY`). `rollback` is
+deliberately **not** gated: removing an element from the blocklist is
+always the safe direction. This is the concrete guardrail against
+self-lockout that exists today, in place of the isolated network lab's
+own self-lockout confirmation (see "The isolated network lab" below -
+that one still needs a real provisioned host's management path to mean
+anything, which no disposable container can stand in for).
+too, dispatch would still default to `dry_run: true` rather than silently
 start applying for real. Nothing in this increment flips that value
 against any real host - that stays a separate, explicitly reviewed step.
 

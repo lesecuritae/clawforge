@@ -68,6 +68,22 @@
 //!   the caller, and the resolved value is never logged or stored beyond
 //!   that call.
 //!
+//! ## Never-block exclusion list
+//!
+//! `NftablesAdapter::new` loads a built-in safety net (loopback,
+//! link-local) plus whatever `CLAWFORGE_FIREWALL_NEVER_BLOCK_CIDRS`
+//! configures (an operator's own management/SSH source range belongs
+//! there). `render` and `apply` both refuse - before building or running
+//! anything - a target whose network overlaps any excluded network in
+//! either direction (a broad target CIDR that merely *contains* an
+//! excluded `/32`, not just the reverse). A malformed configured entry
+//! fails the *entire* list closed rather than silently dropping just that
+//! entry - see `never_block_list_from_env`'s own doc comment. This is the
+//! concrete guardrail against self-lockout that exists today, in place of
+//! the isolated network lab's own self-lockout confirmation, which needs
+//! a real provisioned host's management path to mean anything (see
+//! `docs/firewall-agent.md`).
+//!
 //! ## What changed from the preflight/render-only increment
 //!
 //! `apply`, `verify`, and `rollback` now exist and can genuinely mutate a
@@ -348,6 +364,93 @@ fn set_contains_target(raw_set_json: &str, addr: IpAddr, prefix: Option<u8>) -> 
     })
 }
 
+/// `32` for an IPv4 address, `128` for an IPv6 address - the "just this
+/// one host" prefix length a bare address (no `/n`) implies.
+fn full_prefix(addr: IpAddr) -> u8 {
+    if addr.is_ipv4() {
+        32
+    } else {
+        128
+    }
+}
+
+/// Whether the network `a_addr/a_prefix` and `b_addr/b_prefix` overlap at
+/// all - masked by the *less specific* (numerically smaller) of the two
+/// prefixes, so this is correct regardless of which side is the broader
+/// range (a `/8` never-block entry must catch a `/32` target inside it,
+/// and a broad `/8` target must equally be caught by a `/32` never-block
+/// entry inside *it*). Different address families never overlap.
+fn ranges_overlap(a_addr: IpAddr, a_prefix: u8, b_addr: IpAddr, b_prefix: u8) -> bool {
+    match (a_addr, b_addr) {
+        (IpAddr::V4(a), IpAddr::V4(b)) => {
+            let prefix = a_prefix.min(b_prefix);
+            let mask: u32 = if prefix == 0 {
+                0
+            } else {
+                u32::MAX << (32 - prefix)
+            };
+            (u32::from(a) & mask) == (u32::from(b) & mask)
+        }
+        (IpAddr::V6(a), IpAddr::V6(b)) => {
+            let prefix = a_prefix.min(b_prefix);
+            let mask: u128 = if prefix == 0 {
+                0
+            } else {
+                u128::MAX << (128 - prefix)
+            };
+            (u128::from(a) & mask) == (u128::from(b) & mask)
+        }
+        _ => false,
+    }
+}
+
+/// Built-in safety net (loopback, link-local - always active, not
+/// disable-able by configuration) plus whatever an operator adds via
+/// `CLAWFORGE_FIREWALL_NEVER_BLOCK_CIDRS` (comma-separated IPs/CIDRs) -
+/// this is where an operator's own management/SSH source range belongs.
+/// A malformed configured entry makes the *entire* list `Err`, not just
+/// that one entry silently dropped - `NftablesAdapter::check_never_block`
+/// then refuses every target until it is fixed, the same fail-closed
+/// choice this codebase already made for pseudonymization
+/// (`clawforge-analyzer`'s `CLAWFORGE_ANALYZER_IP_HMAC_KEY`): a safety
+/// exclusion list that can silently lose entries is worse than one that
+/// visibly disables applying anything.
+fn never_block_list_from_env() -> Result<Vec<(IpAddr, u8)>, String> {
+    never_block_list_from_configured(
+        std::env::var("CLAWFORGE_FIREWALL_NEVER_BLOCK_CIDRS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// The pure parser `never_block_list_from_env` delegates to - kept
+/// separate (rather than reading the env var inline) so tests can exercise
+/// every parsing edge case deterministically, without mutating process-wide
+/// environment state that other tests running concurrently in the same
+/// binary could observe.
+fn never_block_list_from_configured(configured: Option<&str>) -> Result<Vec<(IpAddr, u8)>, String> {
+    const BUILTIN: &[&str] = &["127.0.0.0/8", "::1/128", "169.254.0.0/16", "fe80::/10"];
+    let mut list = Vec::new();
+    for entry in BUILTIN {
+        let (addr, prefix) =
+            parse_ip_or_cidr(entry).unwrap_or_else(|| panic!("built-in entry {entry:?} is valid"));
+        list.push((addr, prefix.unwrap_or_else(|| full_prefix(addr))));
+    }
+    if let Some(configured) = configured {
+        for entry in configured.split(',') {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                continue;
+            }
+            let (addr, prefix) = parse_ip_or_cidr(entry).ok_or_else(|| {
+                format!("CLAWFORGE_FIREWALL_NEVER_BLOCK_CIDRS: {entry:?} is not a valid IP or CIDR")
+            })?;
+            list.push((addr, prefix.unwrap_or_else(|| full_prefix(addr))));
+        }
+    }
+    Ok(list)
+}
+
 #[derive(Debug, Clone)]
 pub struct FirewallAction {
     pub target: FirewallTarget,
@@ -422,11 +525,53 @@ pub trait FirewallAdapter: Send + Sync {
     async fn rollback(&self, action: &FirewallAction) -> Result<(), AdapterError>;
 }
 
-pub struct NftablesAdapter;
+pub struct NftablesAdapter {
+    /// `Err` once, at construction, if `CLAWFORGE_FIREWALL_NEVER_BLOCK_CIDRS`
+    /// is set but malformed - see `never_block_list_from_env`'s own doc
+    /// comment for why that fails every subsequent `apply`/`render` closed
+    /// rather than silently dropping the bad entry.
+    never_block: Result<Vec<(IpAddr, u8)>, String>,
+}
 
 impl NftablesAdapter {
     pub fn new() -> Self {
-        Self
+        Self {
+            never_block: never_block_list_from_env(),
+        }
+    }
+
+    /// Refuses a target whose network overlaps the never-block exclusion
+    /// list (loopback/link-local, plus an operator's own configured
+    /// management/SSH range) - called by both `render` and `apply`,
+    /// before either builds or runs anything. Not called by `rollback`:
+    /// removing an element from the blocklist is the safe direction and
+    /// must always be allowed, including for something that should never
+    /// have been added in the first place. `IncidentSource` (unresolved)
+    /// has no address yet to check - it already fails closed for its own,
+    /// independent reason wherever an address would be needed.
+    fn check_never_block(&self, target: &FirewallTarget) -> Result<(), AdapterError> {
+        let never_block = self.never_block.as_ref().map_err(|error| {
+            AdapterError::InvalidTarget(format!(
+                "never-block exclusion list is misconfigured, refusing every target until \
+                 fixed: {error}"
+            ))
+        })?;
+        if matches!(target, FirewallTarget::IncidentSource { .. }) {
+            return Ok(());
+        }
+        let (addr, prefix) = target_address(target)?;
+        let prefix = prefix.unwrap_or_else(|| full_prefix(addr));
+        if never_block
+            .iter()
+            .any(|(net_addr, net_prefix)| ranges_overlap(*net_addr, *net_prefix, addr, prefix))
+        {
+            return Err(AdapterError::InvalidTarget(
+                "target overlaps a never-block exclusion (loopback/link-local or \
+                 CLAWFORGE_FIREWALL_NEVER_BLOCK_CIDRS)"
+                    .into(),
+            ));
+        }
+        Ok(())
     }
 
     /// The read-only command `preflight` runs - a pure function so the
@@ -531,6 +676,7 @@ impl FirewallAdapter for NftablesAdapter {
             ));
         }
         action.target.validate()?;
+        self.check_never_block(&action.target)?;
         let element = element_reference(&action.target)?;
         let set_name = action
             .target
@@ -551,6 +697,7 @@ impl FirewallAdapter for NftablesAdapter {
         dry_run: bool,
     ) -> Result<ApplyResult, AdapterError> {
         action.target.validate()?;
+        self.check_never_block(&action.target)?;
         let element = element_reference(&action.target)?;
         let set_name = action.target.set_name()?.ok_or_else(|| {
             AdapterError::Apply(
@@ -783,6 +930,79 @@ mod tests {
         assert!(rendered.contains("ip-pseudonym:deadbeef"));
         assert!(rendered.contains("<resolved-at-apply-time:"));
         assert!(receipt.is_dry_run);
+    }
+
+    fn action_for(target: FirewallTarget) -> FirewallAction {
+        FirewallAction {
+            target,
+            ttl_seconds: 3600,
+            reason: "test".into(),
+        }
+    }
+
+    #[test]
+    fn never_block_list_always_includes_the_builtin_safety_net_even_with_no_config() {
+        let list = never_block_list_from_configured(None).unwrap();
+        assert!(list.contains(&("127.0.0.0".parse().unwrap(), 8)));
+        assert!(list.contains(&("::1".parse().unwrap(), 128)));
+        assert!(list.contains(&("169.254.0.0".parse().unwrap(), 16)));
+    }
+
+    #[test]
+    fn never_block_list_parses_a_configured_comma_separated_list() {
+        let list =
+            never_block_list_from_configured(Some(" 10.0.0.5/32 , 192.168.1.0/24 ")).unwrap();
+        assert!(list.contains(&("10.0.0.5".parse().unwrap(), 32)));
+        assert!(list.contains(&("192.168.1.0".parse().unwrap(), 24)));
+    }
+
+    #[test]
+    fn a_malformed_configured_entry_fails_the_whole_list_closed() {
+        assert!(never_block_list_from_configured(Some("not-an-ip")).is_err());
+    }
+
+    #[test]
+    fn render_refuses_a_target_that_overlaps_a_configured_never_block_entry() {
+        let adapter = NftablesAdapter {
+            never_block: never_block_list_from_configured(Some("203.0.113.5/32")),
+        };
+        // The exact excluded /32 itself.
+        assert!(adapter
+            .render(&action_for(indicator("203.0.113.5")))
+            .is_err());
+        // A broader target CIDR that merely *contains* the excluded /32 -
+        // must be caught too, not just an exact-address match.
+        assert!(adapter
+            .render(&action_for(indicator("203.0.113.0/24")))
+            .is_err());
+        // An address outside the exclusion must still render normally.
+        assert!(adapter
+            .render(&action_for(indicator("203.0.113.6")))
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn apply_refuses_a_target_that_overlaps_the_builtin_loopback_exclusion() {
+        let adapter = NftablesAdapter {
+            never_block: never_block_list_from_configured(None),
+        };
+        let action = action_for(indicator("127.0.0.1"));
+        let result = adapter.apply(&action, true).await;
+        assert!(
+            result.is_err(),
+            "loopback must be refused even in dry_run mode, not only for a real apply"
+        );
+    }
+
+    #[test]
+    fn a_misconfigured_never_block_list_refuses_every_target_rather_than_silently_ignoring_it() {
+        let adapter = NftablesAdapter {
+            never_block: never_block_list_from_configured(Some("garbage")),
+        };
+        let error = adapter
+            .render(&action_for(indicator("203.0.113.7")))
+            .unwrap_err();
+        assert!(format!("{error}").contains("misconfigured"));
     }
 
     #[test]

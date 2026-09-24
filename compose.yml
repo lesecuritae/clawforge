@@ -470,10 +470,21 @@ services:
       CLAWFORGE_EXECUTOR_WORKER_CAPACITY: ${CLAWFORGE_EXECUTOR_WORKER_CAPACITY:-1}
       CLAWFORGE_ANALYZER_ANONYMIZE_IPS: ${CLAWFORGE_ANALYZER_ANONYMIZE_IPS:-true}
       CLAWFORGE_ANALYZER_IP_HMAC_KEY_FILE: /run/secrets/analyzer_ip_hmac_key
+      # Never applied/rendered by clawforge-firewall-agent regardless of
+      # dry_run - an operator's own management/SSH source range belongs
+      # here, on top of the built-in loopback/link-local safety net. See
+      # docs/firewall-agent.md's "Never-block exclusion list" section.
+      CLAWFORGE_FIREWALL_NEVER_BLOCK_CIDRS: ${CLAWFORGE_FIREWALL_NEVER_BLOCK_CIDRS:-}
       RUST_LOG: ${RUST_LOG:-info}
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=32m
+    # `cap_drop: [ALL]` also means this container cannot mutate nftables
+    # state even once CLAWFORGE_EXECUTOR_DRY_RUN is eventually set to
+    # false elsewhere - a real apply needs CAP_NET_ADMIN, which is
+    # deliberately not granted here yet. Flipping dry-run on for a real
+    # host requires revisiting this alongside it, not just the env var -
+    # see docs/firewall-agent.md.
     cap_drop: [ALL]
     security_opt:
       - no-new-privileges:true

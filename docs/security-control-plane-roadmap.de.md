@@ -360,9 +360,20 @@ Pflichtgates vor der ersten verändernden Lab-Testaktion:
   Recovery-Journal
 - Desired/Actual State, TTL, Drift, Kill-Switch und vollständige Audit-Lineage
   sind vor einem Produktionspilot über ein geprüftes Admin-Werkzeug sichtbar
-- pro Adapter/Ziel gelten getestete Rate-, Concurrency- und Mass-block-Budgets;
-  Zielnormalisierung und technische Ausschlusslisten decken IPv4, IPv6, CIDR
-  und IPv4-mapped IPv6 ab
+- pro Adapter/Ziel gelten getestete Rate-, Concurrency- und Mass-block-Budgets
+  (**noch offen**); Zielnormalisierung und technische Ausschlusslisten decken
+  IPv4, IPv6, CIDR und IPv4-mapped IPv6 ab (**erledigt fuer die
+  Ausschlussliste**: `NftablesAdapter` laedt eine eingebaute Loopback-/
+  Link-local-Sicherung plus eine per `CLAWFORGE_FIREWALL_NEVER_BLOCK_CIDRS`
+  konfigurierbare Liste (dort gehoert die eigene Management-/SSH-Quelle
+  hinein); `render`/`apply` verweigern jedes Ziel, dessen Netz sich mit
+  einem Ausschluss ueberschneidet - in beide Richtungen (ein breites
+  Ziel-CIDR, das einen ausgeschlossenen `/32` nur enthaelt, wird genauso
+  erkannt). Ein fehlerhafter konfigurierter Eintrag macht die GESAMTE
+  Liste fail-closed, nicht nur den einen Eintrag - derselbe Ansatz wie bei
+  der Pseudonymisierung. Das ist die konkrete Selbstsperr-Schutzmassnahme,
+  die heute existiert, anstelle der Lab-Bestaetigung gegen einen echten
+  Management-Zugangspfad, die weiterhin offen ist.)
 - HA-/Leader-/Lease-Tests beweisen, dass dieselbe Action nicht doppelt greift
   (**erledigt**: `concurrent_workers_never_claim_the_same_execution_request_twice`
   laesst zwei unabhaengige `PostgresStore`-Verbindungen - stellvertretend fuer
