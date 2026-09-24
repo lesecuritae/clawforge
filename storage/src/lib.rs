@@ -156,6 +156,14 @@ pub struct PendingKillSwitchRequest {
 
 const DEFAULT_EXECUTION_MAX_RETRIES: i32 = 3;
 const DEFAULT_EXECUTION_TIMEOUT_SECONDS: i32 = 60;
+/// How many missed/delayed sync intervals a provider is given before
+/// `list_provider_views` flags it `is_stale` - roadmap phase 8's
+/// "veraltete Feeds sichtbar machen". 3x its own configured
+/// `interval_seconds` tolerates one or two slow/skipped ticks (a
+/// transient network blip, a longer-than-usual upstream response) without
+/// flagging every provider on every minor delay, while still catching a
+/// feed that has genuinely stopped updating.
+const STALE_INTERVAL_MULTIPLIER: f64 = 3.0;
 
 impl PostgresStore {
     pub async fn connect(database_url: &str) -> Result<Self> {
@@ -533,7 +541,12 @@ impl PostgresStore {
         severity: Option<&str>,
         limit: i64,
     ) -> Result<Vec<serde_json::Value>> {
-        let rows = sqlx::query("SELECT id,source,severity,status,created_at,acknowledged_at,delivery_status,incident_id,summary,updated_at,confidence,last_seen_at,event_count,group_key,EXTRACT(EPOCH FROM (NOW()-last_seen_at)) AS age_seconds FROM alerts WHERE ($1::text IS NULL OR status=$1) AND ($2::text IS NULL OR severity=$2) ORDER BY created_at DESC LIMIT $3")
+        // ::float8 cast: EXTRACT(EPOCH FROM ...) returns Postgres `numeric`,
+        // not `float8` - without it, decoding this column as f64 below
+        // fails (a real, previously-unnoticed bug found while adding
+        // `list_provider_views`'s own `is_stale` flag - see that query's
+        // own comment).
+        let rows = sqlx::query("SELECT id,source,severity,status,created_at,acknowledged_at,delivery_status,incident_id,summary,updated_at,confidence,last_seen_at,event_count,group_key,EXTRACT(EPOCH FROM (NOW()-last_seen_at))::float8 AS age_seconds FROM alerts WHERE ($1::text IS NULL OR status=$1) AND ($2::text IS NULL OR severity=$2) ORDER BY created_at DESC LIMIT $3")
             .bind(status)
             .bind(severity)
             .bind(limit.clamp(1, 500))
@@ -1956,19 +1969,47 @@ impl PostgresStore {
     }
 
     pub async fn list_provider_views(&self) -> Result<Vec<serde_json::Value>> {
-        let rows = sqlx::query("SELECT p.id, p.name, p.source, p.interval_seconds, p.confidence, p.quality_score, p.enabled, s.state, s.last_started_at, s.last_success_at, s.last_failure_at, s.next_run_at, s.consecutive_failures, s.last_error, s.indicator_count, s.sync_duration_ms, s.last_data_at, EXTRACT(EPOCH FROM (NOW() - s.last_data_at)) AS age_seconds FROM providers p LEFT JOIN provider_status s ON s.provider_id = p.id ORDER BY p.id")
+        // EXTRACT(EPOCH FROM ...) returns Postgres `numeric`, not `float8` -
+        // sqlx's `f64` decode only accepts FLOAT8, so without this explicit
+        // cast every row.try_get::<f64,_>("age_seconds") below silently
+        // fails (via its own `.ok()`) and age_seconds always comes back
+        // `None`, real value or not. A real, pre-existing bug that stayed
+        // invisible as long as nothing else depended on the value being
+        // populated - found by `is_stale`'s own real-Postgres test, which
+        // does depend on it.
+        let rows = sqlx::query("SELECT p.id, p.name, p.source, p.interval_seconds, p.confidence, p.quality_score, p.enabled, s.state, s.last_started_at, s.last_success_at, s.last_failure_at, s.next_run_at, s.consecutive_failures, s.last_error, s.indicator_count, s.sync_duration_ms, s.last_data_at, EXTRACT(EPOCH FROM (NOW() - s.last_data_at))::float8 AS age_seconds FROM providers p LEFT JOIN provider_status s ON s.provider_id = p.id ORDER BY p.id")
             .fetch_all(&self.pool).await?;
         rows.into_iter().map(|row| {
                     let status = row.try_get::<String, _>("state").ok();
                     let last_success_at = row.try_get::<chrono::DateTime<chrono::Utc>, _>("last_success_at").ok();
+                    let enabled = row.get::<bool, _>("enabled");
+                    let interval_seconds = row.get::<i64, _>("interval_seconds");
+                    let age_seconds = row.try_get::<f64, _>("age_seconds").ok();
+                    // Roadmap phase 8: "veraltete Feeds sichtbar machen" -
+                    // an explicit, threshold-based flag rather than
+                    // leaving a caller to compare age_seconds against
+                    // interval_seconds themselves. STALE_INTERVAL_MULTIPLIER
+                    // gives a feed room for one or two missed/delayed runs
+                    // before being flagged, not just a single slow tick.
+                    // An enabled feed that has never synced at all
+                    // (age_seconds is None) is stale by definition; a
+                    // disabled feed is never flagged (nothing should be
+                    // relying on it being fresh).
+                    let is_stale = enabled
+                        && match age_seconds {
+                            Some(age) => {
+                                age > (interval_seconds as f64) * STALE_INTERVAL_MULTIPLIER
+                            }
+                            None => true,
+                        };
                     Ok(serde_json::json!({
                         "id": row.get::<String, _>("id"),
                         "name": row.get::<String, _>("name"),
                         "source": row.get::<String, _>("source"),
-                        "interval_seconds": row.get::<i64, _>("interval_seconds"),
+                        "interval_seconds": interval_seconds,
                         "confidence": row.get::<i16, _>("confidence"),
                         "quality_score": row.get::<i16, _>("quality_score"),
-                        "enabled": row.get::<bool, _>("enabled"),
+                        "enabled": enabled,
                         "status": status,
                 "last_started_at": row.try_get::<chrono::DateTime<chrono::Utc>, _>("last_started_at").ok(),
                 "last_success_at": last_success_at,
@@ -1979,11 +2020,58 @@ impl PostgresStore {
                 "indicator_count": row.try_get::<i32, _>("indicator_count").unwrap_or(0),
                 "sync_duration_ms": row.try_get::<i64, _>("sync_duration_ms").unwrap_or(0),
                 "last_data_at": row.try_get::<chrono::DateTime<chrono::Utc>, _>("last_data_at").ok(),
-                        "age_seconds": row.try_get::<f64, _>("age_seconds").ok(),
+                        "age_seconds": age_seconds,
+                        "is_stale": is_stale,
                         "timestamp": last_success_at,
                         "assessment": {"status": status, "last_error": row.try_get::<String, _>("last_error").ok()},
                     }))
                 }).collect()
+    }
+
+    /// Indicator values two or more *distinct* providers disagree on -
+    /// roadmap phase 8's "Konflikte ... sichtbar machen". A conflict here
+    /// means the same `(value, indicator_type)` is independently listed by
+    /// more than one source with a confidence spread of at least
+    /// `min_confidence_spread` - e.g. one feed rating an address 95 and
+    /// another rating the very same address 20 is worth an analyst's
+    /// attention, even though both technically "match". Deliberately not
+    /// used to *suppress* anything automatically (a conflicted indicator
+    /// still participates in `lookup_ip_reputation` normally, picking the
+    /// higher-confidence side per that method's own tie-break) - this is
+    /// visibility, not a new gate.
+    pub async fn list_indicator_conflicts(
+        &self,
+        min_confidence_spread: i16,
+        limit: i64,
+    ) -> Result<Vec<serde_json::Value>> {
+        let rows = sqlx::query(
+            "SELECT value, indicator_type, \
+                    array_agg(source ORDER BY confidence DESC) AS sources, \
+                    array_agg(confidence ORDER BY confidence DESC) AS confidences, \
+                    (MAX(confidence) - MIN(confidence))::smallint AS confidence_spread \
+             FROM indicators \
+             WHERE expires_at > NOW() \
+             GROUP BY value, indicator_type \
+             HAVING COUNT(DISTINCT source) > 1 \
+                AND (MAX(confidence) - MIN(confidence)) >= $1 \
+             ORDER BY confidence_spread DESC, value LIMIT $2",
+        )
+        .bind(min_confidence_spread)
+        .bind(limit.clamp(1, 500))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                serde_json::json!({
+                    "value": row.get::<String, _>("value"),
+                    "indicator_type": row.get::<String, _>("indicator_type"),
+                    "sources": row.get::<Vec<String>, _>("sources"),
+                    "confidences": row.get::<Vec<i16>, _>("confidences"),
+                    "confidence_spread": row.get::<i16, _>("confidence_spread"),
+                })
+            })
+            .collect())
     }
 
     /// Return bounded provider health history. Only normalized operational
@@ -2018,7 +2106,8 @@ impl PostgresStore {
     }
 
     pub async fn list_indicator_views(&self, limit: i64) -> Result<Vec<serde_json::Value>> {
-        let rows = sqlx::query("SELECT i.id, i.value, i.indicator_type, i.categories, i.confidence, i.source, i.first_seen, i.last_seen, i.expires_at, i.metadata, EXTRACT(EPOCH FROM (NOW() - i.last_seen)) AS age_seconds, r.risk_score, r.trust_score, r.reason, r.recorded_at FROM indicators i LEFT JOIN LATERAL (SELECT risk_score, trust_score, reason, recorded_at FROM risk_history WHERE indicator_id = i.id ORDER BY recorded_at DESC LIMIT 1) r ON TRUE ORDER BY i.last_seen DESC LIMIT $1")
+        // ::float8 cast - see list_alerts's own comment for why.
+        let rows = sqlx::query("SELECT i.id, i.value, i.indicator_type, i.categories, i.confidence, i.source, i.first_seen, i.last_seen, i.expires_at, i.metadata, EXTRACT(EPOCH FROM (NOW() - i.last_seen))::float8 AS age_seconds, r.risk_score, r.trust_score, r.reason, r.recorded_at FROM indicators i LEFT JOIN LATERAL (SELECT risk_score, trust_score, reason, recorded_at FROM risk_history WHERE indicator_id = i.id ORDER BY recorded_at DESC LIMIT 1) r ON TRUE ORDER BY i.last_seen DESC LIMIT $1")
             .bind(limit.clamp(1, 1000)).fetch_all(&self.pool).await?;
         rows.into_iter().map(|row| {
                 let risk_score = row.try_get::<i16, _>("risk_score").ok();
@@ -2050,7 +2139,8 @@ impl PostgresStore {
     pub async fn list_network_views(&self, kind: &str) -> Result<Vec<serde_json::Value>> {
         match kind {
             "asn" => {
-                let rows = sqlx::query("SELECT asn, name, organisation, provider, country, registry, prefixes, network_type, reputation, first_seen, last_seen, EXTRACT(EPOCH FROM (NOW() - last_seen)) AS age_seconds FROM asn_records ORDER BY last_seen DESC LIMIT 1000").fetch_all(&self.pool).await?;
+                // ::float8 cast - see list_alerts's own comment for why.
+                let rows = sqlx::query("SELECT asn, name, organisation, provider, country, registry, prefixes, network_type, reputation, first_seen, last_seen, EXTRACT(EPOCH FROM (NOW() - last_seen))::float8 AS age_seconds FROM asn_records ORDER BY last_seen DESC LIMIT 1000").fetch_all(&self.pool).await?;
                 rows.into_iter().map(|row| {
                     let last_seen = row.get::<chrono::DateTime<chrono::Utc>, _>("last_seen");
                     let reputation = row.get::<i16, _>("reputation");
@@ -2060,7 +2150,8 @@ impl PostgresStore {
                 }).collect()
             }
             "bgp" => {
-                let rows = sqlx::query("SELECT prefix, origin_asn, previous_asn, new_asn, event_timestamp, source, status, rpki_status, first_seen, last_seen, change, EXTRACT(EPOCH FROM (NOW() - event_timestamp)) AS age_seconds FROM bgp_events ORDER BY event_timestamp DESC LIMIT 1000").fetch_all(&self.pool).await?;
+                // ::float8 cast - see list_alerts's own comment for why.
+                let rows = sqlx::query("SELECT prefix, origin_asn, previous_asn, new_asn, event_timestamp, source, status, rpki_status, first_seen, last_seen, change, EXTRACT(EPOCH FROM (NOW() - event_timestamp))::float8 AS age_seconds FROM bgp_events ORDER BY event_timestamp DESC LIMIT 1000").fetch_all(&self.pool).await?;
                 rows.into_iter().map(|row| {
                     let status = row.get::<String, _>("status");
                     let timestamp = row.get::<chrono::DateTime<chrono::Utc>, _>("event_timestamp");
@@ -2071,7 +2162,8 @@ impl PostgresStore {
                 }).collect()
             }
             "rpki" => {
-                let rows = sqlx::query("SELECT prefix, asn, status, event_timestamp, source, EXTRACT(EPOCH FROM (NOW() - event_timestamp)) AS age_seconds FROM rpki_records ORDER BY event_timestamp DESC LIMIT 1000").fetch_all(&self.pool).await?;
+                // ::float8 cast - see list_alerts's own comment for why.
+                let rows = sqlx::query("SELECT prefix, asn, status, event_timestamp, source, EXTRACT(EPOCH FROM (NOW() - event_timestamp))::float8 AS age_seconds FROM rpki_records ORDER BY event_timestamp DESC LIMIT 1000").fetch_all(&self.pool).await?;
                 rows.into_iter().map(|row| {
                     let status = row.get::<String, _>("status");
                     let timestamp = row.get::<chrono::DateTime<chrono::Utc>, _>("event_timestamp");
@@ -2082,7 +2174,8 @@ impl PostgresStore {
                 }).collect()
             }
             "trust" => {
-                let rows = sqlx::query("SELECT id, name, network_type, identifier, networks, node_identities, device_tags, groups_json, status, created_at, verified_at, EXTRACT(EPOCH FROM (NOW() - COALESCE(verified_at, created_at))) AS age_seconds FROM trusted_networks ORDER BY created_at DESC LIMIT 1000").fetch_all(&self.pool).await?;
+                // ::float8 cast - see list_alerts's own comment for why.
+                let rows = sqlx::query("SELECT id, name, network_type, identifier, networks, node_identities, device_tags, groups_json, status, created_at, verified_at, EXTRACT(EPOCH FROM (NOW() - COALESCE(verified_at, created_at)))::float8 AS age_seconds FROM trusted_networks ORDER BY created_at DESC LIMIT 1000").fetch_all(&self.pool).await?;
                 rows.into_iter().map(|row| {
                     let status = row.get::<String, _>("status");
                     let created_at = row.get::<chrono::DateTime<chrono::Utc>, _>("created_at");

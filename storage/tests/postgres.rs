@@ -1140,6 +1140,154 @@ async fn ip_reputation_lookup_flags_a_match_without_ever_storing_the_raw_ip() ->
     Ok(())
 }
 
+/// `list_indicator_conflicts` backs the roadmap phase 8 "Konflikte ...
+/// sichtbar machen" gate - proves two independent providers rating the
+/// same value with a wide confidence spread shows up, that a *small*
+/// spread (both providers roughly agree) is filtered out by the
+/// threshold, and that a value only one provider lists at all is never
+/// flagged as a conflict (there is nothing to disagree with).
+#[tokio::test]
+#[ignore = "requires an isolated PostgreSQL test container"]
+async fn list_indicator_conflicts_finds_disagreeing_providers_above_the_threshold(
+) -> anyhow::Result<()> {
+    let url =
+        std::env::var("CLAWFORGE_TEST_DATABASE_URL").or_else(|_| std::env::var("DATABASE_URL"))?;
+    let store = PostgresStore::connect(&url).await?;
+
+    // TEST-NET-3 (RFC 5737) - never a real routable address.
+    let conflicting_value = "203.0.113.240";
+    let agreeing_value = "203.0.113.241";
+    let solo_value = "203.0.113.242";
+    let suffix = uuid::Uuid::new_v4();
+
+    for (value, source, confidence) in [
+        (conflicting_value, format!("test_high_conf_{suffix}"), 95),
+        (conflicting_value, format!("test_low_conf_{suffix}"), 15),
+        (agreeing_value, format!("test_agree_a_{suffix}"), 80),
+        (agreeing_value, format!("test_agree_b_{suffix}"), 75),
+        (solo_value, format!("test_solo_{suffix}"), 90),
+    ] {
+        sqlx::query(
+            "INSERT INTO indicators \
+             (value,indicator_type,categories,confidence,source,first_seen,last_seen,expires_at) \
+             VALUES ($1,'Ip','[]',$2,$3,NOW(),NOW(),NOW()+INTERVAL '1 day')",
+        )
+        .bind(value)
+        .bind(confidence)
+        .bind(&source)
+        .execute(store.pool())
+        .await?;
+    }
+
+    let conflicts = store.list_indicator_conflicts(30, 500).await?;
+    let found = conflicts
+        .iter()
+        .find(|row| row["value"] == conflicting_value)
+        .expect("a wide confidence spread across two providers must be reported as a conflict");
+    assert_eq!(found["confidence_spread"], json!(80));
+    assert_eq!(
+        found["sources"].as_array().map(Vec::len),
+        Some(2),
+        "both disagreeing providers must be named"
+    );
+    assert!(
+        !conflicts.iter().any(|row| row["value"] == agreeing_value),
+        "a spread below the threshold must not be reported as a conflict"
+    );
+    assert!(
+        !conflicts.iter().any(|row| row["value"] == solo_value),
+        "a value only one provider lists has nothing to disagree with"
+    );
+
+    sqlx::query("DELETE FROM indicators WHERE source LIKE '%' || $1")
+        .bind(suffix.to_string())
+        .execute(store.pool())
+        .await?;
+
+    Ok(())
+}
+
+/// `list_provider_views`'s `is_stale` flag backs the roadmap phase 8
+/// "veraltete Feeds sichtbar machen" gate - proves a provider whose last
+/// successful sync is well past `interval_seconds *
+/// STALE_INTERVAL_MULTIPLIER` is flagged, a provider that synced recently
+/// is not, and a *disabled* provider is never flagged regardless of age
+/// (nothing should be relying on a disabled feed being fresh).
+#[tokio::test]
+#[ignore = "requires an isolated PostgreSQL test container"]
+async fn list_provider_views_flags_a_provider_stale_past_its_own_interval() -> anyhow::Result<()> {
+    let url =
+        std::env::var("CLAWFORGE_TEST_DATABASE_URL").or_else(|_| std::env::var("DATABASE_URL"))?;
+    let store = PostgresStore::connect(&url).await?;
+
+    let suffix = uuid::Uuid::new_v4();
+    let stale_id = format!("test-stale-provider-{suffix}");
+    let fresh_id = format!("test-fresh-provider-{suffix}");
+    let disabled_stale_id = format!("test-disabled-stale-provider-{suffix}");
+
+    for (id, enabled) in [
+        (&stale_id, true),
+        (&fresh_id, true),
+        (&disabled_stale_id, false),
+    ] {
+        store
+            .upsert_provider(&Provider {
+                id: id.clone(),
+                name: id.clone(),
+                source: "test".into(),
+                // A short interval so "3x interval_seconds ago" is easy to
+                // backdate reliably without relying on wall-clock timing.
+                interval_seconds: 60,
+                confidence: 80,
+                enabled,
+            })
+            .await?;
+    }
+
+    let long_ago = Utc::now() - Duration::seconds(600);
+    let recently = Utc::now() - Duration::seconds(10);
+    for (id, last_data_at) in [
+        (&stale_id, long_ago),
+        (&fresh_id, recently),
+        (&disabled_stale_id, long_ago),
+    ] {
+        store
+            .provider_succeeded(id, Utc::now(), 1, 10, Some(last_data_at))
+            .await?;
+    }
+
+    let views = store.list_provider_views().await?;
+    let find = |id: &str| {
+        views
+            .iter()
+            .find(|row| row["id"] == id)
+            .unwrap_or_else(|| panic!("provider {id} must be listed"))
+            .clone()
+    };
+    assert_eq!(
+        find(&stale_id)["is_stale"],
+        json!(true),
+        "a provider whose data is far older than 3x its own interval must be flagged stale"
+    );
+    assert_eq!(
+        find(&fresh_id)["is_stale"],
+        json!(false),
+        "a provider that synced recently must not be flagged stale"
+    );
+    assert_eq!(
+        find(&disabled_stale_id)["is_stale"],
+        json!(false),
+        "a disabled provider must never be flagged stale, regardless of age"
+    );
+
+    sqlx::query("DELETE FROM providers WHERE id = ANY($1)")
+        .bind([stale_id, fresh_id, disabled_stale_id].as_slice())
+        .execute(store.pool())
+        .await?;
+
+    Ok(())
+}
+
 /// Proves `claim_execution_request_for_dispatch`/`complete_execution_dispatch`
 /// against real PostgreSQL: the `target` an execution request was created
 /// with comes back unchanged through the claim, the request ends up

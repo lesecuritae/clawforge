@@ -702,7 +702,26 @@ Reputation, lokales Verhalten und Historie nachvollziehbar zusammenführen.
   Exit-Gates dieser Phase. Siehe `docs/policy-engine.md`s "Freshness,
   provenance and confidence"-Abschnitt.)
 - lokale IP-/ASN-/Angriffshistorie als zeitlich abklingendes Signal verwenden
-- Konflikte, Ausfälle und veraltete Feeds sichtbar machen
+- Konflikte, Ausfälle und veraltete Feeds sichtbar machen (**erledigt**:
+  Ausfaelle/Alter waren ueber `provider_status`/`list_provider_views`
+  (Admin-Endpoint `/admin/providers`) schon aus einer frueheren Phase
+  sichtbar (`state`/`last_error`/`consecutive_failures`/`age_seconds`) -
+  neu ist ein expliziter, schwellenwertbasierter `is_stale`-Flag
+  (Standard: 3x das eigene `interval_seconds`, konfigurierbar,
+  deaktivierte Provider werden nie markiert) statt nur des rohen Alters,
+  UND neu die Konflikterkennung selbst: `list_indicator_conflicts`
+  (`GET /admin/indicators/conflicts`) findet Werte, die zwei oder mehr
+  unabhaengige Provider mit deutlich unterschiedlicher Confidence
+  bewerten - reine Sichtbarkeit, unterdrueckt nichts automatisch.
+  **Dabei einen echten, vorbestehenden Bug gefunden+behoben**: `EXTRACT
+  (EPOCH FROM ...) AS age_seconds` liefert in Postgres `numeric`, nicht
+  `float8` - ohne expliziten `::float8`-Cast schlug die Rust-seitige
+  `f64`-Dekodierung an sechs Stellen im Code still fehl (`age_seconds`
+  war ueberall `None`/verursachte bei `list_alerts` sogar einen
+  Panic-Pfad ueber die nicht-tolerante `.get()`-Variante) - unbemerkt,
+  weil bisher nichts von einem tatsaechlich befuellten `age_seconds`
+  abhing, bis der neue `is_stale`-Test genau das tat und den Bug live
+  aufdeckte.)
 - Datenschutz und Aufbewahrung für Identifikatoren festlegen
 
 Exit-Gate: Offline- oder veraltete Feeds reduzieren Confidence und lösen keine

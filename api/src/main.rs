@@ -6028,6 +6028,46 @@ async fn admin_providers(
         })
 }
 
+#[derive(Deserialize, Default)]
+struct IndicatorConflictQuery {
+    min_confidence_spread: Option<i16>,
+    limit: Option<i64>,
+}
+
+/// Roadmap phase 8: "Konflikte ... sichtbar machen" - indicator values two
+/// or more independent providers disagree on (see
+/// `list_indicator_conflicts`'s own doc comment for exactly what counts).
+async fn admin_indicator_conflicts(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<IndicatorConflictQuery>,
+) -> ApiResult<Json<ApiEnvelope<Vec<serde_json::Value>>>> {
+    let principal = authenticate(&state, &headers).await?;
+    require_role(&principal, &["Administrator", "Operator", "Viewer"])?;
+    audit(
+        &state,
+        &principal,
+        "indicator_conflicts_read",
+        "indicators",
+        serde_json::json!({}),
+    )
+    .await;
+    state
+        .store
+        .list_indicator_conflicts(
+            query.min_confidence_spread.unwrap_or(30),
+            query.limit.unwrap_or(100),
+        )
+        .await
+        .map(|data| envelope(data, None))
+        .map_err(|_| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "indicator conflicts unavailable",
+            )
+        })
+}
+
 #[derive(Deserialize)]
 struct ProviderUpdate {
     enabled: Option<bool>,
@@ -7774,6 +7814,10 @@ fn build_router(app_state: AppState) -> Router {
         .route("/admin/providers", get(admin_providers))
         .route("/admin/providers/{id}", post(admin_update_provider))
         .route("/admin/providers/{id}/sync", post(admin_sync_provider))
+        .route(
+            "/admin/indicators/conflicts",
+            get(admin_indicator_conflicts),
+        )
         .route("/operations/summary", get(admin_operations_summary))
         .route("/operations/state", get(admin_operations_state))
         .route(
