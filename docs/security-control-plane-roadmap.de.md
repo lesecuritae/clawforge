@@ -302,7 +302,31 @@ Arbeitspakete:
   ueber das isolierte Lab gefunden und behoben. Registriert, aber
   deaktiviert (`enabled=FALSE`), wie jede andere Connector-Action seit
   Migration `0027`.)
-- HAProxy-Adapter für Maps/ACLs und Rate-Limits implementieren (noch offen)
+- HAProxy-Adapter für Maps/ACLs und Rate-Limits implementieren
+  (**teilweise, ACL-Haelfte erledigt**: `HaproxyAdapter` implementiert
+  denselben `FirewallAdapter`-Vertrag wie `NftablesAdapter` (gleiche
+  Zieltypen), ueber die HAProxy-Runtime-API (`add acl`/`del acl`/`show
+  acl` gegen eine exklusiv Clawforge gehoerende ACL-Pattern-Datei - NICHT
+  die separate `map`-Mechanik, die per `add map`/`show map` ein echtes
+  Key-Value-Objekt ist). Da `haproxy.cfg` anders als eine exklusive
+  nftables-Tabelle eine einzige, bereits produktiv genutzte Datei ist,
+  kann der Adapter sie nicht exklusiv besitzen - `scripts/haproxy-
+  clawforge-provision.sh` legt nur die Pattern-Datei an und gibt die
+  zwei Zeilen aus, die ein Betreiber selbst in jedes zu schuetzende
+  Frontend eintraegt. **Echter Bug im isolierten Lab gefunden+behoben**:
+  die erste Version nutzte faelschlich `add map`/`show map` statt `add
+  acl`/`show acl` - eine `acl ... -f`-Referenz wird gar nicht als "map"-
+  Objekt registriert, `show map` lieferte daher immer eine leere Liste,
+  vom echten `apply`+`verify`-Rundlauf-Test im Lab sofort aufgedeckt
+  (nicht vermutet, sondern live am echten Runtime-API-Protokoll
+  diagnostiziert). Eigenes isoliertes Lab (`scripts/test-haproxy-lab.sh`,
+  disposabler Container, installiert haproxy, keine besonderen
+  Capabilities noetig). Registriert ueber Migration `0038`
+  (`haproxy.block_indicator`/`haproxy.block_incident_source`,
+  `requires_approval=TRUE, enabled=FALSE`), Executor-Dispatch routet
+  `haproxy.*`-Actions dorthin, teilt sich das Mass-block-Budget mit
+  nftables. Rate-Limits (Stick-Tables) bleiben offen - andere Mechanik
+  (Zaehler/Schwellwert, keine Mitgliedschaftsmenge).)
 - Tailscale zunächst nur als freigabepflichtigen Adapter vorbereiten
   (**erledigt**: `TailscaleAdapter` hat bewusst KEINE `apply`/`verify`/
   `rollback`-Methode ueberhaupt - nicht "ein apply, das immer fehlschlaegt",

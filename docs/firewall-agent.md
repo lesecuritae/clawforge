@@ -228,6 +228,63 @@ one. Two actions, not one, because the two target kinds are genuinely
 different risk shapes, not the same action with two ways to fill in a
 parameter.
 
+## HAProxy adapter
+
+`HaproxyAdapter` implements the same [`FirewallAdapter`] contract as
+`NftablesAdapter` - same `FirewallTarget`/`FirewallAction` types, same
+preflight/render/apply/verify/rollback shape - over the HAProxy Runtime
+API's line-oriented text protocol (a `tokio::net::UnixStream` write,
+never a subprocess) instead of `nft` subprocess argv. Only the roadmap's
+"Maps/ACLs" half is built: blocking a source IP/CIDR via an **ACL
+pattern file** (`acl ... src -f <file>`, manipulated at runtime with
+`add acl`/`del acl`/`show acl`) - **not** HAProxy's separate `map`-file
+mechanism (`map_ip()`/`map_str()` converters, a true key -> value lookup,
+manipulated with `add map`/`show map`), which is a different runtime
+object entirely and not what a membership blocklist needs. Rate-limiting
+(HAProxy stick-tables - a counter/threshold, not a membership set) is
+materially different and **not** built here.
+
+Unlike nftables, this adapter cannot own an entire exclusive config file:
+`haproxy.cfg` is a single shared file already serving an operator's real
+frontends. `scripts/haproxy-clawforge-provision.sh` only ensures
+Clawforge's own ACL pattern file exists and prints the two lines an
+operator adds to each frontend they want protected
+(`acl clawforge_blocked src -f <file>` +
+`http-request deny if clawforge_blocked`) - it never edits `haproxy.cfg`
+itself, and neither does the adapter afterwards: only the pattern file's
+entries change, via the Runtime API.
+
+**A real bug, found in the lab, not assumed away**: the first version of
+this adapter used `add map`/`show map`/`del map` (`show map` for an
+`acl ... -f` reference returned literally nothing - `# id (file)
+description` and an empty list - because an ACL pattern file is not
+registered as a "map" object at all). Caught immediately by
+`scripts/test-haproxy-lab.sh`'s real round-trip test failing (`apply`
+reported success, `verify` then reported `NotPresent`), diagnosed by
+inspecting the real Runtime API's actual responses (`show acl` vs `show
+map`) rather than guessing from documentation, and fixed by switching to
+the correct `acl` commands throughout.
+
+**Rehearsed in its own isolated lab** (`scripts/test-haproxy-lab.sh`):
+installs haproxy in a disposable `rust:1.98-bookworm` container (no
+special capabilities needed - the Runtime API is a plain Unix socket),
+provisions the ACL file, starts a minimal throwaway haproxy instance with
+its own frontend/backend (never a real deployment's config), and runs
+the adapter's real round-trip tests against it. Confirmed idempotency
+behavior empirically rather than assuming nftables' own semantics carry
+over: a repeat `add acl` for an already-present pattern did not error,
+and the target remained found after one rollback in this session's runs
+- documented as observed behavior, not guaranteed API contract, since
+HAProxy's own documentation does not commit to it either way.
+
+Registered via migration `0038`: `haproxy.block_indicator` (risk `high`)
+and `haproxy.block_incident_source` (risk `critical`), same
+`requires_approval=TRUE, enabled=FALSE` precedent as nftables.
+`clawforge-executor`'s `dispatch()` routes any `haproxy.`-prefixed action
+to `HaproxyAdapter` the same way it routes `nftables.`-prefixed ones to
+`NftablesAdapter` - both share the same mass-block budget counter (see
+above), not one each.
+
 ## Tailscale adapter (prepared, not operable)
 
 The roadmap is explicit that Tailscale should be prepared "zunächst nur
@@ -268,7 +325,10 @@ on this).
 
 ## What's deliberately not built yet
 
-- **No HAProxy adapter.**
+- **No HAProxy rate-limiting (stick-tables)** - only the "Maps/ACLs" half
+  of the HAProxy adapter is built (see above); rate-limiting is a
+  materially different mechanism (a counter/threshold, not a membership
+  set).
 - **No real Tailscale integration** - `TailscaleAdapter` is prepared
   (see above) but has no `apply` capability at all, on purpose.
 - **No failure-injection tests** beyond lease loss/worker death (proven

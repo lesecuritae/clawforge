@@ -331,6 +331,24 @@ fn element_reference(target: &FirewallTarget) -> Result<String, AdapterError> {
     })
 }
 
+/// Rejects an unresolved `IncidentSource` - shared guard for any adapter's
+/// `apply`/`verify`/`rollback` that (unlike `NftablesAdapter`, which gets
+/// this for free from `set_name`'s own `Ok(None)` case) has no per-family
+/// set-selection step to piggyback the check on. Called *before*
+/// `element_reference`, whose `<resolved-at-apply-time:...>` placeholder
+/// is only ever safe to use inside a rendered receipt, never as a live
+/// command argument.
+fn require_resolved_target(target: &FirewallTarget) -> Result<(), AdapterError> {
+    if matches!(target, FirewallTarget::IncidentSource { .. }) {
+        return Err(AdapterError::InvalidTarget(
+            "an unresolved IncidentSource cannot be applied - resolve it to a \
+             ResolvedIncidentSource first"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Whether `addr`/`prefix` is an element of the set `nft -j list set`
 /// described in `raw_set_json` - parsed structurally, **not** by string
 /// search. `nft`'s own JSON splits a prefixed element into separate
@@ -791,6 +809,244 @@ impl FirewallAdapter for NftablesAdapter {
                 "nft exited with {}: {}",
                 output.status,
                 String::from_utf8_lossy(&output.stderr)
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// The exclusively Clawforge-owned HAProxy ACL pattern file - the direct
+/// analog of nftables' exclusive table/set: an operator adds *one* `acl
+/// ... src -f <file>` reference to it (and a matching `deny`/`reject`
+/// action) to whichever frontend(s) they want protected, ahead of time,
+/// out of band (`scripts/haproxy-clawforge-provision.sh`); this adapter
+/// only ever adds/removes *entries* of this one file's loaded pattern
+/// list via the HAProxy Runtime API, never touches `haproxy.cfg` itself.
+///
+/// **Not** HAProxy's separate `map`-file mechanism (`map_ip()`/`map_str()`
+/// converters, a true key -> value lookup manipulated via `add
+/// map`/`show map`) - an `acl ... -f <file>` pattern list is a different
+/// runtime object, manipulated via `add acl`/`del acl`/`show acl`, and
+/// that is what this adapter actually uses: a blocklist only needs "is
+/// this address present", never a value. Unlike nftables' two typed,
+/// family-separated sets, one ACL pattern file holds both IPv4 and IPv6
+/// entries - it has no type constraint.
+pub const HAPROXY_DEFAULT_ADMIN_SOCKET: &str = "/var/run/haproxy/admin.sock";
+pub const HAPROXY_DEFAULT_BLOCKLIST_ACL_FILE: &str = "/etc/haproxy/maps/clawforge-blocklist.map";
+
+fn haproxy_show_acl_command(acl_file: &str) -> String {
+    format!("show acl {acl_file}")
+}
+
+fn haproxy_add_acl_command(acl_file: &str, key: &str) -> String {
+    format!("add acl {acl_file} {key}")
+}
+
+fn haproxy_del_acl_command(acl_file: &str, key: &str) -> String {
+    format!("del acl {acl_file} {key}")
+}
+
+/// Whether `key` (an already-normalized IP/CIDR string) appears as the
+/// pattern column of a `show acl <file>` response. HAProxy's Runtime API
+/// answers plain text, one entry per line, `<id> <pattern>` (the `id` is
+/// an opaque per-entry pointer, e.g. `0x71d738032af0`) - this checks the
+/// second whitespace-separated field specifically, not a substring
+/// search, so a key that happens to be a prefix of another entry's
+/// pattern (or of its `id`) can never produce a false match.
+fn haproxy_acl_contains_key(raw_response: &str, key: &str) -> bool {
+    raw_response.lines().any(|line| {
+        let mut fields = line.split_whitespace();
+        let _id = fields.next();
+        fields.next() == Some(key)
+    })
+}
+
+/// HAProxy Runtime API adapter - implements the same [`FirewallAdapter`]
+/// contract as [`NftablesAdapter`], over its admin socket's line-oriented
+/// text protocol instead of subprocess argv. There is still no shell to
+/// inject into (a `tokio::net::UnixStream` write, never a subprocess at
+/// all), and command construction only ever uses `key` values that
+/// already passed [`FirewallTarget::validate`] (`parse_ip_or_cidr`) -
+/// syntactically constrained to `[0-9a-fA-F:./]`, so a key can never
+/// contain whitespace or a newline that could inject a second command
+/// into the line-oriented protocol, the same guarantee explicit-argv
+/// construction gives `NftablesAdapter` against a real shell.
+///
+/// Scope: only the roadmap's "Maps/ACLs" half - blocking a source
+/// IP/CIDR via a Runtime API ACL pattern list, verified and rolled back
+/// the same way `NftablesAdapter` verifies/rolls back a set element.
+/// Rate-limiting (HAProxy stick-tables) is materially different (a
+/// counter/threshold, not a membership set) and is **not** built here -
+/// see `docs/firewall-agent.md`.
+pub struct HaproxyAdapter {
+    admin_socket: String,
+    acl_file: String,
+}
+
+impl HaproxyAdapter {
+    pub fn new() -> Self {
+        Self {
+            admin_socket: std::env::var("CLAWFORGE_HAPROXY_ADMIN_SOCKET")
+                .unwrap_or_else(|_| HAPROXY_DEFAULT_ADMIN_SOCKET.to_string()),
+            acl_file: std::env::var("CLAWFORGE_HAPROXY_BLOCKLIST_ACL_FILE")
+                .unwrap_or_else(|_| HAPROXY_DEFAULT_BLOCKLIST_ACL_FILE.to_string()),
+        }
+    }
+
+    #[cfg(unix)]
+    async fn run_command(&self, command: &str) -> Result<String, String> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::UnixStream;
+        let mut stream = UnixStream::connect(&self.admin_socket)
+            .await
+            .map_err(|error| format!("connecting to {}: {error}", self.admin_socket))?;
+        stream
+            .write_all(command.as_bytes())
+            .await
+            .map_err(|error| error.to_string())?;
+        stream
+            .write_all(b"\n")
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut response = String::new();
+        stream
+            .read_to_string(&mut response)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(response)
+    }
+
+    #[cfg(not(unix))]
+    async fn run_command(&self, _command: &str) -> Result<String, String> {
+        Err("the HAProxy Runtime API requires a Unix domain socket".to_string())
+    }
+}
+
+impl Default for HaproxyAdapter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl FirewallAdapter for HaproxyAdapter {
+    fn name(&self) -> &'static str {
+        "haproxy"
+    }
+
+    async fn preflight(&self, target: &FirewallTarget) -> Result<Preflight, AdapterError> {
+        target.validate()?;
+        if matches!(target, FirewallTarget::IncidentSource { .. }) {
+            // Same "cannot guess" reasoning as NftablesAdapter::preflight
+            // for an unresolved incident source.
+            return Ok(Preflight {
+                already_blocked: false,
+                raw_set_json: String::new(),
+            });
+        }
+        let element = element_reference(target)?;
+        let response = self
+            .run_command(&haproxy_show_acl_command(&self.acl_file))
+            .await
+            .map_err(AdapterError::Preflight)?;
+        Ok(Preflight {
+            already_blocked: haproxy_acl_contains_key(&response, &element),
+            raw_set_json: response,
+        })
+    }
+
+    fn render(&self, action: &FirewallAction) -> Result<FirewallActionReceipt, AdapterError> {
+        if let FirewallTarget::ResolvedIncidentSource { .. } = &action.target {
+            return Err(AdapterError::InvalidTarget(
+                "a resolved incident source must never be rendered into a receipt".into(),
+            ));
+        }
+        action.target.validate()?;
+        let element = element_reference(&action.target)?;
+        Ok(FirewallActionReceipt {
+            adapter: self.name(),
+            rendered_commands: vec![vec![haproxy_add_acl_command(&self.acl_file, &element)]],
+            rollback_commands: vec![vec![haproxy_del_acl_command(&self.acl_file, &element)]],
+            is_dry_run: true,
+            ttl_seconds: action.ttl_seconds,
+        })
+    }
+
+    async fn apply(
+        &self,
+        action: &FirewallAction,
+        dry_run: bool,
+    ) -> Result<ApplyResult, AdapterError> {
+        action.target.validate()?;
+        require_resolved_target(&action.target)?;
+        let element = element_reference(&action.target)?;
+        let add = haproxy_add_acl_command(&self.acl_file, &element);
+        let delete = haproxy_del_acl_command(&self.acl_file, &element);
+        if dry_run {
+            return Ok(ApplyResult {
+                receipt: FirewallActionReceipt {
+                    adapter: self.name(),
+                    rendered_commands: vec![vec![add]],
+                    rollback_commands: vec![vec![delete]],
+                    is_dry_run: true,
+                    ttl_seconds: action.ttl_seconds,
+                },
+                observed_state: None,
+            });
+        }
+        let response = self.run_command(&add).await.map_err(AdapterError::Apply)?;
+        if !response.trim().is_empty() {
+            // The Runtime API returns empty output on success for
+            // add/del acl - any non-empty response is an error message.
+            return Err(AdapterError::Apply(format!(
+                "haproxy runtime API rejected {add:?}: {}",
+                response.trim()
+            )));
+        }
+        let listing = self
+            .run_command(&haproxy_show_acl_command(&self.acl_file))
+            .await
+            .map_err(AdapterError::Apply)?;
+        Ok(ApplyResult {
+            receipt: FirewallActionReceipt {
+                adapter: self.name(),
+                rendered_commands: vec![vec![add]],
+                rollback_commands: vec![vec![delete]],
+                is_dry_run: false,
+                ttl_seconds: action.ttl_seconds,
+            },
+            observed_state: Some(listing),
+        })
+    }
+
+    async fn verify(&self, target: &FirewallTarget) -> Result<VerificationResult, AdapterError> {
+        target.validate()?;
+        require_resolved_target(target)?;
+        let element = element_reference(target)?;
+        let response = self
+            .run_command(&haproxy_show_acl_command(&self.acl_file))
+            .await
+            .map_err(AdapterError::Verify)?;
+        if haproxy_acl_contains_key(&response, &element) {
+            Ok(VerificationResult::Verified)
+        } else {
+            Ok(VerificationResult::NotPresent)
+        }
+    }
+
+    async fn rollback(&self, action: &FirewallAction) -> Result<(), AdapterError> {
+        action.target.validate()?;
+        require_resolved_target(&action.target)?;
+        let element = element_reference(&action.target)?;
+        let delete = haproxy_del_acl_command(&self.acl_file, &element);
+        let response = self
+            .run_command(&delete)
+            .await
+            .map_err(AdapterError::Rollback)?;
+        if !response.trim().is_empty() {
+            return Err(AdapterError::Rollback(format!(
+                "haproxy runtime API rejected {delete:?}: {}",
+                response.trim()
             )));
         }
         Ok(())
@@ -1526,6 +1782,139 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// Real-HAProxy tests below, run via scripts/test-haproxy-lab.sh
+    /// against a disposable haproxy instance's own Runtime API socket -
+    /// never against a real deployment. `lab_haproxy_adapter` reads
+    /// `CLAWFORGE_HAPROXY_ADMIN_SOCKET`/`CLAWFORGE_HAPROXY_BLOCKLIST_ACL_FILE`
+    /// the lab script exports, the same way `lab_adapter` implicitly
+    /// relies on the nftables lab's own provisioning.
+    fn lab_haproxy_adapter() -> HaproxyAdapter {
+        HaproxyAdapter::new()
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a real HAProxy Runtime API socket - run via scripts/test-haproxy-lab.sh"]
+    async fn haproxy_apply_verify_rollback_round_trip() {
+        let adapter = lab_haproxy_adapter();
+        let action = action_for(indicator("203.0.113.230"));
+        let applied = adapter
+            .apply(&action, false)
+            .await
+            .expect("apply must succeed");
+        assert!(!applied.receipt.is_dry_run);
+        assert_eq!(
+            adapter.verify(&action.target).await.unwrap(),
+            VerificationResult::Verified
+        );
+        adapter
+            .rollback(&action)
+            .await
+            .expect("rollback must succeed");
+        assert_eq!(
+            adapter.verify(&action.target).await.unwrap(),
+            VerificationResult::NotPresent
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a real HAProxy Runtime API socket - run via scripts/test-haproxy-lab.sh"]
+    async fn haproxy_apply_with_dry_run_true_never_touches_the_real_map() {
+        let adapter = lab_haproxy_adapter();
+        let action = action_for(indicator("203.0.113.231"));
+        let applied = adapter
+            .apply(&action, true)
+            .await
+            .expect("a dry-run apply must not need the real map");
+        assert!(applied.receipt.is_dry_run);
+        assert_eq!(
+            adapter.verify(&action.target).await.unwrap(),
+            VerificationResult::NotPresent,
+            "a dry run must never actually touch the real map"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a real HAProxy Runtime API socket - run via scripts/test-haproxy-lab.sh"]
+    async fn haproxy_applying_the_same_element_twice_is_idempotent() {
+        // Unlike nftables' "add element" (idempotent by default), it is
+        // not obvious from documentation alone whether HAProxy's "add
+        // acl" rejects, ignores, or duplicates an already-present
+        // pattern - the isolated lab is what actually answers this rather
+        // than assumes it, exactly the kind of real behavioral gap
+        // `set_contains_target`'s own bug (found this same way, earlier
+        // this session) was.
+        let adapter = lab_haproxy_adapter();
+        let action = action_for(indicator("203.0.113.232"));
+        adapter
+            .apply(&action, false)
+            .await
+            .expect("first apply must succeed");
+        let second = adapter.apply(&action, false).await;
+        assert!(second.is_ok(), "a repeat apply must not error: {second:?}");
+        assert_eq!(
+            adapter.verify(&action.target).await.unwrap(),
+            VerificationResult::Verified,
+            "the key must still be found regardless of how many entries now exist for it"
+        );
+        // Roll back exactly once and check whether *any* trace remains -
+        // this is the real question a caller cares about (is the target
+        // still blocked), not how many literal map rows exist for it.
+        adapter
+            .rollback(&action)
+            .await
+            .expect("rollback must succeed");
+        let after_one_rollback = adapter.verify(&action.target).await.unwrap();
+        if after_one_rollback == VerificationResult::Verified {
+            // A duplicate entry survived one rollback - roll back again
+            // until it's actually gone, and document that apply is NOT
+            // idempotent for HAProxy the way it is for nftables.
+            adapter
+                .rollback(&action)
+                .await
+                .expect("a second rollback must succeed if a duplicate entry remained");
+        }
+        assert_eq!(
+            adapter.verify(&action.target).await.unwrap(),
+            VerificationResult::NotPresent,
+            "the target must be fully gone after enough rollbacks to match every apply"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a real HAProxy Runtime API socket - run via scripts/test-haproxy-lab.sh"]
+    async fn haproxy_rolling_back_an_element_that_was_never_applied_fails_cleanly() {
+        let adapter = lab_haproxy_adapter();
+        let action = action_for(indicator("203.0.113.233"));
+        let result = adapter.rollback(&action).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a real HAProxy Runtime API socket - run via scripts/test-haproxy-lab.sh"]
+    async fn haproxy_a_resolved_incident_source_applies_and_rolls_back_correctly() {
+        let adapter = lab_haproxy_adapter();
+        let action = action_for(FirewallTarget::ResolvedIncidentSource {
+            raw_ip: "203.0.113.234".into(),
+            pseudonym: "ip-pseudonym:deadbeef".into(),
+        });
+        adapter
+            .apply(&action, false)
+            .await
+            .expect("apply on a resolved incident source must succeed");
+        assert_eq!(
+            adapter.verify(&action.target).await.unwrap(),
+            VerificationResult::Verified
+        );
+        adapter
+            .rollback(&action)
+            .await
+            .expect("rollback must succeed");
+        assert_eq!(
+            adapter.verify(&action.target).await.unwrap(),
+            VerificationResult::NotPresent
+        );
+    }
+
     #[test]
     fn tailscale_render_describes_the_call_it_would_make() {
         let adapter = TailscaleAdapter::new();
@@ -1554,5 +1943,84 @@ mod tests {
             reason: "test".into(),
         };
         assert!(adapter.render(&action).is_err());
+    }
+
+    #[test]
+    fn haproxy_acl_contains_key_matches_the_pattern_column_only() {
+        // Real `show acl <file>` output shape, captured against a real
+        // haproxy instance in scripts/test-haproxy-lab.sh: `<id>
+        // <pattern>`, no third column (unlike HAProxy's separate `map`
+        // mechanism, which this adapter does not use - see
+        // `HaproxyAdapter`'s own doc comment).
+        let response = "0x71d738032af0 203.0.113.5\n0x71d738032b10 198.51.100.0/24\n";
+        assert!(haproxy_acl_contains_key(response, "203.0.113.5"));
+        assert!(haproxy_acl_contains_key(response, "198.51.100.0/24"));
+        assert!(!haproxy_acl_contains_key(response, "203.0.113.6"));
+        // Must match the pattern column, not the id column.
+        assert!(!haproxy_acl_contains_key(response, "0x71d738032af0"));
+    }
+
+    #[test]
+    fn haproxy_acl_contains_key_is_false_for_an_empty_response() {
+        assert!(!haproxy_acl_contains_key("", "203.0.113.5"));
+    }
+
+    #[test]
+    fn haproxy_render_embeds_the_real_cidr_and_never_resolves_an_incident_source() {
+        let adapter = HaproxyAdapter::new();
+        let receipt = adapter
+            .render(&action_for(indicator("203.0.113.9")))
+            .unwrap();
+        assert_eq!(receipt.adapter, "haproxy");
+        let rendered = format!("{:?}", receipt.rendered_commands);
+        assert!(rendered.contains("add acl"));
+        assert!(rendered.contains("203.0.113.9"));
+
+        let incident_receipt = adapter
+            .render(&action_for(FirewallTarget::IncidentSource {
+                pseudonym: "ip-pseudonym:deadbeef".into(),
+            }))
+            .unwrap();
+        let rendered = format!("{:?}", incident_receipt.rendered_commands);
+        assert!(rendered.contains("<resolved-at-apply-time:"));
+        assert!(rendered.contains("ip-pseudonym:deadbeef"));
+    }
+
+    #[test]
+    fn haproxy_render_refuses_a_resolved_incident_source_outright() {
+        let adapter = HaproxyAdapter::new();
+        let action = action_for(FirewallTarget::ResolvedIncidentSource {
+            raw_ip: "203.0.113.9".into(),
+            pseudonym: "ip-pseudonym:deadbeef".into(),
+        });
+        assert!(adapter.render(&action).is_err());
+    }
+
+    #[tokio::test]
+    async fn haproxy_apply_verify_rollback_all_refuse_an_unresolved_incident_source() {
+        let adapter = HaproxyAdapter::new();
+        let action = action_for(FirewallTarget::IncidentSource {
+            pseudonym: "ip-pseudonym:never-resolved".into(),
+        });
+        assert!(adapter.apply(&action, true).await.is_err());
+        assert!(adapter.verify(&action.target).await.is_err());
+        assert!(adapter.rollback(&action).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn haproxy_apply_with_dry_run_never_touches_the_socket() {
+        // No CLAWFORGE_HAPROXY_ADMIN_SOCKET set, no haproxy running here -
+        // a dry-run apply must still succeed, proving it never actually
+        // connects to the admin socket. No other test in this binary sets
+        // this specific env var.
+        std::env::remove_var("CLAWFORGE_HAPROXY_ADMIN_SOCKET");
+        let adapter = HaproxyAdapter::new();
+        let result = adapter
+            .apply(&action_for(indicator("203.0.113.9")), true)
+            .await;
+        assert!(
+            result.is_ok(),
+            "dry-run apply must not need a real socket: {result:?}"
+        );
     }
 }

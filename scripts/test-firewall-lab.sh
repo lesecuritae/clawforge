@@ -25,5 +25,8 @@ docker run --rm \
     apt-get update -qq >/dev/null
     apt-get install -y -qq nftables >/dev/null
     sh scripts/nftables-clawforge-provision.sh
-    cargo test -p clawforge-firewall-agent -- --ignored --test-threads=1
+    # --skip haproxy: this container has no haproxy running (it only
+    # needs nftables) - the HAProxy Runtime API tests are their own
+    # #[ignore]-gated group, run separately via scripts/test-haproxy-lab.sh.
+    cargo test -p clawforge-firewall-agent -- --ignored --test-threads=1 --skip haproxy
   '

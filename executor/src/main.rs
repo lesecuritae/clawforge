@@ -9,12 +9,16 @@
 //! `dry_run: true` rather than silently start applying for real.
 //!
 //! Any action whose name is not a recognized firewall action (`nftables.`
-//! prefix) keeps the exact prior behavior: claimed, marked `running`, then
-//! immediately completed with `"dry_run: no external operation executed"`
-//! - this module changes nothing about docker/github/proxmox actions.
+//! or `haproxy.` prefix) keeps the exact prior behavior: claimed, marked
+//! `running`, then immediately completed with `"dry_run: no external
+//! operation executed"` - this module changes nothing about docker/
+//! github/proxmox actions, or `tailscale.*` ones (`TailscaleAdapter` has
+//! no `apply` capability to dispatch to at all - see
+//! `docs/firewall-agent.md`).
 
 use clawforge_firewall_agent::{
-    FirewallAction, FirewallAdapter, FirewallTarget, NftablesAdapter, VerificationResult,
+    FirewallAction, FirewallAdapter, FirewallTarget, HaproxyAdapter, NftablesAdapter,
+    VerificationResult,
 };
 use clawforge_storage::{
     database_url_from_env, ClaimedExecutionRequest, FirewallActionReceiptInput, PostgresStore,
@@ -50,14 +54,25 @@ fn firewall_max_applies_per_window() -> i64 {
 /// entirely for the common case. Pure and separate from that function so
 /// it can be unit-tested without a real store to hand it.
 fn firewall_budget_applies(action_name: &str, dry_run: bool) -> bool {
-    !dry_run && action_name.starts_with("nftables.")
+    !dry_run && is_firewall_action(action_name)
 }
 
-/// The mass-block budget: how many *real* (non-dry-run) `nftables.*`
-/// applies this database has recorded in the trailing rate window - a
-/// runaway policy engine or a config mistake must not be able to block
-/// hundreds of addresses in a burst. Dry runs and non-firewall actions are
-/// never gated (`Ok(None)`) - there is nothing to bound. DB-backed via
+/// Whether `action_name` is one `dispatch()` actually routes to a real
+/// adapter - `nftables.*` (`NftablesAdapter`) or `haproxy.*`
+/// (`HaproxyAdapter`). `tailscale.*` is deliberately excluded: there is
+/// no apply capability to dispatch to at all (see
+/// `docs/firewall-agent.md`), so it stays on the same generic dry-run
+/// fallback every other non-firewall action already uses.
+fn is_firewall_action(action_name: &str) -> bool {
+    action_name.starts_with("nftables.") || action_name.starts_with("haproxy.")
+}
+
+/// The mass-block budget: how many *real* (non-dry-run) firewall applies
+/// (`nftables.*` or `haproxy.*` - one shared counter across both adapters,
+/// not one per adapter) this database has recorded in the trailing rate
+/// window - a runaway policy engine or a config mistake must not be able
+/// to block hundreds of addresses in a burst. Dry runs and non-firewall
+/// actions are never gated (`Ok(None)`) - there is nothing to bound. DB-backed via
 /// `recent_real_firewall_apply_count` rather than an in-memory counter, so
 /// the budget holds across a process restart and across multiple executor
 /// replicas sharing this database - see that method's own doc comment.
@@ -87,7 +102,7 @@ async fn firewall_mass_block_budget_exceeded(
     Ok(None)
 }
 
-/// Everything `dispatch()` gathers for a successful `nftables.*` apply, for
+/// Everything `dispatch()` gathers for a successful firewall apply, for
 /// `main()`'s loop (the only place with a `store`) to persist as an Action
 /// Receipt via `record_firewall_action_receipt`. `dispatch()` itself stays
 /// DB-free on purpose - its existing unit tests call it directly with no
@@ -103,13 +118,15 @@ struct FirewallDispatchReceipt {
     is_dry_run: bool,
 }
 
-/// `nft -j list set`'s own JSON output, kept as structured JSONB where
-/// possible rather than an opaque string - falls back to wrapping the raw
-/// text if it somehow isn't valid JSON (e.g. an unexpected `nft` version's
-/// output), and to an empty object for the "no resolvable address yet"
-/// case (`Preflight::raw_set_json` is `""` for an unresolved
-/// `IncidentSource` - see that variant's own doc comment).
-fn nft_state_json(raw: &str) -> serde_json::Value {
+/// An adapter's raw preflight/observed-state text (`nft -j list set`'s
+/// JSON for `NftablesAdapter`, `show acl`'s plain text for
+/// `HaproxyAdapter`), kept as structured JSONB where possible rather than
+/// an opaque string - falls back to wrapping the raw text if it isn't
+/// valid JSON (always true for HAProxy's plain-text response, and for an
+/// unexpected `nft` version's output), and to an empty object for the "no
+/// resolvable address yet" case (`Preflight::raw_set_json` is `""` for an
+/// unresolved `IncidentSource` - see that variant's own doc comment).
+fn adapter_state_json(raw: &str) -> serde_json::Value {
     if raw.is_empty() {
         return serde_json::json!({});
     }
@@ -159,14 +176,18 @@ async fn dispatch(
     Option<String>,
     Option<FirewallDispatchReceipt>,
 ) {
-    if !claimed.action_name.starts_with("nftables.") {
+    let adapter: Box<dyn FirewallAdapter> = if claimed.action_name.starts_with("nftables.") {
+        Box::new(NftablesAdapter::new())
+    } else if claimed.action_name.starts_with("haproxy.") {
+        Box::new(HaproxyAdapter::new())
+    } else {
         return (
             true,
             Some("dry_run: no external operation executed".to_string()),
             None,
             None,
         );
-    }
+    };
     let Some(target) = claimed.target.as_ref() else {
         return (
             false,
@@ -182,14 +203,13 @@ async fn dispatch(
         Ok(action) => action,
         Err(error) => return (false, None, Some(error.to_string()), None),
     };
-    let adapter = NftablesAdapter::new();
     let dry_run = dry_run_from_env();
     // Best-effort: preflight is read-only enrichment for the receipt, not
     // a gate - a preflight failure (e.g. no NET_ADMIN in this environment)
     // is recorded as-is and apply is still attempted, since apply's own
     // success/failure is what actually determines the outcome here.
     let preflight_state = match adapter.preflight(&action.target).await {
-        Ok(preflight) => nft_state_json(&preflight.raw_set_json),
+        Ok(preflight) => adapter_state_json(&preflight.raw_set_json),
         Err(error) => serde_json::json!({"error": error.to_string()}),
     };
     match adapter.apply(&action, dry_run).await {
@@ -211,7 +231,7 @@ async fn dispatch(
                 adapter: result.receipt.adapter,
                 preflight_state,
                 rendered_commands: serde_json::json!(result.receipt.rendered_commands),
-                observed_state: result.observed_state.as_deref().map(nft_state_json),
+                observed_state: result.observed_state.as_deref().map(adapter_state_json),
                 verification_result,
                 ttl_seconds: result.receipt.ttl_seconds,
                 rollback_plan: serde_json::json!({"commands": result.receipt.rollback_commands}),
@@ -376,13 +396,18 @@ mod tests {
     #[test]
     fn the_mass_block_budget_only_applies_to_a_real_firewall_apply() {
         assert!(firewall_budget_applies("nftables.block_indicator", false));
+        assert!(firewall_budget_applies("haproxy.block_indicator", false));
         assert!(
             !firewall_budget_applies("nftables.block_indicator", true),
             "a dry run has nothing to bound"
         );
         assert!(
             !firewall_budget_applies("docker.restart_container", false),
-            "only nftables.*-prefixed actions are bounded"
+            "only nftables.*/haproxy.*-prefixed actions are bounded"
+        );
+        assert!(
+            !firewall_budget_applies("tailscale.quarantine_device", false),
+            "tailscale.* has no apply capability to bound in the first place"
         );
     }
 
@@ -447,6 +472,49 @@ mod tests {
             receipt.verification_result.is_none(),
             "a dry run has nothing to verify"
         );
+    }
+
+    #[tokio::test]
+    async fn a_haproxy_action_dispatches_in_dry_run_and_is_routed_to_the_haproxy_adapter() {
+        // Same shape as the nftables dry-run test above, proving
+        // dispatch()'s adapter selection actually picks HaproxyAdapter for
+        // an `haproxy.`-prefixed action name, not just NftablesAdapter for
+        // everything - needs no real HAProxy Runtime API socket since
+        // dry_run never touches it.
+        std::env::remove_var("CLAWFORGE_EXECUTOR_DRY_RUN");
+        let request = claimed(
+            "haproxy.block_indicator",
+            Some(serde_json::json!({
+                "kind": "threat_intel_indicator",
+                "cidr": "203.0.113.0/24",
+                "source": "spamhaus_drop",
+            })),
+        );
+        let (success, summary, error, receipt) = dispatch(&request).await;
+        assert!(success, "dispatch failed: {error:?}");
+        let summary = summary.unwrap();
+        assert!(summary.contains("adapter=haproxy"));
+        assert!(summary.contains("dry_run=true"));
+        let receipt = receipt.expect("a successful firewall apply must produce a receipt");
+        assert_eq!(receipt.adapter, "haproxy");
+        assert!(receipt.is_dry_run);
+    }
+
+    #[tokio::test]
+    async fn a_tailscale_action_keeps_the_generic_dry_run_fallback() {
+        // tailscale.*-prefixed actions are deliberately NOT routed to
+        // TailscaleAdapter - it has no apply capability to dispatch to at
+        // all (see docs/firewall-agent.md), so dispatch() must treat it
+        // exactly like any other non-firewall action.
+        let request = claimed("tailscale.quarantine_device", None);
+        let (success, summary, error, receipt) = dispatch(&request).await;
+        assert!(success);
+        assert_eq!(
+            summary.as_deref(),
+            Some("dry_run: no external operation executed")
+        );
+        assert!(error.is_none());
+        assert!(receipt.is_none());
     }
 
     #[test]
