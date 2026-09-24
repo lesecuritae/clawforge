@@ -228,6 +228,31 @@ one. Two actions, not one, because the two target kinds are genuinely
 different risk shapes, not the same action with two ways to fill in a
 parameter.
 
+## Tailscale adapter (prepared, not operable)
+
+The roadmap is explicit that Tailscale should be prepared "zunächst nur
+als freigabepflichtigen Adapter" - deliberately narrower than
+`NftablesAdapter`'s own first increment, which at least had
+`preflight`/`render` from the start. `TailscaleAdapter` has **no**
+`preflight`, `apply`, `verify`, or `rollback` method at all - not "an
+`apply` that always returns an error", but an `apply` that is not a
+method to call in the first place, so there is no code path anywhere in
+this crate that could reach the real Tailscale Admin API. Its only
+capability is `render(&TailscaleAction) -> TailscaleActionReceipt`: pure,
+synchronous, describes what a real call *would* be (`POST
+/api/v2/device/{id}/disable` to quarantine a device suspected of
+compromise) without ever making it. There is no HTTP client, no API
+token, and no secret wired to this type at all. `TailscaleTarget`
+identifies a device by its Tailscale device ID - never an IP address, a
+genuinely different resource shape from `FirewallTarget`, which is why
+it is its own separate type rather than a fourth `FirewallTarget`
+variant. Migration `0037` registers a `tailscale` connector and the
+`tailscale.quarantine_device` action, `requires_approval=TRUE,
+enabled=FALSE`, same as every nftables action - this is preparation for
+review, not a working integration, and building the real Admin API call
+(auth, HTTP client, error handling, its own tests) is separate,
+not-yet-started follow-up work.
+
 ## `firewall_action_receipts` is populated, nothing reads it back yet
 
 Populated on every `nftables.*` dispatch (preflight, rendered commands,
@@ -243,8 +268,9 @@ on this).
 
 ## What's deliberately not built yet
 
-- **No HAProxy adapter, no Tailscale adapter** (roadmap: Tailscale
-  "zunächst nur als freigabepflichtigen Adapter vorbereiten").
+- **No HAProxy adapter.**
+- **No real Tailscale integration** - `TailscaleAdapter` is prepared
+  (see above) but has no `apply` capability at all, on purpose.
 - **No failure-injection tests** beyond lease loss/worker death (proven
   by `a_worker_that_dies_after_claiming_is_reclaimed_by_a_different_worker`)
   and manual drift (proven by

@@ -797,6 +797,89 @@ impl FirewallAdapter for NftablesAdapter {
     }
 }
 
+/// A device on the tailnet, identified the way Tailscale's own Admin API
+/// identifies one - never an IP address (Tailscale addresses are stable
+/// per-device, not the resource being acted on the way an nftables
+/// target's address is).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TailscaleTarget {
+    pub device_id: String,
+}
+
+impl TailscaleTarget {
+    fn validate(&self) -> Result<(), AdapterError> {
+        if self.device_id.trim().is_empty() {
+            return Err(AdapterError::InvalidTarget(
+                "tailscale device_id must not be empty".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TailscaleAction {
+    pub target: TailscaleTarget,
+    pub reason: String,
+}
+
+/// What a real call to the Tailscale Admin API *would* be - `render`
+/// describes it, nothing ever executes it. See [`TailscaleAdapter`]'s own
+/// doc comment for why there is no equivalent of `apply` at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TailscaleActionReceipt {
+    pub adapter: &'static str,
+    pub described_call: String,
+}
+
+/// Tailscale's own first increment (roadmap: "zunächst nur als
+/// freigabepflichtigen Adapter vorbereiten" - prepare it initially only
+/// as an approval-required adapter) - deliberately narrower than
+/// [`NftablesAdapter`]'s own first increment (which at least had
+/// `preflight`/`render`, with `apply`/`verify`/`rollback` added later in
+/// a separately reviewed increment). This type has **no** `preflight`,
+/// `apply`, `verify`, or `rollback` method at all - not "an apply that
+/// always returns an error", an apply that does not exist to call in the
+/// first place, so there is no code path anywhere that could reach the
+/// real Tailscale Admin API. `render` is the only capability: it
+/// describes, in the same "say exactly what would happen" spirit as
+/// `NftablesAdapter`'s own rendered `nft` argv, what a real call would be
+/// (disabling a device suspected of compromise) - never calls it, and
+/// this type holds no HTTP client, no API token, and no secret at all.
+/// The registered action (migration `0037`) is `requires_approval=TRUE,
+/// enabled=FALSE`, same as every other connector action since migration
+/// `0027` - this is preparation for review, not a working integration.
+pub struct TailscaleAdapter;
+
+impl TailscaleAdapter {
+    pub fn new() -> Self {
+        Self
+    }
+
+    pub fn name(&self) -> &'static str {
+        "tailscale"
+    }
+
+    /// Pure and synchronous, exactly like `NftablesAdapter::render` - no
+    /// network, no filesystem, nothing but string formatting.
+    pub fn render(&self, action: &TailscaleAction) -> Result<TailscaleActionReceipt, AdapterError> {
+        action.target.validate()?;
+        Ok(TailscaleActionReceipt {
+            adapter: self.name(),
+            described_call: format!(
+                "POST /api/v2/device/{}/disable (reason: {})",
+                action.target.device_id, action.reason
+            ),
+        })
+    }
+}
+
+impl Default for TailscaleAdapter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1441,5 +1524,35 @@ mod tests {
         };
         let result = adapter.rollback(&action).await;
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn tailscale_render_describes_the_call_it_would_make() {
+        let adapter = TailscaleAdapter::new();
+        let action = TailscaleAction {
+            target: TailscaleTarget {
+                device_id: "n123456CNTRL".into(),
+            },
+            reason: "corroborated incident abc-123".into(),
+        };
+        let receipt = adapter.render(&action).unwrap();
+        assert_eq!(receipt.adapter, "tailscale");
+        assert!(receipt.described_call.contains("n123456CNTRL"));
+        assert!(receipt.described_call.contains("disable"));
+        assert!(receipt
+            .described_call
+            .contains("corroborated incident abc-123"));
+    }
+
+    #[test]
+    fn tailscale_render_rejects_an_empty_device_id_before_describing_anything() {
+        let adapter = TailscaleAdapter::new();
+        let action = TailscaleAction {
+            target: TailscaleTarget {
+                device_id: "   ".into(),
+            },
+            reason: "test".into(),
+        };
+        assert!(adapter.render(&action).is_err());
     }
 }

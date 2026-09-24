@@ -303,7 +303,16 @@ Arbeitspakete:
   deaktiviert (`enabled=FALSE`), wie jede andere Connector-Action seit
   Migration `0027`.)
 - HAProxy-Adapter für Maps/ACLs und Rate-Limits implementieren (noch offen)
-- Tailscale zunächst nur als freigabepflichtigen Adapter vorbereiten (noch offen)
+- Tailscale zunächst nur als freigabepflichtigen Adapter vorbereiten
+  (**erledigt**: `TailscaleAdapter` hat bewusst KEINE `apply`/`verify`/
+  `rollback`-Methode ueberhaupt - nicht "ein apply, das immer fehlschlaegt",
+  sondern kein aufrufbarer Pfad zur echten Tailscale Admin API. Einzige
+  Faehigkeit ist `render`: rein, synchron, beschreibt nur, was ein echter
+  Aufruf waere (`POST /api/v2/device/{id}/disable`), ohne ihn je
+  auszufuehren - kein HTTP-Client, kein API-Token, kein Secret vorhanden.
+  Migration `0037` registriert Connector + `tailscale.quarantine_device`-
+  Action, `requires_approval=TRUE, enabled=FALSE`. Eine echte Admin-API-
+  Integration ist separates, noch nicht begonnenes Folgewerk.)
 
 **Wichtiger Nebenbefund waehrend dieser Phase**: die bestehende
 Fail-closed-Pseudonymisierung (Nutzerentscheidung aus Empfehlung 5) macht
