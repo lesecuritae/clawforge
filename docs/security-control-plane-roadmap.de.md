@@ -272,13 +272,13 @@ Arbeitspakete:
   `dry_run` weiterhin von `CLAWFORGE_EXECUTOR_DRY_RUN` gesteuert und am
   Aufrufpunkt selbst erneut geprueft, unabhaengig vom Start-Gate.)
 - Action Receipt, Preflight, Istzustand, Verification, TTL und konkreten
-  Rollback persistieren (**teilweise**: Tabelle `firewall_action_receipts`
-  (Migration `0036`) fuer Preflight/gerenderte Kommandos/TTL/Rollback-Plan
-  angelegt; `apply`/`verify`/`rollback` erzeugen den vollstaendigen
-  `FirewallActionReceipt` bereits zur Laufzeit (im `result_summary` des
-  Execution-Requests sichtbar) - er wird aber noch nicht in
-  `firewall_action_receipts` persistiert, das ist der letzte offene Schritt
-  hier.)
+  Rollback persistieren (**erledigt**: `clawforge-executor` schreibt bei
+  jedem `nftables.*`-Dispatch einen vollstaendigen Receipt (Preflight,
+  gerenderte Kommandos, Istzustand, Verification-Ergebnis, TTL,
+  Rollback-Plan) in `firewall_action_receipts` - Tabelle ist bewusst
+  Append-only, `clawforge_executor` hat nur `INSERT`, bewiesen per echtem
+  Rollen-Test. Noch offen: kein Admin-Werkzeug liest die Tabelle
+  zurueck.)
 - Idempotency, Lease, Retry, Timeout und Recovery des vorhandenen Executors
   integrieren (**bereits vorhanden**, unveraendert genutzt: `execution_requests`/
   `execution_leases`/`execution_recovery` mit DB-Trigger-gestuetzten

@@ -164,11 +164,15 @@ parameter.
 - **No HA/leader/lease-race tests** proving no double-application under
   concurrent workers.
 - **No rate/concurrency/mass-block budgets.**
-- **`firewall_action_receipts` is not populated by anything yet** - the
-  table exists (migration `0036`), but no caller writes a preflight/
-  render/apply/verify/rollback receipt to it. `dispatch()` currently only
-  folds `FirewallActionReceipt` into the execution request's
-  `result_summary` text.
+- **`firewall_action_receipts` is now populated** on every `nftables.*`
+  dispatch (preflight, rendered commands, observed state, verification
+  result, TTL, rollback plan) - `clawforge_executor` has `INSERT` only on
+  the table (append-only, proven by
+  `runtime_roles_enforce_service_boundaries`: the role can insert via
+  `record_firewall_action_receipt`, but a raw `UPDATE` on the row it just
+  wrote fails). Nothing reads the table back yet - no admin surface for
+  desired/actual state, drift, or rollback history exists (see the
+  roadmap's own remaining Pflichtgate on this).
 - **Both registered actions stay `enabled=FALSE`** - nothing here changes
   that a reviewed, explicit change is required before any of this can run
   for real, in a lab or otherwise, and `CLAWFORGE_EXECUTOR_DRY_RUN` stays
