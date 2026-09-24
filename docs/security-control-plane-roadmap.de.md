@@ -263,15 +263,22 @@ Ziel: sichere Ausführungsplattform, zunächst vollständig im Dry-Run.
 Arbeitspakete:
 
 - `clawforge-firewall-agent` mit typisiertem Adaptervertrag erstellen
-  (**erledigt, als Bibliotheks-Crate ohne laufenden Dienst** - siehe
-  `docs/firewall-agent.md`: `FirewallAdapter`-Trait mit `preflight`/
-  `render`; kein `apply` existiert. Anbindung an den Executor-Dispatch
-  noch offen.)
+  (**erledigt**: `FirewallAdapter`-Trait mit `preflight`/`render`/`apply`/
+  `verify`/`rollback`, alle real implementiert fuer `NftablesAdapter` -
+  siehe `docs/firewall-agent.md`. Anbindung an den Executor-Dispatch
+  ebenfalls erledigt: `clawforge-executor` claimt `execution_requests`
+  ueber `claim_execution_request_for_dispatch`/`complete_execution_dispatch`
+  und ruft fuer `nftables.*`-Actions echt `NftablesAdapter::apply` auf,
+  `dry_run` weiterhin von `CLAWFORGE_EXECUTOR_DRY_RUN` gesteuert und am
+  Aufrufpunkt selbst erneut geprueft, unabhaengig vom Start-Gate.)
 - Action Receipt, Preflight, Istzustand, Verification, TTL und konkreten
   Rollback persistieren (**teilweise**: Tabelle `firewall_action_receipts`
   (Migration `0036`) fuer Preflight/gerenderte Kommandos/TTL/Rollback-Plan
-  angelegt - wird noch nicht befuellt, da kein `apply` existiert, das
-  etwas zu persistieren haette.)
+  angelegt; `apply`/`verify`/`rollback` erzeugen den vollstaendigen
+  `FirewallActionReceipt` bereits zur Laufzeit (im `result_summary` des
+  Execution-Requests sichtbar) - er wird aber noch nicht in
+  `firewall_action_receipts` persistiert, das ist der letzte offene Schritt
+  hier.)
 - Idempotency, Lease, Retry, Timeout und Recovery des vorhandenen Executors
   integrieren (**bereits vorhanden**, unveraendert genutzt: `execution_requests`/
   `execution_leases`/`execution_recovery` mit DB-Trigger-gestuetzten
@@ -279,13 +286,20 @@ Arbeitspakete:
   vor dieser Phase gebaut, hier nur wiederverwendet, nicht neu erstellt.)
 - nftables-Adapter mit exklusiver Clawforge-Tabelle/-Chain implementieren
   und ausschließlich ein vorprovisioniertes Set verwalten lassen
-  (**erledigt fuer Preflight/Render**: `NftablesAdapter` rendert nur
-  `nft add/delete element inet clawforge blocklist {...}` - nie eine neue
-  Regel, nur Mitgliedschaft in einem vorab vom Betreiber angelegten Set.
-  Zwei Zieltypen: `ThreatIntelIndicator` (rohe, bereits oeffentliche
-  CIDR/IP aus `indicators`) und `IncidentSource` (pseudonymisierte
-  Resource - render loest NIE zur echten IP auf, nur ein
-  `<resolved-at-apply-time:...>`-Platzhalter). Registriert, aber
+  (**erledigt, inkl. echtem Apply/Verify/Rollback**: `NftablesAdapter`
+  rendert und fuehrt nur `nft add/delete element inet clawforge
+  blocklist{,6} {...}` aus - nie eine neue Regel, nur Mitgliedschaft in
+  zwei vorab vom Betreiber angelegten, typisierten Sets (IPv4/IPv6
+  getrennt, da nftables-Sets typisiert sind). Drei Zieltypen:
+  `ThreatIntelIndicator` (rohe, bereits oeffentliche CIDR/IP aus
+  `indicators`), `IncidentSource` (pseudonymisierte Resource - render
+  loest NIE zur echten IP auf, `apply` darauf schlaegt by construction
+  fehl) und `ResolvedIncidentSource` (nur von einem Aufrufer erzeugt, der
+  bereits ueber `security_ip_resolutions` aufgeloest hat; `render`
+  verweigert diese Variante explizit). IPv4-mapped-IPv6-Normalisierung
+  vorhanden. Ein echter Bug (naiver String-Containment-Check statt
+  strukturiertem JSON-Parsing bei der Set-Mitgliedschaftspruefung) wurde
+  ueber das isolierte Lab gefunden und behoben. Registriert, aber
   deaktiviert (`enabled=FALSE`), wie jede andere Connector-Action seit
   Migration `0027`.)
 - HAProxy-Adapter für Maps/ACLs und Rate-Limits implementieren (noch offen)
@@ -312,18 +326,33 @@ Pflichtgates vor der ersten verändernden Lab-Testaktion:
   wie fuer jede Migration in diesem Repo seit Projektbeginn)
 - Executor besitzt Unit-, Crash-/Restart-, Idempotency- und Rollbacktests
   (**teilweise** - die bestehende Executor-Infrastruktur hat Idempotency-/
-  Freigabe-Tests; Crash-/Restart-/Rollback-Tests speziell fuer einen
-  Adapter-Dispatch existieren noch nicht, da kein Dispatch existiert)
+  Freigabe-Tests; `claim_execution_request_for_dispatch`/
+  `complete_execution_dispatch` haben eigene Integrationstests gegen
+  echtes Postgres, `NftablesAdapter` hat echte apply/verify/rollback-
+  Roundtrip-Tests im Lab (u. a. Idempotenz eines doppelten Applies,
+  Rollback eines nie applizierten Elements). Gezielte Crash-/Restart-
+  Tests, die einen Prozessabbruch *waehrend* eines laufenden Dispatch
+  simulieren, existieren noch nicht.)
 - Action API und Adapter bestehen Fuzz-/Negativtests und Command-Injection-
   Review; es existiert keine freie Shell (**teilweise**: Negativtests fuer
   `NftablesAdapter` vorhanden (ungueltige CIDR, leere Quelle, Shell-Metazeichen
-  als Zieltext), jede Kommandokonstruktion nutzt `tokio::process::Command`
-  mit explizitem Argv statt Shell-String. Systematisches Fuzzing noch offen.)
+  als Zieltext, unaufgeloester Pseudonym-Apply), jede Kommandokonstruktion -
+  inklusive der jetzt echten apply/verify/rollback-Aufrufe - nutzt
+  `tokio::process::Command` mit explizitem Argv statt Shell-String.
+  Systematisches Fuzzing noch offen.)
 - isoliertes Netzwerk-Lab bestätigt, dass Allowlist und Managementzugang nicht
-  gesperrt werden können (**noch offen** - braucht echte Lab-Infrastruktur,
-  bewusst nicht ohne Nutzerbeteiligung angegangen)
+  gesperrt werden können (**teilweise**: `scripts/test-firewall-lab.sh`
+  betreibt einen disposablen Container (NET_ADMIN/NET_RAW, nie
+  srv19680 oder ein anderer echter Host) und faehrt dort 8 echte
+  `nft`-Roundtrip-Tests (Apply/Verify/Rollback IPv4+IPv6, Dry-Run-
+  Isolation, Idempotenz, IPv4-mapped-IPv6). Was das noch nicht abdeckt:
+  Selbstsperr-Bestaetigung gegen den echten Management-Zugangspfad
+  (SSH/HAProxy-Admin) eines *provisionierten* Hosts - der Container hat
+  kein Aequivalent dazu. Das bleibt vor jedem echten Apply gegen einen
+  Produktionshost offen und wird bewusst nicht ohne Nutzerbeteiligung
+  angegangen.)
 - Break-glass-Verfahren und manuelles Entfernen aller Clawforge-Regeln sind
-  dokumentiert und geprobt
+  dokumentiert und geprobt (**noch offen**)
 - Failure-Injection deckt Prozess-/Host-/DB-Ausfall zwischen Intent, Apply,
   Receipt und Audit, Lease-Verlust, Reboot, Uhrsprung, konkurrierende Actions,
   abgelaufene TTL, manuelle Drift und fehlgeschlagenes Read-back ab
