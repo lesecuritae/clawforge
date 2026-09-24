@@ -22,6 +22,7 @@ api_password="$(read_secret database_api_password "${CLAWFORGE_DATABASE_API_PASS
 worker_password="$(read_secret database_worker_password "${CLAWFORGE_DATABASE_WORKER_PASSWORD_SECRET_FILE:-/run/secrets/database_worker_password}")"
 correlation_password="$(read_secret database_correlation_password "${CLAWFORGE_DATABASE_CORRELATION_PASSWORD_SECRET_FILE:-/run/secrets/database_correlation_password}")"
 security_engine_password="$(read_secret database_security_engine_password "${CLAWFORGE_DATABASE_SECURITY_ENGINE_PASSWORD_SECRET_FILE:-/run/secrets/database_security_engine_password}")"
+policy_engine_password="$(read_secret database_policy_engine_password "${CLAWFORGE_DATABASE_POLICY_ENGINE_PASSWORD_SECRET_FILE:-/run/secrets/database_policy_engine_password}")"
 incidents_password="$(read_secret database_incidents_password "${CLAWFORGE_DATABASE_INCIDENTS_PASSWORD_SECRET_FILE:-/run/secrets/database_incidents_password}")"
 executor_password="$(read_secret database_executor_password "${CLAWFORGE_DATABASE_EXECUTOR_PASSWORD_SECRET_FILE:-/run/secrets/database_executor_password}")"
 backup_password="$(read_secret database_backup_password "${CLAWFORGE_DATABASE_BACKUP_PASSWORD_SECRET_FILE:-/run/secrets/database_backup_password}")"
@@ -37,6 +38,7 @@ psql \
   --set worker_password="$worker_password" \
   --set correlation_password="$correlation_password" \
   --set security_engine_password="$security_engine_password" \
+  --set policy_engine_password="$policy_engine_password" \
   --set incidents_password="$incidents_password" \
   --set executor_password="$executor_password" \
   --set backup_password="$backup_password" <<'SQL'
@@ -48,6 +50,7 @@ SELECT 'CREATE ROLE clawforge_api' WHERE NOT EXISTS (SELECT FROM pg_roles WHERE 
 SELECT 'CREATE ROLE clawforge_worker' WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname='clawforge_worker') \gexec
 SELECT 'CREATE ROLE clawforge_correlation' WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname='clawforge_correlation') \gexec
 SELECT 'CREATE ROLE clawforge_security_engine' WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname='clawforge_security_engine') \gexec
+SELECT 'CREATE ROLE clawforge_policy_engine' WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname='clawforge_policy_engine') \gexec
 SELECT 'CREATE ROLE clawforge_incidents' WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname='clawforge_incidents') \gexec
 SELECT 'CREATE ROLE clawforge_executor' WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname='clawforge_executor') \gexec
 SELECT 'CREATE ROLE clawforge_backup' WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname='clawforge_backup') \gexec
@@ -56,14 +59,15 @@ ALTER ROLE clawforge_api LOGIN PASSWORD :'api_password' NOSUPERUSER NOCREATEDB N
 ALTER ROLE clawforge_worker LOGIN PASSWORD :'worker_password' NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 32;
 ALTER ROLE clawforge_correlation LOGIN PASSWORD :'correlation_password' NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 16;
 ALTER ROLE clawforge_security_engine LOGIN PASSWORD :'security_engine_password' NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 16;
+ALTER ROLE clawforge_policy_engine LOGIN PASSWORD :'policy_engine_password' NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 16;
 ALTER ROLE clawforge_incidents LOGIN PASSWORD :'incidents_password' NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 16;
 ALTER ROLE clawforge_executor LOGIN PASSWORD :'executor_password' NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 16;
 ALTER ROLE clawforge_backup LOGIN PASSWORD :'backup_password' NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 4;
 
-GRANT CONNECT ON DATABASE :"database_name" TO clawforge_api, clawforge_worker, clawforge_correlation, clawforge_security_engine, clawforge_incidents, clawforge_executor, clawforge_backup;
-GRANT USAGE ON SCHEMA public TO clawforge_api, clawforge_worker, clawforge_correlation, clawforge_security_engine, clawforge_incidents, clawforge_executor, clawforge_backup;
-REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM clawforge_api, clawforge_worker, clawforge_correlation, clawforge_security_engine, clawforge_incidents, clawforge_executor, clawforge_backup;
-REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public FROM clawforge_api, clawforge_worker, clawforge_correlation, clawforge_security_engine, clawforge_incidents, clawforge_executor, clawforge_backup;
+GRANT CONNECT ON DATABASE :"database_name" TO clawforge_api, clawforge_worker, clawforge_correlation, clawforge_security_engine, clawforge_policy_engine, clawforge_incidents, clawforge_executor, clawforge_backup;
+GRANT USAGE ON SCHEMA public TO clawforge_api, clawforge_worker, clawforge_correlation, clawforge_security_engine, clawforge_policy_engine, clawforge_incidents, clawforge_executor, clawforge_backup;
+REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM clawforge_api, clawforge_worker, clawforge_correlation, clawforge_security_engine, clawforge_policy_engine, clawforge_incidents, clawforge_executor, clawforge_backup;
+REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public FROM clawforge_api, clawforge_worker, clawforge_correlation, clawforge_security_engine, clawforge_policy_engine, clawforge_incidents, clawforge_executor, clawforge_backup;
 
 -- The API is the authenticated administrative boundary. It may mutate the
 -- application schema, but migration metadata and append-only audit rows remain
@@ -118,6 +122,18 @@ GRANT INSERT, UPDATE ON TABLE event_consumers, event_delivery,
   runtime_status, security_assessments TO clawforge_security_engine;
 GRANT INSERT ON TABLE security_assessment_events TO clawforge_security_engine;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO clawforge_security_engine;
+
+-- policy-engine (Shadow Mode only, roadmap phase 5) reads security_policies
+-- (never writes them - a policy is authored/versioned separately, this
+-- service only evaluates active ones) and security_assessments, and writes
+-- its own security_policy_decisions. No access to events/event_delivery at
+-- all: unlike security-engine, this service does not consume the canonical
+-- event bus, it polls already-persisted assessments directly.
+GRANT SELECT ON TABLE _sqlx_migrations, security_policies, security_assessments,
+  security_policy_decisions, incidents, runtime_status TO clawforge_policy_engine;
+GRANT INSERT, UPDATE ON TABLE security_policy_decisions, runtime_status
+  TO clawforge_policy_engine;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO clawforge_policy_engine;
 
 -- Promotion also backfills alerts.incident_id for alerts that were created
 -- before their candidate was promoted, and announces new incidents on the

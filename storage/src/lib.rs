@@ -19,8 +19,10 @@ use uuid::Uuid;
 
 mod security_assessments;
 mod security_events;
+mod security_policies;
 pub use security_assessments::{SecurityAssessment, SecurityAssessmentUpsert};
 pub use security_events::SecuritySensor;
+pub use security_policies::{SecurityPolicy, SecurityPolicyDecisionUpsert};
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../migrations");
 

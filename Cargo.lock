@@ -477,6 +477,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "clawforge-policy-engine"
+version = "1.0.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clawforge-policy",
+ "clawforge-risk",
+ "clawforge-storage",
+ "serde_json",
+ "sha2",
+ "sqlx",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "clawforge-risk"
 version = "1.0.0"
 dependencies = [

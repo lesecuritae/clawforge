@@ -215,17 +215,41 @@ Ziel: versionierte Regeln mit explizitem Entscheidungsweg.
 Arbeitspakete:
 
 - persistierte Policy-Versionen, Status, Gültigkeit und Simulation ergänzen
-- Klassen `observe`, `approval` und `automatic` abbilden
+  (**erledigt**: Migration `0034`, `security_policies` versioniert
+  (`UNIQUE (name,version)`), Status `draft`/`active`/`retired`,
+  `valid_from`/`valid_until`. "Simulation" = Shadow-Auswertung, siehe unten.)
+- Klassen `observe`, `approval` und `automatic` abbilden (**erledigt** als
+  Spalte `class` auf `security_policies`; alle drei aktuell seeded mit
+  `observe`, da noch keine Action-Ebene existiert, gegen die `approval`/
+  `automatic` etwas bedeuten würde.)
 - Evidence Snapshot, Allowlist, Zielbereich, TTL und Blast Radius prüfen
+  (**teilweise**: Evidence Snapshot + Hash erledigt (`evidence_snapshot`/
+  `evidence_hash` auf `security_policy_decisions`). Allowlist/Zielbereich/
+  TTL/Blast-Radius-Prüfung noch offen - ergibt erst mit einer echten
+  Action-Ebene (Phase 6) Sinn.)
 - Zwei-Personen-Freigabe für high/critical gegen vorhandene Approval-
-  Infrastruktur durchsetzen
+  Infrastruktur durchsetzen (noch offen - braucht Phase 6)
 - Freigabe an den unveränderlichen Hash von Action, Ziel, TTL, Adapter,
   gerendertem Diff und Policy-/Evidence-Version binden; Drift invalidiert sie
-- Shadow Evaluation und Entscheidungserklärung bereitstellen
+  (**teilweise**: `evidence_hash` bindet heute Policy-Version + Evidence-
+  Snapshot; Action/Ziel/TTL/Adapter/Diff kommen mit Phase 6 dazu.)
+- Shadow Evaluation und Entscheidungserklärung bereitstellen (**erledigt**:
+  neuer Dienst `clawforge-policy-engine`, wertet
+  `clawforge-security-engine`-Assessments gegen aktive Policies aus über
+  das bereits vorhandene `clawforge_policy::decide()` - dieselbe Logik, die
+  schon "ein einzelnes Signal erreicht nie eine Block-Entscheidung"
+  durchsetzt (`evidence_sources>=2` für Block; heute strukturell immer 1,
+  siehe `docs/policy-engine.md`). Jede Entscheidung bekommt eine
+  Klartext-`rationale`. **Es existiert keine Action-Ebene - "Shadow Mode"
+  ist hier eine Eigenschaft der Architektur, nicht nur eine Konfiguration.**)
 
 Exit-Gate: mindestens zwei Wochen Shadow Mode gegen ein vorab festgelegtes
 Goldkorpus und eine genehmigte False-positive-Grenze; Policies können gegen
-historische Incidents replayed werden; keine Action wird produktiv ausgeführt.
+historische Incidents replayed werden (**Replay-Eigenschaft erledigt** - jeder
+Poll-Zyklus wertet die letzten N Assessments neu aus, idempotent per
+`dedupe_key`, siehe echten Postgres-Test in `policy-engine/src/main.rs`. Die
+eigentliche zwei-Wochen-Beobachtung selbst steht noch aus.); keine Action
+wird produktiv ausgeführt (**erfüllt per Konstruktion**, siehe oben).
 
 ## Phase 6: Firewall Action Layer
 

@@ -26,6 +26,7 @@ run_cargo() {
     -e CLAWFORGE_TEST_WORKER_DATABASE_URL \
     -e CLAWFORGE_TEST_CORRELATION_DATABASE_URL \
     -e CLAWFORGE_TEST_SECURITY_ENGINE_DATABASE_URL \
+    -e CLAWFORGE_TEST_POLICY_ENGINE_DATABASE_URL \
     -e CLAWFORGE_TEST_INCIDENTS_DATABASE_URL \
     -e CLAWFORGE_TEST_EXECUTOR_DATABASE_URL \
     -e CLAWFORGE_TEST_BACKUP_DATABASE_URL \
@@ -46,7 +47,7 @@ docker run --rm -d --name "$container" \
 until docker exec "$container" pg_isready -U clawforge -d clawforge_test >/dev/null 2>&1; do sleep 1; done
 
 printf '%s\n' 'test-password-012345' >"$secret_dir/postgres_password"
-for role in api worker correlation security_engine incidents executor; do
+for role in api worker correlation security_engine policy_engine incidents executor; do
   password="test-${role}-password-0123456789"
   printf '%s\n' "$password" >"$secret_dir/database_${role}_password"
   printf 'postgres://clawforge_%s:%s@127.0.0.1:55432/clawforge_test\n' \
@@ -69,6 +70,7 @@ docker run --rm --network host \
   -e CLAWFORGE_DATABASE_WORKER_PASSWORD_SECRET_FILE=/run/test-secrets/database_worker_password \
   -e CLAWFORGE_DATABASE_CORRELATION_PASSWORD_SECRET_FILE=/run/test-secrets/database_correlation_password \
   -e CLAWFORGE_DATABASE_SECURITY_ENGINE_PASSWORD_SECRET_FILE=/run/test-secrets/database_security_engine_password \
+  -e CLAWFORGE_DATABASE_POLICY_ENGINE_PASSWORD_SECRET_FILE=/run/test-secrets/database_policy_engine_password \
   -e CLAWFORGE_DATABASE_INCIDENTS_PASSWORD_SECRET_FILE=/run/test-secrets/database_incidents_password \
   -e CLAWFORGE_DATABASE_EXECUTOR_PASSWORD_SECRET_FILE=/run/test-secrets/database_executor_password \
   -e CLAWFORGE_DATABASE_BACKUP_PASSWORD_SECRET_FILE=/run/test-secrets/database_backup_password \
@@ -86,6 +88,7 @@ CLAWFORGE_TEST_API_DATABASE_URL="$(cat "$secret_dir/database_api_url")" \
 CLAWFORGE_TEST_WORKER_DATABASE_URL="$(cat "$secret_dir/database_worker_url")" \
 CLAWFORGE_TEST_CORRELATION_DATABASE_URL="$(cat "$secret_dir/database_correlation_url")" \
 CLAWFORGE_TEST_SECURITY_ENGINE_DATABASE_URL="$(cat "$secret_dir/database_security_engine_url")" \
+CLAWFORGE_TEST_POLICY_ENGINE_DATABASE_URL="$(cat "$secret_dir/database_policy_engine_url")" \
 CLAWFORGE_TEST_INCIDENTS_DATABASE_URL="$(cat "$secret_dir/database_incidents_url")" \
 CLAWFORGE_TEST_EXECUTOR_DATABASE_URL="$(cat "$secret_dir/database_executor_url")" \
 CLAWFORGE_TEST_BACKUP_DATABASE_URL="postgres://clawforge_backup:${backup_password}@127.0.0.1:55432/clawforge_test" \
@@ -103,6 +106,12 @@ CLAWFORGE_TEST_SECURITY_ENGINE_DATABASE_URL="$(cat "$secret_dir/database_securit
 CLAWFORGE_TEST_INCIDENTS_DATABASE_URL="$(cat "$secret_dir/database_incidents_url")" \
 CLAWFORGE_ANALYZER_IP_HMAC_KEY="test-only-ip-hmac-key-0123456789-not-for-production" \
   run_cargo test -p clawforge-security-engine --bin clawforge-security-engine -- --ignored --test-threads=1
+
+CLAWFORGE_TEST_DATABASE_URL="$owner_url" \
+CLAWFORGE_TEST_POLICY_ENGINE_DATABASE_URL="$(cat "$secret_dir/database_policy_engine_url")" \
+CLAWFORGE_TEST_SECURITY_ENGINE_DATABASE_URL="$(cat "$secret_dir/database_security_engine_url")" \
+CLAWFORGE_ANALYZER_IP_HMAC_KEY="test-only-ip-hmac-key-0123456789-not-for-production" \
+  run_cargo test -p clawforge-policy-engine --bin clawforge-policy-engine -- --ignored --test-threads=1
 
 CLAWFORGE_TEST_DATABASE_URL="$owner_url" \
 CLAWFORGE_ANALYZER_IP_HMAC_KEY="test-only-ip-hmac-key-0123456789-not-for-production" \

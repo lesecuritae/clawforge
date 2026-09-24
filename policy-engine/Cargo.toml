@@ -1,0 +1,21 @@
+[package]
+name = "clawforge-policy-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+clawforge-policy = { path = "../policy" }
+clawforge-risk = { path = "../risk" }
+clawforge-storage = { path = "../storage" }
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+sqlx.workspace = true

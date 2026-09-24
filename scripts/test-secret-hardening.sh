@@ -10,7 +10,7 @@ trap cleanup EXIT INT TERM
 
 export CLAWFORGE_POSTGRES_SECRET_FILE="$test_dir/secrets/postgres_password"
 export CLAWFORGE_DATABASE_URL_SECRET_FILE="$test_dir/secrets/database_url"
-for role in api worker correlation security_engine incidents executor; do
+for role in api worker correlation security_engine policy_engine incidents executor; do
   password_var="CLAWFORGE_DATABASE_$(printf '%s' "$role" | tr '[:lower:]' '[:upper:]')_PASSWORD_SECRET_FILE"
   url_var="CLAWFORGE_DATABASE_$(printf '%s' "$role" | tr '[:lower:]' '[:upper:]')_URL_SECRET_FILE"
   export "$password_var=$test_dir/secrets/database_${role}_password"

@@ -38,7 +38,7 @@ if [ ! -e "$postgres_path" ]; then
   write_new database_url "postgres://clawforge:${postgres_password}@postgres:5432/clawforge"
 fi
 
-for role in api worker correlation security_engine incidents executor; do
+for role in api worker correlation security_engine policy_engine incidents executor; do
   password_path="$secret_dir/database_${role}_password"
   url_path="$secret_dir/database_${role}_url"
   if { [ -e "$password_path" ] && [ ! -e "$url_path" ]; } ||
