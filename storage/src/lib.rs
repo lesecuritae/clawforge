@@ -3237,6 +3237,58 @@ impl PostgresStore {
             .collect())
     }
 
+    /// Read-only listing for an admin surface - the roadmap's own
+    /// Pflichtgate ("Desired/Actual State, TTL, Drift, Kill-Switch und
+    /// vollstaendige Audit-Lineage sind vor einem Produktionspilot ueber
+    /// ein geprueftes Admin-Werkzeug sichtbar"). Every field here is
+    /// already safe to show: `target_fingerprint`/`rendered_commands`/
+    /// `rollback_plan` never carry a raw IP for a `ResolvedIncidentSource`
+    /// (see `redacted_element_reference`'s own doc comment in
+    /// `clawforge-firewall-agent`) - this table was designed from the
+    /// start to be something an operator can look at directly.
+    pub async fn list_firewall_action_receipts(
+        &self,
+        adapter: Option<&str>,
+        target_fingerprint: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<serde_json::Value>> {
+        let rows = sqlx::query(
+            "SELECT id,execution_id,adapter,action_name,receipt_kind,target_fingerprint, \
+                    is_dry_run,verification_result,ttl_seconds,expires_at,created_at, \
+                    rendered_commands,rollback_plan,observed_state \
+             FROM firewall_action_receipts \
+             WHERE ($1::text IS NULL OR adapter = $1) \
+               AND ($2::text IS NULL OR target_fingerprint = $2) \
+             ORDER BY created_at DESC LIMIT $3",
+        )
+        .bind(adapter)
+        .bind(target_fingerprint)
+        .bind(limit.clamp(1, 500))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                serde_json::json!({
+                    "id": r.get::<Uuid, _>("id"),
+                    "execution_id": r.get::<Option<Uuid>, _>("execution_id"),
+                    "adapter": r.get::<String, _>("adapter"),
+                    "action_name": r.get::<String, _>("action_name"),
+                    "receipt_kind": r.get::<String, _>("receipt_kind"),
+                    "target_fingerprint": r.get::<Option<String>, _>("target_fingerprint"),
+                    "is_dry_run": r.get::<bool, _>("is_dry_run"),
+                    "verification_result": r.get::<Option<String>, _>("verification_result"),
+                    "ttl_seconds": r.get::<i32, _>("ttl_seconds"),
+                    "expires_at": r.get::<chrono::DateTime<chrono::Utc>, _>("expires_at"),
+                    "created_at": r.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
+                    "rendered_commands": r.get::<serde_json::Value, _>("rendered_commands"),
+                    "rollback_plan": r.get::<serde_json::Value, _>("rollback_plan"),
+                    "observed_state": r.get::<Option<serde_json::Value>, _>("observed_state"),
+                })
+            })
+            .collect())
+    }
+
     /// How many real (non-dry-run) firewall applies have been recorded in
     /// the last `window_seconds` - the mass-block budget's own counter.
     /// DB-backed rather than an in-memory counter in `clawforge-executor`

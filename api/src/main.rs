@@ -3956,6 +3956,93 @@ async fn admin_executions(
     Ok(envelope(data, Some(pagination)))
 }
 
+#[derive(Deserialize, Default)]
+struct FirewallReceiptsQuery {
+    adapter: Option<String>,
+    target_fingerprint: Option<String>,
+    limit: Option<i64>,
+}
+
+/// The roadmap's own phase 6 Pflichtgate: "Desired/Actual State, TTL,
+/// Drift, Kill-Switch und vollstaendige Audit-Lineage sind vor einem
+/// Produktionspilot ueber ein geprueftes Admin-Werkzeug sichtbar". Every
+/// field `list_firewall_action_receipts` returns is already safe to show
+/// (see that method's own doc comment) - no redaction needed here.
+async fn admin_firewall_receipts(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<FirewallReceiptsQuery>,
+) -> ApiResult<Json<ApiEnvelope<Vec<serde_json::Value>>>> {
+    let principal = authenticate(&state, &headers).await?;
+    require_role(&principal, &["Administrator", "Operator", "Viewer"])?;
+    let values = state
+        .store
+        .list_firewall_action_receipts(
+            query.adapter.as_deref(),
+            query.target_fingerprint.as_deref(),
+            query.limit.unwrap_or(100),
+        )
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "firewall action receipts unavailable",
+            )
+        })?;
+    audit(
+        &state,
+        &principal,
+        "firewall_receipts_read",
+        "firewall_action_receipts",
+        serde_json::json!({"adapter": query.adapter, "target_fingerprint": query.target_fingerprint}),
+    )
+    .await;
+    Ok(envelope(values, None))
+}
+
+/// Drift visibility: every real block whose TTL has passed and that the
+/// TTL sweep (`clawforge-executor`'s `sweep_expired_firewall_targets`)
+/// has not yet rolled back - reuses the exact same query the sweep
+/// itself runs, so this view and the sweep's own behavior can never
+/// disagree about what counts as "still needs rolling back".
+async fn admin_firewall_expired(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<ApiEnvelope<Vec<serde_json::Value>>>> {
+    let principal = authenticate(&state, &headers).await?;
+    require_role(&principal, &["Administrator", "Operator", "Viewer"])?;
+    let expired = state
+        .store
+        .expired_unrolled_back_firewall_targets()
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "expired firewall target check unavailable",
+            )
+        })?;
+    audit(
+        &state,
+        &principal,
+        "firewall_expired_read",
+        "firewall_action_receipts",
+        serde_json::json!({}),
+    )
+    .await;
+    let values: Vec<serde_json::Value> = expired
+        .into_iter()
+        .map(|target| {
+            serde_json::json!({
+                "receipt_id": target.receipt_id,
+                "adapter": target.adapter,
+                "target_fingerprint": target.target_fingerprint,
+                "target_json": target.target_json,
+            })
+        })
+        .collect();
+    Ok(envelope(values, None))
+}
+
 async fn agent_actions(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -7498,6 +7585,8 @@ fn build_router(app_state: AppState) -> Router {
             "/executions",
             get(admin_executions).post(admin_create_execution),
         )
+        .route("/firewall/receipts", get(admin_firewall_receipts))
+        .route("/firewall/expired", get(admin_firewall_expired))
         .route(
             "/admin/executions/{id}/approve",
             post(admin_approve_execution),
@@ -8658,6 +8747,39 @@ mod tests {
         .fetch_one(store.pool())
         .await?;
         assert!(audit_count >= 1);
+
+        Ok(())
+    }
+
+    /// The two new firewall-receipt-visibility routes must actually be
+    /// wired into `build_router` (the same router `main` serves) and
+    /// auth-gated the same way every other `/admin/*` route already is -
+    /// not a full admin-bootstrap-and-login flow (this file has no
+    /// existing helper for that), but enough to prove the routes exist
+    /// and are not accidentally left open.
+    #[tokio::test]
+    #[ignore = "requires an isolated PostgreSQL test container"]
+    async fn admin_firewall_receipt_routes_require_authentication() -> anyhow::Result<()> {
+        use tower::ServiceExt;
+
+        let url = std::env::var("CLAWFORGE_TEST_DATABASE_URL")
+            .or_else(|_| std::env::var("DATABASE_URL"))?;
+        let store = PostgresStore::connect(&url).await?;
+        let app = build_router(test_app_state(store));
+
+        for path in ["/firewall/receipts", "/firewall/expired"] {
+            let request = Request::builder()
+                .method("GET")
+                .uri(path)
+                .body(Body::empty())
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{path} must require authentication"
+            );
+        }
 
         Ok(())
     }

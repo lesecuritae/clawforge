@@ -359,18 +359,35 @@ review, not a working integration, and building the real Admin API call
 (auth, HTTP client, error handling, its own tests) is separate,
 not-yet-started follow-up work.
 
-## `firewall_action_receipts` is populated, nothing reads it back yet
+## `firewall_action_receipts`: populated, and now readable back
 
-Populated on every `nftables.*` dispatch (preflight, rendered commands,
-observed state, verification result, TTL, rollback plan) -
-`clawforge_executor` has `INSERT` and `SELECT` (the latter only for the
-mass-block budget's own aggregate `COUNT(*)`, never a row-by-row
-read-back) on the table, never `UPDATE` - append-only, proven by
-`runtime_roles_enforce_service_boundaries`: the role can insert via
-`record_firewall_action_receipt`, but a raw `UPDATE` on the row it just
-wrote fails. No admin surface for desired/actual state, drift, or
-rollback history exists yet (see the roadmap's own remaining Pflichtgate
-on this).
+Populated on every `nftables.*`/`haproxy.*` dispatch (preflight, rendered
+commands, observed state, verification result, TTL, rollback plan) and
+by the TTL sweep's own rollback rows - `clawforge_executor` has `INSERT`
+and `SELECT` (the latter only for the mass-block budget's own aggregate
+`COUNT(*)`, never a row-by-row read-back) on the table, never `UPDATE` -
+append-only, proven by `runtime_roles_enforce_service_boundaries`: the
+role can insert via `record_firewall_action_receipt`, but a raw `UPDATE`
+on the row it just wrote fails.
+
+**The admin surface the roadmap's own Pflichtgate asks for** ("Desired/
+Actual State, TTL, Drift, Kill-Switch und vollstaendige Audit-Lineage
+sind vor einem Produktionspilot ueber ein geprueftes Admin-Werkzeug
+sichtbar") now exists, read-only, `Administrator`/`Operator`/`Viewer`
+role-gated like every other `/executions`-style admin listing:
+
+- `GET /firewall/receipts?adapter=&target_fingerprint=&limit=` -
+  `PostgresStore::list_firewall_action_receipts`, every field already
+  safe to show (never a raw IP - see "Three target kinds" above).
+- `GET /firewall/expired` - `PostgresStore::expired_unrolled_back_
+  firewall_targets`, the **exact same query** the TTL sweep itself runs,
+  so this view and the sweep's actual behavior can never disagree about
+  what still needs rolling back. This is the "Drift" visibility: any
+  target that would show up here has not yet been reconciled.
+
+No kill-switch surface exists yet (there is nothing to disable
+per-target - the closest equivalent today is break-glass, which is
+all-or-nothing for a host, not a single target).
 
 ## What's deliberately not built yet
 

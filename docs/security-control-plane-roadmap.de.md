@@ -428,6 +428,12 @@ Pflichtgates vor der ersten verändernden Lab-Testaktion:
   Recovery-Journal
 - Desired/Actual State, TTL, Drift, Kill-Switch und vollständige Audit-Lineage
   sind vor einem Produktionspilot über ein geprüftes Admin-Werkzeug sichtbar
+  (**teilweise**: `GET /firewall/receipts` (Filter nach Adapter/Ziel) und
+  `GET /firewall/expired` (Drift - nutzt exakt dieselbe Abfrage wie der
+  TTL-Sweep selbst, kann also nie abweichen) existieren jetzt, rollen-
+  gebunden wie jede andere Admin-Liste, jedes Feld bereits unbedenklich
+  (nie eine rohe IP). Noch offen: Kill-Switch pro Ziel (heute nur
+  Break-glass, alles-oder-nichts pro Host).)
 - pro Adapter/Ziel gelten getestete Rate-, Concurrency- und Mass-block-Budgets
   (**teilweise**: `clawforge-executor` verweigert einen echten (nicht
   Dry-Run) `nftables.*`-Apply, sobald `CLAWFORGE_FIREWALL_MAX_APPLIES_PER_WINDOW`

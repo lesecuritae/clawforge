@@ -1651,3 +1651,64 @@ async fn expired_unrolled_back_firewall_targets_reflects_rollback_receipts() -> 
 
     Ok(())
 }
+
+/// `list_firewall_action_receipts` backs the `/admin/firewall/receipts`
+/// admin surface (the roadmap's own Pflichtgate on receipt visibility) -
+/// proves the `adapter`/`target_fingerprint` filters actually narrow the
+/// result, not just that the query runs.
+#[tokio::test]
+#[ignore = "requires an isolated PostgreSQL test container"]
+async fn list_firewall_action_receipts_filters_by_adapter_and_target_fingerprint(
+) -> anyhow::Result<()> {
+    let url =
+        std::env::var("CLAWFORGE_TEST_DATABASE_URL").or_else(|_| std::env::var("DATABASE_URL"))?;
+    let store = PostgresStore::connect(&url).await?;
+
+    let fingerprint_a = format!("test-list-receipts-a-{}", uuid::Uuid::new_v4());
+    let fingerprint_b = format!("test-list-receipts-b-{}", uuid::Uuid::new_v4());
+    for (adapter, fingerprint) in [("nftables", &fingerprint_a), ("haproxy", &fingerprint_b)] {
+        store
+            .record_firewall_action_receipt(clawforge_storage::FirewallActionReceiptInput {
+                execution_id: None,
+                adapter,
+                action_name: "test.list-receipts",
+                preflight_state: json!({}),
+                rendered_commands: json!([]),
+                observed_state: None,
+                verification_result: None,
+                ttl_seconds: 60,
+                rollback_plan: json!({}),
+                is_dry_run: true,
+                receipt_kind: "apply",
+                target_fingerprint: Some(fingerprint),
+                target_json: None,
+            })
+            .await?;
+    }
+
+    let by_adapter = store
+        .list_firewall_action_receipts(Some("nftables"), None, 100)
+        .await?;
+    assert!(by_adapter
+        .iter()
+        .any(|row| row["target_fingerprint"] == fingerprint_a));
+    assert!(
+        !by_adapter
+            .iter()
+            .any(|row| row["target_fingerprint"] == *fingerprint_b),
+        "the haproxy row must not appear when filtering by adapter=nftables"
+    );
+
+    let by_fingerprint = store
+        .list_firewall_action_receipts(None, Some(&fingerprint_b), 100)
+        .await?;
+    assert_eq!(by_fingerprint.len(), 1);
+    assert_eq!(by_fingerprint[0]["adapter"], "haproxy");
+
+    sqlx::query("DELETE FROM firewall_action_receipts WHERE target_fingerprint = ANY($1)")
+        .bind([fingerprint_a, fingerprint_b].as_slice())
+        .execute(store.pool())
+        .await?;
+
+    Ok(())
+}
