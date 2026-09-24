@@ -28,5 +28,12 @@ docker run --rm \
     # --skip haproxy: this container has no haproxy running (it only
     # needs nftables) - the HAProxy Runtime API tests are their own
     # #[ignore]-gated group, run separately via scripts/test-haproxy-lab.sh.
-    cargo test -p clawforge-firewall-agent -- --ignored --test-threads=1 --skip haproxy
+    # --skip tailscale: the Tailscale round-trip test calls the real,
+    # live Tailscale Admin API against a real device and needs live OAuth
+    # credentials (CLAWFORGE_TAILSCALE_OAUTH_CLIENT_ID_FILE/_SECRET_FILE)
+    # plus CLAWFORGE_TAILSCALE_TEST_DEVICE_ID - this disposable, credential-
+    # less container deliberately never has those, so it is run manually,
+    # outside of CI, only against a device an operator has explicitly
+    # authorized for the test.
+    cargo test -p clawforge-firewall-agent -- --ignored --test-threads=1 --skip haproxy --skip tailscale
   '

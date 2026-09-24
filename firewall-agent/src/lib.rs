@@ -1398,28 +1398,131 @@ pub struct TailscaleActionReceipt {
     pub described_call: String,
 }
 
-/// Tailscale's own first increment (roadmap: "zunächst nur als
-/// freigabepflichtigen Adapter vorbereiten" - prepare it initially only
-/// as an approval-required adapter) - deliberately narrower than
-/// [`NftablesAdapter`]'s own first increment (which at least had
-/// `preflight`/`render`, with `apply`/`verify`/`rollback` added later in
-/// a separately reviewed increment). This type has **no** `preflight`,
-/// `apply`, `verify`, or `rollback` method at all - not "an apply that
-/// always returns an error", an apply that does not exist to call in the
-/// first place, so there is no code path anywhere that could reach the
-/// real Tailscale Admin API. `render` is the only capability: it
-/// describes, in the same "say exactly what would happen" spirit as
-/// `NftablesAdapter`'s own rendered `nft` argv, what a real call would be
-/// (disabling a device suspected of compromise) - never calls it, and
-/// this type holds no HTTP client, no API token, and no secret at all.
-/// The registered action (migration `0037`) is `requires_approval=TRUE,
-/// enabled=FALSE`, same as every other connector action since migration
-/// `0027` - this is preparation for review, not a working integration.
-pub struct TailscaleAdapter;
+const TAILSCALE_CLIENT_ID_FILE_VAR: &str = "CLAWFORGE_TAILSCALE_OAUTH_CLIENT_ID_FILE";
+const TAILSCALE_CLIENT_ID_VAR: &str = "CLAWFORGE_TAILSCALE_OAUTH_CLIENT_ID";
+const TAILSCALE_CLIENT_SECRET_FILE_VAR: &str = "CLAWFORGE_TAILSCALE_OAUTH_CLIENT_SECRET_FILE";
+const TAILSCALE_CLIENT_SECRET_VAR: &str = "CLAWFORGE_TAILSCALE_OAUTH_CLIENT_SECRET";
+/// Must match a `tagOwners` entry in the tailnet's own ACL policy, and
+/// that policy's `acls` accept rule(s) must scope their `src` to
+/// `autogroup:member` (or similar) rather than `*` - tagging a device
+/// alone grants nothing, Tailscale ACLs are additive "accept" only; what
+/// actually denies a tagged device is that it no longer matches
+/// `autogroup:member`. See the module doc comment on
+/// [`TailscaleAdapter`] for the full mechanism.
+const TAILSCALE_DEFAULT_QUARANTINE_TAG: &str = "tag:clawforge-quarantine";
+const TAILSCALE_API_BASE: &str = "https://api.tailscale.com/api/v2";
+
+struct TailscaleCredentials {
+    client_id: String,
+    client_secret: String,
+}
+
+#[derive(serde::Deserialize)]
+struct TailscaleTokenResponse {
+    access_token: String,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct TailscaleDeviceInfo {
+    #[serde(default)]
+    tags: Vec<String>,
+}
+
+#[derive(serde::Serialize)]
+struct TailscaleTagsRequest<'a> {
+    tags: &'a [String],
+}
+
+/// The outcome of a real `apply` call - `applied: false` for a dry run
+/// (nothing was called), mirroring `ApplyResult`'s own shape for the
+/// `FirewallAdapter`-based adapters.
+#[derive(Debug, Clone)]
+pub struct TailscaleApplyResult {
+    pub receipt: TailscaleActionReceipt,
+    pub applied: bool,
+}
+
+/// Tailscale's own second increment: `apply`/`verify`/`rollback` now
+/// exist and can genuinely call the real Tailscale Admin API - the first
+/// increment (see the module doc comment) deliberately had none at all.
+/// Not a [`FirewallAdapter`] implementation: a Tailscale device is
+/// identified by its device ID, not an IP/CIDR - a genuinely different
+/// resource shape from [`FirewallTarget`] (see [`TailscaleTarget`]'s own
+/// doc comment) - so this has its own, parallel `apply`/`verify`/
+/// `rollback` methods instead of sharing that trait.
+///
+/// ## The quarantine mechanism: a tag, not a "disable" call
+///
+/// Tailscale's ACL model has no "deny" - only additive "accept" rules,
+/// default-deny for anything not explicitly granted. Tagging a device
+/// removes it from `autogroup:member` (Tailscale's own "untagged member
+/// device" group); an operator's own ACL policy is what actually decides
+/// whether that then denies the device, by scoping its accept rule(s) to
+/// `autogroup:member` rather than `*`. `apply` adds
+/// `CLAWFORGE_TAILSCALE_QUARANTINE_TAG` (default
+/// `tag:clawforge-quarantine`) to the device's *existing* tag list -
+/// merged, not replaced: Tailscale's own tags endpoint replaces the whole
+/// list, so this reads the current list first and only appends. `rollback`
+/// removes just that one tag, leaving any others the device already had
+/// untouched.
+///
+/// ## Rollback is not always fully automatic - a real platform constraint
+///
+/// Found live against the real API, not documented anywhere obvious
+/// beforehand: Tailscale refuses to remove a device's *last* tag via this
+/// endpoint (`HTTP 400 "tagged nodes cannot be untagged without reauth"`).
+/// Converting a tagged device back to an untagged personal one requires
+/// the device itself to prove control again (reauth), not just an API
+/// call. For the common case (a previously untagged device that only ever
+/// got the quarantine tag added), `rollback` therefore **cannot** complete
+/// automatically: see `rollback`'s own doc comment for exactly what it
+/// does instead (a clear, actionable error) and how an operator actually
+/// clears it (device-side reauth, or the admin console).
+///
+/// ## Credentials
+///
+/// `CLAWFORGE_TAILSCALE_OAUTH_CLIENT_ID`/`_SECRET` (or their `_FILE`
+/// variants, via `clawforge_secret::load_optional` - the same pattern
+/// every other Clawforge service credential uses). `new` never fails even
+/// when neither is configured (every adapter's constructor is infallible,
+/// consistent with `NftablesAdapter`/`HaproxyAdapter`); every method that
+/// would actually need them fails closed with a clear error instead - see
+/// `credentials()`.
+pub struct TailscaleAdapter {
+    credentials: Result<TailscaleCredentials, String>,
+    quarantine_tag: String,
+    http: reqwest::Client,
+}
 
 impl TailscaleAdapter {
     pub fn new() -> Self {
-        Self
+        let credentials = match (
+            clawforge_secret::load_optional(TAILSCALE_CLIENT_ID_FILE_VAR, TAILSCALE_CLIENT_ID_VAR),
+            clawforge_secret::load_optional(
+                TAILSCALE_CLIENT_SECRET_FILE_VAR,
+                TAILSCALE_CLIENT_SECRET_VAR,
+            ),
+        ) {
+            (Ok(Some(client_id)), Ok(Some(client_secret))) => Ok(TailscaleCredentials {
+                client_id,
+                client_secret,
+            }),
+            (Ok(None), Ok(None)) => {
+                Err("CLAWFORGE_TAILSCALE_OAUTH_CLIENT_ID/_SECRET are not configured".to_string())
+            }
+            (Ok(Some(_)), Ok(None)) | (Ok(None), Ok(Some(_))) => Err(
+                "CLAWFORGE_TAILSCALE_OAUTH_CLIENT_ID and _SECRET must both be configured, or \
+                 neither"
+                    .to_string(),
+            ),
+            (Err(error), _) | (_, Err(error)) => Err(error.to_string()),
+        };
+        Self {
+            credentials,
+            quarantine_tag: std::env::var("CLAWFORGE_TAILSCALE_QUARANTINE_TAG")
+                .unwrap_or_else(|_| TAILSCALE_DEFAULT_QUARANTINE_TAG.to_string()),
+            http: reqwest::Client::new(),
+        }
     }
 
     pub fn name(&self) -> &'static str {
@@ -1427,16 +1530,202 @@ impl TailscaleAdapter {
     }
 
     /// Pure and synchronous, exactly like `NftablesAdapter::render` - no
-    /// network, no filesystem, nothing but string formatting.
+    /// network, no filesystem, nothing but string formatting. Never needs
+    /// credentials - it only describes what a real call would be.
     pub fn render(&self, action: &TailscaleAction) -> Result<TailscaleActionReceipt, AdapterError> {
         action.target.validate()?;
         Ok(TailscaleActionReceipt {
             adapter: self.name(),
             described_call: format!(
-                "POST /api/v2/device/{}/disable (reason: {})",
-                action.target.device_id, action.reason
+                "POST {TAILSCALE_API_BASE}/device/{}/tags (add {}, preserving existing tags) \
+                 (reason: {})",
+                action.target.device_id, self.quarantine_tag, action.reason
             ),
         })
+    }
+
+    fn credentials(&self) -> Result<&TailscaleCredentials, AdapterError> {
+        self.credentials.as_ref().map_err(|error| {
+            AdapterError::InvalidTarget(format!(
+                "Tailscale credentials are not configured: {error}"
+            ))
+        })
+    }
+
+    async fn access_token(&self) -> Result<String, AdapterError> {
+        let credentials = self.credentials()?;
+        let response = self
+            .http
+            .post(format!("{TAILSCALE_API_BASE}/oauth/token"))
+            .form(&[
+                ("client_id", &credentials.client_id),
+                ("client_secret", &credentials.client_secret),
+            ])
+            .send()
+            .await
+            .map_err(|error| {
+                AdapterError::Apply(format!("tailscale oauth token request failed: {error}"))
+            })?;
+        if !response.status().is_success() {
+            return Err(AdapterError::Apply(format!(
+                "tailscale oauth token request rejected: HTTP {}",
+                response.status()
+            )));
+        }
+        let token: TailscaleTokenResponse = response.json().await.map_err(|error| {
+            AdapterError::Apply(format!(
+                "tailscale oauth token response was not valid JSON: {error}"
+            ))
+        })?;
+        Ok(token.access_token)
+    }
+
+    async fn device_tags(&self, device_id: &str) -> Result<Vec<String>, AdapterError> {
+        let token = self.access_token().await?;
+        let response = self
+            .http
+            .get(format!(
+                "{TAILSCALE_API_BASE}/device/{device_id}?fields=all"
+            ))
+            .bearer_auth(token)
+            .send()
+            .await
+            .map_err(|error| {
+                AdapterError::Verify(format!("tailscale device lookup failed: {error}"))
+            })?;
+        if !response.status().is_success() {
+            return Err(AdapterError::Verify(format!(
+                "tailscale device lookup rejected: HTTP {}",
+                response.status()
+            )));
+        }
+        let info: TailscaleDeviceInfo = response.json().await.map_err(|error| {
+            AdapterError::Verify(format!(
+                "tailscale device response was not valid JSON: {error}"
+            ))
+        })?;
+        Ok(info.tags)
+    }
+
+    async fn set_device_tags(&self, device_id: &str, tags: &[String]) -> Result<(), AdapterError> {
+        let token = self.access_token().await?;
+        let response = self
+            .http
+            .post(format!("{TAILSCALE_API_BASE}/device/{device_id}/tags"))
+            .bearer_auth(token)
+            .json(&TailscaleTagsRequest { tags })
+            .send()
+            .await
+            .map_err(|error| {
+                AdapterError::Apply(format!("tailscale set-tags request failed: {error}"))
+            })?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AdapterError::Apply(format!(
+                "tailscale set-tags rejected: HTTP {status}: {body}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// `dry_run: true` behaves exactly like `render` (no network call at
+    /// all, and does not even require credentials to be configured, the
+    /// same "dry run never touches real infra" property every other
+    /// adapter's `apply` already has). `dry_run: false` reads the
+    /// device's current tags, adds the quarantine tag if not already
+    /// present (idempotent - a repeat apply is a no-op past the first
+    /// one), and writes the merged list back.
+    pub async fn apply(
+        &self,
+        action: &TailscaleAction,
+        dry_run: bool,
+    ) -> Result<TailscaleApplyResult, AdapterError> {
+        action.target.validate()?;
+        let receipt = self.render(action)?;
+        if dry_run {
+            return Ok(TailscaleApplyResult {
+                receipt,
+                applied: false,
+            });
+        }
+        let mut tags = self.device_tags(&action.target.device_id).await?;
+        if !tags.iter().any(|tag| tag == &self.quarantine_tag) {
+            tags.push(self.quarantine_tag.clone());
+            self.set_device_tags(&action.target.device_id, &tags)
+                .await?;
+        }
+        Ok(TailscaleApplyResult {
+            receipt,
+            applied: true,
+        })
+    }
+
+    pub async fn verify(
+        &self,
+        target: &TailscaleTarget,
+    ) -> Result<VerificationResult, AdapterError> {
+        target.validate()?;
+        let tags = self.device_tags(&target.device_id).await?;
+        if tags.iter().any(|tag| tag == &self.quarantine_tag) {
+            Ok(VerificationResult::Verified)
+        } else {
+            Ok(VerificationResult::NotPresent)
+        }
+    }
+
+    /// Removes only the quarantine tag, preserving any other tags the
+    /// device already had - never a blind overwrite with an empty list.
+    /// **A real, platform-level constraint, found live against the real
+    /// API, not documented anywhere obvious beforehand**: Tailscale
+    /// refuses to fully untag a device via this endpoint - going from one
+    /// or more tags to *zero* tags returns `HTTP 400 "tagged nodes cannot
+    /// be untagged without reauth"`. This is deliberate on Tailscale's
+    /// part (converting a tagged/service identity back to an untagged
+    /// personal device is a meaningful trust change, gated on the device
+    /// itself proving control again) - not a bug in this adapter, and not
+    /// something any API call can work around. For the common case (a
+    /// previously untagged device that only ever had the quarantine tag
+    /// added), this means `rollback` **cannot** complete automatically:
+    /// it detects this case before attempting the doomed API call and
+    /// returns a clear, actionable error instead of a confusing HTTP 400
+    /// passthrough - un-quarantining then requires the device itself to
+    /// reauth (open the Tailscale app and log in again, or run
+    /// `tailscale up`), or an operator using the admin console instead
+    /// (which may handle this differently). If the device has *other*
+    /// tags besides the quarantine one, removing just the quarantine tag
+    /// leaves a non-empty list and works via the API exactly as
+    /// expected - only the "quarantine tag was the device's only tag"
+    /// case hits this constraint.
+    pub async fn rollback(&self, action: &TailscaleAction) -> Result<(), AdapterError> {
+        action.target.validate()?;
+        let tags = self.device_tags(&action.target.device_id).await?;
+        if !tags.iter().any(|tag| tag == &self.quarantine_tag) {
+            // Idempotent success, deliberately *not* an error (unlike
+            // NftablesAdapter's "rollback of something never applied
+            // fails cleanly" precedent): a device the operator has since
+            // manually reauth'd to clear the tag ends up in exactly this
+            // state, and clawforge-executor's TTL sweep needs rollback to
+            // succeed then so it can record the rollback receipt and stop
+            // retrying - erroring here would make it retry forever even
+            // after the real problem is already resolved.
+            return Ok(());
+        }
+        let remaining: Vec<String> = tags
+            .into_iter()
+            .filter(|tag| tag != &self.quarantine_tag)
+            .collect();
+        if remaining.is_empty() {
+            return Err(AdapterError::Rollback(format!(
+                "cannot remove the last tag from device {} via the API - Tailscale requires \
+                 the device itself to reauth (open the Tailscale app and log in again, or run \
+                 `tailscale up`) to fully untag a node; this is a Tailscale platform \
+                 constraint, not something this adapter can complete automatically",
+                action.target.device_id
+            )));
+        }
+        self.set_device_tags(&action.target.device_id, &remaining)
+            .await
     }
 }
 
@@ -2662,7 +2951,8 @@ mod tests {
         let receipt = adapter.render(&action).unwrap();
         assert_eq!(receipt.adapter, "tailscale");
         assert!(receipt.described_call.contains("n123456CNTRL"));
-        assert!(receipt.described_call.contains("disable"));
+        assert!(receipt.described_call.contains("/tags"));
+        assert!(receipt.described_call.contains("tag:clawforge-quarantine"));
         assert!(receipt
             .described_call
             .contains("corroborated incident abc-123"));
@@ -2678,6 +2968,121 @@ mod tests {
             reason: "test".into(),
         };
         assert!(adapter.render(&action).is_err());
+    }
+
+    fn tailscale_action(device_id: &str) -> TailscaleAction {
+        TailscaleAction {
+            target: TailscaleTarget {
+                device_id: device_id.to_string(),
+            },
+            reason: "test".into(),
+        }
+    }
+
+    /// A dry-run apply must work even with zero Tailscale credentials
+    /// configured - the same "dry run never touches real infra" property
+    /// every other adapter's `apply` already has. No other test in this
+    /// binary sets these specific env vars.
+    #[tokio::test]
+    async fn tailscale_dry_run_apply_never_needs_credentials() {
+        std::env::remove_var("CLAWFORGE_TAILSCALE_OAUTH_CLIENT_ID");
+        std::env::remove_var("CLAWFORGE_TAILSCALE_OAUTH_CLIENT_ID_FILE");
+        std::env::remove_var("CLAWFORGE_TAILSCALE_OAUTH_CLIENT_SECRET");
+        std::env::remove_var("CLAWFORGE_TAILSCALE_OAUTH_CLIENT_SECRET_FILE");
+        let adapter = TailscaleAdapter::new();
+        let result = adapter.apply(&tailscale_action("n123456CNTRL"), true).await;
+        let applied = result.expect("dry-run apply must not need real credentials");
+        assert!(!applied.applied);
+    }
+
+    /// A real (non-dry-run) call - apply, verify, or rollback - must fail
+    /// closed with a clear error when credentials are not configured,
+    /// never silently no-op or panic.
+    #[tokio::test]
+    async fn tailscale_real_calls_fail_closed_without_configured_credentials() {
+        std::env::remove_var("CLAWFORGE_TAILSCALE_OAUTH_CLIENT_ID");
+        std::env::remove_var("CLAWFORGE_TAILSCALE_OAUTH_CLIENT_ID_FILE");
+        std::env::remove_var("CLAWFORGE_TAILSCALE_OAUTH_CLIENT_SECRET");
+        std::env::remove_var("CLAWFORGE_TAILSCALE_OAUTH_CLIENT_SECRET_FILE");
+        let adapter = TailscaleAdapter::new();
+        let action = tailscale_action("n123456CNTRL");
+        assert!(adapter.apply(&action, false).await.is_err());
+        assert!(adapter.verify(&action.target).await.is_err());
+        assert!(adapter.rollback(&action).await.is_err());
+    }
+
+    #[test]
+    fn tailscale_quarantine_tag_defaults_but_is_configurable() {
+        std::env::remove_var("CLAWFORGE_TAILSCALE_QUARANTINE_TAG");
+        assert_eq!(
+            TailscaleAdapter::new().quarantine_tag,
+            "tag:clawforge-quarantine"
+        );
+        std::env::set_var(
+            "CLAWFORGE_TAILSCALE_QUARANTINE_TAG",
+            "tag:custom-quarantine",
+        );
+        assert_eq!(
+            TailscaleAdapter::new().quarantine_tag,
+            "tag:custom-quarantine"
+        );
+        std::env::remove_var("CLAWFORGE_TAILSCALE_QUARANTINE_TAG");
+    }
+
+    /// A real, end-to-end round trip against the live Tailscale Admin API
+    /// - deliberately NOT run in CI (there are no Tailscale credentials
+    /// there, and unlike the disposable nftables/HAProxy labs, this talks
+    /// to a real tailnet's real device, not a throwaway container). Run
+    /// once by hand with CLAWFORGE_TAILSCALE_OAUTH_CLIENT_ID_FILE/
+    /// CLAWFORGE_TAILSCALE_OAUTH_CLIENT_SECRET_FILE pointed at the real
+    /// secret files and CLAWFORGE_TAILSCALE_TEST_DEVICE_ID set to a
+    /// device explicitly chosen as safe to briefly quarantine (a phone,
+    /// not a server with active sessions) - confirms apply/verify/
+    /// rollback all work against the real API, not just that the request
+    /// shapes compile.
+    #[tokio::test]
+    #[ignore = "requires real Tailscale credentials and a real, explicitly chosen test device - see this test's own doc comment"]
+    async fn tailscale_real_apply_verify_rollback_round_trip() {
+        let device_id = std::env::var("CLAWFORGE_TAILSCALE_TEST_DEVICE_ID")
+            .expect("CLAWFORGE_TAILSCALE_TEST_DEVICE_ID must be set to run this test");
+        let adapter = TailscaleAdapter::new();
+        let action = tailscale_action(&device_id);
+
+        // Real apply, from whatever state the device is actually in -
+        // idempotent either way (a device that is already tagged just
+        // stays tagged).
+        let applied = adapter
+            .apply(&action, false)
+            .await
+            .expect("a real apply must succeed");
+        assert!(applied.applied);
+        assert_eq!(
+            adapter.verify(&action.target).await.unwrap(),
+            VerificationResult::Verified,
+            "the device must be genuinely tagged after a real apply"
+        );
+
+        // A repeat apply must not error or duplicate the tag.
+        adapter
+            .apply(&action, false)
+            .await
+            .expect("a repeat apply must not fail");
+
+        // The real, live-discovered platform constraint (see rollback's
+        // own doc comment): if the quarantine tag is the device's *only*
+        // tag, Tailscale refuses to remove it via the API at all - proven
+        // here against the real API, not assumed. This device has no
+        // other tags, so rollback must fail with the specific, actionable
+        // error this adapter now detects up front, not a raw HTTP 400.
+        let error = adapter
+            .rollback(&action)
+            .await
+            .expect_err("rollback of a device's only tag must fail, not silently succeed");
+        let error_text = error.to_string();
+        assert!(
+            error_text.contains("reauth"),
+            "the error must explain that device-side reauth is required: {error_text}"
+        );
     }
 
     #[test]

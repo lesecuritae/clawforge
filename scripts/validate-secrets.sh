@@ -45,6 +45,8 @@ declare -A paths=(
   [threatfox_auth_key]="${CLAWFORGE_THREATFOX_SECRET_FILE:-./secrets/threatfox_auth_key}"
   [urlhaus_auth_key]="${CLAWFORGE_URLHAUS_SECRET_FILE:-./secrets/urlhaus_auth_key}"
   [malwarebazaar_auth_key]="${CLAWFORGE_MALWAREBAZAAR_SECRET_FILE:-./secrets/malwarebazaar_auth_key}"
+  [tailscale_oauth_client_id]="${CLAWFORGE_TAILSCALE_OAUTH_CLIENT_ID_SECRET_FILE:-./secrets/tailscale_oauth_client_id}"
+  [tailscale_oauth_client_secret]="${CLAWFORGE_TAILSCALE_OAUTH_CLIENT_SECRET_SECRET_FILE:-./secrets/tailscale_oauth_client_secret}"
 )
 
 fail() {

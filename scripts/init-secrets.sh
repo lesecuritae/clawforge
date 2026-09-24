@@ -67,7 +67,7 @@ write_new mcp_agent_api_token "$(generate_secret)"
 # output (the raw credential it prints once), not an independently random
 # value - a value placed here would not correspond to any row in
 # security_sensors.
-for name in analyzer_api_key notifier_webhook_auth notifier_matrix_auth notifier_smtp_password threatfox_auth_key urlhaus_auth_key malwarebazaar_auth_key github_token proxmox_token linux_sensor_credential haproxy_sensor_credential docker_sensor_credential; do
+for name in analyzer_api_key notifier_webhook_auth notifier_matrix_auth notifier_smtp_password threatfox_auth_key urlhaus_auth_key malwarebazaar_auth_key github_token proxmox_token linux_sensor_credential haproxy_sensor_credential docker_sensor_credential tailscale_oauth_client_id tailscale_oauth_client_secret; do
   write_new "$name" ""
 done
 

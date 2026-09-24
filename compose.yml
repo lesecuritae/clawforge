@@ -495,6 +495,16 @@ services:
       CLAWFORGE_HAPROXY_ADMIN_SOCKET: ${CLAWFORGE_HAPROXY_ADMIN_SOCKET:-/var/run/haproxy/admin.sock}
       CLAWFORGE_HAPROXY_BLOCKLIST_ACL_FILE: ${CLAWFORGE_HAPROXY_BLOCKLIST_ACL_FILE:-/etc/haproxy/maps/clawforge-blocklist.map}
       CLAWFORGE_HAPROXY_RATE_LIMIT_TABLE: ${CLAWFORGE_HAPROXY_RATE_LIMIT_TABLE:-clawforge_ratelimit}
+      # TailscaleAdapter - only matters if a tailscale.*-prefixed action is
+      # actually dispatched. Both credentials are optional at startup (the
+      # adapter fails closed with a clear error on first real use if they
+      # are missing); the quarantine tag must already exist as a tagOwners
+      # entry in the tailnet's own ACL policy, scoped so tagged devices lose
+      # autogroup:member access - see docs/firewall-agent.md's "Tailscale
+      # quarantine adapter" section.
+      CLAWFORGE_TAILSCALE_OAUTH_CLIENT_ID_FILE: /run/secrets/tailscale_oauth_client_id
+      CLAWFORGE_TAILSCALE_OAUTH_CLIENT_SECRET_FILE: /run/secrets/tailscale_oauth_client_secret
+      CLAWFORGE_TAILSCALE_QUARANTINE_TAG: ${CLAWFORGE_TAILSCALE_QUARANTINE_TAG:-tag:clawforge-quarantine}
       RUST_LOG: ${RUST_LOG:-info}
     read_only: true
     tmpfs:
@@ -515,6 +525,8 @@ services:
     secrets:
       - database_executor_url
       - analyzer_ip_hmac_key
+      - tailscale_oauth_client_id
+      - tailscale_oauth_client_secret
     networks:
       - backend
     healthcheck:
@@ -914,6 +926,10 @@ secrets:
     file: ${CLAWFORGE_MCP_AUTH_TOKEN_FILE:?set CLAWFORGE_MCP_AUTH_TOKEN_FILE to a private secret file}
   analyzer_ip_hmac_key:
     file: ${CLAWFORGE_ANALYZER_IP_HMAC_KEY_SECRET_FILE:?set CLAWFORGE_ANALYZER_IP_HMAC_KEY_SECRET_FILE to a private secret file}
+  tailscale_oauth_client_id:
+    file: ${CLAWFORGE_TAILSCALE_OAUTH_CLIENT_ID_SECRET_FILE:?set CLAWFORGE_TAILSCALE_OAUTH_CLIENT_ID_SECRET_FILE to a private secret file}
+  tailscale_oauth_client_secret:
+    file: ${CLAWFORGE_TAILSCALE_OAUTH_CLIENT_SECRET_SECRET_FILE:?set CLAWFORGE_TAILSCALE_OAUTH_CLIENT_SECRET_SECRET_FILE to a private secret file}
   github_token:
     file: ${CLAWFORGE_GITHUB_TOKEN_FILE:?set CLAWFORGE_GITHUB_TOKEN_FILE to a private secret file}
   proxmox_token:

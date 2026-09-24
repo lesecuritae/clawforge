@@ -37,6 +37,8 @@ export CLAWFORGE_DOCKER_SENSOR_CREDENTIAL_SECRET_FILE="$test_dir/secrets/docker_
 export CLAWFORGE_THREATFOX_SECRET_FILE="$test_dir/secrets/threatfox_auth_key"
 export CLAWFORGE_URLHAUS_SECRET_FILE="$test_dir/secrets/urlhaus_auth_key"
 export CLAWFORGE_MALWAREBAZAAR_SECRET_FILE="$test_dir/secrets/malwarebazaar_auth_key"
+export CLAWFORGE_TAILSCALE_OAUTH_CLIENT_ID_SECRET_FILE="$test_dir/secrets/tailscale_oauth_client_id"
+export CLAWFORGE_TAILSCALE_OAUTH_CLIENT_SECRET_SECRET_FILE="$test_dir/secrets/tailscale_oauth_client_secret"
 
 "$repo_dir/scripts/validate-secrets.sh" >/dev/null
 "$repo_dir/scripts/validate-secrets.sh" --bootstrap >/dev/null

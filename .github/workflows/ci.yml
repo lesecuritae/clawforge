@@ -120,7 +120,9 @@ jobs:
             CLAWFORGE_DOCKER_SENSOR_CREDENTIAL_SECRET_FILE=docker_sensor_credential \
             CLAWFORGE_THREATFOX_SECRET_FILE=threatfox_auth_key \
             CLAWFORGE_URLHAUS_SECRET_FILE=urlhaus_auth_key \
-            CLAWFORGE_MALWAREBAZAAR_SECRET_FILE=malwarebazaar_auth_key; do
+            CLAWFORGE_MALWAREBAZAAR_SECRET_FILE=malwarebazaar_auth_key \
+            CLAWFORGE_TAILSCALE_OAUTH_CLIENT_ID_SECRET_FILE=tailscale_oauth_client_id \
+            CLAWFORGE_TAILSCALE_OAUTH_CLIENT_SECRET_SECRET_FILE=tailscale_oauth_client_secret; do
             printf '%s=%s/%s\n' "${mapping%%=*}" "$secret_dir" "${mapping#*=}" >> "$GITHUB_ENV"
           done
       - run: ./scripts/test-secret-hardening.sh

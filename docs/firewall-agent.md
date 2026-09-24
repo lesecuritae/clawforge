@@ -436,30 +436,95 @@ connector action. The mass-block budget (above) counts every adapter a
 one unit - three successful adapters count as three towards the shared
 budget.
 
-## Tailscale adapter (prepared, not operable)
+## Tailscale quarantine adapter
 
-The roadmap is explicit that Tailscale should be prepared "zunächst nur
-als freigabepflichtigen Adapter" - deliberately narrower than
-`NftablesAdapter`'s own first increment, which at least had
-`preflight`/`render` from the start. `TailscaleAdapter` has **no**
-`preflight`, `apply`, `verify`, or `rollback` method at all - not "an
-`apply` that always returns an error", but an `apply` that is not a
-method to call in the first place, so there is no code path anywhere in
-this crate that could reach the real Tailscale Admin API. Its only
-capability is `render(&TailscaleAction) -> TailscaleActionReceipt`: pure,
-synchronous, describes what a real call *would* be (`POST
-/api/v2/device/{id}/disable` to quarantine a device suspected of
-compromise) without ever making it. There is no HTTP client, no API
-token, and no secret wired to this type at all. `TailscaleTarget`
-identifies a device by its Tailscale device ID - never an IP address, a
-genuinely different resource shape from `FirewallTarget`, which is why
-it is its own separate type rather than a fourth `FirewallTarget`
-variant. Migration `0037` registers a `tailscale` connector and the
-`tailscale.quarantine_device` action, `requires_approval=TRUE,
-enabled=FALSE`, same as every nftables action - this is preparation for
-review, not a working integration, and building the real Admin API call
-(auth, HTTP client, error handling, its own tests) is separate,
-not-yet-started follow-up work.
+`TailscaleAdapter` is a real, working integration against the live
+Tailscale Admin API - not a nftables/HAProxy-style `FirewallAdapter`
+(a Tailscale device ID is a fundamentally different resource shape from
+an IP/CIDR, so it deliberately has its own parallel
+`TailscaleTarget{device_id}` / `TailscaleAction{target, reason}` /
+`TailscaleActionReceipt` types rather than a fourth `FirewallTarget`
+variant), but it has real `apply`/`verify`/`rollback` methods that make
+real HTTP calls when `dry_run` is false.
+
+**Mechanism.** Tailscale ACLs are additive "accept" only - there is no
+"deny" action. Quarantining a device works by tagging it: a tag removes
+a device from `autogroup:member`, so it only loses access if the
+tailnet's own ACL policy scopes its accept rule(s) to
+`autogroup:member` rather than `*`. `apply()` therefore does a
+read-modify-write against `GET/POST /api/v2/device/{id}/tags`: it reads
+the device's current tags, appends the quarantine tag
+(`CLAWFORGE_TAILSCALE_QUARANTINE_TAG`, default `tag:clawforge-quarantine`)
+if not already present, and `POST`s the full list back - the tags
+endpoint is a full-replace, not additive, so a blind `POST` of just the
+quarantine tag would silently wipe any other tags the device already
+had. `verify()` re-reads the device's tags and checks the quarantine tag
+is present. `rollback()` does the same read-modify-write in reverse,
+removing the quarantine tag from whatever list is currently set.
+
+**Credentials.** `TailscaleAdapter::new()` never fails - both
+`CLAWFORGE_TAILSCALE_OAUTH_CLIENT_ID_FILE` and
+`CLAWFORGE_TAILSCALE_OAUTH_CLIENT_SECRET_FILE` are optional at
+construction (via `clawforge_secret::load_optional`, the same
+`_FILE`/plain-value pattern used by `threatfox_auth_key` and friends).
+Every method that actually needs to call the API fails closed with a
+clear error if either is missing. A fresh OAuth2 `client_credentials`
+token is fetched from `https://api.tailscale.com/api/v2/oauth/token` on
+every `apply`/`verify`/`rollback` call - no caching, for implementation
+simplicity. The OAuth client should be scoped to the narrow
+`devices:core` capability, nothing broader.
+
+**ACL prerequisite - this is an operational step, not something the
+adapter can do for you.** For quarantine to actually deny traffic, the
+tailnet's ACL policy must already have `tag:clawforge-quarantine`
+declared under `tagOwners` and its accept rule(s) scoped to
+`autogroup:member` (not `*`). `TailscaleAdapter` never writes the ACL
+policy itself - only per-device tags - so this is a one-time setup step
+an operator (or, with explicit authorization, an agent acting on the
+operator's behalf) performs once per tailnet before the adapter is
+useful.
+
+**Rollback is not always fully automatic - a real, verified platform
+constraint.** `POST /device/{id}/tags` rejects reducing a device's tag
+list to *zero* tags with `HTTP 400 "tagged nodes cannot be untagged
+without reauth"`. This was found live, end-to-end, against a real
+tailnet device: rollback failed and the device stayed quarantined until
+it was manually reauthenticated (not merely reconnected - a stale
+session reconnecting does not clear the stuck tag) via the Tailscale
+app or the admin console. This is a deliberate Tailscale security
+property, not a bug to route around: converting a tagged device back to
+an untagged personal device requires the device to prove control again,
+the same way a per-device break-glass procedure requires proof of
+physical/account control rather than a pure API call. `rollback()`
+detects this case up front - when removing the quarantine tag would
+leave the tag list empty - and returns a clear, actionable
+`AdapterError::Rollback` naming the fix, instead of surfacing the raw
+HTTP 400. If the quarantine tag is already absent (for example, an
+operator already resolved it by hand), `rollback()` returns `Ok(())`
+rather than an error - unlike `NftablesAdapter`'s "rollback of something
+never applied fails cleanly" precedent, this is deliberately idempotent
+so the TTL sweep can record success and stop retrying once the real
+problem has already been fixed out of band.
+
+**Executor wiring.** `tailscale.`-prefixed action names are dispatched
+by their own `dispatch_tailscale()` function in `executor/src/main.rs`,
+parallel to (not folded into) `dispatch_multi_adapter()`'s
+`FirewallAdapter` fan-out, because the target JSON contract
+(`{"device_id": "..."}`) and the adapter itself don't fit the
+`FirewallTarget`/`FirewallAdapter` shape the other adapters share. The
+TTL sweep's `rollback_expired_target()` branches the same way for expired
+Tailscale quarantines. `is_firewall_action()` includes the `tailscale.`
+prefix, so the DB-backed mass-block budget (see "Mass-block budget"
+above) also gates real Tailscale quarantines, not just nftables/HAProxy
+applies.
+
+**Headscale.** The ACL *format* (`tagOwners`, `acls`, accept-only) is
+conceptually compatible with Headscale, a self-hosted Tailscale
+alternative, but this adapter talks to Tailscale's own cloud Admin API
+(`https://api.tailscale.com`) with Tailscale's own OAuth flow - a
+Headscale deployment uses a different base URL and a different auth
+mechanism entirely, and would need its own adapter, not a configuration
+option on this one.
 
 ## `firewall_action_receipts`: populated, and now readable back
 

@@ -9,21 +9,25 @@
 //! `dry_run: true` rather than silently start applying for real.
 //!
 //! Any action whose name is not a recognized firewall action (`nftables.`/
-//! `haproxy.`/`haproxy_ratelimit.` prefix, one specific adapter each, or
-//! `firewall.`, every configured adapter at once - see
-//! `dispatch_multi_adapter`) keeps the exact prior behavior: claimed,
-//! marked `running`, then immediately completed with `"dry_run: no
-//! external operation executed"` - this module changes nothing about
-//! docker/github/proxmox actions, or `tailscale.*` ones (`TailscaleAdapter`
-//! has no `apply` capability to dispatch to at all - see
-//! `docs/firewall-agent.md`).
+//! `haproxy.`/`haproxy_ratelimit.`/`tailscale.` prefix, one specific
+//! adapter each, or `firewall.`, every configured `FirewallAdapter`-based
+//! adapter at once - see `dispatch_multi_adapter`) keeps the exact prior
+//! behavior: claimed, marked `running`, then immediately completed with
+//! `"dry_run: no external operation executed"` - this module changes
+//! nothing about docker/github/proxmox actions. `tailscale.*` is
+//! dispatched via its own path (`dispatch_tailscale`), not
+//! `dispatch_multi_adapter`'s fan-out - `TailscaleAdapter` is not a
+//! `FirewallAdapter` (a device ID is a different resource shape from an
+//! IP/CIDR - see `TailscaleTarget`'s own doc comment in
+//! `clawforge-firewall-agent`).
 
 use clawforge_firewall_agent::{
     FirewallAction, FirewallAdapter, FirewallTarget, HaproxyAdapter, HaproxyRateLimitAdapter,
-    NftablesAdapter, VerificationResult,
+    NftablesAdapter, TailscaleAction, TailscaleAdapter, TailscaleTarget, VerificationResult,
 };
 use clawforge_storage::{
-    database_url_from_env, ClaimedExecutionRequest, FirewallActionReceiptInput, PostgresStore,
+    database_url_from_env, ClaimedExecutionRequest, ExpiredFirewallTarget,
+    FirewallActionReceiptInput, PostgresStore,
 };
 use std::{env, time::Duration};
 use tokio::time::{interval, MissedTickBehavior};
@@ -72,17 +76,17 @@ fn firewall_budget_applies(action_name: &str, dry_run: bool) -> bool {
 }
 
 /// Whether `action_name` is one `dispatch()` actually routes to a real
-/// adapter (or adapters) - `nftables.*`/`haproxy.*`/`haproxy_ratelimit.*`
-/// (one specific adapter each) or `firewall.*` (every configured
-/// adapter - see `dispatch_multi_adapter`). `tailscale.*` is deliberately
-/// excluded: there is no apply capability to dispatch to at all (see
-/// `docs/firewall-agent.md`), so it stays on the same generic dry-run
-/// fallback every other non-firewall action already uses.
+/// adapter (or adapters) - `nftables.*`/`haproxy.*`/`haproxy_ratelimit.*`/
+/// `tailscale.*` (one specific adapter each) or `firewall.*` (every
+/// configured `FirewallAdapter`-based adapter at once - see
+/// `dispatch_multi_adapter`; `tailscale.*` is never part of that fan-out,
+/// since `TailscaleAdapter` is not a `FirewallAdapter`).
 fn is_firewall_action(action_name: &str) -> bool {
     action_name.starts_with("nftables.")
         || action_name.starts_with("haproxy_ratelimit.")
         || action_name.starts_with("haproxy.")
         || action_name.starts_with(FIREWALL_MULTI_ADAPTER_PREFIX)
+        || action_name.starts_with(TAILSCALE_ACTION_PREFIX)
 }
 
 /// Which adapters a `firewall.*` action fans out to -
@@ -242,6 +246,50 @@ fn parse_firewall_action(
     })
 }
 
+/// Rolls back one expired target, dispatching to the right adapter shape
+/// for its `adapter` column - `tailscale` has its own `target_json`
+/// contract (`{"device_id":...}`, not `FirewallTarget`'s `{"kind":...}`)
+/// and its own rollback method (not a `FirewallAdapter` implementation -
+/// see `TailscaleAdapter`'s own doc comment), so it cannot go through
+/// `adapter_for`/`FirewallTarget::try_from` the way the other three do.
+/// `TailscaleAdapter::rollback` already treats "tag not present" as
+/// idempotent success (not an error) specifically so this sweep can
+/// converge once a device has been manually reauth'd - see that method's
+/// own doc comment.
+async fn rollback_expired_target(target: &ExpiredFirewallTarget) -> anyhow::Result<()> {
+    if target.adapter == "tailscale" {
+        let device_id = target
+            .target_json
+            .get("device_id")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| anyhow::anyhow!("tailscale target_json is missing device_id"))?;
+        let action = TailscaleAction {
+            target: TailscaleTarget {
+                device_id: device_id.to_string(),
+            },
+            reason: format!("ttl expired auto-rollback (receipt {})", target.receipt_id),
+        };
+        return TailscaleAdapter::new()
+            .rollback(&action)
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()));
+    }
+    let Some(adapter) = adapter_for(&target.adapter) else {
+        anyhow::bail!("unrecognized adapter {:?}", target.adapter);
+    };
+    let firewall_target = FirewallTarget::try_from(&target.target_json)
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let action = FirewallAction {
+        target: firewall_target,
+        ttl_seconds: DEFAULT_FIREWALL_ACTION_TTL_SECONDS,
+        reason: format!("ttl expired auto-rollback (receipt {})", target.receipt_id),
+    };
+    adapter
+        .rollback(&action)
+        .await
+        .map_err(|error| anyhow::anyhow!(error.to_string()))
+}
+
 /// TTL-driven auto-rollback: rolls back every real (non-dry-run) block
 /// whose TTL has passed and that has no later rollback receipt yet (see
 /// `PostgresStore::expired_unrolled_back_firewall_targets`'s own query).
@@ -260,30 +308,7 @@ async fn sweep_expired_firewall_targets(store: &PostgresStore) {
         }
     };
     for target in expired {
-        let Some(adapter) = adapter_for(&target.adapter) else {
-            tracing::warn!(
-                receipt_id = %target.receipt_id,
-                adapter = %target.adapter,
-                "expired firewall target has an unrecognized adapter - skipping"
-            );
-            continue;
-        };
-        let firewall_target = match FirewallTarget::try_from(&target.target_json) {
-            Ok(firewall_target) => firewall_target,
-            Err(error) => {
-                tracing::warn!(
-                    %error, receipt_id = %target.receipt_id,
-                    "expired firewall target has an unparseable target_json - skipping"
-                );
-                continue;
-            }
-        };
-        let action = FirewallAction {
-            target: firewall_target,
-            ttl_seconds: DEFAULT_FIREWALL_ACTION_TTL_SECONDS,
-            reason: format!("ttl expired auto-rollback (receipt {})", target.receipt_id),
-        };
-        if let Err(error) = adapter.rollback(&action).await {
+        if let Err(error) = rollback_expired_target(&target).await {
             tracing::warn!(
                 %error, receipt_id = %target.receipt_id, adapter = %target.adapter,
                 "auto-rollback of an expired firewall target failed - will retry next tick"
@@ -449,6 +474,102 @@ async fn dispatch_multi_adapter(
     }
 }
 
+const TAILSCALE_ACTION_PREFIX: &str = "tailscale.";
+/// `TailscaleAction` carries no `ttl_seconds` of its own (unlike
+/// `FirewallAction`) - used only for the receipt's own bookkeeping field,
+/// not for any TTL-sweep auto-rollback (see `dispatch_tailscale`'s own
+/// doc comment for why tailscale quarantines are deliberately excluded
+/// from that).
+const DEFAULT_TAILSCALE_ACTION_TTL_SECONDS: u32 = 3600;
+
+/// Dispatches a `tailscale.*` action - `TailscaleAdapter` is not a
+/// `FirewallAdapter` (a device ID is a different resource shape from an
+/// IP/CIDR, see `TailscaleTarget`'s own doc comment), so this is its own
+/// path rather than going through `apply_single_adapter`/`adapter_for`.
+/// Target JSON contract: `{"device_id": "..."}`.
+///
+/// **Deliberately not part of the TTL sweep's auto-expiry the way
+/// nftables/HAProxy targets are**: nothing prevents a tailscale receipt
+/// from getting an `expires_at` (the storage layer doesn't distinguish),
+/// but `rollback_expired_target` handles it via `TailscaleAdapter::
+/// rollback` the same as any other manual rollback - the real constraint
+/// is that rollback for a previously-untagged device cannot complete via
+/// the API at all (see `TailscaleAdapter::rollback`'s own doc comment),
+/// so an unattended sweep retrying it forever produces the exact
+/// documented "will fail until fixed by hand" behavior, not a hidden gap.
+async fn dispatch_tailscale(
+    claimed: &ClaimedExecutionRequest,
+) -> (
+    bool,
+    Option<String>,
+    Option<String>,
+    Vec<FirewallDispatchReceipt>,
+) {
+    let Some(target) = claimed.target.as_ref() else {
+        return (
+            false,
+            None,
+            Some(format!(
+                "firewall action {:?} has no target",
+                claimed.action_name
+            )),
+            Vec::new(),
+        );
+    };
+    let device_id = match target.get("device_id").and_then(|value| value.as_str()) {
+        Some(device_id) if !device_id.trim().is_empty() => device_id.to_string(),
+        _ => {
+            return (
+                false,
+                None,
+                Some("tailscale target is missing device_id".to_string()),
+                Vec::new(),
+            )
+        }
+    };
+    let action = TailscaleAction {
+        target: TailscaleTarget {
+            device_id: device_id.clone(),
+        },
+        reason: format!("execution_request {}", claimed.id),
+    };
+    let adapter = TailscaleAdapter::new();
+    let dry_run = dry_run_from_env();
+    match adapter.apply(&action, dry_run).await {
+        Ok(applied) => {
+            let verification_result = if dry_run {
+                None
+            } else {
+                match adapter.verify(&action.target).await {
+                    Ok(VerificationResult::Verified) => Some("verified"),
+                    Ok(VerificationResult::NotPresent) => Some("mismatch"),
+                    Err(_) => Some("failed"),
+                }
+            };
+            let summary = format!(
+                "adapter=tailscale dry_run={} call={:?}",
+                !applied.applied, applied.receipt.described_call
+            );
+            let receipt = FirewallDispatchReceipt {
+                adapter: applied.receipt.adapter,
+                preflight_state: serde_json::json!({}),
+                rendered_commands: serde_json::json!([applied.receipt.described_call]),
+                observed_state: None,
+                verification_result,
+                ttl_seconds: DEFAULT_TAILSCALE_ACTION_TTL_SECONDS,
+                rollback_plan: serde_json::json!({
+                    "note": "removes the quarantine tag - may require device-side reauth if \
+                             it is the device's only tag, see TailscaleAdapter::rollback"
+                }),
+                is_dry_run: !applied.applied,
+                target_fingerprint: device_id,
+            };
+            (true, Some(summary), None, vec![receipt])
+        }
+        Err(error) => (false, None, Some(error.to_string()), Vec::new()),
+    }
+}
+
 /// Dispatches one claimed request. Returns `(success, result_summary,
 /// error_summary, receipts)` for the caller to persist via
 /// `complete_execution_dispatch` (always) and `record_firewall_action_receipt`
@@ -469,6 +590,9 @@ async fn dispatch(
         .starts_with(FIREWALL_MULTI_ADAPTER_PREFIX)
     {
         return dispatch_multi_adapter(claimed).await;
+    }
+    if claimed.action_name.starts_with(TAILSCALE_ACTION_PREFIX) {
+        return dispatch_tailscale(claimed).await;
     }
     let Some(adapter) = adapter_for(&claimed.action_name) else {
         return (
@@ -669,17 +793,17 @@ mod tests {
             false
         ));
         assert!(firewall_budget_applies("firewall.block_indicator", false));
+        assert!(firewall_budget_applies(
+            "tailscale.quarantine_device",
+            false
+        ));
         assert!(
             !firewall_budget_applies("nftables.block_indicator", true),
             "a dry run has nothing to bound"
         );
         assert!(
             !firewall_budget_applies("docker.restart_container", false),
-            "only nftables.*/haproxy.*-prefixed actions are bounded"
-        );
-        assert!(
-            !firewall_budget_applies("tailscale.quarantine_device", false),
-            "tailscale.* has no apply capability to bound in the first place"
+            "only recognized firewall-action prefixes are bounded"
         );
     }
 
@@ -831,20 +955,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_tailscale_action_keeps_the_generic_dry_run_fallback() {
-        // tailscale.*-prefixed actions are deliberately NOT routed to
-        // TailscaleAdapter - it has no apply capability to dispatch to at
-        // all (see docs/firewall-agent.md), so dispatch() must treat it
-        // exactly like any other non-firewall action.
+    async fn a_tailscale_action_without_a_target_fails_with_a_clear_error() {
         let request = claimed("tailscale.quarantine_device", None);
-        let (success, summary, error, receipts) = dispatch(&request).await;
-        assert!(success);
-        assert_eq!(
-            summary.as_deref(),
-            Some("dry_run: no external operation executed")
-        );
-        assert!(error.is_none());
+        let (success, _summary, error, receipts) = dispatch(&request).await;
+        assert!(!success);
+        assert!(error.unwrap().contains("no target"));
         assert!(receipts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_tailscale_action_with_a_malformed_target_fails_with_a_clear_error() {
+        let request = claimed(
+            "tailscale.quarantine_device",
+            Some(serde_json::json!({"not_device_id": "whatever"})),
+        );
+        let (success, _summary, error, receipts) = dispatch(&request).await;
+        assert!(!success);
+        assert!(error.unwrap().contains("device_id"));
+        assert!(receipts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_tailscale_action_dispatches_in_dry_run_and_is_routed_to_the_tailscale_adapter() {
+        // dry_run never touches the real Tailscale API - needs no
+        // credentials configured, mirroring the other adapters' own
+        // dry-run tests.
+        std::env::remove_var("CLAWFORGE_EXECUTOR_DRY_RUN");
+        let request = claimed(
+            "tailscale.quarantine_device",
+            Some(serde_json::json!({"device_id": "n123456CNTRL"})),
+        );
+        let (success, summary, error, receipts) = dispatch(&request).await;
+        assert!(success, "dispatch failed: {error:?}");
+        let summary = summary.unwrap();
+        assert!(summary.contains("adapter=tailscale"));
+        assert!(summary.contains("dry_run=true"));
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].adapter, "tailscale");
+        assert!(receipts[0].is_dry_run);
+        assert!(receipts[0].verification_result.is_none());
     }
 
     /// All three `CLAWFORGE_FIREWALL_ADAPTERS` scenarios in one test,

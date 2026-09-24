@@ -345,16 +345,68 @@ Arbeitspakete:
   Pruefung laeuft VOR der generischen `haproxy`-Pruefung, sonst wuerden
   Rate-Limit-Actions faelschlich zum ACL-Adapter geroutet), alle drei
   HAProxy/nftables-Adapter teilen sich ein Mass-block-Budget.)
-- Tailscale zunächst nur als freigabepflichtigen Adapter vorbereiten
-  (**erledigt**: `TailscaleAdapter` hat bewusst KEINE `apply`/`verify`/
-  `rollback`-Methode ueberhaupt - nicht "ein apply, das immer fehlschlaegt",
-  sondern kein aufrufbarer Pfad zur echten Tailscale Admin API. Einzige
-  Faehigkeit ist `render`: rein, synchron, beschreibt nur, was ein echter
-  Aufruf waere (`POST /api/v2/device/{id}/disable`), ohne ihn je
-  auszufuehren - kein HTTP-Client, kein API-Token, kein Secret vorhanden.
-  Migration `0037` registriert Connector + `tailscale.quarantine_device`-
-  Action, `requires_approval=TRUE, enabled=FALSE`. Eine echte Admin-API-
-  Integration ist separates, noch nicht begonnenes Folgewerk.)
+- Tailscale zunächst nur als freigabepflichtigen Adapter vorbereiten,
+  dann echte Admin-API-Integration (**beide Schritte erledigt**: aus dem
+  reinen `render`-Vorbereitungsstand (v1, s.o.) wurde eine echte,
+  funktionierende Integration gegen die live Tailscale Admin API gebaut,
+  Nutzeranstoss "ja dann mach weiter und du hast meinen tailscale api
+  key". Mechanismus: Tailscale-ACLs sind additiv "accept"-only, es gibt
+  kein "deny" - Quarantaene taggt ein Geraet (`tag:clawforge-quarantine`,
+  konfigurierbar ueber `CLAWFORGE_TAILSCALE_QUARANTINE_TAG`), was es aus
+  `autogroup:member` entfernt; wirksam wird das nur, wenn die eigene
+  ACL-Policy ihre accept-Regel(n) auf `autogroup:member` statt `*` scopt.
+  `apply`/`verify`/`rollback` machen echte HTTP-Calls (OAuth2
+  client_credentials, `CLAWFORGE_TAILSCALE_OAUTH_CLIENT_ID_FILE`/
+  `_SECRET_FILE`, ueber `clawforge_secret::load_optional` - beide
+  Credentials optional bei Konstruktion, jede echte Methode schlaegt
+  ohne sie sauber fehl), read-modify-write auf `/device/{id}/tags` (der
+  Endpunkt ersetzt komplett, daher erst lesen, dann die Quarantaene-Tag
+  ergaenzen/entfernen, nie blind ueberschreiben). Executor-Dispatch: eigene
+  `dispatch_tailscale()`-Funktion (paralell zu, nicht Teil von,
+  `dispatch_multi_adapter()`s `FirewallAdapter`-Fan-out, weil eine
+  Tailscale-Geraete-ID eine grundlegend andere Ressourcenform als eine
+  IP/CIDR ist), `rollback_expired_target()` verzweigt fuer abgelaufene
+  Tailscale-Quarantaenen entsprechend, `is_firewall_action()` deckt das
+  Mass-block-Budget auch fuer `tailscale.*` ab.
+
+  **Live-ACL-Policy des echten Tailnets wurde mit Nutzerfreigabe
+  angepasst** (kein Code, ein externer Systemzustand): `tagOwners` um
+  `tag:clawforge-quarantine` ergaenzt, die einzige accept-Regel von
+  `src: ["*"]` auf `src: ["autogroup:member"]` geaendert - ohne das haette
+  Tagging keine Wirkung gehabt. Vor diesem Schritt (mehrere Dutzend echte
+  Geraete betroffen, darunter kritische selbstgehostete Infrastruktur)
+  wurde explizit nachgefragt und Freigabe eingeholt.
+
+  **Echter End-to-End-Test gegen ein reales, vom Nutzer explizit als
+  niedrigstes Risiko ausgewaehltes Geraet** deckte eine
+  echte Tailscale-Plattform-Eigenschaft auf: `POST /device/{id}/tags`
+  lehnt das Entfernen des LETZTEN Tags mit `HTTP 400 "tagged nodes
+  cannot be untagged without reauth"` ab - das Geraet blieb dadurch
+  zeitweise real quarantaent, bis es manuell (App-Reauth, nicht nur
+  Reconnect) erneut authentifiziert wurde. Das ist kein Bug, sondern
+  eine bewusste Sicherheitseigenschaft (ein getaggtes Geraet zurueck in
+  ein ungetaggtes persoenliches Geraet zu verwandeln verlangt erneuten
+  Besitznachweis - analog zu Break-glass, das physischen/Account-Zugriff
+  voraussetzt statt eines reinen API-Calls). `rollback()` erkennt diesen
+  Fall jetzt VOR dem Aufruf (wenn das Entfernen des Tags die Liste leer
+  liesse) und gibt einen klaren, umsetzbaren Fehler statt des rohen
+  HTTP-400 zurueck; ist das Quarantaene-Tag bereits nicht mehr gesetzt
+  (z.B. weil ein Betreiber es von Hand geloest hat), gibt `rollback()`
+  bewusst `Ok(())` zurueck (anders als `NftablesAdapter`s "Rollback von
+  nie-Angewandtem schlaegt sauber fehl"-Praezedenzfall), damit der
+  TTL-Sweep konvergieren kann statt endlos auf einem bereits geloesten
+  Problem zu scheitern. Das reale Geraet wurde am Ende dieser Sitzung
+  verifiziert vollstaendig entsperrt (`tags: None`).
+
+  Headscale (selbstgehostete Tailscale-Alternative): das ACL-*Format*
+  ist konzeptionell kompatibel, aber dieser Adapter spricht Tailscales
+  eigene Cloud-API/-Auth - eine Headscale-Instanz braeuchte einen
+  eigenen, separaten Adapter.
+
+  Migration `0037` (Connector + `tailscale.quarantine_device`-Action,
+  `requires_approval=TRUE, enabled=FALSE`) unveraendert - die echte
+  Integration aendert nichts an Freigabepflicht/Dry-run-Status,
+  `CLAWFORGE_EXECUTOR_DRY_RUN` bleibt weiterhin hartkodiert `true`.)
 - Multi-Adapter-Dispatch: eine Block-Entscheidung darf nicht nur Dienste
   hinter HAProxy schuetzen, sondern jeden nach aussen gehenden Dienst auf
   dem Host (**erledigt**, Nutzeranstoss: "das jegliche Dienste die nach
