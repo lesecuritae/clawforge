@@ -83,6 +83,28 @@ pub struct ClaimedExecutionRequest {
     pub target: Option<serde_json::Value>,
 }
 
+/// One row for `record_firewall_action_receipt` - the Action Receipt the
+/// roadmap's phase 6 asks for (preflight, rendered commands, observed
+/// state, verification, TTL, rollback plan), one row per dispatch attempt
+/// (this table is an append-only receipt log, never updated in place -
+/// a re-verify or a later rollback gets its own row, not an edit of this
+/// one).
+pub struct FirewallActionReceiptInput<'a> {
+    pub execution_id: Option<Uuid>,
+    pub adapter: &'a str,
+    pub action_name: &'a str,
+    pub preflight_state: serde_json::Value,
+    pub rendered_commands: serde_json::Value,
+    pub observed_state: Option<serde_json::Value>,
+    /// `None` when nothing was actually applied to verify (a dry run) -
+    /// distinct from `Some("mismatch")`, which means apply reported
+    /// success but a real verify call did not find the target in the set.
+    pub verification_result: Option<&'a str>,
+    pub ttl_seconds: u32,
+    pub rollback_plan: serde_json::Value,
+    pub is_dry_run: bool,
+}
+
 const DEFAULT_EXECUTION_MAX_RETRIES: i32 = 3;
 const DEFAULT_EXECUTION_TIMEOUT_SECONDS: i32 = 60;
 
@@ -3098,6 +3120,45 @@ impl PostgresStore {
             .await?;
         }
         Ok(())
+    }
+
+    /// Persists one Action Receipt row - see `FirewallActionReceiptInput`'s
+    /// own doc comment for why this is append-only. `expires_at` is derived
+    /// from `ttl_seconds` here (not passed in) so the two can never drift
+    /// apart.
+    pub async fn record_firewall_action_receipt(
+        &self,
+        input: FirewallActionReceiptInput<'_>,
+    ) -> Result<Uuid> {
+        if let Some(result) = input.verification_result {
+            if !matches!(result, "pending" | "verified" | "mismatch" | "failed") {
+                anyhow::bail!("invalid verification result");
+            }
+        }
+        if input.ttl_seconds == 0 {
+            anyhow::bail!("ttl_seconds must be greater than zero");
+        }
+        let id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO firewall_action_receipts \
+             (id,execution_id,adapter,action_name,preflight_state,rendered_commands, \
+              observed_state,verification_result,ttl_seconds,rollback_plan,is_dry_run,expires_at) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW() + ($9 * INTERVAL '1 second'))",
+        )
+        .bind(id)
+        .bind(input.execution_id)
+        .bind(input.adapter)
+        .bind(input.action_name)
+        .bind(input.preflight_state)
+        .bind(input.rendered_commands)
+        .bind(input.observed_state)
+        .bind(input.verification_result)
+        .bind(i32::try_from(input.ttl_seconds).unwrap_or(i32::MAX))
+        .bind(input.rollback_plan)
+        .bind(input.is_dry_run)
+        .execute(&self.pool)
+        .await?;
+        Ok(id)
     }
 
     pub async fn record_connector_health(

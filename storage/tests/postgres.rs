@@ -118,6 +118,34 @@ async fn runtime_roles_enforce_service_boundaries() -> anyhow::Result<()> {
         .execute(executor.pool())
         .await
         .is_err());
+    // record_firewall_action_receipt (Phase 6's Action Receipt log) must
+    // work under the real least-privilege role, not just under the
+    // superuser connection every other test in this file otherwise uses -
+    // and the table is append-only by design (see
+    // FirewallActionReceiptInput's own doc comment), so the same role must
+    // NOT be able to update a row once written.
+    let receipt_id = executor
+        .record_firewall_action_receipt(clawforge_storage::FirewallActionReceiptInput {
+            execution_id: None,
+            adapter: "nftables",
+            action_name: "least-privilege-test-receipt",
+            preflight_state: json!({}),
+            rendered_commands: json!([]),
+            observed_state: None,
+            verification_result: None,
+            ttl_seconds: 60,
+            rollback_plan: json!({}),
+            is_dry_run: true,
+        })
+        .await?;
+    assert!(
+        sqlx::query("UPDATE firewall_action_receipts SET is_dry_run=is_dry_run WHERE id=$1")
+            .bind(receipt_id)
+            .execute(executor.pool())
+            .await
+            .is_err(),
+        "the executor role must not be able to update a receipt once written"
+    );
 
     let backup = PostgresStore::connect_runtime(&runtime_url("backup")?).await?;
     let _: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events")

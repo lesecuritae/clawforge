@@ -167,6 +167,10 @@ GRANT SELECT ON TABLE _sqlx_migrations, actions, execution_requests,
 GRANT INSERT, UPDATE ON TABLE execution_requests, execution_leases,
   execution_workers, execution_metrics, audit_events, audit_outbox, events,
   event_delivery, runtime_status TO clawforge_executor;
+-- Append-only Action Receipt log (see FirewallActionReceiptInput's own doc
+-- comment) - insert-only, the executor never updates or reads a receipt
+-- back.
+GRANT INSERT ON TABLE firewall_action_receipts TO clawforge_executor;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO clawforge_executor;
 REVOKE UPDATE ON TABLE audit_events FROM clawforge_executor;
 

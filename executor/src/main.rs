@@ -13,14 +13,47 @@
 //! immediately completed with `"dry_run: no external operation executed"`
 //! - this module changes nothing about docker/github/proxmox actions.
 
-use clawforge_firewall_agent::{FirewallAction, FirewallAdapter, FirewallTarget, NftablesAdapter};
-use clawforge_storage::{database_url_from_env, ClaimedExecutionRequest, PostgresStore};
+use clawforge_firewall_agent::{
+    FirewallAction, FirewallAdapter, FirewallTarget, NftablesAdapter, VerificationResult,
+};
+use clawforge_storage::{
+    database_url_from_env, ClaimedExecutionRequest, FirewallActionReceiptInput, PostgresStore,
+};
 use std::{env, time::Duration};
 use tokio::time::{interval, MissedTickBehavior};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 const DEFAULT_FIREWALL_ACTION_TTL_SECONDS: u32 = 3600;
+
+/// Everything `dispatch()` gathers for a successful `nftables.*` apply, for
+/// `main()`'s loop (the only place with a `store`) to persist as an Action
+/// Receipt via `record_firewall_action_receipt`. `dispatch()` itself stays
+/// DB-free on purpose - its existing unit tests call it directly with no
+/// store to hand it.
+struct FirewallDispatchReceipt {
+    adapter: &'static str,
+    preflight_state: serde_json::Value,
+    rendered_commands: serde_json::Value,
+    observed_state: Option<serde_json::Value>,
+    verification_result: Option<&'static str>,
+    ttl_seconds: u32,
+    rollback_plan: serde_json::Value,
+    is_dry_run: bool,
+}
+
+/// `nft -j list set`'s own JSON output, kept as structured JSONB where
+/// possible rather than an opaque string - falls back to wrapping the raw
+/// text if it somehow isn't valid JSON (e.g. an unexpected `nft` version's
+/// output), and to an empty object for the "no resolvable address yet"
+/// case (`Preflight::raw_set_json` is `""` for an unresolved
+/// `IncidentSource` - see that variant's own doc comment).
+fn nft_state_json(raw: &str) -> serde_json::Value {
+    if raw.is_empty() {
+        return serde_json::json!({});
+    }
+    serde_json::from_str(raw).unwrap_or_else(|_| serde_json::json!({"raw": raw}))
+}
 
 fn dry_run_from_env() -> bool {
     env::var("CLAWFORGE_EXECUTOR_DRY_RUN")
@@ -52,14 +85,24 @@ fn parse_firewall_action(
 }
 
 /// Dispatches one claimed request. Returns `(success, result_summary,
-/// error_summary)` for the caller to persist via `complete_execution_dispatch` -
-/// never panics, every adapter/parse error becomes a failed completion with
-/// a clear `error_summary` instead.
-async fn dispatch(claimed: &ClaimedExecutionRequest) -> (bool, Option<String>, Option<String>) {
+/// error_summary, receipt)` for the caller to persist via
+/// `complete_execution_dispatch` (always) and `record_firewall_action_receipt`
+/// (only when `receipt` is `Some`, i.e. a firewall action actually applied
+/// successfully) - never panics, every adapter/parse error becomes a failed
+/// completion with a clear `error_summary` instead.
+async fn dispatch(
+    claimed: &ClaimedExecutionRequest,
+) -> (
+    bool,
+    Option<String>,
+    Option<String>,
+    Option<FirewallDispatchReceipt>,
+) {
     if !claimed.action_name.starts_with("nftables.") {
         return (
             true,
             Some("dry_run: no external operation executed".to_string()),
+            None,
             None,
         );
     }
@@ -71,24 +114,51 @@ async fn dispatch(claimed: &ClaimedExecutionRequest) -> (bool, Option<String>, O
                 "firewall action {:?} has no target",
                 claimed.action_name
             )),
+            None,
         );
     };
     let action = match parse_firewall_action(claimed.id, target) {
         Ok(action) => action,
-        Err(error) => return (false, None, Some(error.to_string())),
+        Err(error) => return (false, None, Some(error.to_string()), None),
     };
     let adapter = NftablesAdapter::new();
     let dry_run = dry_run_from_env();
+    // Best-effort: preflight is read-only enrichment for the receipt, not
+    // a gate - a preflight failure (e.g. no NET_ADMIN in this environment)
+    // is recorded as-is and apply is still attempted, since apply's own
+    // success/failure is what actually determines the outcome here.
+    let preflight_state = match adapter.preflight(&action.target).await {
+        Ok(preflight) => nft_state_json(&preflight.raw_set_json),
+        Err(error) => serde_json::json!({"error": error.to_string()}),
+    };
     match adapter.apply(&action, dry_run).await {
-        Ok(result) => (
-            true,
-            Some(format!(
+        Ok(result) => {
+            let verification_result = if dry_run {
+                None
+            } else {
+                match adapter.verify(&action.target).await {
+                    Ok(VerificationResult::Verified) => Some("verified"),
+                    Ok(VerificationResult::NotPresent) => Some("mismatch"),
+                    Err(_) => Some("failed"),
+                }
+            };
+            let summary = format!(
                 "adapter={} dry_run={} commands={:?}",
                 result.receipt.adapter, result.receipt.is_dry_run, result.receipt.rendered_commands
-            )),
-            None,
-        ),
-        Err(error) => (false, None, Some(error.to_string())),
+            );
+            let receipt = FirewallDispatchReceipt {
+                adapter: result.receipt.adapter,
+                preflight_state,
+                rendered_commands: serde_json::json!(result.receipt.rendered_commands),
+                observed_state: result.observed_state.as_deref().map(nft_state_json),
+                verification_result,
+                ttl_seconds: result.receipt.ttl_seconds,
+                rollback_plan: serde_json::json!({"commands": result.receipt.rollback_commands}),
+                is_dry_run: result.receipt.is_dry_run,
+            };
+            (true, Some(summary), None, Some(receipt))
+        }
+        Err(error) => (false, None, Some(error.to_string()), None),
     }
 }
 
@@ -131,7 +201,30 @@ async fn main() -> anyhow::Result<()> {
                 let started = std::time::Instant::now();
                 match store.claim_execution_request_for_dispatch(Some(worker_id)).await {
                     Ok(Some(claimed)) => {
-                        let (success, result_summary, error_summary) = dispatch(&claimed).await;
+                        let (success, result_summary, error_summary, receipt) = dispatch(&claimed).await;
+                        if let Some(receipt) = receipt {
+                            if let Err(error) = store
+                                .record_firewall_action_receipt(FirewallActionReceiptInput {
+                                    execution_id: Some(claimed.id),
+                                    adapter: receipt.adapter,
+                                    action_name: &claimed.action_name,
+                                    preflight_state: receipt.preflight_state,
+                                    rendered_commands: receipt.rendered_commands,
+                                    observed_state: receipt.observed_state,
+                                    verification_result: receipt.verification_result,
+                                    ttl_seconds: receipt.ttl_seconds,
+                                    rollback_plan: receipt.rollback_plan,
+                                    is_dry_run: receipt.is_dry_run,
+                                })
+                                .await
+                            {
+                                // Best-effort: a receipt is an audit record of
+                                // an already-decided outcome, not a gate on it
+                                // - losing one must not turn a completed
+                                // dispatch into a failed one.
+                                tracing::warn!(%error, execution_id = %claimed.id, "could not persist firewall action receipt");
+                            }
+                        }
                         if let Err(error) = store
                             .complete_execution_dispatch(
                                 claimed.id,
@@ -198,21 +291,26 @@ mod tests {
     #[tokio::test]
     async fn non_firewall_actions_keep_the_original_dry_run_success_behavior() {
         let request = claimed("docker.restart_container", None);
-        let (success, summary, error) = dispatch(&request).await;
+        let (success, summary, error, receipt) = dispatch(&request).await;
         assert!(success);
         assert_eq!(
             summary.as_deref(),
             Some("dry_run: no external operation executed")
         );
         assert!(error.is_none());
+        assert!(
+            receipt.is_none(),
+            "a non-firewall action must never produce a receipt to persist"
+        );
     }
 
     #[tokio::test]
     async fn a_firewall_action_without_a_target_fails_with_a_clear_error() {
         let request = claimed("nftables.block_indicator", None);
-        let (success, _summary, error) = dispatch(&request).await;
+        let (success, _summary, error, receipt) = dispatch(&request).await;
         assert!(!success);
         assert!(error.unwrap().contains("no target"));
+        assert!(receipt.is_none());
     }
 
     #[tokio::test]
@@ -221,9 +319,10 @@ mod tests {
             "nftables.block_indicator",
             Some(serde_json::json!({"kind": "not-a-real-kind"})),
         );
-        let (success, _summary, error) = dispatch(&request).await;
+        let (success, _summary, error, receipt) = dispatch(&request).await;
         assert!(!success);
         assert!(error.is_some());
+        assert!(receipt.is_none());
     }
 
     #[tokio::test]
@@ -239,11 +338,17 @@ mod tests {
                 "source": "spamhaus_drop",
             })),
         );
-        let (success, summary, error) = dispatch(&request).await;
+        let (success, summary, error, receipt) = dispatch(&request).await;
         assert!(success, "dispatch failed: {error:?}");
         let summary = summary.unwrap();
         assert!(summary.contains("dry_run=true"));
         assert!(summary.contains("203.0.113.0/24"));
+        let receipt = receipt.expect("a successful firewall apply must produce a receipt");
+        assert!(receipt.is_dry_run);
+        assert!(
+            receipt.verification_result.is_none(),
+            "a dry run has nothing to verify"
+        );
     }
 
     #[test]
