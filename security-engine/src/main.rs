@@ -142,9 +142,11 @@ async fn persist_assessment_and_incident(
     store: &PostgresStore,
     rule_id: &'static str,
     rule_version: &'static str,
+    event_type: &'static str,
     window_seconds: i64,
     correlation_id: &str,
     bucket: DateTime<Utc>,
+    bucket_end: DateTime<Utc>,
     event_ids: &[Uuid],
     first_seen: DateTime<Utc>,
     last_seen: DateTime<Utc>,
@@ -156,6 +158,15 @@ async fn persist_assessment_and_incident(
         "{rule_id}:v{rule_version}:{correlation_id}:{}",
         bucket.timestamp()
     );
+    // Whether any event in this bucket also matched a threat-intel
+    // indicator at ingest time (record_security_event/lookup_ip_reputation
+    // - never the raw IP itself, see that method's own doc comment). This
+    // is the second, independent evidence source that makes Block
+    // reachable in clawforge-policy-engine's decide() call for the first
+    // time - still only in Shadow Mode, no action layer exists to run one.
+    let threat_intel_corroborated = store
+        .bucket_has_threat_intel_hit(event_type, correlation_id, bucket, bucket_end)
+        .await?;
     let assessment_id = store
         .persist_security_assessment(SecurityAssessmentUpsert {
             rule_id,
@@ -172,6 +183,7 @@ async fn persist_assessment_and_incident(
             first_seen,
             last_seen,
             event_ids,
+            threat_intel_corroborated,
         })
         .await?;
     // Reuse the existing, already-idempotent/escalation-aware incident
@@ -270,9 +282,11 @@ async fn evaluate_rule(
         store,
         rule.rule_id,
         rule.rule_version,
+        rule.event_type,
         rule.window_seconds,
         correlation_id,
         bucket,
+        bucket_end,
         &event_ids,
         first_seen,
         last_seen,
@@ -345,9 +359,11 @@ async fn evaluate_scan_rule(
         store,
         rule.rule_id,
         rule.rule_version,
+        rule.event_type,
         rule.window_seconds,
         correlation_id,
         bucket,
+        bucket_end,
         &event_ids,
         first_seen,
         last_seen,
@@ -795,6 +811,75 @@ mod tests {
                 .fetch_one(owner.pool())
                 .await?;
         assert_eq!(incident_severity, "medium");
+
+        Ok(())
+    }
+
+    /// Proves `threat_intel_corroborated` end to end against real
+    /// PostgreSQL: a bucket where exactly one of five events carries
+    /// `metadata.threat_intel_hit=true` (set by `record_security_event`/
+    /// `lookup_ip_reputation` at ingest time - not reproduced here, this
+    /// publishes the canonical event directly the way that method's own
+    /// storage test already covers) still gets an assessment with
+    /// `threat_intel_corroborated=true`: one hit in the bucket is enough,
+    /// not a majority.
+    #[tokio::test]
+    #[ignore = "requires provisioned roles in an isolated PostgreSQL test container"]
+    async fn a_single_threat_intel_hit_in_the_bucket_corroborates_the_whole_assessment(
+    ) -> Result<()> {
+        let owner_url = env::var("CLAWFORGE_TEST_DATABASE_URL")?;
+        let owner = PostgresStore::connect_runtime(&owner_url).await?;
+        let engine = PostgresStore::connect_runtime(&test_url("security_engine")?).await?;
+        // Promoted at the end too - see http_scan_rule's own test for why
+        // an unpromoted open candidate here would inflate a later test's
+        // own "exactly N newly promoted" count (a real, previously hit gap
+        // this test itself first fell into on its own first run, the same
+        // way http_scan_rule's did).
+        let incidents = PostgresStore::connect_runtime(&test_url("incidents")?).await?;
+
+        let resource = format!("ip-pseudonym:test-{}", Uuid::new_v4());
+        let bucket = bucket_start(Utc::now(), SSH_BRUTEFORCE.window_seconds);
+
+        for i in 0..4 {
+            let occurred_at = bucket + Duration::seconds(i * 10);
+            publish_ssh_login_failure(&owner, &resource, occurred_at, &format!("plain-{i}"))
+                .await?;
+        }
+        // The fifth and last event - the one that actually crosses the
+        // threshold - is the one carrying the threat-intel hit.
+        let fifth_at = bucket + Duration::seconds(40);
+        owner
+            .publish_event(
+                "ssh_login_failure",
+                "test-sensor",
+                "low",
+                fifth_at,
+                Some(&resource),
+                serde_json::json!({"test": true}),
+                serde_json::json!({"threat_intel_hit": true, "threat_intel_source": "spamhaus_drop_test"}),
+                &format!("test:ssh_login_failure:{resource}:threat-intel-hit"),
+            )
+            .await?;
+        let fifth_event = EventRecord {
+            event_type: "ssh_login_failure".to_string(),
+            occurred_at: fifth_at,
+            correlation_id: Some(resource.clone()),
+        };
+        evaluate_rule(&engine, &SSH_BRUTEFORCE, &fifth_event).await?;
+
+        let dedupe_key = format!("ssh_bruteforce:v1:{resource}:{}", bucket.timestamp());
+        let corroborated: bool = sqlx::query_scalar(
+            "SELECT threat_intel_corroborated FROM security_assessments WHERE dedupe_key=$1",
+        )
+        .bind(&dedupe_key)
+        .fetch_one(owner.pool())
+        .await?;
+        assert!(
+            corroborated,
+            "one threat-intel hit anywhere in the bucket must corroborate the whole assessment"
+        );
+
+        assert_eq!(incidents.promote_incident_candidates(10).await?, 1);
 
         Ok(())
     }

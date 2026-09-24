@@ -17,10 +17,17 @@
 //! that could drift from it. That reuse is what gives this service the
 //! roadmap's phase 4 exit-gate property "ein einzelnes Signal erreicht nie
 //! eine Block-Entscheidung" for free: `decide()` only ever reaches `Block`
-//! when `evidence_sources >= 2`, and today every assessment is exactly one
-//! source (this one behavioral rule - no threat-intel corroboration is
-//! wired in yet), so `evidence_sources` is always `1` and `Block` is
-//! structurally unreachable, not merely unlikely.
+//! when `evidence_sources >= 2`. `evidence_sources` is `1` for a plain
+//! behavioral assessment and `2` when `security_assessments.
+//! threat_intel_corroborated` is set - itself only ever set when a raw
+//! sensor-reported IP matched a threat-intel indicator (Spamhaus DROP/
+//! EDROP today) *before* being pseudonymized, at ingest time
+//! (`record_security_event`/`lookup_ip_reputation`; see that method's own
+//! doc comment for why the check has to happen there and can only ever
+//! store a category flag, never the IP). A single evidence source can
+//! still never reach `Block` - that has not changed - but a corroborated
+//! one now genuinely can, still only as a shadow decision: no action layer
+//! exists to execute one.
 //!
 //! ## Replay
 //!
@@ -42,12 +49,18 @@ use sha2::{Digest, Sha256};
 use std::env;
 use tracing::{info, warn};
 
-/// Every assessment this service evaluates has exactly one evidence
-/// source today: the behavioral rule that produced it. A second,
-/// independent source (e.g. a future threat-intel corroboration check)
-/// would raise this - see the module doc comment for why that single
-/// number is precisely what keeps `Block` unreachable in shadow mode.
-const EVIDENCE_SOURCES: i16 = 1;
+/// Every assessment has at least one evidence source: the behavioral rule
+/// that produced it. A second, independent one - threat-intel
+/// corroboration, see the module doc comment - raises this to 2, which is
+/// what `clawforge_policy::decide` requires before it will ever return
+/// `Block`.
+fn evidence_sources_for(assessment: &clawforge_storage::SecurityAssessment) -> i16 {
+    if assessment.threat_intel_corroborated {
+        2
+    } else {
+        1
+    }
+}
 
 /// `security_assessments.confidence` (0-99, `security-engine`'s own scale)
 /// maps directly onto `RiskAssessment::risk_score` (0-100,
@@ -104,26 +117,28 @@ async fn evaluate_assessment(
     let policies = store
         .list_active_security_policies_for_rule(&assessment.rule_id, chrono::Utc::now())
         .await?;
+    let evidence_sources = evidence_sources_for(assessment);
     for policy in policies {
         if !min_severity_met(&assessment.severity, &policy.min_severity) {
             continue;
         }
         let risk = risk_assessment_from_confidence(assessment.confidence);
-        let outcome = decide(&risk, EVIDENCE_SOURCES as usize);
+        let outcome = decide(&risk, evidence_sources as usize);
         let rationale = format!(
-            "assessment {} (rule {}, severity {}, confidence {}, {} events) against policy \
-             '{}' v{} (class {}, min severity {}) -> {} (evidence_sources={}, corroborated={})",
+            "assessment {} (rule {}, severity {}, confidence {}, {} events, threat_intel_corroborated={}) \
+             against policy '{}' v{} (class {}, min severity {}) -> {} (evidence_sources={}, corroborated={})",
             assessment.id,
             assessment.rule_id,
             assessment.severity,
             assessment.confidence,
             assessment.event_count,
+            assessment.threat_intel_corroborated,
             policy.name,
             policy.version,
             policy.class,
             policy.min_severity,
             decision_str(outcome.decision),
-            EVIDENCE_SOURCES,
+            evidence_sources,
             outcome.corroborated,
         );
         let evidence_snapshot = serde_json::json!({
@@ -148,7 +163,7 @@ async fn evaluate_assessment(
                     incident_id: assessment.incident_id,
                     decision: decision_str(outcome.decision),
                     risk_score: outcome.risk_score as i16,
-                    evidence_sources: EVIDENCE_SOURCES,
+                    evidence_sources,
                     corroborated: outcome.corroborated,
                     rationale: &rationale,
                     evidence_snapshot,
@@ -241,13 +256,50 @@ mod tests {
 
     #[test]
     fn a_single_evidence_source_can_never_reach_block() {
-        // The whole point of shadow mode being safe by construction: today
-        // every assessment has exactly one evidence source, and decide()
-        // only reaches Block at evidence_sources >= 2.
+        // A plain behavioral assessment (threat_intel_corroborated=false)
+        // is exactly one evidence source, and decide() only reaches Block
+        // at evidence_sources >= 2 - true regardless of how high its own
+        // confidence/risk_score is.
         let risk = risk_assessment_from_confidence(99);
-        let outcome = decide(&risk, EVIDENCE_SOURCES as usize);
+        let outcome = decide(&risk, 1);
         assert_ne!(outcome.decision, Decision::Block);
         assert!(!outcome.corroborated);
+    }
+
+    #[test]
+    fn threat_intel_corroboration_is_what_makes_block_reachable_at_all() {
+        // A high-confidence assessment that also matched a threat-intel
+        // indicator has two independent evidence sources - this is the one
+        // case decide() can actually reach Block for, proving the whole
+        // point of wiring threat-intel corroboration in at all (still only
+        // ever recorded as a shadow decision - see the module doc comment).
+        let risk = risk_assessment_from_confidence(99);
+        let outcome = decide(&risk, 2);
+        assert_eq!(outcome.decision, Decision::Block);
+        assert!(outcome.corroborated);
+    }
+
+    #[test]
+    fn evidence_sources_for_reflects_threat_intel_corroboration() {
+        let base = clawforge_storage::SecurityAssessment {
+            id: uuid::Uuid::new_v4(),
+            rule_id: "ssh_bruteforce".to_string(),
+            rule_version: "1".to_string(),
+            resource: "ip-pseudonym:test".to_string(),
+            severity: "critical".to_string(),
+            confidence: 99,
+            summary: String::new(),
+            event_count: 20,
+            bucket_start: chrono::Utc::now(),
+            incident_id: None,
+            threat_intel_corroborated: false,
+        };
+        assert_eq!(evidence_sources_for(&base), 1);
+        let corroborated = clawforge_storage::SecurityAssessment {
+            threat_intel_corroborated: true,
+            ..base
+        };
+        assert_eq!(evidence_sources_for(&corroborated), 2);
     }
 
     #[test]
@@ -323,6 +375,7 @@ mod tests {
                 first_seen: now,
                 last_seen: now,
                 event_ids: &[event_id],
+                threat_intel_corroborated: false,
             })
             .await?;
 

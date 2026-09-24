@@ -1002,3 +1002,106 @@ async fn security_events_register_sensor_and_record_event() -> anyhow::Result<()
 
     Ok(())
 }
+
+/// Proves the threat-intel reputation path end to end against real
+/// PostgreSQL: a raw IP matching a seeded Spamhaus-style indicator makes
+/// record_security_event flag the resulting canonical event's metadata
+/// (`threat_intel_hit`/`threat_intel_source`) - and, just as importantly,
+/// that the raw IP itself never appears anywhere in that metadata, nor in
+/// the event's payload/resource - the same "pseudonym or category flag
+/// only, never the value itself" boundary the rest of this ingest path
+/// already enforces. An unlisted IP gets no such flag at all.
+#[tokio::test]
+#[ignore = "requires an isolated PostgreSQL test container"]
+async fn ip_reputation_lookup_flags_a_match_without_ever_storing_the_raw_ip() -> anyhow::Result<()>
+{
+    use clawforge_security_events::{
+        SecurityEventEvidence, SensorEnvelope, Severity, SshLoginFailureEvidence,
+    };
+
+    let url =
+        std::env::var("CLAWFORGE_TEST_DATABASE_URL").or_else(|_| std::env::var("DATABASE_URL"))?;
+    let store = PostgresStore::connect(&url).await?;
+
+    // TEST-NET-2 (RFC 5737) - guaranteed never a real routable address,
+    // safe to seed as a fake "listed" prefix without describing any real
+    // host.
+    let listed_ip = "198.51.100.77";
+    // A different TEST-NET block entirely (RFC 5737) - genuinely outside
+    // the seeded 198.51.100.0/24 prefix, not just a different host inside
+    // it (a real bug this test itself caught on its first run: both
+    // addresses were originally chosen from the same /24, so the "unlisted"
+    // one was in fact listed too, and correctly matched).
+    let unlisted_ip = "203.0.113.55";
+    let indicator_source = format!("spamhaus_drop_test_{}", uuid::Uuid::new_v4());
+
+    sqlx::query(
+        "INSERT INTO indicators \
+         (value,indicator_type,categories,confidence,source,first_seen,last_seen,expires_at) \
+         VALUES ('198.51.100.0/24','Prefix','[\"spamhaus_drop\"]',90,$1,NOW(),NOW(),\
+         NOW()+INTERVAL '1 day')",
+    )
+    .bind(&indicator_source)
+    .execute(store.pool())
+    .await?;
+
+    let hit = store.lookup_ip_reputation(listed_ip).await?;
+    assert_eq!(
+        hit.map(|value| value.source),
+        Some(indicator_source.clone())
+    );
+    assert!(store.lookup_ip_reputation(unlisted_ip).await?.is_none());
+
+    let sensor_id = store
+        .register_security_sensor(
+            &format!("test-reputation-sensor-{}", uuid::Uuid::new_v4()),
+            &format!("test-credential-hash-reputation-{}", uuid::Uuid::new_v4()),
+            "abcd",
+            None,
+            "integration-test",
+        )
+        .await?;
+
+    async fn record_ssh_failure(
+        store: &PostgresStore,
+        sensor_id: uuid::Uuid,
+        ip: &str,
+    ) -> anyhow::Result<uuid::Uuid> {
+        let envelope = SensorEnvelope::new(
+            Utc::now(),
+            "sshd:test-host",
+            Severity::Low,
+            ip,
+            format!("test:reputation:{ip}:{}", uuid::Uuid::new_v4()),
+            SecurityEventEvidence::SshLoginFailure(SshLoginFailureEvidence {
+                username: "root".into(),
+                source_ip: ip.into(),
+                attempt_count: 5,
+            }),
+        )?;
+        store.record_security_event(sensor_id, &envelope).await
+    }
+
+    let listed_event_id = record_ssh_failure(&store, sensor_id, listed_ip).await?;
+    let metadata: serde_json::Value =
+        sqlx::query_scalar("SELECT metadata FROM events WHERE metadata->>'security_event_id'=$1")
+            .bind(listed_event_id.to_string())
+            .fetch_one(store.pool())
+            .await?;
+    assert_eq!(metadata["threat_intel_hit"], json!(true));
+    assert_eq!(metadata["threat_intel_source"], json!(indicator_source));
+    assert!(
+        !metadata.to_string().contains(listed_ip),
+        "the raw IP must never appear in metadata, only the category flag"
+    );
+
+    let unlisted_event_id = record_ssh_failure(&store, sensor_id, unlisted_ip).await?;
+    let unlisted_metadata: serde_json::Value =
+        sqlx::query_scalar("SELECT metadata FROM events WHERE metadata->>'security_event_id'=$1")
+            .bind(unlisted_event_id.to_string())
+            .fetch_one(store.pool())
+            .await?;
+    assert!(unlisted_metadata.get("threat_intel_hit").is_none());
+
+    Ok(())
+}

@@ -30,6 +30,12 @@ pub struct SecurityAssessmentUpsert<'a> {
     pub first_seen: DateTime<Utc>,
     pub last_seen: DateTime<Utc>,
     pub event_ids: &'a [Uuid],
+    /// Whether any event in this bucket also matched a threat-intel
+    /// indicator (see `lookup_ip_reputation`) - a second, independent
+    /// evidence source alongside the behavioral rule itself. See migration
+    /// `0035`'s own comment for why this is what makes `Block` reachable
+    /// for the first time in `clawforge-policy-engine`.
+    pub threat_intel_corroborated: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -44,6 +50,7 @@ pub struct SecurityAssessment {
     pub event_count: i32,
     pub bucket_start: DateTime<Utc>,
     pub incident_id: Option<Uuid>,
+    pub threat_intel_corroborated: bool,
 }
 
 impl PostgresStore {
@@ -76,6 +83,33 @@ impl PostgresStore {
             .into_iter()
             .map(|row| (row.get("event_id"), row.get("occurred_at")))
             .collect())
+    }
+
+    /// Whether any event of `event_type` sharing `correlation_id` within
+    /// `[from, to)` also matched a threat-intel indicator at ingest time
+    /// (`events.metadata->>'threat_intel_hit'`, set by
+    /// `record_security_event`/`lookup_ip_reputation` - never the raw IP
+    /// itself). A rule calls this once per bucket alongside
+    /// `list_events_for_bucket`(`_with_field`) to decide
+    /// `threat_intel_corroborated` for the assessment it persists.
+    pub async fn bucket_has_threat_intel_hit(
+        &self,
+        event_type: &str,
+        correlation_id: &str,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) -> Result<bool> {
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM events \
+             WHERE event_type=$1 AND correlation_id=$2 AND occurred_at >= $3 AND occurred_at < $4 \
+             AND metadata->>'threat_intel_hit'='true')",
+        )
+        .bind(event_type)
+        .bind(correlation_id)
+        .bind(from)
+        .bind(to)
+        .fetch_one(self.pool())
+        .await?)
     }
 
     /// Same bucket membership as `list_events_for_bucket`, plus one evidence
@@ -130,12 +164,15 @@ impl PostgresStore {
         let id: Uuid = sqlx::query_scalar(
             "INSERT INTO security_assessments \
              (id,rule_id,rule_version,engine_version,dedupe_key,resource,severity,confidence,\
-              summary,event_count,window_seconds,bucket_start,first_seen,last_seen) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) \
+              summary,event_count,window_seconds,bucket_start,first_seen,last_seen,\
+              threat_intel_corroborated) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) \
              ON CONFLICT (dedupe_key) DO UPDATE SET \
                severity=EXCLUDED.severity, confidence=EXCLUDED.confidence, \
                summary=EXCLUDED.summary, event_count=EXCLUDED.event_count, \
-               last_seen=EXCLUDED.last_seen, updated_at=NOW() \
+               last_seen=EXCLUDED.last_seen, \
+               threat_intel_corroborated=EXCLUDED.threat_intel_corroborated, \
+               updated_at=NOW() \
              RETURNING id",
         )
         .bind(Uuid::new_v4())
@@ -152,6 +189,7 @@ impl PostgresStore {
         .bind(request.bucket_start)
         .bind(request.first_seen)
         .bind(request.last_seen)
+        .bind(request.threat_intel_corroborated)
         .fetch_one(&mut *tx)
         .await?;
         for event_id in request.event_ids {
@@ -218,10 +256,11 @@ impl PostgresStore {
                 i32,
                 DateTime<Utc>,
                 Option<Uuid>,
+                bool,
             ),
         >(
             "SELECT id,rule_id,rule_version,resource,confidence,severity,summary,event_count,\
-             bucket_start,incident_id FROM security_assessments \
+             bucket_start,incident_id,threat_intel_corroborated FROM security_assessments \
              ORDER BY bucket_start DESC LIMIT $1",
         )
         .bind(limit.clamp(1, 500))
@@ -241,6 +280,7 @@ impl PostgresStore {
                     event_count,
                     bucket_start,
                     incident_id,
+                    threat_intel_corroborated,
                 )| SecurityAssessment {
                     id,
                     rule_id,
@@ -252,6 +292,7 @@ impl PostgresStore {
                     event_count,
                     bucket_start,
                     incident_id,
+                    threat_intel_corroborated,
                 },
             )
             .collect())

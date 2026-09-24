@@ -23,32 +23,52 @@ structurally unreachable right now, proven by
 asserted. The moment a second, independent signal exists (see below), that
 changes on its own, without this service's logic changing at all.
 
-## What would raise `evidence_sources` above 1 (not built yet)
+## Threat-intel corroboration (what raises `evidence_sources` above 1)
 
-The `intelligence` crate already ingests Spamhaus DROP/EDROP/ASN-DROP,
-RPKI, BGP and ASN change feeds into `indicators`/`asn_records`/
-`rpki_records`/`bgp_events` - real threat-intel data, already in this
-database. Combining it with a behavioral assessment (an `ssh_bruteforce`
-detection *and* the same source being Spamhaus-listed) is exactly the
-roadmap's "Threat-Intel-plus-Verhalten" rule shape, and would be the second
-evidence source that makes `Block` reachable for the first time.
+The `intelligence` crate ingests Spamhaus DROP/EDROP/ASN-DROP, RPKI, BGP
+and ASN change feeds into `indicators`/`asn_records`/`rpki_records`/
+`bgp_events` - real threat-intel data. Combining it with a behavioral
+assessment (an `ssh_bruteforce` detection *and* the same source being
+Spamhaus-listed) is exactly the roadmap's "Threat-Intel-plus-Verhalten"
+rule shape, and is the second evidence source that makes `Block` reachable
+for the first time - live, feeds enabled
+(`CLAWFORGE_ENABLE_FEEDS=CLAWFORGE_ENABLE_NETWORK=true`, and
+`clawforge-worker` given its own dedicated `egress` network to actually
+reach them; `backend` stays `internal: true` for every other service).
 
-This is deliberately **not** wired in yet, for two reasons:
+Two real constraints shaped how this is wired in, both explained in
+`PostgresStore::lookup_ip_reputation`'s own doc comment:
 
 1. `clawforge-security-engine`'s assessments only ever hold a pseudonymized
-   resource (`ip-pseudonym:<hash>`, via the same fail-closed HMAC scheme
+   resource (`ip-pseudonym:<hash>`, the same fail-closed HMAC scheme
    `events.correlation_id` already uses) - by design, the raw IP a
    Spamhaus DROP-list lookup needs is never available at that point. The
-   only place a raw sensor-reported IP still exists server-side is
-   *before* `record_security_event` pseudonymizes it - a lookup would have
-   to happen there, storing only a category result (e.g.
-   "spamhaus_listed: true"), never the IP itself, to keep the existing
-   privacy guarantee intact rather than working around it.
-2. This deployment currently runs with `CLAWFORGE_ENABLE_FEEDS=false` and
-   `CLAWFORGE_ENABLE_NETWORK=false` - the Spamhaus/RPKI/BGP/ASN feeds are
-   not actually being polled, so `indicators` etc. are empty right now.
-   Enabling them is a separate decision (real network egress from the
-   host) that has not been made.
+   only place a raw sensor-reported IP still exists server-side at all is
+   *inside* `record_security_event`, right before it pseudonymizes
+   `envelope.resource` - so the lookup happens exactly there, and only a
+   category flag (`metadata.threat_intel_hit`/`threat_intel_source` on the
+   canonical event, matched via Postgres's `<<=` CIDR-containment operator
+   against `indicators` rows with `source LIKE 'spamhaus%'`) crosses into
+   anything persisted further - never the IP itself. The lookup fails
+   *open* (a lookup error is treated as "no hit", never blocks recording
+   the event) - deliberately the opposite of pseudonymization's fail-closed
+   design, since a reputation check is an enrichment, not a privacy
+   boundary that must never be silently bypassed.
+2. `clawforge-security-engine` reads that flag back per bucket
+   (`bucket_has_threat_intel_hit`) when it persists an assessment - one hit
+   anywhere in the bucket is enough to set
+   `security_assessments.threat_intel_corroborated` (migration `0035`),
+   not a majority. `clawforge-policy-engine` then computes
+   `evidence_sources` as `2` instead of the previous hardcoded `1` whenever
+   that flag is set (`evidence_sources_for`), which is what actually lets
+   `clawforge_policy::decide()` reach `Block` for a high-confidence,
+   corroborated assessment - proven by a dedicated unit test
+   (`threat_intel_corroboration_is_what_makes_block_reachable_at_all`) and
+   a real-Postgres one showing a single threat-intel hit in an otherwise
+   plain bucket is enough
+   (`a_single_threat_intel_hit_in_the_bucket_corroborates_the_whole_assessment`).
+   **Still only ever recorded as a shadow decision** - no action layer
+   exists to execute a `Block` on.
 
 ## Schema (migration `0034`)
 

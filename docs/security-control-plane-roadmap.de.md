@@ -189,10 +189,13 @@ Arbeitspakete:
   Tumbling-Window, mit echtem Postgres getestet. Echte Multi-Target-Regel
   (eine Quelle gegen mehrere verschiedene Zielhosts) noch nicht sinnvoll
   umsetzbar - aktuell nur ein ueberwachter SSH- und ein ueberwachter
-  HTTP-Endpunkt. Threat-Intel-plus-Verhalten noch offen (die
-  `intelligence`-Crate liefert Spamhaus DROP/EDROP/ASN-DROP, RPKI-, BGP- und
-  ASN-Signale bereits - die Verknuepfung mit den Verhaltens-Assessments hier
-  ist Aufgabe von Phase 5 "Policy Engine", nicht dieser Crate.)
+  HTTP-Endpunkt. Threat-Intel-plus-Verhalten **erledigt** (Verknuepfung
+  bewusst in Phase 5 "Policy Engine" gebaut, nicht in dieser Crate - siehe
+  `docs/policy-engine.md`: Spamhaus-Reputationsabgleich beim Ingest, bevor
+  die IP pseudonymisiert wird, nur ein Kategorie-Flag geht weiter; die
+  Security-Engine setzt daraus `security_assessments.
+  threat_intel_corroborated`, das der Policy-Engine erstmals einen zweiten
+  Evidence-Quelle liefert).
 - minimale Provenance-, Freshness-, Confidence- und Konfliktregeln für alle
   verwendeten Threat-Intel-Signale implementieren; stale/unklare Daten dürfen
   keine automatische Klasse erreichen. (noch offen)
@@ -238,7 +241,9 @@ Arbeitspakete:
   `clawforge-security-engine`-Assessments gegen aktive Policies aus über
   das bereits vorhandene `clawforge_policy::decide()` - dieselbe Logik, die
   schon "ein einzelnes Signal erreicht nie eine Block-Entscheidung"
-  durchsetzt (`evidence_sources>=2` für Block; heute strukturell immer 1,
+  durchsetzt (`evidence_sources>=2` für Block; ein Assessment ohne
+  Threat-Intel-Treffer bleibt bei 1 und Block bleibt unerreichbar, ein
+  Assessment MIT Treffer bekommt 2 und Block wird erstmals erreichbar -
   siehe `docs/policy-engine.md`). Jede Entscheidung bekommt eine
   Klartext-`rationale`. **Es existiert keine Action-Ebene - "Shadow Mode"
   ist hier eine Eigenschaft der Architektur, nicht nur eine Konfiguration.**)

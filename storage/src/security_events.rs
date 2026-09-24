@@ -18,6 +18,15 @@ use uuid::Uuid;
 
 use crate::{pseudonymize_correlation_id, PostgresStore};
 
+/// A raw IP matched a threat-intel indicator - which one, never anything
+/// about the IP itself. Deliberately the smallest possible shape: a
+/// category flag a caller can pass onward, not a copy of the indicator
+/// row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IpReputationHit {
+    pub source: String,
+}
+
 /// A registered sensor identity, without its credential hash - callers that
 /// need to authenticate a credential use `authenticate_security_sensor`,
 /// which takes the hash as input rather than ever returning one.
@@ -320,6 +329,42 @@ impl PostgresStore {
     /// different content is rejected rather than silently accepted or
     /// silently overwriting the original, per the roadmap's
     /// `security-events-ingress` dedupe requirement.
+    /// A raw IP's reputation from Spamhaus's DROP/EDROP feeds
+    /// (`indicators.source LIKE 'spamhaus%'`) - checked **before** a
+    /// resource is pseudonymized, since indicators are stored as raw CIDR
+    /// prefixes (`indicator_type='Prefix'`) and a pseudonym could never be
+    /// checked against them. Only the result - which feed, never the IP
+    /// itself - is what a caller may persist further (see
+    /// `record_security_event`, the only caller today, which writes just a
+    /// category flag onto the canonical event's `metadata`, never the IP).
+    ///
+    /// Deliberately the opposite of the pseudonymization path's
+    /// fail-closed design: pseudonymization protects a privacy guarantee
+    /// that must never be silently bypassed, so a missing key rejects the
+    /// write outright; a reputation lookup is an enrichment on top of an
+    /// event that is valid and worth recording regardless, so its caller
+    /// treats a lookup failure as "no hit" rather than failing the whole
+    /// event - see the `.unwrap_or_default()` at its call site.
+    pub async fn lookup_ip_reputation(&self, ip: &str) -> Result<Option<IpReputationHit>> {
+        if ip.parse::<std::net::IpAddr>().is_err() {
+            return Ok(None);
+        }
+        let row = sqlx::query(
+            "SELECT source FROM indicators \
+             WHERE source LIKE 'spamhaus%' AND expires_at > NOW() \
+             AND ( \
+               (indicator_type='Ip' AND value=$1) OR \
+               (indicator_type='Prefix' AND $1::inet <<= value::cidr) \
+             ) LIMIT 1",
+        )
+        .bind(ip)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(row.map(|row| IpReputationHit {
+            source: row.get("source"),
+        }))
+    }
+
     pub async fn record_security_event(
         &self,
         sensor_id: Uuid,
@@ -393,6 +438,25 @@ impl PostgresStore {
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
+        // Reputation lookup against the STILL-RAW envelope.resource -
+        // pseudonymization already happened above (into `resource`), but
+        // envelope.resource itself is untouched, and this is the last point
+        // in the whole ingest path where the raw IP is available server-side
+        // at all. Fails open (see lookup_ip_reputation's own doc comment):
+        // a lookup error must never block recording a valid security event.
+        let reputation = self
+            .lookup_ip_reputation(&envelope.resource)
+            .await
+            .unwrap_or_default();
+        let mut metadata = serde_json::json!({"security_event_id": id, "sensor_id": sensor_id});
+        if let Some(hit) = &reputation {
+            // Only the category, in metadata (operational context) rather
+            // than payload (the sensor's own observation) - never the IP,
+            // matching the same boundary pseudonymize_evidence already
+            // draws between what a rule may group by and what it may see.
+            metadata["threat_intel_hit"] = serde_json::json!(true);
+            metadata["threat_intel_source"] = serde_json::json!(hit.source);
+        }
         // Fan this out onto the canonical event bus - exactly once, only for
         // a genuinely new row (the ON CONFLICT/dedupe-hit path above already
         // returned early with the existing id, never reaching here) - so a
@@ -409,7 +473,7 @@ impl PostgresStore {
             envelope.occurred_at,
             Some(&resource),
             evidence_json,
-            serde_json::json!({"security_event_id": id, "sensor_id": sensor_id}),
+            metadata,
             &format!("security-event:{id}"),
         )
         .await?;
