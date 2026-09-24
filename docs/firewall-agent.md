@@ -381,13 +381,18 @@ on this).
 - **No real Tailscale integration** - `TailscaleAdapter` is prepared
   (see above) but has no `apply` capability at all, on purpose.
 - **No failure-injection tests** beyond lease loss/worker death (proven
-  by `a_worker_that_dies_after_claiming_is_reclaimed_by_a_different_worker`)
-  and manual drift (proven by
+  by `a_worker_that_dies_after_claiming_is_reclaimed_by_a_different_worker`),
+  manual drift (proven by
   `verify_detects_manual_drift_after_an_out_of_band_removal`: a real
   out-of-band `nft delete element`, then `verify` correctly reports
-  `NotPresent` rather than stale `Verified`). Still missing: process/
-  host/DB failure between intent/apply/receipt/audit, reboot, clock skew,
-  concurrent actions on the same target, failed read-back.
+  `NotPresent` rather than stale `Verified`), and concurrent actions on
+  the same target (proven by
+  `concurrent_applies_of_the_same_target_never_corrupt_or_crash` and its
+  HAProxy analog: two applies of the same target run genuinely
+  concurrently via `tokio::join!` over two independent adapter instances
+  against a real lab, neither errors/crashes, and the target ends up
+  blocked exactly once). Still missing: process/host/DB failure between
+  intent/apply/receipt/audit, reboot, clock skew, failed read-back.
 - **No concurrency budget across multiple executor replicas targeting the
   same host** - the mass-block *rate* budget (above) is DB-backed and
   already holds across replicas; a *concurrency* ceiling (at most N real

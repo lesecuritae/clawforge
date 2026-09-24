@@ -414,9 +414,16 @@ Pflichtgates vor der ersten verändernden Lab-Testaktion:
   receipts` persistiert worden, sobald ein Aufrufer je einen `Resolved
   IncidentSource` konstruiert (noch keiner tut das). Gefixt mit einer
   redigierten Receipt-Referenz (`redacted_element_reference`), die real
-  ausgefuehrte Befehl bleibt unveraendert real. Noch offen: Prozess-/Host-/
-  DB-Ausfall zwischen den Schritten selbst, Reboot, Uhrsprung, konkurrierende
-  Actions auf demselben Ziel, fehlgeschlagenes Read-back.)
+  ausgefuehrte Befehl bleibt unveraendert real. **Konkurrierende Actions auf
+  demselben Ziel jetzt erledigt**: `concurrent_applies_of_the_same_target_
+  never_corrupt_or_crash` (nftables) und ihr HAProxy-Gegenstueck lassen
+  zwei Applies desselben Ziels echt nebenlaeufig per `tokio::join!` ueber
+  zwei unabhaengige Adapter-Instanzen laufen - beweist, dass keiner
+  fehlschlaegt/abstuerzt und das Ziel danach sauber genau einmal blockiert
+  ist, echt gegen beide Labs getestet, nicht nur sequenziell wie der
+  bestehende Idempotenz-Test. Noch offen: Prozess-/Host-/DB-Ausfall
+  zwischen den Schritten selbst, Reboot, Uhrsprung, fehlgeschlagenes
+  Read-back.)
 - vor `apply` existiert immer ein persistierter Intent und ein lokales
   Recovery-Journal
 - Desired/Actual State, TTL, Drift, Kill-Switch und vollständige Audit-Lineage

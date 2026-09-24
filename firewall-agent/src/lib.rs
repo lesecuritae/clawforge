@@ -1720,6 +1720,43 @@ mod tests {
         adapter.rollback(&action).await.unwrap();
     }
 
+    /// Failure-injection scenario "konkurrierende Actions auf demselben
+    /// Ziel" (roadmap): unlike
+    /// `applying_the_same_element_twice_is_idempotent` (sequential), this
+    /// runs two applies of the *same* target genuinely concurrently via
+    /// `tokio::join!`, over two independent adapter instances (standing
+    /// in for two dispatch paths racing on the same target) - proving
+    /// neither errors, crashes, or corrupts the set under real
+    /// concurrency, not just that idempotency holds when called twice in
+    /// a row.
+    #[tokio::test]
+    #[ignore = "requires nftables (NET_ADMIN/NET_RAW) - run via scripts/test-firewall-lab.sh"]
+    async fn concurrent_applies_of_the_same_target_never_corrupt_or_crash() {
+        let action = FirewallAction {
+            target: indicator("203.0.113.207"),
+            ttl_seconds: 60,
+            reason: "concurrency test".into(),
+        };
+        let adapter_a = lab_adapter().await;
+        let adapter_b = lab_adapter().await;
+        let (result_a, result_b) = tokio::join!(
+            adapter_a.apply(&action, false),
+            adapter_b.apply(&action, false)
+        );
+        assert!(result_a.is_ok(), "{result_a:?}");
+        assert!(result_b.is_ok(), "{result_b:?}");
+        assert_eq!(
+            adapter_a.verify(&action.target).await.unwrap(),
+            VerificationResult::Verified,
+            "the target must end up genuinely blocked after two concurrent applies"
+        );
+        adapter_a.rollback(&action).await.unwrap();
+        assert_eq!(
+            adapter_a.verify(&action.target).await.unwrap(),
+            VerificationResult::NotPresent
+        );
+    }
+
     /// The break-glass drill itself, rehearsed (not just documented) - see
     /// scripts/nftables-clawforge-break-glass.sh's own doc comment. Blocks
     /// a real target, confirms it is genuinely blocked, then runs the
@@ -2007,6 +2044,46 @@ mod tests {
             adapter.verify(&action.target).await.unwrap(),
             VerificationResult::NotPresent,
             "the target must be fully gone after enough rollbacks to match every apply"
+        );
+    }
+
+    /// HAProxy analog of `concurrent_applies_of_the_same_target_never_
+    /// corrupt_or_crash` - two genuinely concurrent applies of the same
+    /// target over two independent adapter instances, over the real
+    /// Runtime API socket.
+    #[tokio::test]
+    #[ignore = "requires a real HAProxy Runtime API socket - run via scripts/test-haproxy-lab.sh"]
+    async fn haproxy_concurrent_applies_of_the_same_target_never_corrupt_or_crash() {
+        let action = action_for(indicator("203.0.113.235"));
+        let adapter_a = lab_haproxy_adapter();
+        let adapter_b = lab_haproxy_adapter();
+        let (result_a, result_b) = tokio::join!(
+            adapter_a.apply(&action, false),
+            adapter_b.apply(&action, false)
+        );
+        assert!(result_a.is_ok(), "{result_a:?}");
+        assert!(result_b.is_ok(), "{result_b:?}");
+        assert_eq!(
+            adapter_a.verify(&action.target).await.unwrap(),
+            VerificationResult::Verified,
+            "the target must end up genuinely blocked after two concurrent applies"
+        );
+        // Same "may need more than one rollback" caveat as the sequential
+        // idempotency test - HAProxy's add acl is not guaranteed
+        // idempotent the way nftables' add element is.
+        adapter_a
+            .rollback(&action)
+            .await
+            .expect("rollback must succeed");
+        if adapter_a.verify(&action.target).await.unwrap() == VerificationResult::Verified {
+            adapter_a
+                .rollback(&action)
+                .await
+                .expect("a second rollback must succeed if a duplicate entry remained");
+        }
+        assert_eq!(
+            adapter_a.verify(&action.target).await.unwrap(),
+            VerificationResult::NotPresent
         );
     }
 
