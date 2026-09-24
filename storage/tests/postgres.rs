@@ -1271,3 +1271,83 @@ async fn claim_execution_request_for_dispatch_threads_the_target_and_completes(
 
     Ok(())
 }
+
+/// Phase 6's HA/leader/lease Pflichtgate: "beweisen, dass dieselbe Action
+/// nicht doppelt greift" (proving the same action never fires twice) under
+/// concurrent workers. Two independent `PostgresStore` connections (two
+/// separate pools, standing in for two separate `clawforge-executor`
+/// replicas in an HA deployment) race for the *same single* pending
+/// request via `tokio::join!` - a real concurrent request against
+/// Postgres, not a fabricated ordering. `claim_execution_request_for_dispatch`'s
+/// `FOR UPDATE SKIP LOCKED` must guarantee exactly one of them wins.
+#[tokio::test]
+#[ignore = "requires an isolated PostgreSQL test container"]
+async fn concurrent_workers_never_claim_the_same_execution_request_twice() -> anyhow::Result<()> {
+    let url =
+        std::env::var("CLAWFORGE_TEST_DATABASE_URL").or_else(|_| std::env::var("DATABASE_URL"))?;
+    let store_a = PostgresStore::connect(&url).await?;
+    let store_b = PostgresStore::connect(&url).await?;
+
+    let connector_id: uuid::Uuid =
+        sqlx::query_scalar("SELECT id FROM connector_registry ORDER BY name LIMIT 1")
+            .fetch_one(store_a.pool())
+            .await?;
+    let action_id = uuid::Uuid::new_v4();
+    let action_name = format!("test.ha-race-{}", uuid::Uuid::new_v4());
+    sqlx::query("INSERT INTO actions (id,connector_id,name,type,description,risk_level,required_scope,requires_approval,enabled) VALUES ($1,$2,$3,'connector_action','ha race test','low','agent:action:read',false,true)")
+        .bind(action_id)
+        .bind(connector_id)
+        .bind(&action_name)
+        .execute(store_a.pool())
+        .await?;
+    let request_id = store_a
+        .create_execution_request(&clawforge_storage::ExecutionRequestInput {
+            action_id,
+            workflow_run_id: None,
+            decision_id: None,
+            requested_by: "ha-race-test".into(),
+            requested_by_id: None,
+            idempotency_key: None,
+            target: None,
+        })
+        .await?;
+
+    let worker_a = store_a
+        .register_execution_worker(&format!("ha-race-a-{}", uuid::Uuid::new_v4()), 1)
+        .await?;
+    let worker_b = store_b
+        .register_execution_worker(&format!("ha-race-b-{}", uuid::Uuid::new_v4()), 1)
+        .await?;
+
+    let (claim_a, claim_b) = tokio::join!(
+        store_a.claim_execution_request_for_dispatch(Some(worker_a)),
+        store_b.claim_execution_request_for_dispatch(Some(worker_b)),
+    );
+    let claims: Vec<_> = [claim_a?, claim_b?].into_iter().flatten().collect();
+    assert_eq!(
+        claims.len(),
+        1,
+        "exactly one of the two concurrent claims must succeed - never both, never neither"
+    );
+    assert_eq!(claims[0].id, request_id);
+    assert_eq!(claims[0].action_name, action_name);
+
+    sqlx::query("DELETE FROM execution_leases WHERE execution_id=$1")
+        .bind(request_id)
+        .execute(store_a.pool())
+        .await?;
+    sqlx::query("DELETE FROM execution_requests WHERE id=$1")
+        .bind(request_id)
+        .execute(store_a.pool())
+        .await?;
+    sqlx::query("DELETE FROM execution_workers WHERE id=ANY($1)")
+        .bind([worker_a, worker_b].as_slice())
+        .execute(store_a.pool())
+        .await?;
+    sqlx::query("DELETE FROM actions WHERE id=$1")
+        .bind(action_id)
+        .execute(store_a.pool())
+        .await?;
+
+    Ok(())
+}

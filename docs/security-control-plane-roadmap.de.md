@@ -363,7 +363,14 @@ Pflichtgates vor der ersten verändernden Lab-Testaktion:
 - pro Adapter/Ziel gelten getestete Rate-, Concurrency- und Mass-block-Budgets;
   Zielnormalisierung und technische Ausschlusslisten decken IPv4, IPv6, CIDR
   und IPv4-mapped IPv6 ab
-- HA-/Leader-/Lease-Tests beweisen, dass dieselbe Action nicht doppelt greift;
+- HA-/Leader-/Lease-Tests beweisen, dass dieselbe Action nicht doppelt greift
+  (**teilweise**: `concurrent_workers_never_claim_the_same_execution_request_twice`
+  laesst zwei unabhaengige `PostgresStore`-Verbindungen - stellvertretend fuer
+  zwei Executor-Replicas - echt nebenlaeufig per `tokio::join!` um denselben
+  einzelnen Request konkurrieren; `FOR UPDATE SKIP LOCKED` garantiert genau
+  einen Gewinner, echter Test gegen Postgres, nicht nur behauptet. Noch offen:
+  Leader-Election/Lease-Uebernahme bei einem Worker-Ausfall waehrend eines
+  laufenden Applies.);
   Rollback-p95, Drift-Erkennungszeit und erlaubte verwaiste Regeln (`0`) werden
   vor dem Labtest quantifiziert
 
