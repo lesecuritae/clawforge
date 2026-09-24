@@ -364,13 +364,17 @@ Pflichtgates vor der ersten verändernden Lab-Testaktion:
   Zielnormalisierung und technische Ausschlusslisten decken IPv4, IPv6, CIDR
   und IPv4-mapped IPv6 ab
 - HA-/Leader-/Lease-Tests beweisen, dass dieselbe Action nicht doppelt greift
-  (**teilweise**: `concurrent_workers_never_claim_the_same_execution_request_twice`
+  (**erledigt**: `concurrent_workers_never_claim_the_same_execution_request_twice`
   laesst zwei unabhaengige `PostgresStore`-Verbindungen - stellvertretend fuer
   zwei Executor-Replicas - echt nebenlaeufig per `tokio::join!` um denselben
   einzelnen Request konkurrieren; `FOR UPDATE SKIP LOCKED` garantiert genau
-  einen Gewinner, echter Test gegen Postgres, nicht nur behauptet. Noch offen:
-  Leader-Election/Lease-Uebernahme bei einem Worker-Ausfall waehrend eines
-  laufenden Applies.);
+  einen Gewinner. `a_worker_that_dies_after_claiming_is_reclaimed_by_a_
+  different_worker` beweist die andere Haelfte: ein Worker, der nach dem
+  Claim stirbt (nie `complete_execution_dispatch` aufruft), haelt den
+  Request nicht fuer immer fest - die bestehende Lease-Ablauf-Wiedereinsammlung
+  in `run_execution_maintenance` gibt ihn frei, ein zweiter Worker uebernimmt
+  und schliesst ihn erfolgreich ab. Beide echte Tests gegen Postgres, nicht
+  nur behauptet.);
   Rollback-p95, Drift-Erkennungszeit und erlaubte verwaiste Regeln (`0`) werden
   vor dem Labtest quantifiziert
 

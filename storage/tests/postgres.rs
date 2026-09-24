@@ -1351,3 +1351,124 @@ async fn concurrent_workers_never_claim_the_same_execution_request_twice() -> an
 
     Ok(())
 }
+
+/// The other half of the HA/leader/lease Pflichtgate: a worker that claims
+/// a request and then dies before ever completing it (crash, OOM-kill, lost
+/// network - `complete_execution_dispatch` is simply never called) must not
+/// strand the request in `starting` forever. `run_execution_maintenance`
+/// (run at the top of every `claim_execution_request_for_dispatch` call, by
+/// a *different* worker's own poll tick in production) reclaims an expired
+/// lease back to `queued`, making the request claimable again. Backdates
+/// the lease's `expires_at` directly rather than waiting out the real
+/// 2-minute lease TTL - the reclaim query only cares that `expires_at` is
+/// in the past, not how it got there.
+#[tokio::test]
+#[ignore = "requires an isolated PostgreSQL test container"]
+async fn a_worker_that_dies_after_claiming_is_reclaimed_by_a_different_worker() -> anyhow::Result<()>
+{
+    let url =
+        std::env::var("CLAWFORGE_TEST_DATABASE_URL").or_else(|_| std::env::var("DATABASE_URL"))?;
+    let store = PostgresStore::connect(&url).await?;
+
+    let connector_id: uuid::Uuid =
+        sqlx::query_scalar("SELECT id FROM connector_registry ORDER BY name LIMIT 1")
+            .fetch_one(store.pool())
+            .await?;
+    let action_id = uuid::Uuid::new_v4();
+    let action_name = format!("test.lease-takeover-{}", uuid::Uuid::new_v4());
+    sqlx::query("INSERT INTO actions (id,connector_id,name,type,description,risk_level,required_scope,requires_approval,enabled) VALUES ($1,$2,$3,'connector_action','lease takeover test','low','agent:action:read',false,true)")
+        .bind(action_id)
+        .bind(connector_id)
+        .bind(&action_name)
+        .execute(store.pool())
+        .await?;
+    let request_id = store
+        .create_execution_request(&clawforge_storage::ExecutionRequestInput {
+            action_id,
+            workflow_run_id: None,
+            decision_id: None,
+            requested_by: "lease-takeover-test".into(),
+            requested_by_id: None,
+            idempotency_key: None,
+            target: None,
+        })
+        .await?;
+
+    let dead_worker = store
+        .register_execution_worker(&format!("dead-worker-{}", uuid::Uuid::new_v4()), 1)
+        .await?;
+    let claimed_by_dead_worker = store
+        .claim_execution_request_for_dispatch(Some(dead_worker))
+        .await?
+        .expect("the freshly created request must be claimable");
+    assert_eq!(claimed_by_dead_worker.id, request_id);
+    let status_while_stuck: String =
+        sqlx::query_scalar("SELECT status FROM execution_requests WHERE id=$1")
+            .bind(request_id)
+            .fetch_one(store.pool())
+            .await?;
+    assert_eq!(status_while_stuck, "starting");
+    // `dead_worker` now "dies" - simulated by never calling
+    // complete_execution_dispatch and instead backdating its lease as if
+    // its 2-minute TTL had already elapsed.
+    sqlx::query(
+        "UPDATE execution_leases SET expires_at=NOW()-INTERVAL '1 second' WHERE execution_id=$1",
+    )
+    .bind(request_id)
+    .execute(store.pool())
+    .await?;
+
+    let rescue_worker = store
+        .register_execution_worker(&format!("rescue-worker-{}", uuid::Uuid::new_v4()), 1)
+        .await?;
+    let claimed_by_rescue_worker = store
+        .claim_execution_request_for_dispatch(Some(rescue_worker))
+        .await?
+        .expect("a request whose lease expired must be reclaimable by another worker");
+    assert_eq!(claimed_by_rescue_worker.id, request_id);
+    assert_eq!(claimed_by_rescue_worker.action_name, action_name);
+
+    store
+        .complete_execution_dispatch(
+            request_id,
+            Some(rescue_worker),
+            std::time::Instant::now(),
+            true,
+            Some("completed by the rescue worker"),
+            None,
+        )
+        .await?;
+    let (final_status, final_summary): (String, Option<String>) =
+        sqlx::query_as("SELECT status,result_summary FROM execution_requests WHERE id=$1")
+            .bind(request_id)
+            .fetch_one(store.pool())
+            .await?;
+    assert_eq!(final_status, "success");
+    assert_eq!(
+        final_summary.as_deref(),
+        Some("completed by the rescue worker")
+    );
+
+    sqlx::query("DELETE FROM execution_metrics WHERE worker_id=$1")
+        .bind(rescue_worker)
+        .execute(store.pool())
+        .await?;
+    sqlx::query("DELETE FROM execution_leases WHERE execution_id=$1")
+        .bind(request_id)
+        .execute(store.pool())
+        .await?;
+    sqlx::query("DELETE FROM execution_requests WHERE id=$1")
+        .bind(request_id)
+        .execute(store.pool())
+        .await?;
+    sqlx::query("DELETE FROM execution_workers WHERE id=ANY($1)")
+        .bind([dead_worker, rescue_worker].as_slice())
+        .execute(store.pool())
+        .await?;
+    sqlx::query("DELETE FROM actions WHERE id=$1")
+        .bind(action_id)
+        .execute(store.pool())
+        .await?;
+
+    Ok(())
+}
