@@ -1827,3 +1827,98 @@ async fn kill_switch_request_rejects_empty_adapter_or_fingerprint() -> anyhow::R
 
     Ok(())
 }
+
+/// `begin_firewall_inflight_operation`/`firewall_inflight_operation_count`/
+/// `end_firewall_inflight_operation` back the concurrency budget - proves
+/// a reservation is counted while live, that releasing it drops the count
+/// back down, and that a stale reservation (older than the staleness
+/// window) stops counting even without being released - the self-healing
+/// property that keeps a crashed replica from leaking a slot forever.
+#[tokio::test]
+#[ignore = "requires an isolated PostgreSQL test container"]
+async fn firewall_inflight_operation_count_reflects_reservations_and_ignores_stale_ones(
+) -> anyhow::Result<()> {
+    let url =
+        std::env::var("CLAWFORGE_TEST_DATABASE_URL").or_else(|_| std::env::var("DATABASE_URL"))?;
+    let store = PostgresStore::connect(&url).await?;
+
+    let adapter = format!("test-inflight-{}", uuid::Uuid::new_v4());
+    assert_eq!(
+        store
+            .firewall_inflight_operation_count(&adapter, 60)
+            .await?,
+        0
+    );
+
+    let id_a = store
+        .begin_firewall_inflight_operation(&adapter, None)
+        .await?;
+    let id_b = store
+        .begin_firewall_inflight_operation(&adapter, None)
+        .await?;
+    assert_eq!(
+        store
+            .firewall_inflight_operation_count(&adapter, 60)
+            .await?,
+        2,
+        "two live reservations must both count"
+    );
+
+    store.end_firewall_inflight_operation(id_a).await?;
+    assert_eq!(
+        store
+            .firewall_inflight_operation_count(&adapter, 60)
+            .await?,
+        1,
+        "releasing one reservation must drop the count by exactly one"
+    );
+
+    // Idempotent: releasing an already-released (or never-existing) id
+    // must not error.
+    store.end_firewall_inflight_operation(id_a).await?;
+
+    // Backdate the remaining reservation past a short staleness window -
+    // it must stop counting without ever being explicitly released,
+    // proving the self-healing property.
+    sqlx::query(
+        "UPDATE firewall_inflight_operations SET started_at = NOW() - INTERVAL '120 seconds' \
+         WHERE id = $1",
+    )
+    .bind(id_b)
+    .execute(store.pool())
+    .await?;
+    assert_eq!(
+        store
+            .firewall_inflight_operation_count(&adapter, 60)
+            .await?,
+        0,
+        "a reservation older than the staleness window must stop counting on its own"
+    );
+
+    sqlx::query("DELETE FROM firewall_inflight_operations WHERE adapter = $1")
+        .bind(&adapter)
+        .execute(store.pool())
+        .await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated PostgreSQL test container"]
+async fn firewall_inflight_operation_count_rejects_non_positive_staleness_window(
+) -> anyhow::Result<()> {
+    let url =
+        std::env::var("CLAWFORGE_TEST_DATABASE_URL").or_else(|_| std::env::var("DATABASE_URL"))?;
+    let store = PostgresStore::connect(&url).await?;
+
+    assert!(store
+        .firewall_inflight_operation_count("nftables", 0)
+        .await
+        .is_err());
+    assert!(store
+        .firewall_inflight_operation_count("nftables", -5)
+        .await
+        .is_err());
+
+    Ok(())
+}

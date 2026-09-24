@@ -597,6 +597,53 @@ Admin surface:
   confirm a past kill-switch actually completed, not just fire-and-forget
   it.
 
+## Concurrency budget per adapter (migration `0043`)
+
+Distinct from, and complementary to, the mass-block **rate** budget
+above: that one bounds how *often* real applies happen over time (DB-
+backed, already held across replicas since it existed); this one bounds
+how many may be *simultaneously in flight* against the same adapter's
+shared resource (the HAProxy Runtime API socket, the local nftables/
+netlink interface, the Tailscale Admin API) across every executor
+replica sharing this database - several replicas each claiming a
+different `execution_request` at nearly the same instant must not be
+able to hammer the same shared resource unbounded.
+
+Mechanism: `firewall_inflight_operations` (`adapter`, `execution_id`,
+`started_at`) is a reservation table, not a log - a row exists only
+while its operation is believed to be in flight.
+`try_begin_inflight(store, adapter)` inserts a reservation, then checks
+the live count (rows younger than
+`CLAWFORGE_FIREWALL_INFLIGHT_STALE_SECONDS`, default 120s) against
+`CLAWFORGE_FIREWALL_MAX_CONCURRENT_APPLIES_PER_ADAPTER` (default 5); if
+that pushes the count over budget, it immediately releases its own
+reservation and refuses. The staleness window is what makes this
+self-healing: a replica that crashes between reserving and releasing a
+slot leaks nothing permanent - the row simply ages out and stops
+counting, the same property `execution_leases` already has via its own
+expiry.
+
+This is insert-then-check, not a hard lock (e.g. `pg_advisory_lock`) -
+like the rate budget, it accepts a small, bounded race (two replicas
+reserving at nearly the same instant could both pass the check and
+briefly push the live count one over the limit) as the cost of a
+*budget*, not a safety invariant the way the never-block exclusion list
+is.
+
+Wired in at every real apply/rollback call site: `main()`'s loop
+reserves a slot per adapter `adapters_touched_by(action_name)` names
+(one adapter for `nftables.`/`haproxy.`/`haproxy_ratelimit.`/
+`tailscale.`, every `configured_multi_adapters()` adapter for
+`firewall.*`) *before* calling `dispatch()`, and releases them all
+afterward regardless of outcome; `sweep_expired_firewall_targets` and
+`sweep_kill_switch_requests` do the same around each of their own
+`rollback_target` calls. `dispatch()`/`apply_single_adapter`/
+`rollback_target` themselves stay completely unchanged (still DB-free,
+still directly unit-testable with no store) - `adapters_touched_by` is a
+separate, pure function that mirrors their routing logic from the
+outside, specifically so the concurrency tracking could be added without
+threading a `store` through them.
+
 ## What's deliberately not built yet
 
 - **No failure-injection tests** beyond lease loss/worker death (proven
@@ -612,11 +659,6 @@ Admin surface:
   against a real lab, neither errors/crashes, and the target ends up
   blocked exactly once). Still missing: process/host/DB failure between
   intent/apply/receipt/audit, reboot, clock skew, failed read-back.
-- **No concurrency budget across multiple executor replicas targeting the
-  same host** - the mass-block *rate* budget (above) is DB-backed and
-  already holds across replicas; a *concurrency* ceiling (at most N real
-  applies in flight at once, cluster-wide) is a separate, still-open
-  refinement.
 - **Both registered actions stay `enabled=FALSE`** - nothing here changes
   that a reviewed, explicit change is required before any of this can run
   for real, in a lab or otherwise, and `CLAWFORGE_EXECUTOR_DRY_RUN` stays

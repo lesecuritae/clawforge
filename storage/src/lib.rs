@@ -3442,6 +3442,69 @@ impl PostgresStore {
             .collect())
     }
 
+    /// Reserves one "in-flight" slot for a real (non-dry-run) apply or
+    /// rollback against `adapter` - the concurrency budget's own
+    /// reservation (see migration `0043`'s own comment). Always paired
+    /// with `end_firewall_inflight_operation` once the real work (or the
+    /// budget check itself, if it turns out to be over budget) is done.
+    pub async fn begin_firewall_inflight_operation(
+        &self,
+        adapter: &str,
+        execution_id: Option<Uuid>,
+    ) -> Result<Uuid> {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO firewall_inflight_operations (id,adapter,execution_id) \
+             VALUES ($1,$2,$3)",
+        )
+        .bind(id)
+        .bind(adapter)
+        .bind(execution_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(id)
+    }
+
+    /// Releases a slot reserved by `begin_firewall_inflight_operation`.
+    /// Idempotent - deleting an id that is no longer present (already
+    /// released, or aged out past the staleness window) is not an error,
+    /// since a caller must be able to call this unconditionally on every
+    /// exit path (success, failure, or "turned out to be over budget")
+    /// without needing to track whether it already ran.
+    pub async fn end_firewall_inflight_operation(&self, id: Uuid) -> Result<()> {
+        sqlx::query("DELETE FROM firewall_inflight_operations WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// How many real apply/rollback operations are currently reserved
+    /// ("in flight") for `adapter`, across every executor replica sharing
+    /// this database - the concurrency budget's own counter. Only counts
+    /// rows younger than `stale_after_seconds`, so a replica that crashes
+    /// between reserving and releasing a slot cannot leak it forever - the
+    /// row ages out and simply stops counting (the same self-healing
+    /// property `execution_leases` already has via its own expiry).
+    pub async fn firewall_inflight_operation_count(
+        &self,
+        adapter: &str,
+        stale_after_seconds: i64,
+    ) -> Result<i64> {
+        if stale_after_seconds <= 0 {
+            anyhow::bail!("stale_after_seconds must be positive");
+        }
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM firewall_inflight_operations \
+             WHERE adapter = $1 AND started_at > NOW() - ($2 * INTERVAL '1 second')",
+        )
+        .bind(adapter)
+        .bind(stale_after_seconds)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count)
+    }
+
     pub async fn record_connector_health(
         &self,
         connector_id: Uuid,

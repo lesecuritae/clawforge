@@ -542,14 +542,33 @@ Pflichtgates vor der ersten verändernden Lab-Testaktion:
   `GET /firewall/kill-switch` zeigt sowohl offene als auch bereits
   verarbeitete Anfragen.)
 - pro Adapter/Ziel gelten getestete Rate-, Concurrency- und Mass-block-Budgets
-  (**teilweise**: `clawforge-executor` verweigert einen echten (nicht
-  Dry-Run) `nftables.*`-Apply, sobald `CLAWFORGE_FIREWALL_MAX_APPLIES_PER_WINDOW`
+  (**erledigt**: `clawforge-executor` verweigert einen echten (nicht
+  Dry-Run) Apply, sobald `CLAWFORGE_FIREWALL_MAX_APPLIES_PER_WINDOW`
   (Standard 20) echte Applies innerhalb von `CLAWFORGE_FIREWALL_RATE_WINDOW_SECONDS`
   (Standard 300) bereits erfasst wurden - DB-gestuetzt ueber
   `firewall_action_receipts` selbst, nicht ein In-Prozess-Zaehler, haelt
   also auch ueber einen Prozessneustart und mehrere Executor-Replicas
-  hinweg, echt gegen Postgres getestet. Noch offen: ein Concurrency-Limit
-  ueber mehrere Replicas hinweg, die DASSELBE Zielsystem bedienen.);
+  hinweg, echt gegen Postgres getestet. **Concurrency-Limit jetzt ebenfalls
+  erledigt** (Migration `0043`): getrennt von diesem RATE-Budget begrenzt
+  es, wie viele echte Applies/Rollbacks GLEICHZEITIG gegen denselben
+  Adapter laufen duerfen, ueber alle Executor-Replicas hinweg -
+  `firewall_inflight_operations` ist eine Reservierungs-Tabelle (Zeile
+  existiert nur waehrend die Operation als laufend gilt), `try_begin_
+  inflight` reserviert einen Platz und prueft danach den lebenden
+  Zaehlerstand (nur Zeilen juenger als `CLAWFORGE_FIREWALL_INFLIGHT_
+  STALE_SECONDS`, Standard 120s) gegen `CLAWFORGE_FIREWALL_MAX_CONCURRENT_
+  APPLIES_PER_ADAPTER` (Standard 5); bei Ueberschreitung wird die eigene
+  Reservierung sofort wieder freigegeben. Das Staleness-Fenster macht das
+  selbstheilend - ein zwischen Reservieren und Freigeben abgestuerzter
+  Replica hinterlaesst nichts Dauerhaftes, die Zeile veraltet einfach.
+  Bewusst insert-then-check statt harte Sperre (wie schon beim RATE-Budget)
+  - ein kleines, begrenztes Race wird als Budget-Kosten akzeptiert, keine
+  Sicherheitsinvariante wie die Never-block-Liste. `dispatch()`/
+  `apply_single_adapter`/`rollback_target` bleiben dabei unveraendert
+  DB-frei (direkt unit-testbar ohne Store) - eine neue, reine Funktion
+  `adapters_touched_by` spiegelt deren Routing von aussen, `main()`s
+  Schleife reserviert/gibt frei rund um den `dispatch()`-Aufruf, die
+  beiden Sweeps rund um ihre eigenen `rollback_target`-Aufrufe.);
   Zielnormalisierung und technische Ausschlusslisten decken
   IPv4, IPv6, CIDR und IPv4-mapped IPv6 ab (**erledigt fuer die
   Ausschlussliste**: `NftablesAdapter` laedt eine eingebaute Loopback-/

@@ -178,6 +178,11 @@ GRANT INSERT, SELECT ON TABLE firewall_action_receipts TO clawforge_executor;
 -- inserts one itself (clawforge-api does that, via its own blanket
 -- grant), so no INSERT here.
 GRANT SELECT, UPDATE ON TABLE firewall_kill_switch_requests TO clawforge_executor;
+-- Concurrency-budget reservation table (migration 0043): the executor
+-- both reserves (INSERT) and releases (DELETE) its own slots, plus reads
+-- (SELECT) the live count - clawforge_api never touches this table at
+-- all (it only ever records kill-switch *intent*, never a real apply).
+GRANT INSERT, SELECT, DELETE ON TABLE firewall_inflight_operations TO clawforge_executor;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO clawforge_executor;
 REVOKE UPDATE ON TABLE audit_events FROM clawforge_executor;
 

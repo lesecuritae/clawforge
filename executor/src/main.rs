@@ -36,6 +36,19 @@ use uuid::Uuid;
 const DEFAULT_FIREWALL_ACTION_TTL_SECONDS: u32 = 3600;
 const DEFAULT_FIREWALL_RATE_WINDOW_SECONDS: i64 = 300;
 const DEFAULT_FIREWALL_MAX_APPLIES_PER_WINDOW: i64 = 20;
+/// The concurrency budget: at most this many real apply/rollback calls
+/// may be simultaneously "in flight" (reserved, not yet released) against
+/// one adapter at once, across every executor replica sharing this
+/// database - see `try_begin_inflight`'s own doc comment.
+const DEFAULT_FIREWALL_MAX_CONCURRENT_APPLIES_PER_ADAPTER: i64 = 5;
+/// How long a reservation keeps counting toward the concurrency budget
+/// before it is treated as stale (and therefore ignored) - long enough to
+/// cover any real apply/rollback call this codebase makes (all of them
+/// are single local syscalls or a handful of HTTP/socket round trips, not
+/// long-running operations), short enough that a crashed replica's leaked
+/// reservation self-heals reasonably quickly rather than needing a
+/// separate cleanup job.
+const DEFAULT_FIREWALL_INFLIGHT_STALE_SECONDS: i64 = 120;
 /// A `firewall.*` action (as opposed to `nftables.*`/`haproxy.*`/
 /// `haproxy_ratelimit.*`) fans out to every configured adapter - see
 /// `dispatch_multi_adapter`'s own doc comment.
@@ -63,6 +76,22 @@ fn firewall_max_applies_per_window() -> i64 {
         .and_then(|value| value.parse::<i64>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_FIREWALL_MAX_APPLIES_PER_WINDOW)
+}
+
+fn firewall_max_concurrent_applies_per_adapter() -> i64 {
+    env::var("CLAWFORGE_FIREWALL_MAX_CONCURRENT_APPLIES_PER_ADAPTER")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_FIREWALL_MAX_CONCURRENT_APPLIES_PER_ADAPTER)
+}
+
+fn firewall_inflight_stale_seconds() -> i64 {
+    env::var("CLAWFORGE_FIREWALL_INFLIGHT_STALE_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_FIREWALL_INFLIGHT_STALE_SECONDS)
 }
 
 /// Whether a claimed request needs a mass-block budget check at all - a
@@ -126,6 +155,36 @@ fn configured_multi_adapters() -> Vec<String> {
     names
 }
 
+/// Which adapter(s) `action_name` will actually touch if dispatched for
+/// real - the concurrency budget's own "which counter(s) does this
+/// reserve a slot in" key(s). Mirrors `dispatch()`'s own routing (a
+/// single-adapter prefix routes to one adapter; `firewall.*` fans out to
+/// every `configured_multi_adapters()` adapter) as a separate, pure,
+/// DB-free function rather than threading a `store` into `dispatch()`/
+/// `apply_single_adapter` themselves (which stay DB-free on purpose, see
+/// `dispatch()`'s own doc comment) - `main()`'s loop calls this *before*
+/// calling `dispatch()`, reserves a slot in each returned adapter's
+/// counter, calls `dispatch()`, then releases them, wrapping the call
+/// from outside instead of threading concurrency-tracking through it.
+fn adapters_touched_by(action_name: &str) -> Vec<String> {
+    if action_name.starts_with(FIREWALL_MULTI_ADAPTER_PREFIX) {
+        return configured_multi_adapters();
+    }
+    if action_name.starts_with(TAILSCALE_ACTION_PREFIX) {
+        return vec!["tailscale".to_string()];
+    }
+    if action_name.starts_with("haproxy_ratelimit.") {
+        return vec!["haproxy_ratelimit".to_string()];
+    }
+    if action_name.starts_with("haproxy.") {
+        return vec!["haproxy".to_string()];
+    }
+    if action_name.starts_with("nftables.") {
+        return vec!["nftables".to_string()];
+    }
+    Vec::new()
+}
+
 /// Picks the adapter an `nftables.`/`haproxy.`/`haproxy_ratelimit.`-prefixed
 /// action name (or, for the TTL sweep, an `adapter` column value -
 /// `"nftables"`/`"haproxy"`/`"haproxy_ratelimit"`, no trailing dot) routes
@@ -158,11 +217,9 @@ fn adapter_for(name: &str) -> Option<Box<dyn FirewallAdapter>> {
 /// `recent_real_firewall_apply_count` rather than an in-memory counter, so
 /// the budget holds across a process restart and across multiple executor
 /// replicas sharing this database - see that method's own doc comment.
-/// Concurrency (more than one real apply in flight at once) is not a
-/// separate counter here: this loop claims and dispatches one request per
-/// tick, sequentially, so within a single process it is already 1 by
-/// construction; bounding it across multiple replicas targeting the *same*
-/// host is a still-open item (see docs/firewall-agent.md).
+/// Bounds *how often* real applies happen over time; `try_begin_inflight`
+/// (below) is the separate, per-adapter budget for how many may be
+/// *simultaneously* in flight - the two are independent and both apply.
 async fn firewall_mass_block_budget_exceeded(
     store: &PostgresStore,
     action_name: &str,
@@ -182,6 +239,43 @@ async fn firewall_mass_block_budget_exceeded(
         )));
     }
     Ok(None)
+}
+
+/// The concurrency budget: reserves one "in flight" slot for a real
+/// apply/rollback against `adapter`, refusing (and immediately releasing
+/// its own reservation again) if that would push the count over
+/// `CLAWFORGE_FIREWALL_MAX_CONCURRENT_APPLIES_PER_ADAPTER` - bounding how
+/// many real operations may run *simultaneously* against the same
+/// adapter's shared resource (the HAProxy Runtime API socket, the local
+/// nftables/netlink interface, the Tailscale Admin API) across every
+/// executor replica sharing this database, distinct from the mass-block
+/// budget's *rate-over-time* bound above. Returns the reservation id to
+/// release via `store.end_firewall_inflight_operation` once the real work
+/// is done - `Ok(None)` means "refused, nothing to release".
+///
+/// Deliberately insert-then-check rather than a hard lock (e.g.
+/// `pg_advisory_lock`): like the mass-block budget, this accepts a small,
+/// bounded race (two replicas reserving at nearly the same instant could
+/// both pass the check and briefly push the live count one over the
+/// limit) as the cost of a budget, not a safety invariant the way the
+/// never-block exclusion list is - the same trade-off this codebase
+/// already makes for the rate budget above.
+async fn try_begin_inflight(store: &PostgresStore, adapter: &str) -> Result<Option<Uuid>, String> {
+    let id = store
+        .begin_firewall_inflight_operation(adapter, None)
+        .await
+        .map_err(|error| error.to_string())?;
+    let max = firewall_max_concurrent_applies_per_adapter();
+    let stale = firewall_inflight_stale_seconds();
+    let count = store
+        .firewall_inflight_operation_count(adapter, stale)
+        .await
+        .map_err(|error| error.to_string())?;
+    if count > max {
+        let _ = store.end_firewall_inflight_operation(id).await;
+        return Ok(None);
+    }
+    Ok(Some(id))
 }
 
 /// Everything `dispatch()` gathers for a successful firewall apply, for
@@ -316,8 +410,24 @@ async fn sweep_expired_firewall_targets(store: &PostgresStore) {
         }
     };
     for target in expired {
+        let inflight_id = match try_begin_inflight(store, &target.adapter).await {
+            Ok(Some(id)) => id,
+            Ok(None) => {
+                tracing::warn!(
+                    receipt_id = %target.receipt_id, adapter = %target.adapter,
+                    "concurrency budget exceeded - will retry this expired target next tick"
+                );
+                continue;
+            }
+            Err(error) => {
+                tracing::warn!(%error, receipt_id = %target.receipt_id, adapter = %target.adapter, "could not check the concurrency budget - will retry next tick");
+                continue;
+            }
+        };
         let context = format!("ttl expired auto-rollback (receipt {})", target.receipt_id);
-        if let Err(error) = rollback_target(&target.adapter, &target.target_json, context).await {
+        let result = rollback_target(&target.adapter, &target.target_json, context).await;
+        let _ = store.end_firewall_inflight_operation(inflight_id).await;
+        if let Err(error) = result {
             tracing::warn!(
                 %error, receipt_id = %target.receipt_id, adapter = %target.adapter,
                 "auto-rollback of an expired firewall target failed - will retry next tick"
@@ -384,12 +494,28 @@ async fn sweep_kill_switch_requests(store: &PostgresStore) {
         }
     };
     for request in pending {
+        let inflight_id = match try_begin_inflight(store, &request.adapter).await {
+            Ok(Some(id)) => id,
+            Ok(None) => {
+                tracing::warn!(
+                    request_id = %request.request_id, adapter = %request.adapter,
+                    "concurrency budget exceeded - will retry this kill-switch request next tick"
+                );
+                continue;
+            }
+            Err(error) => {
+                tracing::warn!(%error, request_id = %request.request_id, adapter = %request.adapter, "could not check the concurrency budget - will retry next tick");
+                continue;
+            }
+        };
         let context = format!(
             "kill-switch request {} ({})",
             request.request_id,
             request.reason.as_deref().unwrap_or("no reason given")
         );
-        if let Err(error) = rollback_target(&request.adapter, &request.target_json, context).await {
+        let result = rollback_target(&request.adapter, &request.target_json, context).await;
+        let _ = store.end_firewall_inflight_operation(inflight_id).await;
+        if let Err(error) = result {
             tracing::warn!(
                 %error, request_id = %request.request_id, adapter = %request.adapter,
                 "kill-switch rollback failed - will retry next tick"
@@ -762,6 +888,39 @@ async fn main() -> anyhow::Result<()> {
                                 Some(format!("could not check mass-block budget: {error}"))
                             }
                         };
+                        // Concurrency budget: reserve a slot in every
+                        // adapter this action would touch *before*
+                        // dispatching for real, so two replicas racing to
+                        // claim different requests against the same
+                        // adapter cannot both proceed unbounded. Only
+                        // relevant for a real (non-dry-run) firewall
+                        // action that the mass-block budget has not
+                        // already refused - see `firewall_budget_applies`.
+                        let mut inflight_ids = Vec::new();
+                        let mut concurrency_refusal = None;
+                        if refusal.is_none()
+                            && firewall_budget_applies(&claimed.action_name, dry_run_from_env())
+                        {
+                            for adapter in adapters_touched_by(&claimed.action_name) {
+                                match try_begin_inflight(&store, &adapter).await {
+                                    Ok(Some(id)) => inflight_ids.push(id),
+                                    Ok(None) => {
+                                        concurrency_refusal = Some(format!(
+                                            "concurrency budget exceeded for adapter {adapter:?} \
+                                             (see CLAWFORGE_FIREWALL_MAX_CONCURRENT_APPLIES_PER_ADAPTER)"
+                                        ));
+                                        break;
+                                    }
+                                    Err(error) => {
+                                        tracing::warn!(%error, execution_id = %claimed.id, %adapter, "could not check the concurrency budget");
+                                        concurrency_refusal =
+                                            Some(format!("could not check concurrency budget: {error}"));
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        let refusal = refusal.or(concurrency_refusal);
                         let (success, result_summary, error_summary, receipts) =
                             if let Some(reason) = refusal {
                                 tracing::warn!(execution_id = %claimed.id, action = %claimed.action_name, reason = %reason, "refusing dispatch");
@@ -769,6 +928,14 @@ async fn main() -> anyhow::Result<()> {
                             } else {
                                 dispatch(&claimed).await
                             };
+                        // Release every reserved slot regardless of how
+                        // dispatch turned out - a partial reservation
+                        // (concurrency_refusal broke out of the loop
+                        // early) only ever holds the ones it actually
+                        // acquired, so this is correct for that case too.
+                        for id in inflight_ids {
+                            let _ = store.end_firewall_inflight_operation(id).await;
+                        }
                         // One receipt row per adapter that actually applied -
                         // a firewall.* fan-out (dispatch_multi_adapter) can
                         // produce more than one; every other action produces
@@ -914,6 +1081,45 @@ mod tests {
         );
         assert!(adapter_for("tailscale.quarantine_device").is_none());
         assert!(adapter_for("docker.restart_container").is_none());
+    }
+
+    #[test]
+    fn adapters_touched_by_matches_dispatchs_own_routing() {
+        assert_eq!(
+            adapters_touched_by("nftables.block_indicator"),
+            vec!["nftables"]
+        );
+        assert_eq!(
+            adapters_touched_by("haproxy.block_indicator"),
+            vec!["haproxy"]
+        );
+        // Same ordering trap as `adapter_for` - must not be misrouted to
+        // the plain "haproxy" domain.
+        assert_eq!(
+            adapters_touched_by("haproxy_ratelimit.block_indicator"),
+            vec!["haproxy_ratelimit"]
+        );
+        assert_eq!(
+            adapters_touched_by("tailscale.quarantine_device"),
+            vec!["tailscale"]
+        );
+        assert!(
+            adapters_touched_by("docker.restart_container").is_empty(),
+            "a non-firewall action touches no adapter's concurrency budget"
+        );
+        // firewall.* must reserve a slot in every configured adapter,
+        // nftables always among them (mirrors configured_multi_adapters).
+        // SAFETY: single-threaded test process.
+        std::env::remove_var("CLAWFORGE_FIREWALL_ADAPTERS");
+        assert_eq!(
+            adapters_touched_by("firewall.block_indicator"),
+            vec!["nftables"]
+        );
+        std::env::set_var("CLAWFORGE_FIREWALL_ADAPTERS", "haproxy");
+        let touched = adapters_touched_by("firewall.block_indicator");
+        assert!(touched.contains(&"nftables".to_string()));
+        assert!(touched.contains(&"haproxy".to_string()));
+        std::env::remove_var("CLAWFORGE_FIREWALL_ADAPTERS");
     }
 
     #[tokio::test]
