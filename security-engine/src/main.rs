@@ -71,6 +71,38 @@ const HTTP_ANOMALY_BURST: CountThresholdRule = CountThresholdRule {
 
 const RULES: &[CountThresholdRule] = &[SSH_BRUTEFORCE, HTTP_ANOMALY_BURST];
 
+/// A scan/reconnaissance rule: not "how many events", but "how many
+/// *distinct* values of one evidence field" - the shape a vulnerability
+/// scanner actually has (many different paths probed, each maybe only
+/// once) and `http_anomaly_burst` cannot express (a burst counts raw
+/// volume regardless of whether every hit is the same path or a hundred
+/// different ones). Same pseudonymous-source grouping and deterministic
+/// tumbling-window bucket as a `CountThresholdRule`; the only difference is
+/// counting `COUNT(DISTINCT payload->>field)` instead of `COUNT(*)`.
+struct DistinctValueThresholdRule {
+    rule_id: &'static str,
+    rule_version: &'static str,
+    event_type: &'static str,
+    /// The evidence JSON field to count distinct values of - e.g. `"path"`
+    /// on `HttpAnomalyEvidence`. Already pseudonymized/sanitized like every
+    /// other field on the canonical event, so this rule never needs to
+    /// parse or store anything sensitive itself.
+    field: &'static str,
+    window_seconds: i64,
+    threshold: usize,
+}
+
+const HTTP_SCAN: DistinctValueThresholdRule = DistinctValueThresholdRule {
+    rule_id: "http_scan",
+    rule_version: "1",
+    event_type: "http_anomaly",
+    field: "path",
+    window_seconds: 300,
+    threshold: 8,
+};
+
+const DISTINCT_VALUE_RULES: &[DistinctValueThresholdRule] = &[HTTP_SCAN];
+
 /// How long an incident candidate stays open to be extended by a later
 /// bucket from the same resource/rule, deliberately much longer than any
 /// single rule's own detection window - an attacker rarely stops after
@@ -100,11 +132,100 @@ fn confidence_for_count(count: usize, threshold: usize) -> i16 {
     (60 + over * 4).clamp(60, 99)
 }
 
-/// Evaluate one rule against the event that just arrived. Cheap and
-/// idempotent to call for every qualifying event, including ones below
-/// threshold (a no-op until the bucket's count crosses it) - the caller
-/// does not need to know in advance which event will be the one that tips
-/// it over.
+/// The common tail every rule shares once it has decided to fire: persist
+/// the assessment, extend/create the incident candidate via the reused
+/// `persist_correlation` path, and best-effort-link the two. Pulled out of
+/// `evaluate_rule` so `evaluate_scan_rule` (a different membership query,
+/// distinct-value instead of raw-count) does not have to duplicate it.
+#[allow(clippy::too_many_arguments)]
+async fn persist_assessment_and_incident(
+    store: &PostgresStore,
+    rule_id: &'static str,
+    rule_version: &'static str,
+    window_seconds: i64,
+    correlation_id: &str,
+    bucket: DateTime<Utc>,
+    event_ids: &[Uuid],
+    first_seen: DateTime<Utc>,
+    last_seen: DateTime<Utc>,
+    severity: &'static str,
+    confidence: i16,
+    summary: &str,
+) -> Result<()> {
+    let dedupe_key = format!(
+        "{rule_id}:v{rule_version}:{correlation_id}:{}",
+        bucket.timestamp()
+    );
+    let assessment_id = store
+        .persist_security_assessment(SecurityAssessmentUpsert {
+            rule_id,
+            rule_version,
+            engine_version: ENGINE_VERSION,
+            dedupe_key: &dedupe_key,
+            resource: correlation_id,
+            severity,
+            confidence,
+            summary,
+            event_count: event_ids.len() as i32,
+            window_seconds: window_seconds as i32,
+            bucket_start: bucket,
+            first_seen,
+            last_seen,
+            event_ids,
+        })
+        .await?;
+    // Reuse the existing, already-idempotent/escalation-aware incident
+    // candidate path (clawforge-correlation's persist_correlation) instead
+    // of a second incident-creation mechanism. The candidate key is stable
+    // across buckets (not bucket-scoped, unlike the assessment's own
+    // dedupe_key) so a later bucket from the same resource/rule extends the
+    // same candidate rather than spawning a new incident every window.
+    let candidate_key = format!("security-assessment:{rule_id}:{correlation_id}");
+    // persist_correlation returns incident_candidates.id, NOT incidents.id -
+    // promote_incident_candidates always mints a fresh, distinct id for the
+    // incident row itself (see its own doc comment), so the two must never
+    // be conflated.
+    let candidate_id = store
+        .persist_correlation(CorrelationPersistence {
+            correlation_key: &candidate_key,
+            confidence,
+            severity,
+            summary,
+            first_seen,
+            last_seen,
+            window: CANDIDATE_EXTENSION_WINDOW,
+            event_ids,
+            relationships: &[],
+        })
+        .await?;
+    // Linking security_assessments.incident_id is a best-effort courtesy
+    // (it only ever sets an unset column, and nothing downstream relies on
+    // it for correctness - the incident itself already exists and is
+    // escalation-safe via persist_correlation regardless), so a candidate
+    // that has not been promoted yet simply leaves it NULL here; the next
+    // promotion pass does not retroactively backfill it, unlike alerts.
+    match store.get_incident_id_for_candidate(candidate_id).await {
+        Ok(Some(incident_id)) => {
+            if let Err(error) = store
+                .link_security_assessment_incident(assessment_id, incident_id)
+                .await
+            {
+                warn!(%error, "could not link security assessment to its incident");
+            }
+        }
+        Ok(None) => {}
+        Err(error) => {
+            warn!(%error, "could not look up the incident for a candidate");
+        }
+    }
+    Ok(())
+}
+
+/// Evaluate one count-threshold rule against the event that just arrived.
+/// Cheap and idempotent to call for every qualifying event, including ones
+/// below threshold (a no-op until the bucket's count crosses it) - the
+/// caller does not need to know in advance which event will be the one
+/// that tips it over.
 async fn evaluate_rule(
     store: &PostgresStore,
     rule: &CountThresholdRule,
@@ -145,76 +266,96 @@ async fn evaluate_rule(
         "{} events of type {} from the same source within {}s (rule {} v{})",
         count, rule.event_type, rule.window_seconds, rule.rule_id, rule.rule_version
     );
-    let dedupe_key = format!(
-        "{}:v{}:{}:{}",
+    persist_assessment_and_incident(
+        store,
         rule.rule_id,
         rule.rule_version,
+        rule.window_seconds,
         correlation_id,
-        bucket.timestamp()
-    );
-    let assessment_id = store
-        .persist_security_assessment(SecurityAssessmentUpsert {
-            rule_id: rule.rule_id,
-            rule_version: rule.rule_version,
-            engine_version: ENGINE_VERSION,
-            dedupe_key: &dedupe_key,
-            resource: correlation_id,
-            severity,
-            confidence,
-            summary: &summary,
-            event_count: count as i32,
-            window_seconds: rule.window_seconds as i32,
-            bucket_start: bucket,
-            first_seen,
-            last_seen,
-            event_ids: &event_ids,
-        })
+        bucket,
+        &event_ids,
+        first_seen,
+        last_seen,
+        severity,
+        confidence,
+        &summary,
+    )
+    .await
+}
+
+/// Evaluate one distinct-value rule (a scan) against the event that just
+/// arrived. Same shape as `evaluate_rule`, except membership counts
+/// `COUNT(DISTINCT payload->>field)`, not `COUNT(*)` - a source hitting the
+/// same path 50 times is a burst, not a scan; a source hitting eight
+/// different paths once each is a scan even though the raw count is lower.
+async fn evaluate_scan_rule(
+    store: &PostgresStore,
+    rule: &DistinctValueThresholdRule,
+    event: &EventRecord,
+) -> Result<()> {
+    let Some(correlation_id) = event
+        .correlation_id
+        .as_deref()
+        .filter(|v| !v.trim().is_empty())
+    else {
+        return Ok(());
+    };
+    let bucket = bucket_start(event.occurred_at, rule.window_seconds);
+    let bucket_end = bucket + Duration::seconds(rule.window_seconds);
+    let members = store
+        .list_events_for_bucket_with_field(
+            rule.event_type,
+            correlation_id,
+            rule.field,
+            bucket,
+            bucket_end,
+        )
         .await?;
-    // Reuse the existing, already-idempotent/escalation-aware incident
-    // candidate path (clawforge-correlation's persist_correlation) instead
-    // of a second incident-creation mechanism. The candidate key is stable
-    // across buckets (not bucket-scoped, unlike the assessment's own
-    // dedupe_key) so a later bucket from the same resource/rule extends the
-    // same candidate rather than spawning a new incident every window.
-    let candidate_key = format!("security-assessment:{}:{}", rule.rule_id, correlation_id);
-    // persist_correlation returns incident_candidates.id, NOT incidents.id -
-    // promote_incident_candidates always mints a fresh, distinct id for the
-    // incident row itself (see its own doc comment), so the two must never
-    // be conflated.
-    let candidate_id = store
-        .persist_correlation(CorrelationPersistence {
-            correlation_key: &candidate_key,
-            confidence,
-            severity,
-            summary: &summary,
-            first_seen,
-            last_seen,
-            window: CANDIDATE_EXTENSION_WINDOW,
-            event_ids: &event_ids,
-            relationships: &[],
-        })
-        .await?;
-    // Linking security_assessments.incident_id is a best-effort courtesy
-    // (it only ever sets an unset column, and nothing downstream relies on
-    // it for correctness - the incident itself already exists and is
-    // escalation-safe via persist_correlation regardless), so a candidate
-    // that has not been promoted yet simply leaves it NULL here; the next
-    // promotion pass does not retroactively backfill it, unlike alerts.
-    match store.get_incident_id_for_candidate(candidate_id).await {
-        Ok(Some(incident_id)) => {
-            if let Err(error) = store
-                .link_security_assessment_incident(assessment_id, incident_id)
-                .await
-            {
-                warn!(%error, "could not link security assessment to its incident");
-            }
-        }
-        Ok(None) => {}
-        Err(error) => {
-            warn!(%error, "could not look up the incident for a candidate");
-        }
+    let distinct_values: std::collections::BTreeSet<&str> = members
+        .iter()
+        .filter_map(|(_, _, value)| value.as_deref())
+        .collect();
+    if distinct_values.len() < rule.threshold {
+        return Ok(());
     }
-    Ok(())
+    let event_ids: Vec<Uuid> = members.iter().map(|(id, _, _)| *id).collect();
+    let first_seen = members
+        .first()
+        .map(|(_, at, _)| *at)
+        .unwrap_or(event.occurred_at);
+    let last_seen = members
+        .last()
+        .map(|(_, at, _)| *at)
+        .unwrap_or(event.occurred_at);
+    let distinct_count = distinct_values.len();
+    let severity = severity_for_count(distinct_count, rule.threshold);
+    let confidence = confidence_for_count(distinct_count, rule.threshold);
+    let summary = format!(
+        "{} distinct {} values across {} events of type {} from the same source within {}s \
+         (rule {} v{})",
+        distinct_count,
+        rule.field,
+        members.len(),
+        rule.event_type,
+        rule.window_seconds,
+        rule.rule_id,
+        rule.rule_version
+    );
+    persist_assessment_and_incident(
+        store,
+        rule.rule_id,
+        rule.rule_version,
+        rule.window_seconds,
+        correlation_id,
+        bucket,
+        &event_ids,
+        first_seen,
+        last_seen,
+        severity,
+        confidence,
+        &summary,
+    )
+    .await
 }
 
 #[derive(Debug, Clone)]
@@ -249,6 +390,11 @@ async fn process_delivery(store: &PostgresStore, event: EventRecord) -> Result<(
             evaluate_rule(store, rule, &event).await?;
         }
     }
+    for rule in DISTINCT_VALUE_RULES {
+        if rule.event_type == event.event_type {
+            evaluate_scan_rule(store, rule, &event).await?;
+        }
+    }
     Ok(())
 }
 
@@ -271,7 +417,11 @@ async fn main() -> Result<()> {
     store
         .set_runtime_status(CONSUMER_NAME, "running", None)
         .await?;
-    info!(rules = RULES.len(), "Clawforge security engine started");
+    info!(
+        count_threshold_rules = RULES.len(),
+        distinct_value_rules = DISTINCT_VALUE_RULES.len(),
+        "Clawforge security engine started"
+    );
     let mut interval = tokio::time::interval(poll);
     loop {
         tokio::select! {
@@ -521,6 +671,130 @@ mod tests {
                 .fetch_one(owner.pool())
                 .await?;
         assert_eq!(assessment_incident_id, Some(incident_id));
+
+        Ok(())
+    }
+
+    async fn publish_http_anomaly(
+        store: &PostgresStore,
+        correlation_id: &str,
+        occurred_at: DateTime<Utc>,
+        path: &str,
+        nonce: &str,
+    ) -> Result<EventRecord> {
+        store
+            .publish_event(
+                "http_anomaly",
+                "test-sensor",
+                "low",
+                occurred_at,
+                Some(correlation_id),
+                serde_json::json!({"path": path, "status_code": 404}),
+                serde_json::json!({}),
+                &format!("test:http_anomaly:{correlation_id}:{nonce}"),
+            )
+            .await?;
+        Ok(EventRecord {
+            event_type: "http_anomaly".to_string(),
+            occurred_at,
+            correlation_id: Some(correlation_id.to_string()),
+        })
+    }
+
+    /// Proves the distinct-value rule against real PostgreSQL: many hits on
+    /// the *same* path never fire it (a burst, not a scan - exactly what
+    /// `http_anomaly_burst` exists for instead), but the same number of
+    /// hits spread across enough *distinct* paths does; a real assessment
+    /// and incident result, via the same reused, already-tested path the
+    /// count-threshold rule uses.
+    #[tokio::test]
+    #[ignore = "requires provisioned roles in an isolated PostgreSQL test container"]
+    async fn http_scan_rule_ignores_a_same_path_burst_but_fires_on_path_diversity() -> Result<()> {
+        let owner_url = env::var("CLAWFORGE_TEST_DATABASE_URL")?;
+        let owner = PostgresStore::connect_runtime(&owner_url).await?;
+        let engine = PostgresStore::connect_runtime(&test_url("security_engine")?).await?;
+        // Also promoted at the end, not just asserted as an open candidate:
+        // promote_incident_candidates(limit) processes every open candidate
+        // in the whole database, not just this test's - an unpromoted one
+        // left behind here would otherwise inflate a *later* test's own
+        // "exactly N newly promoted" count (this is a real, previously hit
+        // test-isolation gap: ssh_bruteforce's own promotion count was 2,
+        // not 1, before this test cleaned up after itself).
+        let incidents = PostgresStore::connect_runtime(&test_url("incidents")?).await?;
+
+        let resource = format!("ip-pseudonym:test-{}", Uuid::new_v4());
+        let bucket = bucket_start(Utc::now(), HTTP_SCAN.window_seconds);
+
+        // Eight hits, but all the same path - a burst the scan rule must
+        // not mistake for reconnaissance.
+        let mut last_event = None;
+        for i in 0..8 {
+            let occurred_at = bucket + Duration::seconds(i * 10);
+            let event = publish_http_anomaly(
+                &owner,
+                &resource,
+                occurred_at,
+                "/repeated",
+                &format!("same-path-{i}"),
+            )
+            .await?;
+            evaluate_scan_rule(&engine, &HTTP_SCAN, &event).await?;
+            last_event = Some(event);
+        }
+        let _ = last_event;
+        let dedupe_key = format!("http_scan:v1:{resource}:{}", bucket.timestamp());
+        let same_path_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM security_assessments WHERE dedupe_key=$1")
+                .bind(&dedupe_key)
+                .fetch_one(owner.pool())
+                .await?;
+        assert_eq!(
+            same_path_count, 0,
+            "a same-path burst must not be mistaken for a scan"
+        );
+
+        // A second, distinct resource: eight hits across eight distinct
+        // paths - genuine path diversity, must fire.
+        let scanning_resource = format!("ip-pseudonym:test-scan-{}", Uuid::new_v4());
+        let scan_dedupe_key = format!("http_scan:v1:{scanning_resource}:{}", bucket.timestamp());
+        for i in 0..8 {
+            let occurred_at = bucket + Duration::seconds(i * 10);
+            let event = publish_http_anomaly(
+                &owner,
+                &scanning_resource,
+                occurred_at,
+                &format!("/probe-{i}"),
+                &format!("distinct-path-{i}"),
+            )
+            .await?;
+            evaluate_scan_rule(&engine, &HTTP_SCAN, &event).await?;
+        }
+        let event_count: i32 =
+            sqlx::query_scalar("SELECT event_count FROM security_assessments WHERE dedupe_key=$1")
+                .bind(&scan_dedupe_key)
+                .fetch_one(owner.pool())
+                .await?;
+        assert_eq!(event_count, 8);
+
+        let candidate_key = format!("security-assessment:http_scan:{scanning_resource}");
+        let candidate_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM incident_candidates WHERE correlation_key=$1")
+                .bind(&candidate_key)
+                .fetch_one(owner.pool())
+                .await?;
+        assert_eq!(candidate_count, 1);
+
+        // Promote it too, proving the scan rule's candidate is genuinely
+        // promotable (not just an inert row) and leaving no open candidate
+        // behind for a later test's own promotion-count assertion to trip
+        // over.
+        assert_eq!(incidents.promote_incident_candidates(10).await?, 1);
+        let incident_severity: String =
+            sqlx::query_scalar("SELECT severity FROM incidents WHERE correlation_key=$1")
+                .bind(&candidate_key)
+                .fetch_one(owner.pool())
+                .await?;
+        assert_eq!(incident_severity, "medium");
 
         Ok(())
     }

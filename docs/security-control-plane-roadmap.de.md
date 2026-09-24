@@ -182,9 +182,17 @@ Arbeitspakete:
   resource/bucket_start.)
 - Regeln für SSH-Bruteforce, Scans, Multi-Target-Angriffe, HTTP-Anomalien sowie
   Threat-Intel-plus-Verhalten implementieren. (**teilweise**: `ssh_bruteforce`
-  und `http_anomaly_burst` als deterministische Zähl-Schwellwert-Regeln über
-  ein festes Tumbling-Window implementiert und mit echtem Postgres getestet.
-  Scan-/Multi-Target-/Threat-Intel-plus-Verhalten-Regeln noch offen.)
+  und `http_anomaly_burst` als deterministische Zähl-Schwellwert-Regeln,
+  `http_scan` als Distinct-Value-Schwellwert-Regel (viele verschiedene Pfade
+  statt vieler Treffer - erkennt Scanner-Verhalten, das ein reiner Zähler
+  nicht von einem Burst unterscheiden könnte), alle drei über ein festes
+  Tumbling-Window, mit echtem Postgres getestet. Echte Multi-Target-Regel
+  (eine Quelle gegen mehrere verschiedene Zielhosts) noch nicht sinnvoll
+  umsetzbar - aktuell nur ein ueberwachter SSH- und ein ueberwachter
+  HTTP-Endpunkt. Threat-Intel-plus-Verhalten noch offen (die
+  `intelligence`-Crate liefert Spamhaus DROP/EDROP/ASN-DROP, RPKI-, BGP- und
+  ASN-Signale bereits - die Verknuepfung mit den Verhaltens-Assessments hier
+  ist Aufgabe von Phase 5 "Policy Engine", nicht dieser Crate.)
 - minimale Provenance-, Freshness-, Confidence- und Konfliktregeln für alle
   verwendeten Threat-Intel-Signale implementieren; stale/unklare Daten dürfen
   keine automatische Klasse erreichen. (noch offen)

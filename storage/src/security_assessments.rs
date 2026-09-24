@@ -78,6 +78,43 @@ impl PostgresStore {
             .collect())
     }
 
+    /// Same bucket membership as `list_events_for_bucket`, plus one evidence
+    /// field's value per event (`payload->>field`) - what a distinct-value
+    /// rule (a scan: many different paths probed, not just many hits) needs
+    /// to count `COUNT(DISTINCT ...)` over in Rust, without ever needing a
+    /// second, field-specific storage method for each such rule.
+    pub async fn list_events_for_bucket_with_field(
+        &self,
+        event_type: &str,
+        correlation_id: &str,
+        field: &str,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) -> Result<Vec<(Uuid, DateTime<Utc>, Option<String>)>> {
+        let rows = sqlx::query(
+            "SELECT event_id, occurred_at, payload->>$5 AS field_value FROM events \
+             WHERE event_type=$1 AND correlation_id=$2 AND occurred_at >= $3 AND occurred_at < $4 \
+             ORDER BY occurred_at ASC LIMIT 1000",
+        )
+        .bind(event_type)
+        .bind(correlation_id)
+        .bind(from)
+        .bind(to)
+        .bind(field)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                (
+                    row.get("event_id"),
+                    row.get("occurred_at"),
+                    row.get("field_value"),
+                )
+            })
+            .collect())
+    }
+
     /// Upsert one assessment and its evidence references. Idempotent by
     /// `dedupe_key`: a repeat call with the same key (a replay, or the same
     /// bucket recomputed as later events in it are processed) updates the

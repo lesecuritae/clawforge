@@ -66,20 +66,33 @@ caught in the very next one.
 
 Currently implemented (`security-engine/src/main.rs`):
 
-- **`ssh_bruteforce`** (v1): 5+ `ssh_login_failure` events from the same
-  pseudonymous source within 300s.
-- **`http_anomaly_burst`** (v1): 10+ `http_anomaly` events from the same
-  pseudonymous source within 300s.
+- **`ssh_bruteforce`** (v1, `CountThresholdRule`): 5+ `ssh_login_failure`
+  events from the same pseudonymous source within 300s.
+- **`http_anomaly_burst`** (v1, `CountThresholdRule`): 10+ `http_anomaly`
+  events from the same pseudonymous source within 300s.
+- **`http_scan`** (v1, `DistinctValueThresholdRule`): 8+ *distinct* `path`
+  values across `http_anomaly` events from the same pseudonymous source
+  within 300s - not a raw count. A scanner probing eight different
+  endpoints once each and a script hammering the same endpoint eight times
+  are different behaviors; `http_anomaly_burst` catches the second, this
+  catches the first. `evaluate_rule` and `evaluate_scan_rule` share the
+  same persistence tail (`persist_assessment_and_incident`) so both kinds
+  of rule inherit the same dedupe/replay/incident-reuse behavior from one
+  place.
 
-Severity/confidence scale with how far over the threshold the count is
-(`severity_for_count`/`confidence_for_count`). Not yet implemented, left for
-a later increment: port-scan and multi-target rules, threat-intel
-provenance/freshness/confidence/conflict rules, and the golden attack
-scenario / false-positive / false-negative fixture suite the roadmap's exit
-gate also asks for - this increment covers the mechanism (deterministic
-count-threshold rules, persisted versioned assessments, idempotent replay-
-safe incident creation) and two concrete rules built on it, not the full
-rule catalog yet.
+Severity/confidence scale with how far over the threshold the count (or,
+for a `DistinctValueThresholdRule`, the distinct-value count) is
+(`severity_for_count`/`confidence_for_count`). Not yet implemented, left
+for a later increment: a genuine multi-*target* rule (one source hitting
+many different destination hosts - not meaningful yet with only one
+monitored SSH endpoint and one monitored HTTP endpoint; revisit once more
+are), threat-intel provenance/freshness/confidence/conflict rules (the
+`intelligence` crate already ingests Spamhaus DROP/EDROP/ASN-DROP, RPKI,
+BGP and ASN change feeds - combining those with this engine's own
+behavioral assessments into one decision is Phase 5 "Policy Engine"'s job,
+not this crate's), and a full golden attack scenario / false-positive /
+false-negative fixture suite beyond what each rule's own tests already
+cover.
 
 ## Persistence
 
