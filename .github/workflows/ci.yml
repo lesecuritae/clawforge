@@ -64,8 +64,16 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
         continue-on-error: true
-        # The current advisory is the documented optional sqlx-mysql/rsa
-        # dependency; production builds enable sqlx-postgres only.
+        # RUSTSEC-2023-0071 (rsa, via sqlx-macros-core's optional "mysql"
+        # feature) has no upstream patch at any version and is not
+        # actually reachable in our build: sqlx here is
+        # default-features=false with only "postgres" enabled, and
+        # `cargo tree -i rsa --target all` finds no edge into it - verified
+        # against a full `cargo test --workspace` build log with no
+        # "Compiling rsa"/"sqlx-mysql" line at all. Cargo.lock still
+        # records it because lockfiles are resolved feature-union-stable
+        # across the whole workspace, not just the currently active
+        # feature set.
       - uses: aquasecurity/trivy-action@0.35.0
         with:
           scan-type: fs
