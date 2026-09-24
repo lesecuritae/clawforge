@@ -152,20 +152,46 @@ re-running the full lab suite.
 
 ## The isolated network lab
 
-`scripts/test-firewall-lab.sh` runs the 8 `#[ignore]`-gated real-`nft`
+`scripts/test-firewall-lab.sh` runs the 9 `#[ignore]`-gated real-`nft`
 tests (round-trip apply/verify/rollback for IPv4 and IPv6, dry-run
 never touching the real set, idempotent double-apply, resolved-source
 apply, unresolved-source fails closed, rollback-of-never-applied fails
-cleanly, IPv4-mapped-IPv6 normalization) inside a disposable
-`rust:1.98-bookworm` container (`--cap-add=NET_ADMIN --cap-add=NET_RAW`),
-never against srv19680 or any other real host - the container's network
-namespace is created fresh by the runtime and destroyed with it. This is
-the "isoliertes Netzwerk-Lab" the roadmap's phase 6 gate asks for, in the
-form the tools available in this environment can actually provide. What
-it does **not** provide: self-lockout confirmation against a
-*provisioned* host's real management path (SSH, HAProxy admin, etc.) -
-this container has no equivalent of that at all. That confirmation is
-still an open item before ever applying for real against a live host.
+cleanly, IPv4-mapped-IPv6 normalization, and the break-glass drill below)
+inside a disposable `rust:1.98-bookworm` container
+(`--cap-add=NET_ADMIN --cap-add=NET_RAW`), never against srv19680 or any
+other real host - the container's network namespace is created fresh by
+the runtime and destroyed with it. This is the "isoliertes Netzwerk-Lab"
+the roadmap's phase 6 gate asks for, in the form the tools available in
+this environment can actually provide. What it does **not** provide:
+self-lockout confirmation against a *provisioned* host's real management
+path (SSH, HAProxy admin, etc.) - this container has no equivalent of
+that at all. That confirmation is still an open item before ever
+applying for real against a live host.
+
+## Break-glass procedure
+
+`scripts/nftables-clawforge-break-glass.sh` removes Clawforge's *entire*
+nftables footprint on a host in one atomic `nft delete table inet
+clawforge` call - not a selective per-target rollback. It has no
+dependency on `clawforge-executor`, the API, Docker, or Postgres being
+reachable or even running: it is meant to be run directly over SSH on the
+affected host when something more than a normal rollback is needed -
+suspected self-lockout, a malfunctioning executor, or any situation where
+"stop everything Clawforge did to this host's firewall, right now" is the
+correct response. Because `NftablesAdapter` never renders anything
+outside that one table (see "One exclusive table" below), deleting it
+undoes 100% of Clawforge's footprint at once, with zero risk to any other
+rule, table, or chain on the host. After running it, Clawforge blocks
+nothing on that host until the table is reprovisioned
+(`scripts/nftables-clawforge-provision.sh`) and the executor's current
+desired state is re-applied.
+
+**Rehearsed, not just documented**: the lab's own
+`break_glass_removes_every_trace_of_the_clawforge_table` test blocks a
+real target, confirms it is genuinely blocked, runs the break-glass
+script, confirms the table is entirely gone, and reprovisions it
+afterwards - in the same disposable, isolated container every other real
+lab test uses.
 
 ## Executor dispatch wiring
 
@@ -219,7 +245,6 @@ on this).
 
 - **No HAProxy adapter, no Tailscale adapter** (roadmap: Tailscale
   "zunächst nur als freigabepflichtigen Adapter vorbereiten").
-- **No break-glass procedure documentation or drill.**
 - **No failure-injection tests** beyond lease loss/worker death (process/
   host/DB failure between intent/apply/receipt/audit, reboot, clock skew,
   expired TTL, manual drift, failed read-back).

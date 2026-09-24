@@ -98,11 +98,12 @@
 //! concurrent HA workers (see `storage/tests/postgres.rs`'s
 //! `concurrent_workers_never_claim_the_same_execution_request_twice` and
 //! `a_worker_that_dies_after_claiming_is_reclaimed_by_a_different_worker`).
-//! Still open: the roadmap's remaining mandatory gates beyond what this
-//! crate's own tests cover (break-glass drill, failure injection beyond
-//! lease loss, a rate/concurrency budget bounding multiple replicas
-//! targeting the *same* host) - see `docs/firewall-agent.md`'s own
-//! remaining list.
+//! A break-glass drill (`break_glass_removes_every_trace_of_the_clawforge_table`)
+//! and a DB-backed mass-block rate budget also exist now. Still open: the
+//! roadmap's remaining mandatory gates beyond what this crate's own tests
+//! cover (failure injection beyond lease loss, a concurrency budget
+//! bounding multiple replicas targeting the *same* host) - see
+//! `docs/firewall-agent.md`'s own remaining list.
 
 use async_trait::async_trait;
 use std::net::IpAddr;
@@ -1261,6 +1262,70 @@ mod tests {
         let second = adapter.apply(&action, false).await;
         assert!(second.is_ok(), "a repeat apply must not fail: {second:?}");
         adapter.rollback(&action).await.unwrap();
+    }
+
+    /// The break-glass drill itself, rehearsed (not just documented) - see
+    /// scripts/nftables-clawforge-break-glass.sh's own doc comment. Blocks
+    /// a real target, confirms it is genuinely blocked, then runs the
+    /// break-glass script and confirms the *entire* table is gone - not
+    /// just the one element. Reprovisions afterwards (the lab's own
+    /// provisioning script is idempotent) so whichever other `--ignored`
+    /// test runs next in this same container still finds a properly
+    /// provisioned table.
+    #[tokio::test]
+    #[ignore = "requires nftables (NET_ADMIN/NET_RAW) - run via scripts/test-firewall-lab.sh"]
+    async fn break_glass_removes_every_trace_of_the_clawforge_table() {
+        let adapter = lab_adapter().await;
+        let action = FirewallAction {
+            target: indicator("203.0.113.222"),
+            ttl_seconds: 60,
+            reason: "break-glass drill".into(),
+        };
+        let applied = adapter
+            .apply(&action, false)
+            .await
+            .expect("apply must succeed");
+        assert!(!applied.receipt.is_dry_run);
+        assert_eq!(
+            adapter.verify(&action.target).await.unwrap(),
+            VerificationResult::Verified,
+            "the target must genuinely be blocked before the drill removes it"
+        );
+
+        let break_glass_script = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../scripts/nftables-clawforge-break-glass.sh"
+        );
+        let status = tokio::process::Command::new("sh")
+            .arg(break_glass_script)
+            .status()
+            .await
+            .expect("the break-glass script must run");
+        assert!(status.success(), "the break-glass script must exit 0");
+
+        let listing = tokio::process::Command::new("nft")
+            .args(["list", "table", "inet", "clawforge"])
+            .output()
+            .await
+            .expect("nft must run");
+        assert!(
+            !listing.status.success(),
+            "the entire clawforge table must be gone after break-glass, not just the one element"
+        );
+
+        let provision_script = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../scripts/nftables-clawforge-provision.sh"
+        );
+        let reprovisioned = tokio::process::Command::new("sh")
+            .arg(provision_script)
+            .status()
+            .await
+            .expect("reprovisioning must run");
+        assert!(
+            reprovisioned.success(),
+            "reprovisioning after the drill must succeed so later tests find a valid table"
+        );
     }
 
     #[tokio::test]

@@ -352,7 +352,15 @@ Pflichtgates vor der ersten verändernden Lab-Testaktion:
   Produktionshost offen und wird bewusst nicht ohne Nutzerbeteiligung
   angegangen.)
 - Break-glass-Verfahren und manuelles Entfernen aller Clawforge-Regeln sind
-  dokumentiert und geprobt (**noch offen**)
+  dokumentiert und geprobt (**erledigt**: `scripts/nftables-clawforge-break-glass.sh`
+  entfernt die gesamte exklusive Clawforge-Tabelle in einem atomaren
+  `nft delete table`-Aufruf, ohne Abhaengigkeit von Executor/API/Postgres -
+  direkt per SSH auf dem betroffenen Host ausfuehrbar. Echt geprobt, nicht
+  nur dokumentiert: der Lab-Test `break_glass_removes_every_trace_of_the_
+  clawforge_table` blockiert ein echtes Ziel, bestaetigt die Sperre, fuehrt
+  das Skript aus, bestaetigt dass die GESAMTE Tabelle weg ist, und
+  reprovisioniert danach - im selben isolierten Container wie jeder andere
+  echte Lab-Test.)
 - Failure-Injection deckt Prozess-/Host-/DB-Ausfall zwischen Intent, Apply,
   Receipt und Audit, Lease-Verlust, Reboot, Uhrsprung, konkurrierende Actions,
   abgelaufene TTL, manuelle Drift und fehlgeschlagenes Read-back ab
