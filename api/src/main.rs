@@ -27,7 +27,7 @@ use clawforge_intelligence::{NetworkType, TrustedNetwork, VerificationStatus};
 use clawforge_notification::{allowed_hosts, validate_channel};
 use clawforge_policy::authorize_action;
 use clawforge_secret::{ensure_distinct, load_optional, load_required_token, validate_token};
-use clawforge_security_events::SensorEnvelope;
+use clawforge_security_events::{SecurityEventType, SensorEnvelope};
 use clawforge_storage::{
     database_url_from_env, AdminPrincipal, AgentPrincipal, AuditEventFilter, MigrationStatus,
     PostgresStore,
@@ -6068,6 +6068,116 @@ async fn admin_indicator_conflicts(
         })
 }
 
+#[derive(Deserialize, Default)]
+struct SecurityAssessmentsQuery {
+    limit: Option<i64>,
+}
+
+/// Roadmap phase 9 "Dashboard": the "Assessments" third of "Live Security
+/// mit Angriffen, Assessments und Incidents". `clawforge-security-engine`'s
+/// persisted, versioned assessments - every field here (including the
+/// `resource`) is already pseudonymized well before it reaches this table,
+/// see `security_assessments.rs`'s own doc comment; nothing further is
+/// redacted here.
+async fn admin_security_assessments(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<SecurityAssessmentsQuery>,
+) -> ApiResult<Json<ApiEnvelope<Vec<serde_json::Value>>>> {
+    let principal = authenticate(&state, &headers).await?;
+    require_role(&principal, &["Administrator", "Operator", "Viewer"])?;
+    let assessments = state
+        .store
+        .list_security_assessments(query.limit.unwrap_or(100))
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "security assessments unavailable",
+            )
+        })?;
+    audit(
+        &state,
+        &principal,
+        "security_assessments_read",
+        "security_assessments",
+        serde_json::json!({}),
+    )
+    .await;
+    let values: Vec<serde_json::Value> = assessments
+        .into_iter()
+        .map(|item| {
+            serde_json::json!({
+                "id": item.id,
+                "rule_id": item.rule_id,
+                "rule_version": item.rule_version,
+                "resource": item.resource,
+                "severity": item.severity,
+                "confidence": item.confidence,
+                "summary": item.summary,
+                "event_count": item.event_count,
+                "bucket_start": item.bucket_start,
+                "incident_id": item.incident_id,
+                "threat_intel_corroborated": item.threat_intel_corroborated,
+                "threat_intel": item.threat_intel.map(|hit| serde_json::json!({
+                    "source": hit.source,
+                    "confidence": hit.confidence,
+                    "last_seen": hit.last_seen,
+                })),
+            })
+        })
+        .collect();
+    Ok(envelope(values, None))
+}
+
+#[derive(Deserialize, Default)]
+struct SecurityEventsQuery {
+    event_type: Option<String>,
+    limit: Option<i64>,
+}
+
+/// Roadmap phase 9 "Dashboard": the "Angriffe" third of "Live Security mit
+/// Angriffen, Assessments und Incidents" - the raw sensor events
+/// (`clawforge-linux-sensor`/`-haproxy-sensor`/`-docker-sensor`) an
+/// assessment's rule fired on, before any correlation. `resource` is
+/// already the pseudonymized HMAC reference by the time it is persisted
+/// (`record_security_event`), never a raw IP - see `security_events.rs`.
+async fn admin_security_events(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<SecurityEventsQuery>,
+) -> ApiResult<Json<ApiEnvelope<Vec<serde_json::Value>>>> {
+    let principal = authenticate(&state, &headers).await?;
+    require_role(&principal, &["Administrator", "Operator", "Viewer"])?;
+    let event_type = match query.event_type.as_deref() {
+        Some(value) => Some(
+            value
+                .parse::<SecurityEventType>()
+                .map_err(|_| api_error(StatusCode::BAD_REQUEST, "unknown security event_type"))?,
+        ),
+        None => None,
+    };
+    let events = state
+        .store
+        .list_security_events(event_type, query.limit.unwrap_or(100))
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "security events unavailable",
+            )
+        })?;
+    audit(
+        &state,
+        &principal,
+        "security_events_read",
+        "security_events",
+        serde_json::json!({"event_type": query.event_type}),
+    )
+    .await;
+    Ok(envelope(events, None))
+}
+
 #[derive(Deserialize)]
 struct ProviderUpdate {
     enabled: Option<bool>,
@@ -7818,6 +7928,11 @@ fn build_router(app_state: AppState) -> Router {
             "/admin/indicators/conflicts",
             get(admin_indicator_conflicts),
         )
+        .route(
+            "/admin/security/assessments",
+            get(admin_security_assessments),
+        )
+        .route("/admin/security/events", get(admin_security_events))
         .route("/operations/summary", get(admin_operations_summary))
         .route("/operations/state", get(admin_operations_state))
         .route(
@@ -9036,6 +9151,8 @@ mod tests {
             "/firewall/expired",
             "/firewall/kill-switch",
             "/executions/00000000-0000-0000-0000-000000000000",
+            "/admin/security/assessments",
+            "/admin/security/events",
         ] {
             let request = Request::builder()
                 .method("GET")

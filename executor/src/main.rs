@@ -1007,6 +1007,21 @@ async fn shutdown_signal() {
 mod tests {
     use super::*;
 
+    /// `CLAWFORGE_FIREWALL_ADAPTERS` is mutated by exactly two tests
+    /// (`adapters_touched_by_matches_dispatchs_own_routing` and
+    /// `firewall_action_fan_out_honors_configured_multi_adapters`).
+    /// `cargo test`'s default parallel execution runs both in the same
+    /// process on different threads, so without serializing them a
+    /// `set_var` from one can be observed by a read in the other between
+    /// its own set/assert/remove steps - a real, previously-unguarded
+    /// race (an earlier version of one test wrongly assumed a "single-
+    /// threaded test process"). Every access to that env var in this
+    /// module must hold this lock for the whole set-assert-remove span.
+    /// A `tokio::sync::Mutex`, not `std::sync::Mutex`: the async test below
+    /// holds the guard across several `.await` points, which clippy
+    /// (correctly) rejects for a std mutex.
+    static FIREWALL_ADAPTERS_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     fn claimed(action_name: &str, target: Option<serde_json::Value>) -> ClaimedExecutionRequest {
         ClaimedExecutionRequest {
             id: Uuid::new_v4(),
@@ -1101,7 +1116,7 @@ mod tests {
         );
         // firewall.* must reserve a slot in every configured adapter,
         // nftables always among them (mirrors configured_multi_adapters).
-        // SAFETY: single-threaded test process.
+        let _env_guard = FIREWALL_ADAPTERS_ENV_LOCK.blocking_lock();
         std::env::remove_var("CLAWFORGE_FIREWALL_ADAPTERS");
         assert_eq!(
             adapters_touched_by("firewall.block_indicator"),
@@ -1279,9 +1294,13 @@ mod tests {
     /// because they need three different values of the *same* env var and
     /// cargo test's default parallel execution would otherwise race them
     /// against each other (unlike a plain set/unset check, three specific
-    /// values genuinely need to not interleave).
+    /// values genuinely need to not interleave). Also holds
+    /// `FIREWALL_ADAPTERS_ENV_LOCK` for its whole span - the other test
+    /// that touches this same env var races it otherwise, see that lock's
+    /// own doc comment.
     #[tokio::test]
     async fn firewall_action_fan_out_honors_configured_multi_adapters() {
+        let _env_guard = FIREWALL_ADAPTERS_ENV_LOCK.lock().await;
         std::env::remove_var("CLAWFORGE_EXECUTOR_DRY_RUN");
         let request = || {
             claimed(
