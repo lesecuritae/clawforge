@@ -15,3 +15,13 @@ export type OperationsSummary = { overall_status: string; risk_level: string; ac
 export type FirewallReceipt = { id: string; execution_id?: string | null; adapter: string; action_name: string; receipt_kind: "apply" | "rollback"; target_fingerprint?: string | null; is_dry_run: boolean; verification_result?: string | null; ttl_seconds: number; expires_at: string; created_at: string; rendered_commands: unknown; rollback_plan: unknown; observed_state?: unknown };
 export type FirewallExpiredTarget = { receipt_id: string; adapter: string; target_fingerprint: string; target_json: unknown };
 export type FirewallKillSwitchRequest = { id: string; adapter: string; target_fingerprint: string; target_json: unknown; reason?: string | null; requested_by: string; created_at: string; processed_at?: string | null };
+
+// Roadmap phase 9 "Dashboard" - "Live Security mit Angriffen, Assessments
+// und Incidents". `resource` on both types below is already the
+// pseudonymized HMAC reference by the time it is persisted
+// (clawforge-storage's `record_security_event`/`persist_security_assessment`
+// via the shared IP-HMAC machinery) - never a raw IP, see
+// docs/security-events.md and docs/security-engine.md.
+export type SecurityEvent = { id: string; event_type: string; sensor_id: string; occurred_at: string; received_at: string; severity: string; resource: string; evidence: Record<string, unknown>; created_at: string };
+export type IpReputationHit = { source: string; confidence: number; last_seen: string };
+export type SecurityAssessment = { id: string; rule_id: string; rule_version: string; resource: string; severity: string; confidence: number; summary: string; event_count: number; bucket_start: string; incident_id?: string | null; threat_intel_corroborated: boolean; threat_intel?: IpReputationHit | null };
