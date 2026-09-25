@@ -58,6 +58,17 @@ const SCOPE_CONNECTOR: &str = "agent:connector:read";
 const SCOPE_ACTION: &str = "agent:action:read";
 const SCOPE_EXECUTION: &str = "agent:execution:read";
 const SCOPE_OPERATIONS_STATE: &str = "agent:operations:state";
+// Roadmap phase 10 "OpenClaw Security Integration": "Ressourcen fuer
+// Assessment, Policy Decision, Action Receipt und Firewall-Status
+// ergaenzen" - three new read-only scopes, mirroring
+// clawforge-api's AGENT_SCOPE_ASSESSMENT_READ/POLICY_DECISION_READ/
+// FIREWALL_READ exactly. No tool below can ever approve or execute
+// anything - the same "MCP wires only GET-style read tools" property
+// SCOPE_WORKFLOW_APPROVE already relies on (that scope exists for the
+// API's own agent-token validation; no #[tool] here uses it).
+const SCOPE_ASSESSMENT: &str = "agent:assessment:read";
+const SCOPE_POLICY_DECISION: &str = "agent:policy-decision:read";
+const SCOPE_FIREWALL: &str = "agent:firewall:read";
 const SCOPE_ALL: &str = "agent:read";
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_REQUEST_BYTES: usize = 256 * 1024;
@@ -265,6 +276,20 @@ struct FindingArgs {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+struct AssessmentArgs {
+    #[schemars(description = "Maximum number of assessments to return, capped at 500")]
+    limit: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+struct PolicyDecisionArgs {
+    #[schemars(description = "Filter by decision: observe, challenge, rate_limit, or block")]
+    decision: Option<String>,
+    #[schemars(description = "Maximum number of decisions to return, capped at 500")]
+    limit: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 struct TrustArgs {
     #[schemars(description = "1-based page number")]
     page: Option<i64>,
@@ -467,6 +492,9 @@ fn parse_scopes(value: &str) -> Result<HashSet<String>> {
         SCOPE_ACTION,
         SCOPE_EXECUTION,
         SCOPE_OPERATIONS_STATE,
+        SCOPE_ASSESSMENT,
+        SCOPE_POLICY_DECISION,
+        SCOPE_FIREWALL,
         SCOPE_ALL,
     ];
     if scopes.is_empty()
@@ -1076,6 +1104,50 @@ impl McpServer {
     }
 
     #[tool(
+        name = "list_security_assessments",
+        description = "List clawforge-security-engine's persisted rule assessments (resource, severity, confidence, event count, threat-intel corroboration); read-only, requires agent:assessment:read"
+    )]
+    async fn list_security_assessments(
+        &self,
+        Parameters(args): Parameters<AssessmentArgs>,
+    ) -> Result<Json<ToolResponse>, ErrorData> {
+        let query = assessment_query(&args);
+        Ok(Json(
+            self.get(SCOPE_ASSESSMENT, "/api/v1/security/assessments", &query)
+                .await?,
+        ))
+    }
+
+    #[tool(
+        name = "list_security_decisions",
+        description = "List clawforge-policy-engine's shadow policy decisions (policy, rule, decision, risk score, evidence sources, rationale); always shadow-only and never executed; read-only, requires agent:policy-decision:read"
+    )]
+    async fn list_security_decisions(
+        &self,
+        Parameters(args): Parameters<PolicyDecisionArgs>,
+    ) -> Result<Json<ToolResponse>, ErrorData> {
+        let query = policy_decision_query(&args);
+        Ok(Json(
+            self.get(SCOPE_POLICY_DECISION, "/api/v1/security/decisions", &query)
+                .await?,
+        ))
+    }
+
+    #[tool(
+        name = "get_firewall_status",
+        description = "Read firewall action receipts (desired/applied state), expired/unrolled-back drift, and kill-switch requests; this tool never invokes an adapter or changes any state; read-only, requires agent:firewall:read"
+    )]
+    async fn get_firewall_status(
+        &self,
+        Parameters(_args): Parameters<EmptyArgs>,
+    ) -> Result<Json<ToolResponse>, ErrorData> {
+        Ok(Json(
+            self.get(SCOPE_FIREWALL, "/api/v1/firewall/status", &[])
+                .await?,
+        ))
+    }
+
+    #[tool(
         name = "get_trust_status",
         description = "Read verified, pending, and revoked trusted networks; MCP cannot change trust; requires agent:network:read"
     )]
@@ -1562,6 +1634,23 @@ fn finding_query(args: &FindingArgs) -> Vec<(String, String)> {
     ])
 }
 
+fn assessment_query(args: &AssessmentArgs) -> Vec<(String, String)> {
+    pairs([(
+        "limit".into(),
+        args.limit.map(|v| v.clamp(1, 500).to_string()),
+    )])
+}
+
+fn policy_decision_query(args: &PolicyDecisionArgs) -> Vec<(String, String)> {
+    pairs([
+        ("decision".into(), args.decision.clone()),
+        (
+            "limit".into(),
+            args.limit.map(|v| v.clamp(1, 500).to_string()),
+        ),
+    ])
+}
+
 fn trust_query(args: &TrustArgs) -> Vec<(String, String)> {
     pairs([
         ("page".into(), args.page.map(|v| v.to_string())),
@@ -1680,6 +1769,18 @@ mod tests {
             .get_operations_summary(Parameters(EmptyArgs::default()))
             .await
             .is_err());
+        assert!(server
+            .list_security_assessments(Parameters(AssessmentArgs::default()))
+            .await
+            .is_err());
+        assert!(server
+            .list_security_decisions(Parameters(PolicyDecisionArgs::default()))
+            .await
+            .is_err());
+        assert!(server
+            .get_firewall_status(Parameters(EmptyArgs::default()))
+            .await
+            .is_err());
     }
 
     #[test]
@@ -1707,6 +1808,19 @@ mod tests {
         let knowledge = McpServer::new(test_config(&[SCOPE_KNOWLEDGE]));
         assert!(knowledge.require_scope(SCOPE_KNOWLEDGE).is_ok());
         assert!(knowledge.require_scope(SCOPE_SECURITY).is_err());
+        // Roadmap phase 10: the three new resource scopes are independent
+        // of each other and of every pre-existing scope - a token scoped
+        // to only one of them cannot read the others.
+        let assessment = McpServer::new(test_config(&[SCOPE_ASSESSMENT]));
+        assert!(assessment.require_scope(SCOPE_ASSESSMENT).is_ok());
+        assert!(assessment.require_scope(SCOPE_POLICY_DECISION).is_err());
+        assert!(assessment.require_scope(SCOPE_FIREWALL).is_err());
+        let policy_decision = McpServer::new(test_config(&[SCOPE_POLICY_DECISION]));
+        assert!(policy_decision.require_scope(SCOPE_POLICY_DECISION).is_ok());
+        assert!(policy_decision.require_scope(SCOPE_ASSESSMENT).is_err());
+        let firewall = McpServer::new(test_config(&[SCOPE_FIREWALL]));
+        assert!(firewall.require_scope(SCOPE_FIREWALL).is_ok());
+        assert!(firewall.require_scope(SCOPE_ASSESSMENT).is_err());
     }
 
     #[test]
@@ -1885,6 +1999,7 @@ mod tests {
                 "get_decisions",
                 "get_execution_history",
                 "get_execution_status",
+                "get_firewall_status",
                 "get_health_overview",
                 "get_incident",
                 "get_incident_details",
@@ -1912,6 +2027,8 @@ mod tests {
                 "list_events",
                 "list_incidents",
                 "list_pending_executions",
+                "list_security_assessments",
+                "list_security_decisions",
                 "list_security_findings",
                 "list_workflows",
             ]
@@ -2047,7 +2164,7 @@ mod tests {
         );
         let client = ClientInfo::default().serve(transport).await.unwrap();
         let tools = client.list_tools(None).await.unwrap();
-        assert_eq!(tools.tools.len(), 39);
+        assert_eq!(tools.tools.len(), 42);
         let expected = [
             "list_connectors",
             "get_connector_status",
@@ -2088,6 +2205,9 @@ mod tests {
             "list_pending_executions",
             "get_pending_approvals",
             "get_execution_history",
+            "list_security_assessments",
+            "list_security_decisions",
+            "get_firewall_status",
         ];
         for name in expected {
             let tool = tools

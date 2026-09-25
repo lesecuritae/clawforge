@@ -37,6 +37,9 @@
             ,"get_pending_approvals"
             ,"get_execution_history"
             ,"get_connector_health"
+            ,"list_security_assessments"
+            ,"list_security_decisions"
+            ,"get_firewall_status"
           ]
         }
       }

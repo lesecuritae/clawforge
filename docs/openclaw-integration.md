@@ -35,6 +35,9 @@ Für ein read-only Agent-Profil werden nur die benötigten Scopes vergeben:
 - `agent:system:graph:read`
 - `agent:action:read`
 - `agent:execution:read`
+- `agent:assessment:read`
+- `agent:policy-decision:read`
+- `agent:firewall:read`
 
 `agent:read` kann diese Einzelrechte zusammenfassen, sollte aber nur für ein
 bewusst breit lesendes Profil verwendet werden. Für `get_status`,
@@ -46,7 +49,7 @@ bewusst breit lesendes Profil verwendet werden. Für `get_status`,
 
 1. MCP-Container und API im isolierten Compose-Netz starten.
 2. MCP-Token und Agent-Token getrennt rotieren und als Secrets laden.
-3. Tool-Liste abrufen und die 38 read-only Tools erkennen.
+3. Tool-Liste abrufen und die 42 read-only Tools erkennen.
 4. `get_status`, `get_agent_context`, `get_decisions`,
    `get_operations_summary`, `get_daily_operations_briefing`,
    `get_operations_recommendations`, `get_decision_history`,
@@ -71,11 +74,19 @@ historischen ungeschützten Routen verwenden.
 ## Live-Abnahme
 
 Die produktive Testverbindung wurde mit einem getrennten MCP-Token und einem
-separaten Agent-API-Token geprüft. Die MCP-Discovery liefert alle 38
-read-only Tools einschließlich `list_workflows`, `get_workflow_status`,
- `get_workflow_history` und der Produktionsstatus-Werkzeuge. Erfolgreich geprüft wurden `get_operations_summary`,
+separaten Agent-API-Token geprüft. Die MCP-Discovery lieferte zu diesem
+Zeitpunkt alle 38 read-only Tools einschließlich `list_workflows`,
+`get_workflow_status`, `get_workflow_history` und der
+Produktionsstatus-Werkzeuge. Erfolgreich geprüft wurden `get_operations_summary`,
 `get_agent_context` und `list_incidents`; die Agent-API-Auditspur enthält
 Quelle, Ressource und Zeitpunkt, aber keine Tokenwerte.
+
+Roadmap Phase 10 hat seither drei weitere read-only Tools ergänzt
+(`list_security_assessments`, `list_security_decisions`,
+`get_firewall_status` - Scopes siehe oben). Diese sind gegen die echte
+Postgres-Suite und die MCP-Integrationstests verifiziert, aber noch
+**nicht** erneut gegen eine echte OpenClaw-Live-Verbindung geprüft - das
+bleibt ein offener Schritt für die nächste Live-Abnahme.
 
 Der Operations-Agent ist als read-only Rolle definiert. Er darf den Zustand
 bewerten, Incidents erklären und Prüfungen empfehlen. Er darf weder Policies,

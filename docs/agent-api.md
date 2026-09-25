@@ -137,6 +137,9 @@ rollenbasierte Exportfunktionen. Zeitangaben sind UTC in RFC-3339-Format.
 | `GET /api/v1/security/overview` | Security-Zusammenfassung | Finding-Anzahl, aktive Findings, Severity-Verteilung, höchste gespeicherte Bewertung | `agent:security:read` |
 | `GET /api/v1/security/posture` | Security Posture | Findings, betroffene Komponenten, Severity-Verteilung und historische Richtung | `agent:security:read` |
 | `GET /api/v1/security/briefing` | Security Briefing | aktuelle Lage, Incidents, Findings, Provider-Probleme und Unsicherheiten | `agent:security:briefing` |
+| `GET /api/v1/security/assessments` | Security Assessments | `clawforge-security-engine`s persistierte Regel-Assessments: Ressource, Regel, Severity, Confidence, Eventanzahl, Threat-Intel-Korrobierung | `agent:assessment:read` |
+| `GET /api/v1/security/decisions` | Policy-Entscheidungen | `clawforge-policy-engine`s Shadow-Entscheidungen: Policy, Regel, Empfehlung, Risk Score, Evidence-Quellen, Begründung | `agent:policy-decision:read` |
+| `GET /api/v1/firewall/status` | Firewall-Status | Action Receipts (Soll-/Ist-Zustand), Drift (TTL-abgelaufen, nicht zurückgerollt) und Kill-Switch-Anfragen gebündelt | `agent:firewall:read` |
 | `GET /api/v1/network/asn` | ASN-Kontext | ASN, Organisation, Provider, Land, Prefixe, Netzwerktyp, Reputation, Alter | `agent:network:read` |
 | `GET /api/v1/network/prefixes` | Prefix-Kontext | Prefix, ASN, Netzwerktyp, Zeit und Quelle | `agent:network:read` |
 | `GET /api/v1/network/bgp` | Routing-Ereignisse | Prefix, vorherige/neue ASN, Status, Quelle, Zeit, Confidence | `agent:network:read` |
@@ -187,6 +190,9 @@ Scopes sind:
 | `agent:incident:replay` | `/api/v1/incidents/{id}/replay` |
 | `agent:security:briefing` | `/api/v1/security/briefing` |
 | `agent:system:graph:read` | `/api/v1/system/graph` |
+| `agent:assessment:read` | `/api/v1/security/assessments` |
+| `agent:policy-decision:read` | `/api/v1/security/decisions`; immer Shadow, nie ausgeführt |
+| `agent:firewall:read` | `/api/v1/firewall/status`; nur Lesen, kein Adapter-Aufruf |
 | `agent:read` | explizit erteiltes read-only Gesamtprofil |
 
 Ein fehlender oder ungültiger Bearer-Token liefert `401`, ein gültiger Token

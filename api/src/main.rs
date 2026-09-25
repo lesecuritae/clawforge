@@ -30,7 +30,7 @@ use clawforge_secret::{ensure_distinct, load_optional, load_required_token, vali
 use clawforge_security_events::{SecurityEventType, SensorEnvelope};
 use clawforge_storage::{
     database_url_from_env, AdminPrincipal, AgentPrincipal, AuditEventFilter, MigrationStatus,
-    PostgresStore,
+    PostgresStore, SecurityAssessment,
 };
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
@@ -126,6 +126,14 @@ const AGENT_SCOPE_ACTION_READ: &str = "agent:action:read";
 const AGENT_SCOPE_EXECUTION_READ: &str = "agent:execution:read";
 const AGENT_SCOPE_OPERATIONS_STATE: &str = "agent:operations:state";
 const AGENT_SCOPE_METRICS_READ: &str = "agent:metrics:read";
+// Roadmap phase 10 "OpenClaw Security Integration": "Ressourcen fuer
+// Assessment, Policy Decision, Action Receipt und Firewall-Status
+// ergaenzen" - three new read-only scopes, no write/execute counterpart
+// exists for any of them (unlike AGENT_SCOPE_WORKFLOW_APPROVE, which is
+// a pre-existing, unrelated capability MCP itself never wires a tool to).
+const AGENT_SCOPE_ASSESSMENT_READ: &str = "agent:assessment:read";
+const AGENT_SCOPE_POLICY_DECISION_READ: &str = "agent:policy-decision:read";
+const AGENT_SCOPE_FIREWALL_READ: &str = "agent:firewall:read";
 const AGENT_SCOPE_ALL_READ: &str = "agent:read";
 
 const AGENT_SCOPES: &[&str] = &[
@@ -153,6 +161,9 @@ const AGENT_SCOPES: &[&str] = &[
     AGENT_SCOPE_EXECUTION_READ,
     AGENT_SCOPE_OPERATIONS_STATE,
     AGENT_SCOPE_METRICS_READ,
+    AGENT_SCOPE_ASSESSMENT_READ,
+    AGENT_SCOPE_POLICY_DECISION_READ,
+    AGENT_SCOPE_FIREWALL_READ,
     AGENT_SCOPE_ALL_READ,
 ];
 
@@ -5070,6 +5081,171 @@ async fn agent_security_overview(
     ))
 }
 
+/// Shared between `admin_security_assessments` and `agent_security_assessments`,
+/// which both show the identical, already-pseudonymized shape (see
+/// `security_assessments.rs`'s own doc comment on `resource`) - this is
+/// the one place that JSON shape is defined.
+fn security_assessment_json(item: SecurityAssessment) -> serde_json::Value {
+    serde_json::json!({
+        "id": item.id,
+        "rule_id": item.rule_id,
+        "rule_version": item.rule_version,
+        "resource": item.resource,
+        "severity": item.severity,
+        "confidence": item.confidence,
+        "summary": item.summary,
+        "event_count": item.event_count,
+        "bucket_start": item.bucket_start,
+        "incident_id": item.incident_id,
+        "threat_intel_corroborated": item.threat_intel_corroborated,
+        "threat_intel": item.threat_intel.map(|hit| serde_json::json!({
+            "source": hit.source,
+            "confidence": hit.confidence,
+            "last_seen": hit.last_seen,
+        })),
+    })
+}
+
+#[derive(Deserialize, Default)]
+struct AgentSecurityAssessmentsQuery {
+    limit: Option<i64>,
+}
+
+/// Roadmap phase 10 "OpenClaw Security Integration": the "Assessment"
+/// resource. Read-only, same data `GET /admin/security/assessments`
+/// shows an operator - OpenClaw gets exactly the same view, never a raw
+/// IP, never write access.
+async fn agent_security_assessments(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AgentSecurityAssessmentsQuery>,
+) -> ApiResult<Json<ApiEnvelope<Vec<serde_json::Value>>>> {
+    let principal = authenticate_agent(&state, &headers).await?;
+    require_agent_scope(&principal, AGENT_SCOPE_ASSESSMENT_READ)?;
+    let assessments = state
+        .store
+        .list_security_assessments(None, query.limit.unwrap_or(100))
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "security assessments unavailable",
+            )
+        })?;
+    audit_agent_read(
+        &state,
+        &principal,
+        "/api/v1/security/assessments",
+        AGENT_SCOPE_ASSESSMENT_READ,
+    )
+    .await;
+    Ok(envelope(
+        assessments
+            .into_iter()
+            .map(security_assessment_json)
+            .collect(),
+        None,
+    ))
+}
+
+#[derive(Deserialize, Default)]
+struct AgentSecurityDecisionsQuery {
+    decision: Option<String>,
+    limit: Option<i64>,
+}
+
+/// Roadmap phase 10 "OpenClaw Security Integration": the "Policy
+/// Decision" resource - clawforge-policy-engine's shadow decisions, each
+/// joined with the policy evaluated and the assessment it came from
+/// (same shape `GET /admin/security/decisions` shows). Still shadow-only
+/// (`is_shadow` is always `true` today) - nothing here was ever executed,
+/// and this tool cannot execute anything either.
+async fn agent_security_decisions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AgentSecurityDecisionsQuery>,
+) -> ApiResult<Json<ApiEnvelope<Vec<serde_json::Value>>>> {
+    let principal = authenticate_agent(&state, &headers).await?;
+    require_agent_scope(&principal, AGENT_SCOPE_POLICY_DECISION_READ)?;
+    if let Some(decision) = query.decision.as_deref() {
+        if !["observe", "challenge", "rate_limit", "block"].contains(&decision) {
+            return Err(api_error(StatusCode::BAD_REQUEST, "unknown decision value"));
+        }
+    }
+    let decisions = state
+        .store
+        .list_security_policy_decisions(query.decision.as_deref(), None, query.limit.unwrap_or(100))
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "security policy decisions unavailable",
+            )
+        })?;
+    audit_agent_read(
+        &state,
+        &principal,
+        "/api/v1/security/decisions",
+        AGENT_SCOPE_POLICY_DECISION_READ,
+    )
+    .await;
+    Ok(envelope(decisions, None))
+}
+
+/// Roadmap phase 10 "OpenClaw Security Integration": the "Action Receipt"
+/// and "Firewall-Status" resources combined into one read - receipts
+/// (desired/applied state), drift (expired, not yet rolled back - same
+/// query the TTL sweep itself runs), and kill-switch requests. Exactly
+/// the same three read-only admin endpoints
+/// (`/firewall/receipts`/`/firewall/expired`/`/firewall/kill-switch`)
+/// joined into one response so a single tool call gives the full
+/// picture. No adapter is ever invoked from this handler - it only
+/// reads what the executor already persisted.
+async fn agent_firewall_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<ApiEnvelope<serde_json::Value>>> {
+    let principal = authenticate_agent(&state, &headers).await?;
+    require_agent_scope(&principal, AGENT_SCOPE_FIREWALL_READ)?;
+    let (receipts, expired, kill_switch) = tokio::try_join!(
+        state.store.list_firewall_action_receipts(None, None, 100),
+        state.store.expired_unrolled_back_firewall_targets(),
+        state.store.list_firewall_kill_switch_requests(100),
+    )
+    .map_err(|_| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "firewall status unavailable",
+        )
+    })?;
+    let expired_json: Vec<serde_json::Value> = expired
+        .into_iter()
+        .map(|target| {
+            serde_json::json!({
+                "receipt_id": target.receipt_id,
+                "adapter": target.adapter,
+                "target_fingerprint": target.target_fingerprint,
+                "target_json": target.target_json,
+            })
+        })
+        .collect();
+    audit_agent_read(
+        &state,
+        &principal,
+        "/api/v1/firewall/status",
+        AGENT_SCOPE_FIREWALL_READ,
+    )
+    .await;
+    Ok(envelope(
+        serde_json::json!({
+            "receipts": receipts,
+            "expired": expired_json,
+            "kill_switch": kill_switch,
+        }),
+        None,
+    ))
+}
+
 async fn agent_network_values(state: &AppState, kind: &str) -> ApiResult<Vec<serde_json::Value>> {
     state
         .store
@@ -8147,6 +8323,9 @@ fn build_router(app_state: AppState) -> Router {
                 .route("/security/overview", get(agent_security_overview))
                 .route("/security/posture", get(agent_security_posture))
                 .route("/security/briefing", get(agent_security_briefing))
+                .route("/security/assessments", get(agent_security_assessments))
+                .route("/security/decisions", get(agent_security_decisions))
+                .route("/firewall/status", get(agent_firewall_status))
                 .route("/system/graph", get(agent_system_graph))
                 .route("/network/asn", get(agent_asn))
                 .route("/network/prefixes", get(agent_prefixes))
@@ -9245,6 +9424,194 @@ mod tests {
             StatusCode::UNAUTHORIZED,
             "POST /firewall/kill-switch must require authentication"
         );
+
+        Ok(())
+    }
+
+    /// Roadmap phase 10 "OpenClaw Security Integration": the three new
+    /// `/api/v1/security/assessments`, `/api/v1/security/decisions`, and
+    /// `/api/v1/firewall/status` routes, end to end against a real
+    /// database - real seeded data comes back through the real router,
+    /// and a token scoped to only one of the three cannot read the other
+    /// two.
+    #[tokio::test]
+    #[ignore = "requires an isolated PostgreSQL test container"]
+    async fn agent_phase10_routes_return_real_data_and_enforce_scope() -> anyhow::Result<()> {
+        use clawforge_storage::{SecurityAssessmentUpsert, SecurityPolicyDecisionUpsert};
+        use tower::ServiceExt;
+
+        let url = std::env::var("CLAWFORGE_TEST_DATABASE_URL")
+            .or_else(|_| std::env::var("DATABASE_URL"))?;
+        let store = PostgresStore::connect(&url).await?;
+        let unique = Uuid::new_v4();
+        let resource = format!("ip-pseudonym:phase10-test-{unique}");
+        let rule_id = format!("phase10_test_rule_{unique}");
+
+        // Seed one assessment (clawforge-security-engine's own shape).
+        let now = chrono::Utc::now();
+        let assessment_id = store
+            .persist_security_assessment(SecurityAssessmentUpsert {
+                rule_id: &rule_id,
+                rule_version: "1",
+                engine_version: "test",
+                dedupe_key: &format!("{rule_id}:1:{resource}:{now}"),
+                resource: &resource,
+                severity: "critical",
+                confidence: 90,
+                summary: "phase 10 contract test assessment",
+                event_count: 5,
+                window_seconds: 300,
+                bucket_start: now,
+                first_seen: now,
+                last_seen: now,
+                event_ids: &[],
+                threat_intel: None,
+            })
+            .await?;
+
+        // Seed one policy + one shadow decision derived from it
+        // (clawforge-policy-engine's own shape).
+        let policy_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO security_policies (id,name,version,status,class,rule_id,min_severity) \
+             VALUES ($1,$2,1,'active','observe',$3,'medium')",
+        )
+        .bind(policy_id)
+        .bind(format!("phase10-test-policy-{unique}"))
+        .bind(&rule_id)
+        .execute(store.pool())
+        .await?;
+        let decision_dedupe_key = format!("{policy_id}:1:{assessment_id}");
+        store
+            .persist_security_policy_decision(
+                &decision_dedupe_key,
+                SecurityPolicyDecisionUpsert {
+                    policy_id,
+                    policy_version: 1,
+                    assessment_id,
+                    incident_id: None,
+                    decision: "observe",
+                    risk_score: 40,
+                    evidence_sources: 1,
+                    corroborated: false,
+                    rationale: "phase 10 contract test decision",
+                    evidence_snapshot: serde_json::json!({}),
+                    evidence_hash: "test-hash",
+                },
+            )
+            .await?;
+
+        // Seed one firewall action receipt (clawforge-executor's own shape).
+        let receipt_id = Uuid::new_v4();
+        let target_fingerprint = format!("phase10-test-target-{unique}");
+        sqlx::query(
+            "INSERT INTO firewall_action_receipts \
+             (id,adapter,action_name,ttl_seconds,expires_at,receipt_kind,target_fingerprint,is_dry_run) \
+             VALUES ($1,'nftables','nftables.block_indicator',300,NOW() + INTERVAL '300 seconds','apply',$2,TRUE)",
+        )
+        .bind(receipt_id)
+        .bind(&target_fingerprint)
+        .execute(store.pool())
+        .await?;
+
+        // A token scoped to all three new resources sees all three.
+        let full_credential = new_secret();
+        store
+            .create_agent_token(
+                &format!("phase10-full-{unique}"),
+                &digest(&full_credential),
+                &full_credential[..8],
+                &[
+                    AGENT_SCOPE_ASSESSMENT_READ.to_string(),
+                    AGENT_SCOPE_POLICY_DECISION_READ.to_string(),
+                    AGENT_SCOPE_FIREWALL_READ.to_string(),
+                ],
+                chrono::Utc::now() + chrono::Duration::hours(1),
+                None,
+            )
+            .await?;
+
+        let app = build_router(test_app_state(store.clone()));
+        let get = |path: &str, token: &str| {
+            let request = Request::builder()
+                .method("GET")
+                .uri(path)
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap();
+            app.clone().oneshot(request)
+        };
+
+        let response = get("/api/v1/security/assessments", &full_credential)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())?;
+        assert!(
+            body["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["id"] == assessment_id.to_string()),
+            "seeded assessment must appear in /api/v1/security/assessments"
+        );
+
+        let response = get("/api/v1/security/decisions", &full_credential)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())?;
+        let decision = body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["rule_id"] == rule_id)
+            .expect("seeded decision must appear in /api/v1/security/decisions");
+        assert_eq!(decision["is_shadow"], true);
+        assert_eq!(decision["resource"], resource);
+
+        let response = get("/api/v1/firewall/status", &full_credential)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())?;
+        assert!(
+            body["data"]["receipts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["id"] == receipt_id.to_string()),
+            "seeded receipt must appear in /api/v1/firewall/status"
+        );
+
+        // A token scoped to none of the three is rejected by all three -
+        // scope is per-resource, not implied by any other read access.
+        let narrow_credential = new_secret();
+        store
+            .create_agent_token(
+                &format!("phase10-narrow-{unique}"),
+                &digest(&narrow_credential),
+                &narrow_credential[..8],
+                &[AGENT_SCOPE_EVENTS_READ.to_string()],
+                chrono::Utc::now() + chrono::Duration::hours(1),
+                None,
+            )
+            .await?;
+        for path in [
+            "/api/v1/security/assessments",
+            "/api/v1/security/decisions",
+            "/api/v1/firewall/status",
+        ] {
+            let response = get(path, &narrow_credential).await.unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::FORBIDDEN,
+                "{path} must reject a token without the matching scope"
+            );
+        }
 
         Ok(())
     }

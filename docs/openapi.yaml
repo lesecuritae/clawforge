@@ -1057,6 +1057,42 @@ paths:
         '403': { description: agent:security:read scope missing }
         '429': { $ref: '#/components/responses/RateLimited' }
         '503': { description: Security posture unavailable }
+  /api/v1/security/assessments:
+    get:
+      security: [{ agentBearerAuth: [] }]
+      description: Read-only clawforge-security-engine rule assessments (resource, rule, severity, confidence, event count, threat-intel corroboration); resource is already the pseudonymized HMAC reference, never a raw IP. Requires agent:assessment:read.
+      parameters:
+        - { in: query, name: limit, schema: { type: integer, minimum: 1, maximum: 500, default: 100 } }
+      responses:
+        '200': { description: Security assessment list envelope }
+        '401': { description: Agent token missing or invalid }
+        '403': { description: agent:assessment:read scope missing }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { description: Security assessments unavailable }
+  /api/v1/security/decisions:
+    get:
+      security: [{ agentBearerAuth: [] }]
+      description: Read-only clawforge-policy-engine shadow decisions, each joined with the policy evaluated and the assessment it came from. is_shadow is always true - nothing here was ever executed, and this route cannot execute anything either. Requires agent:policy-decision:read.
+      parameters:
+        - { in: query, name: decision, schema: { type: string, enum: [observe, challenge, rate_limit, block] } }
+        - { in: query, name: limit, schema: { type: integer, minimum: 1, maximum: 500, default: 100 } }
+      responses:
+        '200': { description: Policy decision list envelope }
+        '400': { description: Unknown decision filter value }
+        '401': { description: Agent token missing or invalid }
+        '403': { description: agent:policy-decision:read scope missing }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { description: Policy decisions unavailable }
+  /api/v1/firewall/status:
+    get:
+      security: [{ agentBearerAuth: [] }]
+      description: Read-only firewall action receipts (desired/applied state), expired/unrolled-back drift, and kill-switch requests, bundled into one response. This route never invokes an adapter or changes any state. Requires agent:firewall:read.
+      responses:
+        '200': { description: Firewall status envelope with receipts, expired, and kill_switch }
+        '401': { description: Agent token missing or invalid }
+        '403': { description: agent:firewall:read scope missing }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { description: Firewall status unavailable }
   /api/v1/network/asn:
     get:
       security: [{ agentBearerAuth: [] }]

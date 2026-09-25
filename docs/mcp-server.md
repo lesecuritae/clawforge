@@ -2,7 +2,7 @@
 
 Status: Read-only MCP-Adapter produktionsbereit. Der MCP-Dienst ist ein
 isolierter Rust-Service und wurde mit OpenClaw Discovery sowie den
-Operations-Leseabfragen geprüft. Die aktuelle Tool-Liste umfasst 38 Tools.
+Operations-Leseabfragen geprüft. Die aktuelle Tool-Liste umfasst 42 Tools.
 
 Dieses Dokument beschreibt einen separaten, read-only MCP-Dienst für
 OpenClaw. Die Agent API v1 bleibt die einzige Datenquelle. Der MCP-Dienst
@@ -63,6 +63,8 @@ als MCP-Upstream verwendet.
 | `get_incident_replay` | `GET /api/v1/incidents/{id}/replay` | `agent:incident:replay` | gespeicherte Rekonstruktion |
 | `get_security_overview` | `GET /api/v1/security/overview` + Incident-Liste | `agent:security:read` + `agent:incident:read` | direkt nutzbar |
 | `list_security_findings` | `GET /api/v1/security/findings` | `agent:security:read` | direkt nutzbar |
+| `list_security_assessments` | `GET /api/v1/security/assessments` | `agent:assessment:read` | Roadmap Phase 10 |
+| `list_security_decisions` | `GET /api/v1/security/decisions` | `agent:policy-decision:read` | Roadmap Phase 10, immer Shadow |
 | `get_security_posture` | `GET /api/v1/security/posture` | `agent:security:read` | Trend- und Komponentenansicht |
 | `get_knowledge_context` | `GET /api/v1/knowledge` | `agent:knowledge:read` | Lessons Learned und Muster |
 | `get_security_briefing` | `GET /api/v1/security/briefing` | `agent:security:briefing` | kompakte Lagebewertung |
@@ -82,6 +84,7 @@ als MCP-Upstream verwendet.
 | `get_pending_approvals` | `GET /api/v1/executions?status=waiting_approval` | `agent:execution:read` | Offene Approval-Datensätze |
 | `get_execution_history` | `GET /api/v1/executions` | `agent:execution:read` | Historie mit Retry-/Recovery-Status |
 | `get_connector_health` | `GET /api/v1/connectors` | `agent:connector:read` | Connector Health Übersicht |
+| `get_firewall_status` | `GET /api/v1/firewall/status` | `agent:firewall:read` | Roadmap Phase 10, kein Adapter-Aufruf |
 
 `get_trust_status` verwendet ausschließlich den versionierten
 `/api/v1/network/trust`-Vertrag. Die historische Route `/network/trust` bleibt
@@ -299,6 +302,40 @@ nicht aktiviert.
 - Ausgabe: normalisierte Findings mit Quelle, Confidence, Alter, Ablauf,
   Risk-/Trust-Werten und Begründung
 
+### `list_security_assessments`
+
+- Eingabe: `limit` (maximal 500)
+- Upstream: `/api/v1/security/assessments`
+- Scope: `agent:assessment:read`
+- Ausgabe: `clawforge-security-engine`s persistierte Regel-Assessments
+  (Ressource, Regel, Severity, Confidence, Eventanzahl,
+  Threat-Intel-Korrobierung) - dieselbe Sicht wie
+  `GET /admin/security/assessments` im Dashboard
+- `resource` ist bereits das pseudonymisierte HMAC-Pseudonym, nie eine
+  rohe IP - siehe `docs/security-events.md`
+
+### `list_security_decisions`
+
+- Eingabe: optional `decision` (`observe`, `challenge`, `rate_limit`,
+  `block`), `limit` (maximal 500)
+- Upstream: `/api/v1/security/decisions`
+- Scope: `agent:policy-decision:read`
+- Ausgabe: `clawforge-policy-engine`s Shadow-Entscheidungen mit Policy,
+  Regel, Empfehlung, Risk Score, Evidence-Quellen und Begründung
+- `is_shadow` ist immer `true`; es wurde noch nie etwas ausgeführt, und
+  dieses Tool kann auch nichts ausführen
+
+### `get_firewall_status`
+
+- Eingabe: keine
+- Upstream: `/api/v1/firewall/status` (bündelt Receipts, Drift und
+  Kill-Switch-Anfragen)
+- Scope: `agent:firewall:read`
+- Ausgabe: `{ receipts, expired, kill_switch }` - Soll-/Ist-Zustand, TTL
+  und noch nicht zurückgerollte Sperren
+- Dieses Tool ruft nie einen Adapter auf und ändert keinen Zustand; es
+  liest ausschließlich, was der Executor bereits persistiert hat
+
 ### `get_trust_status`
 
 - Eingabe: optionaler Status- oder Typfilter
@@ -321,7 +358,7 @@ Aktivierung, Policy-Änderungen, Incident-Statusänderungen oder Blockaktionen.
 
 ## Produktionsvertrag und OpenClaw-Vorbereitung
 
-Der MCP-Server ist ein stateless read-only Adapter. Alle 38 Tools verwenden
+Der MCP-Server ist ein stateless read-only Adapter. Alle 42 Tools verwenden
 die versionierte Agent API v1 als einzige Datenquelle; es gibt keine direkte
 PostgreSQL-, Event-Backbone- oder Worker-Verbindung. Upstream-Aufrufe haben
 ein konfigurierbares Timeout (`CLAWFORGE_MCP_UPSTREAM_TIMEOUT_SECONDS`,
@@ -570,7 +607,13 @@ fachliche Zugriffsspur.
 
 ## Nicht Bestandteil dieser Phase
 
-- keine Änderung an `api/src/main.rs`
+Diese Liste beschreibt den ursprünglichen Umfang, als dieses Dokument
+geschrieben wurde. Roadmap Phase 10 ("OpenClaw Security Integration")
+hat gezielt drei neue read-only `/api/v1`-Routen ergänzt (Assessment,
+Policy Decision, Firewall-Status - siehe Tabelle oben), also inzwischen
+sehr wohl eine (additive, ausschließlich lesende) Änderung an
+`api/src/main.rs`. Die übrigen Punkte gelten unverändert:
+
 - keine neue Migration
 - keine Änderung an Risk, Policy, Trust, Providern oder Event Backbone
 - kein direkter Storage-Zugriff des MCP-Dienstes
