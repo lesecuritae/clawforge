@@ -8,6 +8,15 @@ without an explicitly documented administrative process.
 
 - Indicators are expired from the active set at their `expires_at` time. The
   worker performs this cleanup during its regular maintenance cycle.
+- Security assessments (`security_assessments` - carry a pseudonymized
+  `resource` identifier, the same kind of identifier
+  `security_ip_resolutions`' own short TTL already treats as sensitive)
+  are removed once past `CLAWFORGE_SECURITY_ASSESSMENT_RETENTION_SECONDS`
+  (default 90 days) of inactivity, in the same worker maintenance cycle -
+  but only ones never promoted to an incident. An assessment tied to a
+  real incident, open or closed, is never touched by this: it follows
+  the incident's own retention decision below, not a separate automatic
+  one.
 - Events and correlation relationships should be archived to the configured
   backup/archive store before their operational retention window is reached.
 - Incident records and their timeline remain available while an incident is

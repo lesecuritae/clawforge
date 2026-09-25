@@ -15,6 +15,26 @@ use clawforge_storage::PostgresStore;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
+/// Roadmap phase 8: "Datenschutz und Aufbewahrung fuer Identifikatoren
+/// festlegen". 90 days gives `resource_history_score`'s own decay
+/// (default 14-day half-life, see `clawforge-policy-engine`) several
+/// half-lives of margin before an assessment it might still meaningfully
+/// contribute to becomes eligible for cleanup at all - retention and the
+/// history signal are deliberately not fighting each other. Configurable,
+/// since the actual number is an operator policy decision, not something
+/// to hardcode without one - see `PostgresStore::
+/// delete_expired_security_assessments`'s own doc comment for exactly
+/// what this does and does not delete.
+const DEFAULT_SECURITY_ASSESSMENT_RETENTION_SECONDS: i64 = 90 * 24 * 3600;
+
+fn security_assessment_retention_seconds() -> i64 {
+    env::var("CLAWFORGE_SECURITY_ASSESSMENT_RETENTION_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_SECURITY_ASSESSMENT_RETENTION_SECONDS)
+}
+
 struct ScheduledProvider {
     adapter: Arc<dyn ProviderAdapter>,
     interval: Duration,
@@ -407,6 +427,16 @@ impl Scheduler {
         };
         if let Err(error) = store.expire_indicators(Utc::now()).await {
             warn!(%error, "indicator expiry cleanup failed");
+        }
+        let assessment_cutoff =
+            Utc::now() - ChronoDuration::seconds(security_assessment_retention_seconds());
+        match store
+            .delete_expired_security_assessments(assessment_cutoff)
+            .await
+        {
+            Ok(0) => {}
+            Ok(deleted) => info!(deleted, "expired security assessments past retention"),
+            Err(error) => warn!(%error, "security assessment retention cleanup failed"),
         }
         self.process_manual_syncs(store).await;
         let now = Instant::now();

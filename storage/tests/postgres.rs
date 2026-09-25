@@ -1328,6 +1328,170 @@ async fn resource_history_score_rejects_non_positive_half_life() -> anyhow::Resu
     Ok(())
 }
 
+/// `delete_expired_security_assessments` backs the roadmap phase 8
+/// "Datenschutz und Aufbewahrung fuer Identifikatoren festlegen" gate -
+/// proves an old, never-promoted assessment (and its own policy decision)
+/// is removed, that an old assessment already tied to a real incident is
+/// never touched regardless of age, and that a recent assessment (inside
+/// the retention window) is left alone either way.
+#[tokio::test]
+#[ignore = "requires an isolated PostgreSQL test container"]
+async fn delete_expired_security_assessments_only_removes_old_unpromoted_ones() -> anyhow::Result<()>
+{
+    let url =
+        std::env::var("CLAWFORGE_TEST_DATABASE_URL").or_else(|_| std::env::var("DATABASE_URL"))?;
+    let store = PostgresStore::connect(&url).await?;
+
+    let suffix = uuid::Uuid::new_v4();
+    let old = Utc::now() - Duration::days(120);
+    let recent = Utc::now() - Duration::days(1);
+    let cutoff = Utc::now() - Duration::days(90);
+
+    async fn seed(
+        store: &PostgresStore,
+        resource: &str,
+        last_seen: chrono::DateTime<Utc>,
+        dedupe_suffix: &str,
+    ) -> anyhow::Result<uuid::Uuid> {
+        store
+            .persist_security_assessment(clawforge_storage::SecurityAssessmentUpsert {
+                rule_id: "ssh_bruteforce",
+                rule_version: "1",
+                engine_version: "test",
+                dedupe_key: &format!("test-retention:{dedupe_suffix}"),
+                resource,
+                severity: "critical",
+                confidence: 90,
+                summary: "test fixture",
+                event_count: 10,
+                window_seconds: 300,
+                bucket_start: last_seen,
+                first_seen: last_seen,
+                last_seen,
+                event_ids: &[],
+                threat_intel: None,
+            })
+            .await
+    }
+
+    let old_unpromoted_resource = format!("ip-pseudonym:test-retention-old-{suffix}");
+    let old_promoted_resource = format!("ip-pseudonym:test-retention-promoted-{suffix}");
+    let recent_resource = format!("ip-pseudonym:test-retention-recent-{suffix}");
+
+    let old_unpromoted_id = seed(
+        &store,
+        &old_unpromoted_resource,
+        old,
+        &format!("unpromoted-{suffix}"),
+    )
+    .await?;
+    let old_promoted_id = seed(
+        &store,
+        &old_promoted_resource,
+        old,
+        &format!("promoted-{suffix}"),
+    )
+    .await?;
+    let recent_id = seed(
+        &store,
+        &recent_resource,
+        recent,
+        &format!("recent-{suffix}"),
+    )
+    .await?;
+
+    // Tie the "promoted" assessment to a real incident - it must survive
+    // regardless of age.
+    let incident_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO incidents (id,status,severity,risk_score,summary,correlation_key) \
+         VALUES ($1,'open','critical',90,'test fixture',$2)",
+    )
+    .bind(incident_id)
+    .bind(format!("test-retention-incident-{suffix}"))
+    .execute(store.pool())
+    .await?;
+    sqlx::query("UPDATE security_assessments SET incident_id=$1 WHERE id=$2")
+        .bind(incident_id)
+        .bind(old_promoted_id)
+        .execute(store.pool())
+        .await?;
+
+    // A policy decision referencing the old, unpromoted assessment - must
+    // be cleaned up alongside it (no ON DELETE CASCADE from
+    // security_assessments to security_policy_decisions).
+    let policy_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO security_policies \
+         (id,name,version,status,class,rule_id,min_severity) \
+         VALUES ($1,$2,1,'active','observe','ssh_bruteforce','medium')",
+    )
+    .bind(policy_id)
+    .bind(format!("test-retention-policy-{suffix}"))
+    .execute(store.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO security_policy_decisions \
+         (id,policy_id,policy_version,assessment_id,decision,risk_score,evidence_sources, \
+          corroborated,rationale,evidence_snapshot,evidence_hash,dedupe_key) \
+         VALUES ($1,$2,1,$3,'observe',50,1,false,'test','{}'::jsonb,$4,$5)",
+    )
+    .bind(uuid::Uuid::new_v4())
+    .bind(policy_id)
+    .bind(old_unpromoted_id)
+    .bind("a".repeat(64))
+    .bind(format!("test-retention-decision-{suffix}"))
+    .execute(store.pool())
+    .await?;
+
+    let deleted = store.delete_expired_security_assessments(cutoff).await?;
+    assert_eq!(
+        deleted, 1,
+        "only the old, never-promoted assessment must be deleted"
+    );
+
+    let remaining_ids: Vec<uuid::Uuid> =
+        sqlx::query_scalar("SELECT id FROM security_assessments WHERE id = ANY($1)")
+            .bind([old_unpromoted_id, old_promoted_id, recent_id].as_slice())
+            .fetch_all(store.pool())
+            .await?;
+    assert!(!remaining_ids.contains(&old_unpromoted_id));
+    assert!(
+        remaining_ids.contains(&old_promoted_id),
+        "an assessment tied to a real incident must never be deleted, regardless of age"
+    );
+    assert!(
+        remaining_ids.contains(&recent_id),
+        "an assessment inside the retention window must never be deleted"
+    );
+
+    let orphaned_decisions: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM security_policy_decisions WHERE assessment_id = $1",
+    )
+    .bind(old_unpromoted_id)
+    .fetch_one(store.pool())
+    .await?;
+    assert_eq!(
+        orphaned_decisions, 0,
+        "the deleted assessment's own policy decision must be cleaned up too"
+    );
+
+    sqlx::query("DELETE FROM security_assessments WHERE id = ANY($1)")
+        .bind([old_promoted_id, recent_id].as_slice())
+        .execute(store.pool())
+        .await?;
+    sqlx::query("DELETE FROM security_policies WHERE id=$1")
+        .bind(policy_id)
+        .execute(store.pool())
+        .await?;
+    sqlx::query("DELETE FROM incidents WHERE id=$1")
+        .bind(incident_id)
+        .execute(store.pool())
+        .await?;
+
+    Ok(())
+}
+
 /// `list_provider_views`'s `is_stale` flag backs the roadmap phase 8
 /// "veraltete Feeds sichtbar machen" gate - proves a provider whose last
 /// successful sync is well past `interval_seconds *

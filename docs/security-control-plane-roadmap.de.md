@@ -741,7 +741,27 @@ Reputation, lokales Verhalten und Historie nachvollziehbar zusammenführen.
   weil bisher nichts von einem tatsaechlich befuellten `age_seconds`
   abhing, bis der neue `is_stale`-Test genau das tat und den Bug live
   aufdeckte.)
-- Datenschutz und Aufbewahrung für Identifikatoren festlegen
+- Datenschutz und Aufbewahrung für Identifikatoren festlegen (**erledigt**:
+  neue `PostgresStore::delete_expired_security_assessments` - eine
+  pseudonymisierte `resource` ist zwar keine rohe personenbezogene
+  Angabe, aber trotzdem ein Identifikator, der nicht unbegrenzt liegen
+  bleiben sollte (dasselbe Prinzip wie die bereits bestehende kurze TTL
+  von `security_ip_resolutions` und `indicators.expires_at`). Bewusst eng
+  gefasst: loescht NUR Assessments, die NIE zu einem Incident befoerdert
+  wurden (`incident_id IS NULL`) und laenger als
+  `CLAWFORGE_SECURITY_ASSESSMENT_RETENTION_SECONDS` (Standard 90 Tage -
+  laesst `resource_history_score`s eigenem 14-Tage-Halbwertszeit-Signal
+  reichlich Spielraum) keine Aktivitaet mehr gesehen haben
+  (`last_seen`). Eine Assessment, die an einen echten Incident gebunden
+  ist - offen, geschlossen, egal - wird NIE angefasst, unabhaengig vom
+  Alter: Incident-Aufbewahrung bleibt die eigene, separat mit dem
+  Betreiber abgestimmte Entscheidung (`docs/retention.md`). Zugehoerige
+  `security_policy_decisions` werden mitentfernt (keine Kaskade von
+  `security_assessments`, also erst die Decisions, dann die Assessment -
+  sonst wuerde das Loeschen an der Fremdschluessel-Bindung scheitern);
+  `events` selbst werden nie angefasst. In `clawforge-worker`s
+  bestehendem Wartungszyklus verdrahtet, direkt neben der schon
+  vorhandenen Indikator-Ablauf-Bereinigung.)
 
 Exit-Gate: Offline- oder veraltete Feeds reduzieren Confidence und lösen keine
 automatische Eskalation aus; jede Score-Komponente bleibt erklärbar.

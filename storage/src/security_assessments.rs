@@ -210,6 +210,61 @@ impl PostgresStore {
         .await?)
     }
 
+    /// Retention for `security_assessments` - roadmap phase 8's
+    /// "Datenschutz und Aufbewahrung fuer Identifikatoren festlegen".
+    /// `resource` is a pseudonymized identifier, not raw personal data,
+    /// but a pseudonym is still an identifier this codebase's own
+    /// pseudonymization design treats as sensitive (see
+    /// `pseudonymize_correlation_id`'s own doc comment) - it should not
+    /// accumulate here forever with no defined lifetime, the same
+    /// principle `security_ip_resolutions`' own short TTL and
+    /// `indicators.expires_at` already apply elsewhere.
+    ///
+    /// Deliberately narrow: only ever deletes an assessment that was
+    /// *never* promoted to an incident (`incident_id IS NULL`) and has
+    /// seen no activity (`last_seen`) more recent than `older_than`. An
+    /// assessment tied to a real incident - open, closed, or anything in
+    /// between - is never touched by this, regardless of age: incident
+    /// retention is its own, separately operator-agreed decision (see
+    /// `docs/retention.md`), not something this method decides on its
+    /// behalf. `security_policy_decisions` referencing a deleted
+    /// assessment are removed first (no `ON DELETE CASCADE` from
+    /// `security_assessments` to `security_policy_decisions` - migration
+    /// `0034` left that FK`RESTRICT`, so this must happen in this order or
+    /// the assessment delete would fail outright rather than silently
+    /// orphan a decision). `security_assessment_events` rows cascade away
+    /// automatically (migration `0033`'s own `ON DELETE CASCADE`) -
+    /// `events` themselves are never touched at all, on purpose: they
+    /// carry their own, separate retention/audit lifecycle this method
+    /// has no business shortening.
+    ///
+    /// Returns how many assessment rows were actually removed, so a
+    /// caller (a maintenance job) can log a real number rather than
+    /// silently succeeding either way.
+    pub async fn delete_expired_security_assessments(
+        &self,
+        older_than: DateTime<Utc>,
+    ) -> Result<u64> {
+        let mut tx = self.pool().begin().await?;
+        sqlx::query(
+            "DELETE FROM security_policy_decisions WHERE assessment_id IN ( \
+                 SELECT id FROM security_assessments \
+                 WHERE incident_id IS NULL AND last_seen < $1 \
+             )",
+        )
+        .bind(older_than)
+        .execute(&mut *tx)
+        .await?;
+        let result = sqlx::query(
+            "DELETE FROM security_assessments WHERE incident_id IS NULL AND last_seen < $1",
+        )
+        .bind(older_than)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(result.rows_affected())
+    }
+
     /// Same bucket membership as `list_events_for_bucket`, plus one evidence
     /// field's value per event (`payload->>field`) - what a distinct-value
     /// rule (a scan: many different paths probed, not just many hits) needs
