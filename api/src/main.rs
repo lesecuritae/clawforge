@@ -6178,6 +6178,51 @@ async fn admin_security_events(
     Ok(envelope(events, None))
 }
 
+#[derive(Deserialize, Default)]
+struct SecurityDecisionsQuery {
+    decision: Option<String>,
+    limit: Option<i64>,
+}
+
+/// Roadmap phase 9 "Dashboard": "Agentenentscheidungen mit Analyse,
+/// Empfehlung, Policy und Resultat" - `clawforge-policy-engine`'s shadow
+/// decisions, each joined with the policy evaluated and the assessment
+/// ("Analyse") it came from. Still shadow-only (`is_shadow` is always
+/// `true` today, see `security_policies.rs`'s own doc comment) - nothing
+/// here was ever executed.
+async fn admin_security_decisions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<SecurityDecisionsQuery>,
+) -> ApiResult<Json<ApiEnvelope<Vec<serde_json::Value>>>> {
+    let principal = authenticate(&state, &headers).await?;
+    require_role(&principal, &["Administrator", "Operator", "Viewer"])?;
+    if let Some(decision) = query.decision.as_deref() {
+        if !["observe", "challenge", "rate_limit", "block"].contains(&decision) {
+            return Err(api_error(StatusCode::BAD_REQUEST, "unknown decision value"));
+        }
+    }
+    let decisions = state
+        .store
+        .list_security_policy_decisions(query.decision.as_deref(), query.limit.unwrap_or(100))
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "security policy decisions unavailable",
+            )
+        })?;
+    audit(
+        &state,
+        &principal,
+        "security_decisions_read",
+        "security_policy_decisions",
+        serde_json::json!({"decision": query.decision}),
+    )
+    .await;
+    Ok(envelope(decisions, None))
+}
+
 #[derive(Deserialize)]
 struct ProviderUpdate {
     enabled: Option<bool>,
@@ -7933,6 +7978,7 @@ fn build_router(app_state: AppState) -> Router {
             get(admin_security_assessments),
         )
         .route("/admin/security/events", get(admin_security_events))
+        .route("/admin/security/decisions", get(admin_security_decisions))
         .route("/operations/summary", get(admin_operations_summary))
         .route("/operations/state", get(admin_operations_state))
         .route(
@@ -9153,6 +9199,7 @@ mod tests {
             "/executions/00000000-0000-0000-0000-000000000000",
             "/admin/security/assessments",
             "/admin/security/events",
+            "/admin/security/decisions",
         ] {
             let request = Request::builder()
                 .method("GET")

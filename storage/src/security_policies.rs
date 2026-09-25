@@ -116,4 +116,61 @@ impl PostgresStore {
         .await?;
         Ok(id)
     }
+
+    /// Roadmap phase 9 "Dashboard": "Agentenentscheidungen mit Analyse,
+    /// Empfehlung, Policy und Resultat" - every shadow decision
+    /// `clawforge-policy-engine` has recorded, joined with the policy it
+    /// was evaluated against and the assessment (the "Analyse") it was
+    /// derived from, so a single admin read gives all four without a
+    /// second round trip. `resource`/`summary` come from
+    /// `security_assessments`, already pseudonymized the same way
+    /// `list_security_assessments` returns them - nothing further is
+    /// redacted here.
+    pub async fn list_security_policy_decisions(
+        &self,
+        decision: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<serde_json::Value>> {
+        let rows = sqlx::query(
+            "SELECT d.id, d.decision, d.risk_score, d.evidence_sources, d.corroborated, \
+                    d.rationale, d.is_shadow, d.decided_at, d.incident_id, \
+                    p.name AS policy_name, p.version AS policy_version, p.class AS policy_class, \
+                    p.rule_id, \
+                    a.resource, a.severity AS assessment_severity, a.summary AS assessment_summary, \
+                    a.confidence AS assessment_confidence \
+             FROM security_policy_decisions d \
+             JOIN security_policies p ON p.id = d.policy_id \
+             JOIN security_assessments a ON a.id = d.assessment_id \
+             WHERE $1::text IS NULL OR d.decision = $1 \
+             ORDER BY d.decided_at DESC LIMIT $2",
+        )
+        .bind(decision)
+        .bind(limit.clamp(1, 500))
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                serde_json::json!({
+                    "id": row.get::<Uuid, _>("id"),
+                    "decision": row.get::<String, _>("decision"),
+                    "risk_score": row.get::<i16, _>("risk_score"),
+                    "evidence_sources": row.get::<i16, _>("evidence_sources"),
+                    "corroborated": row.get::<bool, _>("corroborated"),
+                    "rationale": row.get::<String, _>("rationale"),
+                    "is_shadow": row.get::<bool, _>("is_shadow"),
+                    "decided_at": row.get::<DateTime<Utc>, _>("decided_at"),
+                    "incident_id": row.get::<Option<Uuid>, _>("incident_id"),
+                    "policy_name": row.get::<String, _>("policy_name"),
+                    "policy_version": row.get::<i32, _>("policy_version"),
+                    "policy_class": row.get::<String, _>("policy_class"),
+                    "rule_id": row.get::<String, _>("rule_id"),
+                    "resource": row.get::<String, _>("resource"),
+                    "assessment_severity": row.get::<String, _>("assessment_severity"),
+                    "assessment_summary": row.get::<String, _>("assessment_summary"),
+                    "assessment_confidence": row.get::<i16, _>("assessment_confidence"),
+                })
+            })
+            .collect())
+    }
 }
