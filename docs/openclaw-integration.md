@@ -84,9 +84,17 @@ Quelle, Ressource und Zeitpunkt, aber keine Tokenwerte.
 Roadmap Phase 10 hat seither drei weitere read-only Tools ergänzt
 (`list_security_assessments`, `list_security_decisions`,
 `get_firewall_status` - Scopes siehe oben). Diese sind gegen die echte
-Postgres-Suite und die MCP-Integrationstests verifiziert, aber noch
-**nicht** erneut gegen eine echte OpenClaw-Live-Verbindung geprüft - das
-bleibt ein offener Schritt für die nächste Live-Abnahme.
+Postgres-Suite und die MCP-Integrationstests verifiziert **und
+zusätzlich am 2026-09-25 live gegen eine echte OpenClaw-Verbindung
+bestätigt**: `openclaw mcp probe` verband sich live gegen den
+laufenden `clawforge-mcp`-Dienst und meldete alle 42 Tools; ein echter
+Agent-Turn (`openclaw agent`, Modell `nvidia/nemotron-3-ultra-550b-a55b`
+über OpenRouter) rief alle drei neuen Tools tatsächlich auf
+(`toolSummary.calls: 3`, Tool-Namen `clawforge__list_security_assessments`,
+`clawforge__list_security_decisions`, `clawforge__get_firewall_status`)
+und fasste die (zu diesem Zeitpunkt leeren, da security-engine auf dem
+Testhost nicht läuft) Ergebnisse korrekt zusammen - kein Halluzinieren,
+keine Fehlermeldung.
 
 Der Operations-Agent ist als read-only Rolle definiert. Er darf den Zustand
 bewerten, Incidents erklären und Prüfungen empfehlen. Er darf weder Policies,
