@@ -1,47 +1,17 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { api, unauthorizedEvent, textApi, type Envelope } from "./api";
+import { api, unauthorizedEvent, type Envelope } from "./api";
 import type { AuditEvent, Incident, Indicator, NetworkRecord, OperationsSummary, Provider } from "./types";
+import { useApi, useTextApi, Card, Table, Empty, Loading, PageTitle, Badge, Meter, formatDate, dateQuery, ErrorNotice, Pager, SearchControls } from "./ui";
+import { FirewallStatus } from "./FirewallStatus";
 import "./styles.css";
 
-type View = "overview" | "operations" | "recommendations" | "workflows" | "connectors" | "controlled" | "posture" | "briefing" | "incidents" | "threats" | "network" | "visualization" | "events" | "trust" | "administration" | "audit";
+type View = "overview" | "operations" | "recommendations" | "workflows" | "connectors" | "controlled" | "firewall" | "posture" | "briefing" | "incidents" | "threats" | "network" | "visualization" | "events" | "trust" | "administration" | "audit";
 const views: Array<[View, string, string]> = [
-  ["overview", "Overview", "⌂"], ["operations", "Operations", "◆"], ["recommendations", "Operations Center", "✦"], ["workflows", "Workflows", "↻"], ["connectors", "Connectors", "⬡"], ["controlled", "Controlled Operations", "⚙"], ["posture", "Security Posture", "◒"], ["briefing", "Security Briefing", "!"], ["incidents", "Incident Center", "◎"], ["threats", "Threat Intelligence", "◈"],
+  ["overview", "Overview", "⌂"], ["operations", "Operations", "◆"], ["recommendations", "Operations Center", "✦"], ["workflows", "Workflows", "↻"], ["connectors", "Connectors", "⬡"], ["controlled", "Controlled Operations", "⚙"], ["firewall", "Firewall Status", "▲"], ["posture", "Security Posture", "◒"], ["briefing", "Security Briefing", "!"], ["incidents", "Incident Center", "◎"], ["threats", "Threat Intelligence", "◈"],
   ["network", "Network Intelligence", "⌁"], ["visualization", "Visualization", "◌"], ["events", "Event Stream", "↯"], ["trust", "Trust Management", "✓"], ["administration", "Administration", "⚙"], ["audit", "Audit", "≡"]
 ];
 
-function useApi<T>(path: string, token: string | null, fallback: T) {
-  const [data, setData] = useState(fallback);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const [pagination, setPagination] = useState<Envelope<T>["pagination"]>(null);
-  const [revision, setRevision] = useState(0);
-  useEffect(() => {
-    if (!token && path !== "/health" && path !== "/ready") { setLoading(false); return; }
-    let cancelled = false;
-    setLoading(true); setError(null);
-    api<Envelope<T>>(path, token ?? undefined).then((response) => { if (!cancelled) { setData(response.data); setPagination(response.pagination ?? null); } }).catch((reason: unknown) => { if (!cancelled) setError(reason instanceof Error ? reason.message : "API request failed"); }).finally(() => { if (!cancelled) setLoading(false); });
-    return () => { cancelled = true; };
-  }, [path, token, revision]);
-  return { data, loading, error, pagination, reload: () => setRevision((value) => value + 1) };
-}
-
-function useTextApi(path: string, token: string | null) {
-  const [data, setData] = useState(""); const [error, setError] = useState<string | null>(null);
-  useEffect(() => { if (!token) return; let cancelled = false; textApi(path, token).then((value) => { if (!cancelled) setData(value); }).catch((reason: unknown) => { if (!cancelled) setError(reason instanceof Error ? reason.message : "API request failed"); }); return () => { cancelled = true; }; }, [path, token]);
-  return { data, error };
-}
-
-function Card({ title, value, hint, tone = "default" }: { title: string; value: React.ReactNode; hint?: string; tone?: string }) {
-  return <section className={"card metric " + tone}><span className="eyebrow">{title}</span><strong>{value}</strong>{hint && <small>{hint}</small>}</section>;
-}
-function Table({ children }: { children: React.ReactNode }) { return <div className="table-wrap"><table>{children}</table></div>; }
-function Empty({ text = "No records returned by the API." }: { text?: string }) { return <div className="empty">{text}</div>; }
-function Loading() { return <div className="empty">Loading API data…</div>; }
-function PageTitle({ eyebrow, title, subtitle }: { eyebrow: string; title: string; subtitle: string }) { return <div className="page-heading"><div><p className="eyebrow">{eyebrow}</p><h2>{title}</h2><p className="muted">{subtitle}</p></div></div>; }
-function Badge({ value }: { value: string }) { return <span className={"badge " + value.toLowerCase().replaceAll(" ", "-")}>{value}</span>; }
-function Meter({ value }: { value: number }) { return <span className="meter"><i style={{ width: Math.max(0, Math.min(100, value)) + "%" }} /><em>{value}</em></span>; }
-function formatDate(value: string) { if (!value) return "—"; const date = new Date(value); return Number.isNaN(date.valueOf()) ? value : date.toLocaleString(); }
 function parseMetrics(text: string) {
   const metrics: Record<string, number> = {};
   for (const line of text.split("\n")) {
@@ -59,15 +29,6 @@ function parseMetrics(text: string) {
 function metricState(metrics: Record<string, number>, name: string, online = "Online") {
   if (!(name in metrics)) return "Not reported";
   return metrics[name] > 0 ? online : "Down";
-}
-function dateQuery(value: string) { return value ? new Date(value).toISOString() : ""; }
-function ErrorNotice({ error }: { error: string | null }) { return error ? <div className="form-error api-error">{error}</div> : null; }
-function Pager({ page, pagination, onPage }: { page: number; pagination: Envelope<unknown>["pagination"]; onPage: (page: number) => void }) {
-  if (!pagination || (pagination.total <= pagination.page_size && page === 1)) return null;
-  return <div className="pager"><button disabled={page <= 1} onClick={() => onPage(page - 1)}>Previous</button><span>Page {pagination.page} · {pagination.total} records</span><button disabled={!pagination.has_next} onClick={() => onPage(page + 1)}>Next</button></div>;
-}
-function SearchControls({ search, setSearch, children }: { search: string; setSearch: (value: string) => void; children?: React.ReactNode }) {
-  return <div className="toolbar"><label className="search-label">Search<input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Filter current results" /></label>{children}</div>;
 }
 
 function Login({ onLogin }: { onLogin: (token: string) => void }) {
@@ -242,7 +203,7 @@ function Audit({ token }: { token: string }) { const [page, setPage] = useState(
 function App() {
   const [token, setToken] = useState(() => sessionStorage.getItem("clawforge_token")); const [view, setView] = useState<View>("overview");
   useEffect(() => { const logout = () => { sessionStorage.removeItem("clawforge_token"); setToken(null); }; window.addEventListener(unauthorizedEvent, logout); return () => window.removeEventListener(unauthorizedEvent, logout); }, []);
-  const content = useMemo(() => { if (!token) return null; switch (view) { case "overview": return <Overview token={token} />; case "operations": return <Operations token={token} />; case "recommendations": return <OperationsCenter token={token} />; case "workflows": return <Workflows token={token} />; case "connectors": return <Connectors token={token} />; case "controlled": return <ControlledOperations token={token} />; case "posture": return <SecurityPosture token={token} />; case "briefing": return <SecurityBriefing token={token} />; case "incidents": return <Incidents token={token} />; case "threats": return <Threats token={token} />; case "network": return <Network token={token} />; case "visualization": return <Visualization token={token} />; case "events": return <EventStream token={token} />; case "trust": return <Trust token={token} />; case "administration": return <Administration token={token} />; case "audit": return <Audit token={token} />; } }, [token, view]);
+  const content = useMemo(() => { if (!token) return null; switch (view) { case "overview": return <Overview token={token} />; case "operations": return <Operations token={token} />; case "recommendations": return <OperationsCenter token={token} />; case "workflows": return <Workflows token={token} />; case "connectors": return <Connectors token={token} />; case "controlled": return <ControlledOperations token={token} />; case "firewall": return <FirewallStatus token={token} />; case "posture": return <SecurityPosture token={token} />; case "briefing": return <SecurityBriefing token={token} />; case "incidents": return <Incidents token={token} />; case "threats": return <Threats token={token} />; case "network": return <Network token={token} />; case "visualization": return <Visualization token={token} />; case "events": return <EventStream token={token} />; case "trust": return <Trust token={token} />; case "administration": return <Administration token={token} />; case "audit": return <Audit token={token} />; } }, [token, view]);
   if (!token) return <Login onLogin={setToken} />;
   return <div className="app-shell"><aside className="sidebar"><div className="brand"><div className="brand-mark">C</div><div><b>CLAWFORGE</b><small>INTELLIGENCE CONSOLE</small></div></div><nav>{views.map(([id, label, icon]) => <button key={id} className={view === id ? "active" : ""} onClick={() => setView(id)}><span>{icon}</span>{label}</button>)}</nav><div className="sidebar-footer"><span className="status-led" />API connected<button className="logout" onClick={() => { sessionStorage.removeItem("clawforge_token"); setToken(null); }}>Sign out</button></div></aside><main className="content">{content}</main></div>;
 }
