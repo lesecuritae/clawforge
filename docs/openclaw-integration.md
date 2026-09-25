@@ -85,16 +85,27 @@ Roadmap Phase 10 hat seither drei weitere read-only Tools ergänzt
 (`list_security_assessments`, `list_security_decisions`,
 `get_firewall_status` - Scopes siehe oben). Diese sind gegen die echte
 Postgres-Suite und die MCP-Integrationstests verifiziert **und
-zusätzlich am 2026-09-25 live gegen eine echte OpenClaw-Verbindung
-bestätigt**: `openclaw mcp probe` verband sich live gegen den
-laufenden `clawforge-mcp`-Dienst und meldete alle 42 Tools; ein echter
-Agent-Turn (`openclaw agent`, Modell `nvidia/nemotron-3-ultra-550b-a55b`
-über OpenRouter) rief alle drei neuen Tools tatsächlich auf
-(`toolSummary.calls: 3`, Tool-Namen `clawforge__list_security_assessments`,
-`clawforge__list_security_decisions`, `clawforge__get_firewall_status`)
-und fasste die (zu diesem Zeitpunkt leeren, da security-engine auf dem
-Testhost nicht läuft) Ergebnisse korrekt zusammen - kein Halluzinieren,
-keine Fehlermeldung.
+zusätzlich am 2026-09-25 zweifach live bestätigt**:
+
+1. Gegen eine leere Testinstanz (`openclaw mcp probe` verband sich live
+   gegen den laufenden `clawforge-mcp`-Dienst und meldete alle 42
+   Tools; ein echter Agent-Turn, Modell
+   `nvidia/nemotron-3-ultra-550b-a55b` über OpenRouter, rief alle drei
+   neuen Tools tatsächlich auf und fasste die zu diesem Zeitpunkt
+   leeren Ergebnisse korrekt zusammen).
+2. **Gegen die echte Produktivinstanz mit realen Angriffsdaten** (ein
+   zweiter, separat registrierter MCP-Server `clawforge-homeserver`,
+   verbunden mit der laufenden Soak-Test-Instanz, die echte
+   `srv19680`-Sensordaten verarbeitet): derselbe Agent rief
+   `list_security_assessments`, `list_security_decisions`,
+   `get_firewall_status` und `list_incidents` auf
+   (`toolSummary.calls: 4, failures: 0`) und erstellte daraus eine
+   korrekte, detaillierte Sicherheitsanalyse einer echten,
+   laufenden SSH-Brute-Force-Kampagne (10+ Quell-IPs, korrekte
+   Severity-/Confidence-/Threat-Intel-Auswertung, korrekte Einordnung
+   "nur Shadow-Mode, Firewall greift nicht aktiv ein", sinnvolle
+   Handlungsempfehlung) - kein Halluzinieren, keine Fehlermeldung, alle
+   Werte durch Gegenprobe gegen die Agent API bestätigt.
 
 Der Operations-Agent ist als read-only Rolle definiert. Er darf den Zustand
 bewerten, Incidents erklären und Prüfungen empfehlen. Er darf weder Policies,
