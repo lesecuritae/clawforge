@@ -25,7 +25,12 @@ export default defineConfig({
     command: "npm run dev -- --port 5173 --strictPort",
     url: "http://127.0.0.1:5173",
     reuseExistingServer: !process.env.CI,
-    timeout: 30_000,
+    // A cold CI runner (fresh node_modules, no OS/FS cache) can take
+    // noticeably longer than a warm local machine to bring Vite's dev
+    // server up - 30s was cutting it close (observed timeout in CI on
+    // the first real run) even though the server itself starts in well
+    // under a second locally.
+    timeout: 120_000,
   },
   projects: [{ name: "chromium", use: { ...devices["Desktop Chrome"] } }],
 });
