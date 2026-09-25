@@ -781,6 +781,10 @@ Ansichten:
   und `GET+POST /firewall/kill-switch`; Component-Tests gegen ein
   gemocktes `api`-Modul.
 - Agentenentscheidungen mit Analyse, Empfehlung, Policy und Resultat
+  (umgesetzt): neue Ansicht auf `GET /admin/security/decisions` (neue
+  Storage-Funktion, joint `security_policy_decisions` mit `security_policies`
+  und `security_assessments`) - alle vier Felder in einer Tabelle, klar als
+  "Shadow only" gekennzeichnet.
 - durchgängige Auditkette vom Event bis zum Rollback
 
 Vor Abschluss werden Component- und Browser-E2E-Tests ergänzt; TypeScript-
