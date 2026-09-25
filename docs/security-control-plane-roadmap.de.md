@@ -793,13 +793,16 @@ Ansichten:
   keine `incident_id`-Spalte besitzt.
 
 **Damit existieren alle vier geforderten Ansichten.** Component-Tests
-(10 Tests über 4 Views) sind vorhanden; Browser-E2E-Tests fehlen noch.
+(10 Tests über 4 Views, Vitest+jsdom) und echte Browser-E2E-Tests (6 Tests,
+Playwright+Chromium gegen den echten Vite-Dev-Server, API per
+`page.route` gemockt statt Live-Backend) sind vorhanden und laufen in CI
+(`npm run test:e2e`, eigener Schritt im `frontend`-Job, HTML-Report als
+Artefakt bei Fehlschlag).
 
-Vor Abschluss werden Component- und Browser-E2E-Tests ergänzt; TypeScript-
-Kompilierung allein reicht nicht als Frontend-Test. Component-Test-
-Infrastruktur (Vitest + React Testing Library) ist jetzt vorhanden
-(`npm test` führt `tsc -b` und `vitest run` aus); Browser-E2E-Tests fehlen
-noch, ebenso die übrigen drei Ansichten.
+**Phase 9 "Dashboard" ist damit vollständig abgeschlossen** (TypeScript-
+Kompilierung allein war explizit nicht als Frontend-Test ausreichend -
+`npm test` führte vorher nur `tsc -b` aus; jetzt `tsc -b` + `vitest run`
++ `playwright test`).
 
 Exit-Gate: Operatoren können Entscheidungen nachvollziehen, Freigaben getrennt
 erteilen und Rollbacks verfolgen, ohne Rohsecrets oder unbereinigte Payloads zu
