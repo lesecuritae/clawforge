@@ -25,3 +25,12 @@ export type FirewallKillSwitchRequest = { id: string; adapter: string; target_fi
 export type SecurityEvent = { id: string; event_type: string; sensor_id: string; occurred_at: string; received_at: string; severity: string; resource: string; evidence: Record<string, unknown>; created_at: string };
 export type IpReputationHit = { source: string; confidence: number; last_seen: string };
 export type SecurityAssessment = { id: string; rule_id: string; rule_version: string; resource: string; severity: string; confidence: number; summary: string; event_count: number; bucket_start: string; incident_id?: string | null; threat_intel_corroborated: boolean; threat_intel?: IpReputationHit | null };
+
+// Roadmap phase 9 "Dashboard" - "Agentenentscheidungen mit Analyse,
+// Empfehlung, Policy und Resultat". Analyse = resource/assessment_*
+// (from security_assessments), Empfehlung = decision, Policy =
+// policy_name/policy_version/policy_class/rule_id, Resultat =
+// risk_score/evidence_sources/corroborated/rationale. is_shadow is
+// always true today - clawforge-policy-engine never executes anything,
+// see docs/policy-engine.md.
+export type SecurityPolicyDecision = { id: string; decision: "observe" | "challenge" | "rate_limit" | "block"; risk_score: number; evidence_sources: number; corroborated: boolean; rationale: string; is_shadow: boolean; decided_at: string; incident_id?: string | null; policy_name: string; policy_version: number; policy_class: "observe" | "approval" | "automatic"; rule_id: string; resource: string; assessment_severity: string; assessment_summary: string; assessment_confidence: number };
