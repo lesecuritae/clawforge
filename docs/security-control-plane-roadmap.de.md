@@ -772,7 +772,10 @@ Ziel: operative Sicht und sichere Bedienung.
 
 Ansichten:
 
-- Live Security mit Angriffen, Assessments und Incidents
+- Live Security mit Angriffen, Assessments und Incidents (umgesetzt):
+  neue Ansicht auf zwei neuen Endpunkten `GET /admin/security/assessments`
+  und `GET /admin/security/events` (vorher rein intern, nur von
+  `clawforge-policy-engine` gelesen) plus dem bestehenden `GET /incidents`.
 - Firewall Status mit Desired/Actual State, Sperren, TTL und Drift
   (umgesetzt): neue Ansicht auf `/firewall/receipts`, `/firewall/expired`
   und `GET+POST /firewall/kill-switch`; Component-Tests gegen ein
