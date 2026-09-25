@@ -785,7 +785,15 @@ Ansichten:
   Storage-Funktion, joint `security_policy_decisions` mit `security_policies`
   und `security_assessments`) - alle vier Felder in einer Tabelle, klar als
   "Shadow only" gekennzeichnet.
-- durchgängige Auditkette vom Event bis zum Rollback
+- durchgängige Auditkette vom Event bis zum Rollback (umgesetzt): neue
+  Ansicht wählt einen Incident und stellt die Kette aus vier unabhängig
+  gelesenen Quellen zusammen (Event → Assessment → Decision → Firewall-
+  Aktion/Rollback), letzterer Schritt per Wertabgleich über den
+  pseudonymisierten `target_fingerprint`, da `firewall_action_receipts`
+  keine `incident_id`-Spalte besitzt.
+
+**Damit existieren alle vier geforderten Ansichten.** Component-Tests
+(10 Tests über 4 Views) sind vorhanden; Browser-E2E-Tests fehlen noch.
 
 Vor Abschluss werden Component- und Browser-E2E-Tests ergänzt; TypeScript-
 Kompilierung allein reicht nicht als Frontend-Test. Component-Test-
