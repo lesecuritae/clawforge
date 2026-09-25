@@ -125,10 +125,13 @@ impl PostgresStore {
     /// second round trip. `resource`/`summary` come from
     /// `security_assessments`, already pseudonymized the same way
     /// `list_security_assessments` returns them - nothing further is
-    /// redacted here.
+    /// redacted here. `incident_id` narrows to one incident's own
+    /// decisions - the other link the "durchgaengige Auditkette vom Event
+    /// bis zum Rollback" exit gate needs.
     pub async fn list_security_policy_decisions(
         &self,
         decision: Option<&str>,
+        incident_id: Option<Uuid>,
         limit: i64,
     ) -> Result<Vec<serde_json::Value>> {
         let rows = sqlx::query(
@@ -141,10 +144,12 @@ impl PostgresStore {
              FROM security_policy_decisions d \
              JOIN security_policies p ON p.id = d.policy_id \
              JOIN security_assessments a ON a.id = d.assessment_id \
-             WHERE $1::text IS NULL OR d.decision = $1 \
-             ORDER BY d.decided_at DESC LIMIT $2",
+             WHERE ($1::text IS NULL OR d.decision = $1) \
+               AND ($2::uuid IS NULL OR d.incident_id = $2) \
+             ORDER BY d.decided_at DESC LIMIT $3",
         )
         .bind(decision)
+        .bind(incident_id)
         .bind(limit.clamp(1, 500))
         .fetch_all(self.pool())
         .await?;

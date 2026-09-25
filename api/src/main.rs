@@ -6070,15 +6070,17 @@ async fn admin_indicator_conflicts(
 
 #[derive(Deserialize, Default)]
 struct SecurityAssessmentsQuery {
+    incident_id: Option<Uuid>,
     limit: Option<i64>,
 }
 
 /// Roadmap phase 9 "Dashboard": the "Assessments" third of "Live Security
-/// mit Angriffen, Assessments und Incidents". `clawforge-security-engine`'s
-/// persisted, versioned assessments - every field here (including the
-/// `resource`) is already pseudonymized well before it reaches this table,
-/// see `security_assessments.rs`'s own doc comment; nothing further is
-/// redacted here.
+/// mit Angriffen, Assessments und Incidents", and (with `incident_id` set)
+/// one link of the "durchgaengige Auditkette vom Event bis zum Rollback".
+/// `clawforge-security-engine`'s persisted, versioned assessments - every
+/// field here (including the `resource`) is already pseudonymized well
+/// before it reaches this table, see `security_assessments.rs`'s own doc
+/// comment; nothing further is redacted here.
 async fn admin_security_assessments(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -6088,7 +6090,7 @@ async fn admin_security_assessments(
     require_role(&principal, &["Administrator", "Operator", "Viewer"])?;
     let assessments = state
         .store
-        .list_security_assessments(query.limit.unwrap_or(100))
+        .list_security_assessments(query.incident_id, query.limit.unwrap_or(100))
         .await
         .map_err(|_| {
             api_error(
@@ -6101,7 +6103,7 @@ async fn admin_security_assessments(
         &principal,
         "security_assessments_read",
         "security_assessments",
-        serde_json::json!({}),
+        serde_json::json!({"incident_id": query.incident_id}),
     )
     .await;
     let values: Vec<serde_json::Value> = assessments
@@ -6181,15 +6183,18 @@ async fn admin_security_events(
 #[derive(Deserialize, Default)]
 struct SecurityDecisionsQuery {
     decision: Option<String>,
+    incident_id: Option<Uuid>,
     limit: Option<i64>,
 }
 
 /// Roadmap phase 9 "Dashboard": "Agentenentscheidungen mit Analyse,
-/// Empfehlung, Policy und Resultat" - `clawforge-policy-engine`'s shadow
-/// decisions, each joined with the policy evaluated and the assessment
-/// ("Analyse") it came from. Still shadow-only (`is_shadow` is always
-/// `true` today, see `security_policies.rs`'s own doc comment) - nothing
-/// here was ever executed.
+/// Empfehlung, Policy und Resultat", and (with `incident_id` set) one link
+/// of the "durchgaengige Auditkette vom Event bis zum Rollback" -
+/// `clawforge-policy-engine`'s shadow decisions, each joined with the
+/// policy evaluated and the assessment ("Analyse") it came from. Still
+/// shadow-only (`is_shadow` is always `true` today, see
+/// `security_policies.rs`'s own doc comment) - nothing here was ever
+/// executed.
 async fn admin_security_decisions(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -6204,7 +6209,11 @@ async fn admin_security_decisions(
     }
     let decisions = state
         .store
-        .list_security_policy_decisions(query.decision.as_deref(), query.limit.unwrap_or(100))
+        .list_security_policy_decisions(
+            query.decision.as_deref(),
+            query.incident_id,
+            query.limit.unwrap_or(100),
+        )
         .await
         .map_err(|_| {
             api_error(
@@ -6217,7 +6226,7 @@ async fn admin_security_decisions(
         &principal,
         "security_decisions_read",
         "security_policy_decisions",
-        serde_json::json!({"decision": query.decision}),
+        serde_json::json!({"decision": query.decision, "incident_id": query.incident_id}),
     )
     .await;
     Ok(envelope(decisions, None))

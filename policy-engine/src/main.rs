@@ -325,7 +325,7 @@ async fn main() -> Result<()> {
                 if let Err(error) = store.set_runtime_status("policy-engine", "running", None).await {
                     warn!(%error, "could not heartbeat policy-engine runtime status");
                 }
-                match store.list_security_assessments(limit).await {
+                match store.list_security_assessments(None, limit).await {
                     Ok(assessments) => {
                         for assessment in assessments {
                             if let Err(error) = evaluate_assessment(&store, &assessment).await {
@@ -763,7 +763,7 @@ mod tests {
             .await?;
 
         let assessment = policy_engine
-            .list_security_assessments(500)
+            .list_security_assessments(None, 500)
             .await?
             .into_iter()
             .find(|value| value.id == assessment_id)

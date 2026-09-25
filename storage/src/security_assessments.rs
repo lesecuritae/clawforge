@@ -406,13 +406,24 @@ impl PostgresStore {
         )
     }
 
-    pub async fn list_security_assessments(&self, limit: i64) -> Result<Vec<SecurityAssessment>> {
+    /// `incident_id` narrows to the assessments a specific incident was
+    /// promoted from or escalated by - roadmap phase 9's "durchgaengige
+    /// Auditkette vom Event bis zum Rollback" traces exactly this link.
+    /// `None` (every internal caller except the phase 9 admin endpoint)
+    /// keeps the original unfiltered behavior.
+    pub async fn list_security_assessments(
+        &self,
+        incident_id: Option<Uuid>,
+        limit: i64,
+    ) -> Result<Vec<SecurityAssessment>> {
         let rows = sqlx::query(
             "SELECT id,rule_id,rule_version,resource,confidence,severity,summary,event_count,\
              bucket_start,incident_id,threat_intel_corroborated,threat_intel_source,\
              threat_intel_confidence,threat_intel_indicator_last_seen FROM security_assessments \
-             ORDER BY bucket_start DESC LIMIT $1",
+             WHERE $1::uuid IS NULL OR incident_id = $1 \
+             ORDER BY bucket_start DESC LIMIT $2",
         )
+        .bind(incident_id)
         .bind(limit.clamp(1, 500))
         .fetch_all(self.pool())
         .await?;
