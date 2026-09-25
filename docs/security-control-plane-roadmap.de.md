@@ -774,11 +774,17 @@ Ansichten:
 
 - Live Security mit Angriffen, Assessments und Incidents
 - Firewall Status mit Desired/Actual State, Sperren, TTL und Drift
+  (umgesetzt): neue Ansicht auf `/firewall/receipts`, `/firewall/expired`
+  und `GET+POST /firewall/kill-switch`; Component-Tests gegen ein
+  gemocktes `api`-Modul.
 - Agentenentscheidungen mit Analyse, Empfehlung, Policy und Resultat
 - durchgängige Auditkette vom Event bis zum Rollback
 
 Vor Abschluss werden Component- und Browser-E2E-Tests ergänzt; TypeScript-
-Kompilierung allein reicht nicht als Frontend-Test.
+Kompilierung allein reicht nicht als Frontend-Test. Component-Test-
+Infrastruktur (Vitest + React Testing Library) ist jetzt vorhanden
+(`npm test` führt `tsc -b` und `vitest run` aus); Browser-E2E-Tests fehlen
+noch, ebenso die übrigen drei Ansichten.
 
 Exit-Gate: Operatoren können Entscheidungen nachvollziehen, Freigaben getrennt
 erteilen und Rollbacks verfolgen, ohne Rohsecrets oder unbereinigte Payloads zu
