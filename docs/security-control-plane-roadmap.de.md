@@ -702,6 +702,25 @@ Reputation, lokales Verhalten und Historie nachvollziehbar zusammenführen.
   Exit-Gates dieser Phase. Siehe `docs/policy-engine.md`s "Freshness,
   provenance and confidence"-Abschnitt.)
 - lokale IP-/ASN-/Angriffshistorie als zeitlich abklingendes Signal verwenden
+  (**teilweise erledigt - nur der IP/Ressourcen-Teil, nicht ASN**:
+  `clawforge-policy-engine`s `evidence_sources_for` bekommt einen DRITTEN,
+  unabhaengigen Korrobierungspfad neben Threat-Intel und Cross-Rule -
+  `resource_history_score` summiert ueber jede FRUEHERE Assessment
+  derselben (pseudonymisierten) Ressource (jede Regel, nicht nur dieselbe)
+  ein Exponential-Decay-Gewicht `0.5^(Alter/Halbwertszeit)` (Standard-
+  Halbwertszeit 14 Tage, konfigurierbar) - ein frischer Wiederholungsfall
+  zaehlt fast voll, einer genau eine Halbwertszeit alt nur noch halb, ohne
+  harten Cutoff. Ab `CLAWFORGE_HISTORY_MIN_SCORE` (Standard 0.5) gilt das
+  als eigene, unabhaengige Korrobierung - dieselbe Regel, die zweimal
+  kurz hintereinander an derselben Ressource ausloest, kann jetzt allein
+  dadurch (ohne Threat-Intel-Treffer, ohne andere Regel) `evidence_sources
+  =2` erreichen. `exclude_assessment_id` sorgt dafuer, dass eine
+  Assessment nie sich selbst als eigene Historie zaehlt. **ASN-Historie
+  bewusst NICHT gebaut**: dafuer muesste am Ingest-Zeitpunkt (wo die rohe
+  IP noch verfuegbar ist, wie beim Threat-Intel-Reputation-Lookup) eine
+  IP-zu-ASN-Ruecksuche gegen `asn_records.prefixes` erfolgen und als
+  eigenes Metadata-Flag mitgefuehrt werden - separates, noch nicht
+  begonnenes Folgewerk.)
 - Konflikte, Ausfälle und veraltete Feeds sichtbar machen (**erledigt**:
   Ausfaelle/Alter waren ueber `provider_status`/`list_provider_views`
   (Admin-Endpoint `/admin/providers`) schon aus einer frueheren Phase

@@ -112,6 +112,37 @@ closed both gaps at once:
   the persisted assessment or in this service's own env config - "jede
   Score-Komponente bleibt erklaerbar" by construction, not by convention.
 
+## Local history corroboration (roadmap phase 8)
+
+A third, independent path to `evidence_sources=2` - "lokale IP-/
+Angriffshistorie als zeitlich abklingendes Signal verwenden". A resource
+that keeps tripping detections is its own form of evidence, separate from
+*which* rule noticed it this time or that time - even the *same* rule
+firing twice, close together, is meaningful on its own.
+
+`PostgresStore::resource_history_score(resource, exclude_assessment_id,
+half_life_seconds)` sums an exponential-decay weight
+(`0.5 ^ (age_seconds / half_life_seconds)`) over every *other* past
+assessment for that resource (any rule, `exclude_assessment_id` leaves
+out the one currently being evaluated so it can never count as its own
+history). A still-fresh prior assessment contributes close to 1.0; one
+exactly one half-life old contributes ~0.5; contributions keep roughly
+halving every further half-life rather than hitting a hard cutoff.
+`evidence_sources_for` counts this as corroborating once the sum reaches
+`CLAWFORGE_HISTORY_MIN_SCORE` (default 0.5 - a single prior occurrence
+that is not much older than one half-life is already enough on its own;
+`CLAWFORGE_HISTORY_HALF_LIFE_SECONDS` defaults to 14 days).
+
+Only the resource's *own* history, at the (pseudonymized) resource level
+- not yet an ASN-level equivalent ("lokale ... ASN-... Historie" is only
+partially addressed by this). An ASN-level decaying signal would need an
+IP-to-ASN reverse lookup against `asn_records.prefixes` at ingest time
+(the same "raw IP is only available right before pseudonymization"
+constraint threat-intel corroboration already works within - see
+`lookup_ip_reputation`'s own doc comment), carried as its own metadata
+flag the way `threat_intel_source` already is. Separate, not-yet-started
+follow-up work.
+
 ## Schema (migration `0034`)
 
 `security_policies`: versioned (`UNIQUE (name, version)`), `status`

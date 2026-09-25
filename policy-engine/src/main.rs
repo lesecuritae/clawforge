@@ -98,10 +98,29 @@ fn threat_intel_hit_is_corroborating(hit: &clawforge_storage::IpReputationHit) -
     age_seconds >= 0 && age_seconds <= threat_intel_max_staleness_seconds()
 }
 
+const DEFAULT_HISTORY_HALF_LIFE_SECONDS: i64 = 14 * 24 * 3600;
+const DEFAULT_HISTORY_MIN_SCORE: f64 = 0.5;
+
+fn history_half_life_seconds() -> i64 {
+    env::var("CLAWFORGE_HISTORY_HALF_LIFE_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_HISTORY_HALF_LIFE_SECONDS)
+}
+
+fn history_min_score() -> f64 {
+    env::var("CLAWFORGE_HISTORY_MIN_SCORE")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| *value > 0.0)
+        .unwrap_or(DEFAULT_HISTORY_MIN_SCORE)
+}
+
 /// Every assessment has at least one evidence source: the behavioral rule
 /// that produced it. A second, independent one raises this to 2, which is
 /// what `clawforge_policy::decide` requires before it will ever return
-/// `Block` - two different shapes of it exist:
+/// `Block` - three different shapes of it exist:
 ///
 /// - **Threat-intel corroboration**: the source is independently listed by
 ///   an external reputation feed, and that listing is itself fresh and
@@ -120,6 +139,16 @@ fn threat_intel_hit_is_corroborating(hit: &clawforge_storage::IpReputationHit) -
 ///   *every* event, not only a reputation hit: this combination has to be
 ///   resolvable to a real address later too, and `clawforge-security-engine`
 ///   (which only ever sees pseudonyms) cannot be the one to retain it.
+/// - **Local history corroboration** (roadmap phase 8: "lokale IP-/
+///   Angriffshistorie als zeitlich abklingendes Signal verwenden"): this
+///   *same* resource has a decaying history of its own past assessments
+///   (`resource_history_score`, any rule, not just this one) above
+///   `CLAWFORGE_HISTORY_MIN_SCORE` (default 0.5 - a single prior
+///   assessment counts on its own as long as it is not much older than
+///   one half-life; several older ones can also add up to it). A resource
+///   that keeps tripping detections is its own form of independent
+///   evidence, separate from *which* rule
+///   noticed it this time or that time.
 async fn evidence_sources_for(
     store: &PostgresStore,
     assessment: &clawforge_storage::SecurityAssessment,
@@ -134,6 +163,16 @@ async fn evidence_sources_for(
         .resource_has_other_rule_assessment(&assessment.resource, &assessment.rule_id, since)
         .await?
     {
+        return Ok(2);
+    }
+    let history_score = store
+        .resource_history_score(
+            &assessment.resource,
+            assessment.id,
+            history_half_life_seconds(),
+        )
+        .await?;
+    if history_score >= history_min_score() {
         return Ok(2);
     }
     Ok(1)
@@ -493,7 +532,7 @@ mod tests {
             resource: &str,
             rule_id: &str,
             now: chrono::DateTime<chrono::Utc>,
-        ) -> Result<()> {
+        ) -> Result<uuid::Uuid> {
             let dedupe_key = format!("{rule_id}:v1:{resource}:{}", now.timestamp());
             owner
                 .persist_security_assessment(clawforge_storage::SecurityAssessmentUpsert {
@@ -513,15 +552,20 @@ mod tests {
                     event_ids: &[],
                     threat_intel: None,
                 })
-                .await?;
-            Ok(())
+                .await
         }
 
         // Only ssh_bruteforce has fired so far - one evidence source, no
-        // corroboration yet.
-        seed_assessment(&owner, &resource, "ssh_bruteforce", now).await?;
+        // corroboration yet. Uses the *real* persisted id (not a fresh
+        // random one) so `resource_history_score`'s own exclusion
+        // (`evidence_sources_for`'s third, local-history path) correctly
+        // excludes this very row from its own score - otherwise this
+        // fixture's own freshly-seeded assessment would immediately look
+        // like "history" of itself and corroborate on that path before
+        // http_scan is even seeded, which is not what this test is about.
+        let ssh_only_id = seed_assessment(&owner, &resource, "ssh_bruteforce", now).await?;
         let ssh_only = clawforge_storage::SecurityAssessment {
-            id: uuid::Uuid::new_v4(),
+            id: ssh_only_id,
             rule_id: "ssh_bruteforce".to_string(),
             rule_version: "1".to_string(),
             resource: resource.clone(),
@@ -547,6 +591,95 @@ mod tests {
             evidence_sources_for(&store, &ssh_only).await?,
             2,
             "a second, independent rule on the same resource must corroborate the first"
+        );
+
+        Ok(())
+    }
+
+    /// Proves the third corroboration path (roadmap phase 8: "lokale IP-/
+    /// Angriffshistorie als zeitlich abklingendes Signal") against real
+    /// PostgreSQL: the *same* resource having its own still-fresh prior
+    /// assessment corroborates a new one, even with no threat-intel hit
+    /// and no *different* rule involved at all - the same rule tripping
+    /// twice, close together, is itself independent evidence.
+    #[tokio::test]
+    #[ignore = "requires provisioned roles in an isolated PostgreSQL test container"]
+    async fn a_resources_own_recent_history_corroborates_a_new_assessment_from_the_same_rule(
+    ) -> Result<()> {
+        let owner_url = env::var("CLAWFORGE_TEST_DATABASE_URL")?;
+        let owner = PostgresStore::connect_runtime(&owner_url).await?;
+        let store =
+            PostgresStore::connect_runtime(&env::var("CLAWFORGE_TEST_POLICY_ENGINE_DATABASE_URL")?)
+                .await?;
+
+        let resource = format!("ip-pseudonym:test-history-{}", uuid::Uuid::new_v4());
+        let now = chrono::Utc::now();
+
+        async fn seed(
+            owner: &PostgresStore,
+            resource: &str,
+            now: chrono::DateTime<chrono::Utc>,
+        ) -> Result<uuid::Uuid> {
+            let dedupe_key = format!("ssh_bruteforce:v1:{resource}:{}", now.timestamp());
+            owner
+                .persist_security_assessment(clawforge_storage::SecurityAssessmentUpsert {
+                    rule_id: "ssh_bruteforce",
+                    rule_version: "1",
+                    engine_version: "test",
+                    dedupe_key: &dedupe_key,
+                    resource,
+                    severity: "critical",
+                    confidence: 90,
+                    summary: "test fixture",
+                    event_count: 10,
+                    window_seconds: 300,
+                    bucket_start: now,
+                    first_seen: now,
+                    last_seen: now,
+                    event_ids: &[],
+                    threat_intel: None,
+                })
+                .await
+        }
+
+        // A first occurrence, with no prior history yet, is not
+        // corroborated by this path.
+        let first_id = seed(&owner, &resource, now).await?;
+        let first = clawforge_storage::SecurityAssessment {
+            id: first_id,
+            rule_id: "ssh_bruteforce".to_string(),
+            rule_version: "1".to_string(),
+            resource: resource.clone(),
+            severity: "critical".to_string(),
+            confidence: 90,
+            summary: String::new(),
+            event_count: 10,
+            bucket_start: now,
+            incident_id: None,
+            threat_intel_corroborated: false,
+            threat_intel: None,
+        };
+        assert_eq!(
+            evidence_sources_for(&store, &first).await?,
+            1,
+            "a resource's very first assessment has no history to corroborate on yet"
+        );
+
+        // The *same* rule trips again shortly after - the new assessment's
+        // own recent history (the first one, still very fresh) now
+        // corroborates it, with no different rule and no threat-intel hit
+        // involved anywhere.
+        let soon_after = now + chrono::Duration::minutes(5);
+        let second_id = seed(&owner, &resource, soon_after).await?;
+        let second = clawforge_storage::SecurityAssessment {
+            id: second_id,
+            bucket_start: soon_after,
+            ..first
+        };
+        assert_eq!(
+            evidence_sources_for(&store, &second).await?,
+            2,
+            "a resource's own still-fresh prior assessment must corroborate a new one"
         );
 
         Ok(())

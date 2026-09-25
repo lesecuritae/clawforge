@@ -164,6 +164,52 @@ impl PostgresStore {
         .await?)
     }
 
+    /// A resource's own decaying history of *past* assessments - roadmap
+    /// phase 8's "lokale IP-/Angriffshistorie als zeitlich abklingendes
+    /// Signal verwenden". Every prior assessment for `resource` (any rule,
+    /// any bucket, excluding `exclude_assessment_id` itself - the one
+    /// currently being evaluated, which would otherwise always contribute
+    /// its own ~1.0 and make this never purely "history") contributes
+    /// `0.5 ^ (age_seconds / half_life_seconds)` - a fresh repeat (age near
+    /// zero) contributes close to 1.0, one exactly `half_life_seconds` old
+    /// contributes exactly 0.5, and contributions keep roughly halving
+    /// every further half-life rather than ever hitting a hard cutoff. The
+    /// sum across every prior assessment is a single, continuous "has this
+    /// resource kept doing this, recently" score - a resource with several
+    /// still-fresh past assessments scores higher than one with only a
+    /// single old one, without needing a separate count *and* a separate
+    /// age check.
+    ///
+    /// `::float8` casts throughout: `EXTRACT(EPOCH FROM ...)` and `POWER`
+    /// on it both return Postgres `numeric`, not `float8` - sqlx's `f64`
+    /// decode only accepts `FLOAT8`, so without the casts this would hit
+    /// the exact same silent-decode-failure bug `list_provider_views`'s
+    /// own `is_stale` flag found and fixed (see that query's own
+    /// comment) - fixed here from the start rather than rediscovered.
+    pub async fn resource_history_score(
+        &self,
+        resource: &str,
+        exclude_assessment_id: Uuid,
+        half_life_seconds: i64,
+    ) -> Result<f64> {
+        if half_life_seconds <= 0 {
+            anyhow::bail!("half_life_seconds must be positive");
+        }
+        Ok(sqlx::query_scalar(
+            "SELECT COALESCE(SUM( \
+                 POWER(0.5::float8, \
+                       EXTRACT(EPOCH FROM (NOW() - bucket_start))::float8 / $3::float8) \
+               ), 0.0)::float8 \
+             FROM security_assessments \
+             WHERE resource = $1 AND id <> $2",
+        )
+        .bind(resource)
+        .bind(exclude_assessment_id)
+        .bind(half_life_seconds)
+        .fetch_one(self.pool())
+        .await?)
+    }
+
     /// Same bucket membership as `list_events_for_bucket`, plus one evidence
     /// field's value per event (`payload->>field`) - what a distinct-value
     /// rule (a scan: many different paths probed, not just many hits) needs

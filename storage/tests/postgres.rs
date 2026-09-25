@@ -1207,6 +1207,127 @@ async fn list_indicator_conflicts_finds_disagreeing_providers_above_the_threshol
     Ok(())
 }
 
+/// `resource_history_score` backs the roadmap phase 8 "lokale IP-/
+/// Angriffshistorie als zeitlich abklingendes Signal" gate - proves a
+/// still-fresh prior assessment contributes close to its full weight, an
+/// assessment exactly one half-life old contributes almost exactly half,
+/// a resource with no prior assessments at all scores zero, and the
+/// assessment being excluded (the one "currently being evaluated") never
+/// contributes to its own score.
+#[tokio::test]
+#[ignore = "requires an isolated PostgreSQL test container"]
+async fn resource_history_score_decays_with_age_and_excludes_itself() -> anyhow::Result<()> {
+    let url =
+        std::env::var("CLAWFORGE_TEST_DATABASE_URL").or_else(|_| std::env::var("DATABASE_URL"))?;
+    let store = PostgresStore::connect(&url).await?;
+
+    let resource = format!("ip-pseudonym:test-history-{}", uuid::Uuid::new_v4());
+    let half_life_seconds: i64 = 3600;
+
+    async fn seed(
+        store: &PostgresStore,
+        resource: &str,
+        bucket_start: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<uuid::Uuid> {
+        store
+            .persist_security_assessment(clawforge_storage::SecurityAssessmentUpsert {
+                rule_id: "ssh_bruteforce",
+                rule_version: "1",
+                engine_version: "test",
+                dedupe_key: &format!("test-history:{resource}:{}", uuid::Uuid::new_v4()),
+                resource,
+                severity: "critical",
+                confidence: 90,
+                summary: "test fixture",
+                event_count: 10,
+                window_seconds: 300,
+                bucket_start,
+                first_seen: bucket_start,
+                last_seen: bucket_start,
+                event_ids: &[],
+                threat_intel: None,
+            })
+            .await
+    }
+
+    // A resource with no history at all scores exactly zero.
+    let evaluating_id = seed(&store, &resource, Utc::now()).await?;
+    assert_eq!(
+        store
+            .resource_history_score(&resource, evaluating_id, half_life_seconds)
+            .await?,
+        0.0,
+        "a resource with no OTHER prior assessments must score zero"
+    );
+
+    // A still-fresh prior assessment (a few seconds old) contributes close
+    // to its full weight of 1.0.
+    let _fresh_id = seed(&store, &resource, Utc::now() - Duration::seconds(5)).await?;
+    let fresh_score = store
+        .resource_history_score(&resource, evaluating_id, half_life_seconds)
+        .await?;
+    assert!(
+        fresh_score > 0.99,
+        "a prior assessment only seconds old must contribute close to its full weight, got {fresh_score}"
+    );
+
+    // A second prior assessment exactly one half-life old adds
+    // approximately 0.5 more.
+    seed(
+        &store,
+        &resource,
+        Utc::now() - Duration::seconds(half_life_seconds),
+    )
+    .await?;
+    let combined_score = store
+        .resource_history_score(&resource, evaluating_id, half_life_seconds)
+        .await?;
+    assert!(
+        (combined_score - 1.5).abs() < 0.05,
+        "fresh (~1.0) + one half-life old (~0.5) must sum to ~1.5, got {combined_score}"
+    );
+
+    // Excluding an id that matches none of the three real rows must
+    // include all three (evaluating_id's own row now counts too, on top
+    // of the two `combined_score` already summed) - proves
+    // exclude_assessment_id excludes exactly the row it names, not some
+    // other convention (e.g. "always exclude the most recent").
+    let excluding_nothing_real = store
+        .resource_history_score(&resource, uuid::Uuid::new_v4(), half_life_seconds)
+        .await?;
+    assert!(
+        excluding_nothing_real > combined_score,
+        "excluding an id matching no real row must count every row, including evaluating_id's \
+         own (excluding_nothing_real={excluding_nothing_real}, combined_score={combined_score})"
+    );
+
+    sqlx::query("DELETE FROM security_assessments WHERE resource = $1")
+        .bind(&resource)
+        .execute(store.pool())
+        .await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated PostgreSQL test container"]
+async fn resource_history_score_rejects_non_positive_half_life() -> anyhow::Result<()> {
+    let url =
+        std::env::var("CLAWFORGE_TEST_DATABASE_URL").or_else(|_| std::env::var("DATABASE_URL"))?;
+    let store = PostgresStore::connect(&url).await?;
+
+    assert!(store
+        .resource_history_score("ip-pseudonym:test", uuid::Uuid::new_v4(), 0)
+        .await
+        .is_err());
+    assert!(store
+        .resource_history_score("ip-pseudonym:test", uuid::Uuid::new_v4(), -1)
+        .await
+        .is_err());
+
+    Ok(())
+}
+
 /// `list_provider_views`'s `is_stale` flag backs the roadmap phase 8
 /// "veraltete Feeds sichtbar machen" gate - proves a provider whose last
 /// successful sync is well past `interval_seconds *
