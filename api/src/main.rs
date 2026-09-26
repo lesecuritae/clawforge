@@ -238,6 +238,9 @@ fn role_multiplier(role: Option<&str>) -> u32 {
 }
 
 fn global_limit(policy: RatePolicy, role: Option<&str>) -> u32 {
+    if policy.class == "internal-event" {
+        return policy.limit;
+    }
     let base = match policy.class {
         "login" => 10,
         "bootstrap" => 6,
@@ -247,6 +250,26 @@ fn global_limit(policy: RatePolicy, role: Option<&str>) -> u32 {
         base
     } else {
         base.saturating_mul(role_multiplier(role)) / 100
+    }
+}
+
+fn internal_event_policy(path: &str, identity: Option<InternalIdentity>) -> Option<RatePolicy> {
+    let delivery_consumer = path.starts_with("/internal/events/")
+        && identity.is_some_and(|value| value.event_consumer().is_some());
+    let notification_consumer = (path == "/internal/notifier/events"
+        || path.starts_with("/internal/notifier/events/"))
+        && identity == Some(InternalIdentity::Notifier);
+    if delivery_consumer || notification_consumer {
+        // A single delivery batch can acknowledge many events. The ordinary
+        // anonymous limit blocks the fixed, authenticated service consumers
+        // during a backlog, even though their own endpoint auth succeeds.
+        Some(RatePolicy {
+            class: "internal-event",
+            limit: 6_000,
+            window: StdDuration::from_secs(60),
+        })
+    } else {
+        None
     }
 }
 
@@ -319,13 +342,17 @@ async fn rate_limit_middleware(
         return response;
     };
     let headers = request.headers();
+    let internal_event_policy =
+        internal_event_policy(&path, internal_identity(&state.config, headers));
     let source = request
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|info| info.0.ip().to_string())
         .unwrap_or_else(|| header_client_identity(headers));
     let bearer_token = bearer(headers);
-    let principal = if let Some(token) = bearer_token {
+    let principal = if internal_event_policy.is_some() {
+        None
+    } else if let Some(token) = bearer_token {
         state
             .store
             .authenticate_credential(&digest(token))
@@ -336,7 +363,9 @@ async fn rate_limit_middleware(
         None
     };
     let role = principal.as_ref().map(|value| value.role.as_str());
-    let policy = policy_for(&path, request.method(), role).expect("non-exempt policy");
+    let policy = internal_event_policy
+        .or_else(|| policy_for(&path, request.method(), role))
+        .expect("non-exempt policy");
     let identity = bearer_token.map(digest).unwrap_or_else(|| digest(&source));
     let global_limit = global_limit(policy, role).max(1);
     let global = state.rate_limiter.check(
@@ -8589,6 +8618,48 @@ mod tests {
                 .unwrap()
                 .class,
             "write"
+        );
+    }
+
+    #[test]
+    fn internal_event_limit_only_applies_to_authenticated_consumers() {
+        for identity in [
+            InternalIdentity::Analyzer,
+            InternalIdentity::Events,
+            InternalIdentity::Notifier,
+        ] {
+            let policy = internal_event_policy("/internal/events/consume", Some(identity)).unwrap();
+            assert_eq!(policy.class, "internal-event");
+            assert_eq!(policy.limit, 6_000);
+            assert_eq!(global_limit(policy, None), 6_000);
+        }
+        assert!(internal_event_policy("/internal/events/consume", None).is_none());
+        assert!(internal_event_policy(
+            "/internal/events/consume",
+            Some(InternalIdentity::Operations)
+        )
+        .is_none());
+        assert!(internal_event_policy(
+            "/internal/notifier/events",
+            Some(InternalIdentity::Notifier)
+        )
+        .is_some());
+        assert!(internal_event_policy(
+            "/internal/notifier/events/123/result",
+            Some(InternalIdentity::Notifier)
+        )
+        .is_some());
+        assert!(
+            internal_event_policy("/internal/notifier/events", Some(InternalIdentity::Events))
+                .is_none()
+        );
+        assert!(internal_event_policy(
+            "/internal/security-events/batch",
+            Some(InternalIdentity::Events)
+        )
+        .is_none());
+        assert!(
+            internal_event_policy("/admin/auth/login", Some(InternalIdentity::Events)).is_none()
         );
     }
 
