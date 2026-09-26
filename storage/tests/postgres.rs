@@ -42,6 +42,13 @@ async fn runtime_roles_enforce_service_boundaries() -> anyhow::Result<()> {
         .list_incidents(None, 10)
         .await
         .expect("list_incidents must succeed under the worker role's own grants");
+    assert_eq!(
+        worker
+            .delete_expired_security_assessments(Utc::now() - Duration::days(36_500))
+            .await
+            .expect("assessment retention must succeed under the worker role's own grants"),
+        0
+    );
 
     let correlation = PostgresStore::connect_runtime(&runtime_url("correlation")?).await?;
     correlation

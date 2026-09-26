@@ -1183,7 +1183,37 @@ impl PostgresStore {
         status: Option<&str>,
         limit: i64,
     ) -> Result<Vec<serde_json::Value>> {
-        let rows = sqlx::query("SELECT i.id,i.title,i.status,i.source,i.severity,i.confidence,i.candidate_id,i.created_at,i.updated_at,i.risk_score,i.summary,i.correlation_key,(SELECT string_agg(DISTINCT e.source, ', ' ORDER BY e.source) FROM incident_relations source_relation JOIN events e ON e.event_id=source_relation.event_id WHERE source_relation.incident_id=i.id) AS event_sources,(COUNT(DISTINCT ie.event_id)+COUNT(DISTINCT ir.event_id)) AS event_count FROM incidents i LEFT JOIN incident_events ie ON ie.incident_id=i.id LEFT JOIN incident_relations ir ON ir.incident_id=i.id AND ir.relation_type='event' WHERE ($1::text IS NULL OR i.status=$1) GROUP BY i.id ORDER BY i.updated_at DESC LIMIT $2")
+        // Select the requested incidents before aggregating their events. Joining both
+        // event tables first multiplies their rows and makes this read path time out
+        // for incidents with a large event history.
+        let rows = sqlx::query(
+            "WITH selected AS ( \
+                 SELECT id,title,status,source,severity,confidence,candidate_id,created_at,updated_at,risk_score,summary,correlation_key \
+                 FROM incidents WHERE ($1::text IS NULL OR status=$1) \
+                 ORDER BY updated_at DESC LIMIT $2 \
+             ) \
+             SELECT i.*, relations.event_sources, \
+                    (legacy.event_count + relations.event_count) AS event_count \
+             FROM selected i \
+             LEFT JOIN LATERAL ( \
+                 SELECT COUNT(DISTINCT event_id) AS event_count \
+                 FROM incident_events WHERE incident_id=i.id \
+             ) legacy ON TRUE \
+             LEFT JOIN LATERAL ( \
+                 SELECT COUNT(*) FILTER (WHERE r.direct_event) AS event_count, \
+                        string_agg(DISTINCT e.source, ', ' ORDER BY e.source) AS event_sources \
+                 FROM ( \
+                     SELECT event_id, BOOL_OR(relation_type='event') AS direct_event \
+                     FROM incident_relations \
+                     WHERE incident_id=i.id AND event_id IS NOT NULL \
+                     GROUP BY event_id \
+                 ) r \
+                 LEFT JOIN LATERAL ( \
+                     SELECT source FROM events WHERE event_id=r.event_id OFFSET 0 \
+                 ) e ON TRUE \
+             ) relations ON TRUE \
+             ORDER BY i.updated_at DESC",
+        )
             .bind(status).bind(limit.clamp(1, 500)).fetch_all(&self.pool).await?;
         Ok(rows
             .into_iter()

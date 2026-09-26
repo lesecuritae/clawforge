@@ -88,7 +88,8 @@ GRANT SELECT ON TABLE _sqlx_migrations,
   alerts, incidents, incident_relations, providers, provider_status,
   runtime_status, knowledge_entries, events, rules, decisions, workflows,
   workflow_steps, workflow_runs, approvals, notification_rules,
-  notification_channels, event_consumers
+  notification_channels, event_consumers, security_assessments,
+  security_policy_decisions
   TO clawforge_worker;
 GRANT SELECT, INSERT, UPDATE ON TABLE
   providers, provider_status, provider_history, provider_sync_requests,
@@ -100,6 +101,7 @@ GRANT SELECT, INSERT, UPDATE ON TABLE
   audit_events, audit_outbox, notification_events
   TO clawforge_worker;
 GRANT DELETE ON TABLE indicators TO clawforge_worker;
+GRANT DELETE ON TABLE security_policy_decisions, security_assessments TO clawforge_worker;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO clawforge_worker;
 REVOKE UPDATE ON TABLE audit_events FROM clawforge_worker;
 
