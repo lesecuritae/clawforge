@@ -1,0 +1,11 @@
+# Operator-owned policy: the Clawforge adapter never edits this file.
+challenges:
+  refresh:
+    runtime: refresh
+rules:
+  - name: clawforge-challenge
+    conditions:
+      - 'remoteAddress.network("clawforge_challenge")'
+    action: challenge
+    settings:
+      challenges: [refresh]

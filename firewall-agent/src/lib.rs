@@ -113,7 +113,11 @@
 //! cover - see `docs/firewall-agent.md`'s own remaining list.
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::io::AsyncWriteExt;
 
 /// Clawforge's own, exclusive nftables table and the two typed sets
 /// (nftables sets are typed - one set cannot hold both IPv4 and IPv6
@@ -1368,13 +1372,424 @@ impl FirewallAdapter for HaproxyRateLimitAdapter {
     }
 }
 
+/// The Clawforge-owned YAML snippet go-away loads through `--policy-snippets`.
+/// Upstream merges *network definitions* from snippets but never their rules;
+/// an operator must place the one `remoteAddress.network(...)` challenge rule
+/// in the main policy at the intended precedence. Clawforge only manages the
+/// named network's prefixes, like its exclusive nftables sets.
+const GOAWAY_MANAGED_NETWORK_NAME: &str = "clawforge_challenge";
+const GOAWAY_DEFAULT_POLICY_FILE: &str = "/etc/go-away/policy-snippets/clawforge-managed.yml";
+static GOAWAY_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+/// `systemctl kill --signal=HUP <unit>` - sends the signal straight to the
+/// unit's main process, so it works whether or not the unit file defines
+/// `ExecReload` (`systemctl reload` would silently no-op without one).
+/// The whole argv is configurable (`CLAWFORGE_GOAWAY_RELOAD_COMMAND`,
+/// comma-separated) rather than just the unit name, specifically so the
+/// isolated lab test can swap it for a direct `kill -HUP <pid>` against a
+/// real spawned go-away process - a throwaway test container has no
+/// systemd of its own to route through.
+const GOAWAY_DEFAULT_RELOAD_COMMAND: [&str; 4] =
+    ["systemctl", "kill", "--signal=HUP", "go-away.service"];
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct GoAwayNetwork {
+    prefixes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct GoAwayManagedPolicy {
+    networks: BTreeMap<String, Vec<GoAwayNetwork>>,
+}
+
+impl GoAwayManagedPolicy {
+    /// An empty source list is valid in go-away; one source with an empty
+    /// `prefixes` list is not, because upstream rejects a source with no URL,
+    /// file, ASN, or prefixes when it initializes the network.
+    fn fresh() -> Self {
+        let mut networks = BTreeMap::new();
+        networks.insert(GOAWAY_MANAGED_NETWORK_NAME.to_string(), Vec::new());
+        GoAwayManagedPolicy { networks }
+    }
+
+    fn prefixes(&self) -> &[String] {
+        self.networks
+            .get(GOAWAY_MANAGED_NETWORK_NAME)
+            .and_then(|sources| sources.first())
+            .map(|network| network.prefixes.as_slice())
+            .unwrap_or_default()
+    }
+
+    fn prefixes_mut(&mut self) -> &mut Vec<String> {
+        let sources = self
+            .networks
+            .entry(GOAWAY_MANAGED_NETWORK_NAME.to_string())
+            .or_default();
+        if sources.is_empty() {
+            sources.push(GoAwayNetwork::default());
+        }
+        &mut sources[0].prefixes
+    }
+
+    fn clear_empty_source(&mut self) {
+        if self.prefixes().is_empty() {
+            self.networks
+                .insert(GOAWAY_MANAGED_NETWORK_NAME.to_string(), Vec::new());
+        }
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.networks.len() != 1 {
+            return Err("go-away managed snippet must contain only the Clawforge network".into());
+        }
+        let Some(sources) = self.networks.get(GOAWAY_MANAGED_NETWORK_NAME) else {
+            return Err("go-away managed snippet is missing the Clawforge network".into());
+        };
+        if sources.len() > 1
+            || sources
+                .first()
+                .is_some_and(|source| source.prefixes.is_empty())
+        {
+            return Err("go-away managed network has an unsupported source layout".into());
+        }
+        Ok(())
+    }
+}
+
+/// go-away adapter - the Challenge counterpart to `NftablesAdapter` (block)
+/// and `HaproxyRateLimitAdapter` (rate-limit). It changes only its own
+/// network snippet, then signals go-away to re-read the operator's main
+/// policy plus snippets. Upstream's `cmd/go-away/main.go` handles SIGHUP
+/// without restarting the process. The main policy's rule is never edited.
+pub struct GoAwayAdapter {
+    policy_file: String,
+    reload_command: Vec<String>,
+    /// Same never-block exclusion list as every other adapter - see
+    /// `check_never_block`'s own doc comment.
+    never_block: Result<Vec<(IpAddr, u8)>, String>,
+}
+
+impl GoAwayAdapter {
+    pub fn new() -> Self {
+        Self {
+            policy_file: std::env::var("CLAWFORGE_GOAWAY_POLICY_FILE")
+                .unwrap_or_else(|_| GOAWAY_DEFAULT_POLICY_FILE.to_string()),
+            reload_command: std::env::var("CLAWFORGE_GOAWAY_RELOAD_COMMAND")
+                .ok()
+                .map(|value| value.split(',').map(str::to_string).collect())
+                .unwrap_or_else(|| {
+                    GOAWAY_DEFAULT_RELOAD_COMMAND
+                        .iter()
+                        .map(|part| part.to_string())
+                        .collect()
+                }),
+            never_block: never_block_list_from_env(),
+        }
+    }
+
+    /// A missing file reads as [`GoAwayManagedPolicy::fresh`] - the very
+    /// first `apply` this adapter ever makes creates it, rather than
+    /// requiring an operator to pre-seed an empty file by hand.
+    async fn read_policy(&self) -> Result<GoAwayManagedPolicy, String> {
+        match tokio::fs::read_to_string(&self.policy_file).await {
+            Ok(raw) => {
+                let policy: GoAwayManagedPolicy = serde_yaml::from_str(&raw)
+                    .map_err(|error| format!("parsing {}: {error}", self.policy_file))?;
+                policy.validate()?;
+                Ok(policy)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(GoAwayManagedPolicy::fresh())
+            }
+            Err(error) => Err(format!("reading {}: {error}", self.policy_file)),
+        }
+    }
+
+    async fn write_policy(&self, policy: &GoAwayManagedPolicy) -> Result<(), String> {
+        policy.validate()?;
+        let rendered = serde_yaml::to_string(policy)
+            .map_err(|error| format!("serializing {}: {error}", self.policy_file))?;
+        let path = std::path::Path::new(&self.policy_file);
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|error| format!("creating {}: {error}", parent.display()))?;
+        }
+        // Go-away may read snippets on SIGHUP or on its own restart. Never
+        // leave it a truncated YAML document, even if this process dies mid-write.
+        let temporary = path.with_file_name(format!(
+            ".{}.{}.{}.tmp",
+            path.file_name().unwrap_or_default().to_string_lossy(),
+            std::process::id(),
+            GOAWAY_TEMP_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let result = async {
+            let mut file = tokio::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)
+                .await?;
+            file.write_all(rendered.as_bytes()).await?;
+            file.sync_all().await?;
+            if let Ok(metadata) = tokio::fs::metadata(path).await {
+                tokio::fs::set_permissions(&temporary, metadata.permissions()).await?;
+            }
+            tokio::fs::rename(&temporary, path).await
+        }
+        .await;
+        if result.is_err() {
+            let _ = tokio::fs::remove_file(&temporary).await;
+        }
+        result.map_err(|error| format!("writing {}: {error}", self.policy_file))
+    }
+
+    /// Runs `reload_command` (default `systemctl kill --signal=HUP
+    /// go-away.service`) - see [`GOAWAY_DEFAULT_RELOAD_COMMAND`]'s own
+    /// doc comment for why the whole argv, not just a unit name, is
+    /// configurable.
+    async fn reload(&self) -> Result<(), String> {
+        let Some((program, args)) = self.reload_command.split_first() else {
+            return Err("CLAWFORGE_GOAWAY_RELOAD_COMMAND must not be empty".to_string());
+        };
+        let output = tokio::process::Command::new(program)
+            .args(args)
+            .output()
+            .await
+            .map_err(|error| format!("running {}: {error}", self.reload_command.join(" ")))?;
+        if !output.status.success() {
+            return Err(format!(
+                "{} failed: {}",
+                self.reload_command.join(" "),
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Default for GoAwayAdapter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn goaway_rendered_commands(
+    policy_file: &str,
+    element: &str,
+    reload_command: &[String],
+) -> Vec<Vec<String>> {
+    vec![
+        vec![
+            "yaml-prefix-add".to_string(),
+            policy_file.to_string(),
+            GOAWAY_MANAGED_NETWORK_NAME.to_string(),
+            element.to_string(),
+        ],
+        reload_command.to_vec(),
+    ]
+}
+
+fn goaway_rollback_commands(
+    policy_file: &str,
+    element: &str,
+    reload_command: &[String],
+) -> Vec<Vec<String>> {
+    vec![
+        vec![
+            "yaml-prefix-remove".to_string(),
+            policy_file.to_string(),
+            GOAWAY_MANAGED_NETWORK_NAME.to_string(),
+            element.to_string(),
+        ],
+        reload_command.to_vec(),
+    ]
+}
+
+#[async_trait]
+impl FirewallAdapter for GoAwayAdapter {
+    fn name(&self) -> &'static str {
+        "goaway"
+    }
+
+    async fn preflight(&self, target: &FirewallTarget) -> Result<Preflight, AdapterError> {
+        target.validate()?;
+        if matches!(target, FirewallTarget::IncidentSource { .. }) {
+            return Ok(Preflight {
+                already_blocked: false,
+                raw_set_json: String::new(),
+            });
+        }
+        let element = element_reference(target)?;
+        let policy = self.read_policy().await.map_err(AdapterError::Preflight)?;
+        let already_blocked = policy.prefixes().iter().any(|prefix| prefix == &element);
+        let raw_set_json = serde_json::to_string(policy.prefixes())
+            .map_err(|error| AdapterError::Preflight(error.to_string()))?;
+        Ok(Preflight {
+            already_blocked,
+            raw_set_json,
+        })
+    }
+
+    fn render(&self, action: &FirewallAction) -> Result<FirewallActionReceipt, AdapterError> {
+        if let FirewallTarget::ResolvedIncidentSource { .. } = &action.target {
+            return Err(AdapterError::InvalidTarget(
+                "a resolved incident source must never be rendered into a receipt".into(),
+            ));
+        }
+        action.target.validate()?;
+        check_never_block(&self.never_block, &action.target)?;
+        let element = element_reference(&action.target)?;
+        Ok(FirewallActionReceipt {
+            adapter: self.name(),
+            rendered_commands: goaway_rendered_commands(
+                &self.policy_file,
+                &element,
+                &self.reload_command,
+            ),
+            rollback_commands: goaway_rollback_commands(
+                &self.policy_file,
+                &element,
+                &self.reload_command,
+            ),
+            is_dry_run: true,
+            ttl_seconds: action.ttl_seconds,
+            target_fingerprint: element,
+        })
+    }
+
+    async fn apply(
+        &self,
+        action: &FirewallAction,
+        dry_run: bool,
+    ) -> Result<ApplyResult, AdapterError> {
+        action.target.validate()?;
+        require_resolved_target(&action.target)?;
+        check_never_block(&self.never_block, &action.target)?;
+        let element = element_reference(&action.target)?;
+        let receipt_element = redacted_element_reference(&action.target)?;
+        if dry_run {
+            return Ok(ApplyResult {
+                receipt: FirewallActionReceipt {
+                    adapter: self.name(),
+                    rendered_commands: goaway_rendered_commands(
+                        &self.policy_file,
+                        &receipt_element,
+                        &self.reload_command,
+                    ),
+                    rollback_commands: goaway_rollback_commands(
+                        &self.policy_file,
+                        &receipt_element,
+                        &self.reload_command,
+                    ),
+                    is_dry_run: true,
+                    ttl_seconds: action.ttl_seconds,
+                    target_fingerprint: receipt_element,
+                },
+                observed_state: None,
+            });
+        }
+        let mut policy = self.read_policy().await.map_err(AdapterError::Apply)?;
+        let original_policy = policy.clone();
+        let prefixes = policy.prefixes_mut();
+        if !prefixes.iter().any(|prefix| prefix == &element) {
+            prefixes.push(element.clone());
+        }
+        self.write_policy(&policy)
+            .await
+            .map_err(AdapterError::Apply)?;
+        if let Err(error) = self.reload().await {
+            self.write_policy(&original_policy)
+                .await
+                .map_err(|restore| {
+                    AdapterError::Apply(format!(
+                        "reload failed: {error}; restoring snippet failed: {restore}"
+                    ))
+                })?;
+            return Err(AdapterError::Apply(format!(
+                "reload failed; previous snippet restored: {error}"
+            )));
+        }
+        let observed_state = serde_json::to_string(policy.prefixes())
+            .map_err(|error| AdapterError::Apply(error.to_string()))?;
+        Ok(ApplyResult {
+            receipt: FirewallActionReceipt {
+                adapter: self.name(),
+                rendered_commands: goaway_rendered_commands(
+                    &self.policy_file,
+                    &receipt_element,
+                    &self.reload_command,
+                ),
+                rollback_commands: goaway_rollback_commands(
+                    &self.policy_file,
+                    &receipt_element,
+                    &self.reload_command,
+                ),
+                is_dry_run: false,
+                ttl_seconds: action.ttl_seconds,
+                target_fingerprint: receipt_element,
+            },
+            observed_state: Some(observed_state),
+        })
+    }
+
+    async fn verify(&self, target: &FirewallTarget) -> Result<VerificationResult, AdapterError> {
+        target.validate()?;
+        require_resolved_target(target)?;
+        let element = element_reference(target)?;
+        let policy = self.read_policy().await.map_err(AdapterError::Verify)?;
+        if policy.prefixes().iter().any(|prefix| prefix == &element) {
+            Ok(VerificationResult::Verified)
+        } else {
+            Ok(VerificationResult::NotPresent)
+        }
+    }
+
+    async fn rollback(&self, action: &FirewallAction) -> Result<(), AdapterError> {
+        action.target.validate()?;
+        require_resolved_target(&action.target)?;
+        let element = element_reference(&action.target)?;
+        let mut policy = self.read_policy().await.map_err(AdapterError::Rollback)?;
+        let original_policy = policy.clone();
+        let before = policy.prefixes().len();
+        policy.prefixes_mut().retain(|prefix| prefix != &element);
+        if policy.prefixes().len() == before {
+            // Idempotent, like every other adapter's rollback - removing
+            // something already absent (a repeated kill-switch tick, or a
+            // TTL sweep racing an operator's manual rollback) is success,
+            // not an error. Still reloads: harmless if nothing changed,
+            // and cheap insurance against a policy file that drifted out
+            // of band.
+            self.reload().await.map_err(AdapterError::Rollback)?;
+            return Ok(());
+        }
+        policy.clear_empty_source();
+        self.write_policy(&policy)
+            .await
+            .map_err(AdapterError::Rollback)?;
+        if let Err(error) = self.reload().await {
+            self.write_policy(&original_policy)
+                .await
+                .map_err(|restore| {
+                    AdapterError::Rollback(format!(
+                        "reload failed: {error}; restoring snippet failed: {restore}"
+                    ))
+                })?;
+            return Err(AdapterError::Rollback(format!(
+                "reload failed; previous snippet restored: {error}"
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// Picks the [`FirewallAdapter`] an `nftables.`/`haproxy.`/
-/// `haproxy_ratelimit.`-prefixed action name (or a bare `adapter` column
-/// value - `"nftables"`/`"haproxy"`/`"haproxy_ratelimit"`, no trailing
-/// dot) routes to. `"haproxy_ratelimit"` is checked *before* the plain
-/// `"haproxy"` prefix - `"haproxy_ratelimit..."` also starts with
-/// `"haproxy"`, so checking the generic prefix first would silently route
-/// rate-limit actions to the wrong (ACL) adapter.
+/// `haproxy_ratelimit.`/`goaway.`-prefixed action name (or a bare
+/// `adapter` column value - `"nftables"`/`"haproxy"`/`"haproxy_ratelimit"`/
+/// `"goaway"`, no trailing dot) routes to. `"haproxy_ratelimit"` is
+/// checked *before* the plain `"haproxy"` prefix - `"haproxy_ratelimit..."`
+/// also starts with `"haproxy"`, so checking the generic prefix first
+/// would silently route rate-limit actions to the wrong (ACL) adapter.
 ///
 /// A single shared function (moved here from what was originally
 /// `clawforge-executor`'s own private `adapter_for`) rather than one copy
@@ -1391,6 +1806,8 @@ pub fn adapter_for_action(name: &str) -> Option<Box<dyn FirewallAdapter>> {
         Some(Box::new(HaproxyRateLimitAdapter::new()))
     } else if name.starts_with("haproxy") {
         Some(Box::new(HaproxyAdapter::new()))
+    } else if name.starts_with("goaway") {
+        Some(Box::new(GoAwayAdapter::new()))
     } else {
         None
     }
@@ -1772,6 +2189,25 @@ impl Default for TailscaleAdapter {
 mod tests {
     use super::*;
 
+    /// `CLAWFORGE_TAILSCALE_QUARANTINE_TAG` is mutated by exactly one test
+    /// (`tailscale_quarantine_tag_defaults_but_is_configurable`) and read
+    /// implicitly by every other test that constructs a `TailscaleAdapter`
+    /// (`TailscaleAdapter::new()` reads it). `cargo test`'s default
+    /// parallel execution runs them on different threads, so without
+    /// serializing them a `set_var` from the one mutator can be observed
+    /// by `TailscaleAdapter::new()` in an unrelated test between its own
+    /// set/assert/remove steps - the same class of race already found and
+    /// fixed for `CLAWFORGE_FIREWALL_ADAPTERS` in `clawforge-executor`'s
+    /// own test suite this session. Every test that touches this env var
+    /// must hold this lock for its whole span.
+    static TAILSCALE_QUARANTINE_TAG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_tailscale_quarantine_tag_env() -> std::sync::MutexGuard<'static, ()> {
+        TAILSCALE_QUARANTINE_TAG_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     fn indicator(cidr: &str) -> FirewallTarget {
         FirewallTarget::ThreatIntelIndicator {
             cidr: cidr.to_string(),
@@ -2084,6 +2520,212 @@ mod tests {
             "the raw resolved IP must never appear in anything apply's receipt returns: {rendered}"
         );
         assert!(rendered.contains("ip-pseudonym:deadbeef"));
+    }
+
+    /// A `GoAwayAdapter` pointed at a fresh, uniquely-named temp file (so
+    /// parallel tests never collide on the same policy file) with a
+    /// harmless no-op reload command (`true`, always exits 0) - lets a
+    /// test exercise the real file-read/write path without needing a
+    /// real go-away process or systemd. Real signal-delivery-and-observed-
+    /// effect coverage lives in the isolated lab
+    /// (`scripts/test-goaway-lab.sh`), not here.
+    fn goaway_adapter_with_temp_file() -> GoAwayAdapter {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let policy_file = std::env::temp_dir()
+            .join(format!(
+                "clawforge-goaway-test-{}-{id}.yml",
+                std::process::id()
+            ))
+            .to_string_lossy()
+            .into_owned();
+        GoAwayAdapter {
+            policy_file,
+            reload_command: vec!["true".to_string()],
+            never_block: never_block_list_from_env(),
+        }
+    }
+
+    #[test]
+    fn goaway_fresh_snippet_has_the_upstream_empty_network_shape_and_no_rule() {
+        let policy = GoAwayManagedPolicy::fresh();
+        assert_eq!(policy.prefixes(), Vec::<String>::new().as_slice());
+        let rendered = serde_yaml::to_string(&policy).unwrap();
+        assert!(rendered.contains("clawforge_challenge: []"));
+        assert!(!rendered.contains("rules:"));
+        policy.validate().unwrap();
+        assert!(serde_yaml::from_str::<GoAwayManagedPolicy>(
+            "networks:\n  clawforge_challenge: []\nrules:\n  - name: unexpected\n"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn goaway_render_embeds_the_real_cidr_and_never_resolves_an_incident_source() {
+        let adapter = goaway_adapter_with_temp_file();
+        let receipt = adapter
+            .render(&action_for(indicator("203.0.113.10")))
+            .unwrap();
+        assert_eq!(receipt.adapter, "goaway");
+        let rendered = format!("{:?}", receipt.rendered_commands);
+        assert!(rendered.contains("yaml-prefix-add"));
+        assert!(rendered.contains("203.0.113.10"));
+        assert!(rendered.contains(GOAWAY_MANAGED_NETWORK_NAME));
+
+        let incident_receipt = adapter
+            .render(&action_for(FirewallTarget::IncidentSource {
+                pseudonym: "ip-pseudonym:deadbeef".into(),
+            }))
+            .unwrap();
+        let rendered = format!("{:?}", incident_receipt.rendered_commands);
+        assert!(rendered.contains("<resolved-at-apply-time:"));
+        assert!(rendered.contains("ip-pseudonym:deadbeef"));
+    }
+
+    #[test]
+    fn goaway_render_refuses_a_resolved_incident_source_outright() {
+        let adapter = goaway_adapter_with_temp_file();
+        let action = action_for(FirewallTarget::ResolvedIncidentSource {
+            raw_ip: "203.0.113.10".into(),
+            pseudonym: "ip-pseudonym:deadbeef".into(),
+        });
+        assert!(adapter.render(&action).is_err());
+    }
+
+    #[test]
+    fn goaway_render_refuses_a_target_that_overlaps_a_never_block_entry() {
+        let mut adapter = goaway_adapter_with_temp_file();
+        adapter.never_block = Ok(vec![("203.0.113.0".parse().unwrap(), 24)]);
+        let error = adapter
+            .render(&action_for(indicator("203.0.113.10")))
+            .unwrap_err();
+        assert!(matches!(error, AdapterError::InvalidTarget(_)));
+    }
+
+    #[tokio::test]
+    async fn goaway_apply_verify_rollback_all_refuse_an_unresolved_incident_source() {
+        let adapter = goaway_adapter_with_temp_file();
+        let action = action_for(FirewallTarget::IncidentSource {
+            pseudonym: "ip-pseudonym:never-resolved".into(),
+        });
+        assert!(adapter.apply(&action, true).await.is_err());
+        assert!(adapter.verify(&action.target).await.is_err());
+        assert!(adapter.rollback(&action).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn goaway_apply_with_dry_run_never_touches_the_filesystem() {
+        let adapter = goaway_adapter_with_temp_file();
+        let policy_file = adapter.policy_file.clone();
+        let result = adapter
+            .apply(&action_for(indicator("203.0.113.10")), true)
+            .await;
+        assert!(
+            result.is_ok(),
+            "dry-run apply must not need a real file or reload command: {result:?}"
+        );
+        assert!(
+            !std::path::Path::new(&policy_file).exists(),
+            "dry-run apply must never create the policy file"
+        );
+    }
+
+    #[tokio::test]
+    async fn goaway_apply_receipt_never_embeds_the_resolved_raw_ip() {
+        let adapter = goaway_adapter_with_temp_file();
+        let action = FirewallAction {
+            target: FirewallTarget::ResolvedIncidentSource {
+                raw_ip: "203.0.113.205".into(),
+                pseudonym: "ip-pseudonym:deadbeef".into(),
+            },
+            ttl_seconds: 3600,
+            reason: "test".into(),
+        };
+        let applied = adapter.apply(&action, true).await.unwrap();
+        let rendered = format!(
+            "{:?} {:?} {}",
+            applied.receipt.rendered_commands,
+            applied.receipt.rollback_commands,
+            applied.receipt.target_fingerprint
+        );
+        assert!(
+            !rendered.contains("203.0.113.205"),
+            "the raw resolved IP must never appear in anything apply's receipt returns: {rendered}"
+        );
+        assert!(rendered.contains("ip-pseudonym:deadbeef"));
+    }
+
+    #[tokio::test]
+    async fn goaway_apply_verify_rollback_round_trip_against_a_real_temp_file() {
+        // No real go-away process or systemd involved - `reload_command`
+        // is the harmless no-op `true`. What this proves: the adapter's
+        // own file-read/modify/write/reload-call sequencing is correct
+        // end to end, including creating the file fresh on first apply
+        // and idempotent re-application/rollback.
+        let adapter = goaway_adapter_with_temp_file();
+        let action = FirewallAction {
+            target: FirewallTarget::ResolvedIncidentSource {
+                raw_ip: "203.0.113.77".into(),
+                pseudonym: "ip-pseudonym:roundtrip".into(),
+            },
+            ttl_seconds: 3600,
+            reason: "test".into(),
+        };
+
+        assert_eq!(
+            adapter.verify(&action.target).await.unwrap(),
+            VerificationResult::NotPresent
+        );
+
+        adapter.apply(&action, false).await.unwrap();
+        assert_eq!(
+            adapter.verify(&action.target).await.unwrap(),
+            VerificationResult::Verified
+        );
+        let policy = adapter.read_policy().await.unwrap();
+        assert_eq!(policy.prefixes(), &["203.0.113.77".to_string()]);
+        assert_eq!(policy.networks[GOAWAY_MANAGED_NETWORK_NAME].len(), 1);
+
+        // Applying the same target again must not duplicate the entry.
+        adapter.apply(&action, false).await.unwrap();
+        let policy = adapter.read_policy().await.unwrap();
+        assert_eq!(policy.prefixes().len(), 1);
+
+        adapter.rollback(&action).await.unwrap();
+        assert_eq!(
+            adapter.verify(&action.target).await.unwrap(),
+            VerificationResult::NotPresent
+        );
+        let policy = adapter.read_policy().await.unwrap();
+        assert!(policy.networks[GOAWAY_MANAGED_NETWORK_NAME].is_empty());
+
+        // Rolling back an element that is not present is idempotent, like
+        // every other adapter's rollback.
+        assert!(adapter.rollback(&action).await.is_ok());
+
+        let _ = tokio::fs::remove_file(&adapter.policy_file).await;
+    }
+
+    #[tokio::test]
+    async fn goaway_reload_failure_restores_the_previous_snippet() {
+        let mut adapter = goaway_adapter_with_temp_file();
+        let action = action_for(indicator("203.0.113.77"));
+        adapter.reload_command = vec!["false".to_string()];
+        assert!(adapter.apply(&action, false).await.is_err());
+        assert_eq!(
+            adapter.verify(&action.target).await.unwrap(),
+            VerificationResult::NotPresent
+        );
+
+        adapter.reload_command = vec!["true".to_string()];
+        adapter.apply(&action, false).await.unwrap();
+        adapter.reload_command = vec!["false".to_string()];
+        assert!(adapter.rollback(&action).await.is_err());
+        assert_eq!(
+            adapter.verify(&action.target).await.unwrap(),
+            VerificationResult::Verified
+        );
+        let _ = tokio::fs::remove_file(&adapter.policy_file).await;
     }
 
     #[test]
@@ -2972,8 +3614,130 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    #[ignore = "requires a real go-away process - run via scripts/test-goaway-lab.sh"]
+    async fn goaway_lab_apply_verify_rollback_round_trip_signals_the_real_process() {
+        async fn wait_for_http_status(expected: reqwest::StatusCode) {
+            let client = reqwest::Client::new();
+            let mut last_status = None;
+            for _ in 0..100 {
+                if let Ok(response) = client
+                    .get("http://127.0.0.1:18090/")
+                    .header(reqwest::header::HOST, "test.local")
+                    .header("X-Forwarded-For", "203.0.113.250")
+                    .send()
+                    .await
+                {
+                    last_status = Some(response.status());
+                    if last_status == Some(expected) {
+                        return;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            panic!("go-away returned {last_status:?}, expected {expected}");
+        }
+
+        // CLAWFORGE_GOAWAY_POLICY_FILE/CLAWFORGE_GOAWAY_RELOAD_COMMAND are
+        // set by the lab script itself, pointed at the real running
+        // go-away's own policy file and a direct `kill -HUP <pid>` (no
+        // systemd in a throwaway container - see
+        // GOAWAY_DEFAULT_RELOAD_COMMAND's own doc comment).
+        let adapter = GoAwayAdapter::new();
+        let action = action_for(indicator("203.0.113.250"));
+
+        assert_eq!(
+            adapter.verify(&action.target).await.unwrap(),
+            VerificationResult::NotPresent
+        );
+        wait_for_http_status(reqwest::StatusCode::OK).await;
+
+        let applied = adapter
+            .apply(&action, false)
+            .await
+            .expect("apply against the real go-away process must succeed");
+        assert!(!applied.receipt.is_dry_run);
+        assert_eq!(
+            adapter.verify(&action.target).await.unwrap(),
+            VerificationResult::Verified,
+            "the element must be present in go-away's own policy file after a real apply"
+        );
+        wait_for_http_status(reqwest::StatusCode::IM_A_TEAPOT).await;
+
+        adapter
+            .rollback(&action)
+            .await
+            .expect("rollback against the real go-away process must succeed");
+        assert_eq!(
+            adapter.verify(&action.target).await.unwrap(),
+            VerificationResult::NotPresent
+        );
+        wait_for_http_status(reqwest::StatusCode::OK).await;
+
+        // Idempotent, like every other adapter - rolling back an already-
+        // absent element must not error.
+        assert!(adapter.rollback(&action).await.is_ok());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a real go-away process - run via scripts/test-goaway-lab.sh"]
+    async fn goaway_lab_a_resolved_incident_source_applies_and_rolls_back_correctly() {
+        let adapter = GoAwayAdapter::new();
+        let action = action_for(FirewallTarget::ResolvedIncidentSource {
+            raw_ip: "203.0.113.251".into(),
+            pseudonym: "ip-pseudonym:deadbeef".into(),
+        });
+        let applied = adapter
+            .apply(&action, false)
+            .await
+            .expect("apply on a resolved incident source must succeed");
+        let rendered = format!(
+            "{:?} {:?} {}",
+            applied.receipt.rendered_commands,
+            applied.receipt.rollback_commands,
+            applied.receipt.target_fingerprint
+        );
+        assert!(
+            !rendered.contains("203.0.113.251"),
+            "a real apply's own receipt must never embed the resolved raw IP: {rendered}"
+        );
+        assert_eq!(
+            adapter.verify(&action.target).await.unwrap(),
+            VerificationResult::Verified
+        );
+        adapter
+            .rollback(&action)
+            .await
+            .expect("rollback must succeed");
+        assert_eq!(
+            adapter.verify(&action.target).await.unwrap(),
+            VerificationResult::NotPresent
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a real go-away process - run via scripts/test-goaway-lab.sh"]
+    async fn goaway_lab_applying_the_same_element_twice_is_idempotent() {
+        let adapter = GoAwayAdapter::new();
+        let action = action_for(indicator("203.0.113.252"));
+        adapter.apply(&action, false).await.unwrap();
+        adapter.apply(&action, false).await.unwrap();
+        let policy = adapter.read_policy().await.unwrap();
+        assert_eq!(
+            policy
+                .prefixes()
+                .iter()
+                .filter(|p| *p == "203.0.113.252")
+                .count(),
+            1,
+            "applying the same target twice must not duplicate the prefix entry"
+        );
+        adapter.rollback(&action).await.unwrap();
+    }
+
     #[test]
     fn tailscale_render_describes_the_call_it_would_make() {
+        let _env_guard = lock_tailscale_quarantine_tag_env();
         let adapter = TailscaleAdapter::new();
         let action = TailscaleAction {
             target: TailscaleTarget {
@@ -3046,6 +3810,7 @@ mod tests {
 
     #[test]
     fn tailscale_quarantine_tag_defaults_but_is_configurable() {
+        let _env_guard = lock_tailscale_quarantine_tag_env();
         std::env::remove_var("CLAWFORGE_TAILSCALE_QUARANTINE_TAG");
         assert_eq!(
             TailscaleAdapter::new().quarantine_tag,

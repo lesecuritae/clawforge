@@ -105,7 +105,7 @@ fn firewall_budget_applies(action_name: &str, dry_run: bool) -> bool {
 
 /// Whether `action_name` is one `dispatch()` actually routes to a real
 /// adapter (or adapters) - `nftables.*`/`haproxy.*`/`haproxy_ratelimit.*`/
-/// `tailscale.*` (one specific adapter each) or `firewall.*` (every
+/// `goaway.*`/`tailscale.*` (one specific adapter each) or `firewall.*` (every
 /// configured `FirewallAdapter`-based adapter at once - see
 /// `dispatch_multi_adapter`; `tailscale.*` is never part of that fan-out,
 /// since `TailscaleAdapter` is not a `FirewallAdapter`).
@@ -113,6 +113,7 @@ fn is_firewall_action(action_name: &str) -> bool {
     action_name.starts_with("nftables.")
         || action_name.starts_with("haproxy_ratelimit.")
         || action_name.starts_with("haproxy.")
+        || action_name.starts_with("goaway.")
         || action_name.starts_with(FIREWALL_MULTI_ADAPTER_PREFIX)
         || action_name.starts_with(TAILSCALE_ACTION_PREFIX)
 }
@@ -178,6 +179,9 @@ fn adapters_touched_by(action_name: &str) -> Vec<String> {
     }
     if action_name.starts_with("haproxy.") {
         return vec!["haproxy".to_string()];
+    }
+    if action_name.starts_with("goaway.") {
+        return vec!["goaway".to_string()];
     }
     if action_name.starts_with("nftables.") {
         return vec!["nftables".to_string()];
@@ -1042,6 +1046,7 @@ mod tests {
     fn the_mass_block_budget_only_applies_to_a_real_firewall_apply() {
         assert!(firewall_budget_applies("nftables.block_indicator", false));
         assert!(firewall_budget_applies("haproxy.block_indicator", false));
+        assert!(firewall_budget_applies("goaway.challenge_indicator", false));
         assert!(firewall_budget_applies(
             "haproxy_ratelimit.block_indicator",
             false
@@ -1077,11 +1082,16 @@ mod tests {
             adapter_for("haproxy_ratelimit.block_indicator").map(|a| a.name()),
             Some("haproxy_ratelimit")
         );
+        assert_eq!(
+            adapter_for("goaway.challenge_indicator").map(|a| a.name()),
+            Some("goaway")
+        );
         // The TTL sweep looks adapters up by the bare `adapter` column
         // value (no trailing dot), not an action name - must resolve the
         // same way.
         assert_eq!(adapter_for("nftables").map(|a| a.name()), Some("nftables"));
         assert_eq!(adapter_for("haproxy").map(|a| a.name()), Some("haproxy"));
+        assert_eq!(adapter_for("goaway").map(|a| a.name()), Some("goaway"));
         assert_eq!(
             adapter_for("haproxy_ratelimit").map(|a| a.name()),
             Some("haproxy_ratelimit")
@@ -1099,6 +1109,10 @@ mod tests {
         assert_eq!(
             adapters_touched_by("haproxy.block_indicator"),
             vec!["haproxy"]
+        );
+        assert_eq!(
+            adapters_touched_by("goaway.challenge_indicator"),
+            vec!["goaway"]
         );
         // Same ordering trap as `adapter_for` - must not be misrouted to
         // the plain "haproxy" domain.

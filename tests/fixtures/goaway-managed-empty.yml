@@ -1,0 +1,3 @@
+# Clawforge-owned snippet. Empty source lists are valid in go-away.
+networks:
+  clawforge_challenge: []

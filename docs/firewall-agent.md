@@ -663,6 +663,23 @@ separate, pure function that mirrors their routing logic from the
 outside, specifically so the concurrency tracking could be added without
 threading a `store` through them.
 
+## Go-Away challenge adapter (lab only)
+
+`GoAwayAdapter` manages only `clawforge_challenge` in a dedicated YAML
+snippet (default `/etc/go-away/policy-snippets/clawforge-managed.yml`).
+The operator-owned main policy must define a challenge and a rule for
+`remoteAddress.network("clawforge_challenge")` at the intended precedence.
+Go-Away merges network definitions from `--policy-snippets`, but does not
+merge snippet rules. Clawforge therefore never edits the main policy.
+
+`scripts/test-goaway-lab.sh` builds a pinned upstream Go-Away revision in
+an isolated container and proves that apply changes the actual HTTP
+response, rollback restores it, and SIGHUP reloads without a restart.
+The adapter is routed under `goaway.*` and accounted for in the executor's
+mass-block and concurrency budgets, but no production action is registered
+or enabled. The executor remains hard-gated to dry-run. Provisioning a
+Go-Away main policy or enabling live actions is outside this lab step.
+
 ## What's deliberately not built yet
 
 - **No failure-injection tests** beyond lease loss/worker death (proven
