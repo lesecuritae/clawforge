@@ -634,6 +634,18 @@ Test des öffentlichen Ingress, kein Production-Deployment und keine
 Freigabe für automatische oder reale Produktionsaktionen.** Gate 7A bleibt
 offen.
 
+Nachtest (2026-09-27): Mit einer separaten `js-pow-sha256`-Policy wurde auf
+`srv19680` erneut die Clawforge-verwaltete IP-Liste per echter Adapter-Aktion
+gesetzt. Für die gelistete Testadresse lieferte Go-Away eine sichtbare
+„Checking you are not a bot“-HTML-Seite mit JavaScript-Proof-of-Work,
+nicht nur Status `418`. Der Read-back bestätigte die Liste; Rollback
+stellte `200` und die leere Liste wieder her. Die Testprozesse und Dateien
+wurden entfernt. Der JavaScript-Lösevorgang im Browser wurde dabei noch
+nicht durchgespielt. Eine interaktive CAPTCHA ist **nicht** nachgewiesen:
+die gepinnte Go-Away-Version liefert dafür keinen fertigen Runtime-Typ.
+Auf Production steht die Datenbank noch bei Migration `45`, daher erscheint
+die Go-Away-Aktion dort auch noch nicht in der Aktionsliste.
+
 Exit-Gate A: Dry-Run rendert und validiert Regeln, verändert aber nichts.
 Exit-Gate B: zeitlich befristete Einzel-IP-Sperre nur im Lab, mit Read-back und
 erfolgreichem automatischem Rollback. Produktion bleibt deaktiviert.

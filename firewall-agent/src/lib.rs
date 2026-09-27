@@ -3642,6 +3642,16 @@ mod tests {
                 {
                     last_status = Some(response.status());
                     if last_status == Some(expected) {
+                        if expected == reqwest::StatusCode::IM_A_TEAPOT
+                            && std::env::var_os("CLAWFORGE_GOAWAY_EXPECT_JS_POW").is_some()
+                        {
+                            let body = response.text().await.expect("challenge HTML body");
+                            assert!(
+                                body.contains("Checking you are not a bot")
+                                    && body.contains("js-pow-sha256"),
+                                "the visible JavaScript proof-of-work page was not served"
+                            );
+                        }
                         return;
                     }
                 }

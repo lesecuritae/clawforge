@@ -90,5 +90,36 @@ docker run --rm \
     fi
     echo "go-away (pid $goaway_pid) survived every SIGHUP reload and is still answering - confirmed no restart"
 
+    # Repeat the real list -> challenge -> rollback path with a visible
+    # JavaScript proof-of-work page. This is not a checkbox/image CAPTCHA.
+    kill "$goaway_pid"
+    wait "$goaway_pid" 2>/dev/null || true
+    cp /src/tests/fixtures/goaway-managed-empty.yml "$CLAWFORGE_GOAWAY_POLICY_FILE"
+    go-away --backend "test.local=http://127.0.0.1:19000" \
+      --policy /src/tests/fixtures/goaway-main-policy-pow.yml \
+      --policy-snippets /tmp/goaway-snippets --client-ip-header X-Forwarded-For --check
+    go-away --bind 127.0.0.1:18090 --backend "test.local=http://127.0.0.1:19000" \
+      --policy /src/tests/fixtures/goaway-main-policy-pow.yml \
+      --policy-snippets /tmp/goaway-snippets \
+      --client-ip-header X-Forwarded-For >/tmp/go-away-pow.log 2>&1 &
+    goaway_pid=$!
+    tries=0
+    while ! curl -fsS -H "Host: test.local" -o /dev/null "http://127.0.0.1:18090/" 2>/dev/null; do
+      tries=$((tries + 1))
+      if [ "$tries" -gt 100 ]; then
+        echo "PoW go-away never came up:" >&2
+        cat /tmp/go-away-pow.log >&2
+        exit 1
+      fi
+      sleep 0.1
+    done
+    export CLAWFORGE_GOAWAY_RELOAD_COMMAND="kill,-HUP,$goaway_pid"
+    export CLAWFORGE_GOAWAY_EXPECT_JS_POW=1
+    cargo test -p clawforge-firewall-agent -- --ignored --test-threads=1 goaway_lab_apply_verify_rollback_round_trip_signals_the_real_process
+    kill -0 "$goaway_pid"
+    curl -fsS -H "Host: test.local" -o /dev/null "http://127.0.0.1:18090/"
+    grep -q "clawforge_challenge: \[\]" "$CLAWFORGE_GOAWAY_POLICY_FILE"
+    echo "visible PoW challenge verified; rollback restored HTTP 200 and an empty list"
+
     kill "$goaway_pid" "$backend_pid" 2>/dev/null || true
   '

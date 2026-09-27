@@ -675,6 +675,12 @@ merge snippet rules. Clawforge therefore never edits the main policy.
 `scripts/test-goaway-lab.sh` builds a pinned upstream Go-Away revision in
 an isolated container and proves that apply changes the actual HTTP
 response, rollback restores it, and SIGHUP reloads without a restart.
+It now repeats the list/apply/read-back/rollback path with the upstream
+`js-pow-sha256` runtime and checks that the HTTP response contains the
+visible proof-of-work challenge page, not only status `418`. The original
+`refresh` policy remains a separate lightweight scenario. Neither policy
+is an interactive image/checkbox CAPTCHA; that would require a custom
+Go-Away runtime or a separate CAPTCHA integration.
 The adapter is routed under `goaway.*` and accounted for in the executor's
 mass-block and concurrency budgets, but no production action is enabled.
 The executor remains hard-gated to dry-run. Provisioning a

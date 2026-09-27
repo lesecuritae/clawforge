@@ -1,0 +1,20 @@
+# A visible JavaScript proof-of-work challenge for the Clawforge-owned list.
+# This is not a checkbox/image CAPTCHA; Go-Away requires a custom challenge
+# runtime or external integration for that variant.
+challenges:
+  js-pow-sha256:
+    runtime: js
+    parameters:
+      path: js-pow-sha256
+      js-loader: load.mjs
+      wasm-runtime: runtime.wasm
+      wasm-runtime-settings:
+        difficulty: 20
+      verify-probability: 0.02
+rules:
+  - name: clawforge-challenge
+    conditions:
+      - 'remoteAddress.network("clawforge_challenge")'
+    action: challenge
+    settings:
+      challenges: [js-pow-sha256]
