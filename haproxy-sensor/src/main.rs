@@ -318,55 +318,83 @@ async fn flush(
     if buffer.is_empty() {
         return;
     }
-    let envelopes: Vec<&SensorEnvelope> = buffer.iter().map(|item| &item.envelope).collect();
-    let response = client
-        .post(format!("{ingress_url}/internal/security-events/batch"))
-        .bearer_auth(credential)
-        .json(&envelopes)
-        .send()
-        .await;
-    match response {
-        Ok(response) if response.status().is_success() => {
-            match response.json::<serde_json::Value>().await {
-                Ok(body) => {
-                    let accepted = body["data"]["accepted"].as_u64().unwrap_or(0);
-                    let rejected = body["data"]["rejected"].as_u64().unwrap_or(0);
-                    metrics
-                        .accepted_total
-                        .fetch_add(accepted, Ordering::Relaxed);
-                    metrics
-                        .rejected_total
-                        .fetch_add(rejected, Ordering::Relaxed);
-                    if let Some(results) = body["data"]["results"].as_array() {
-                        for (item, result) in buffer.iter().zip(results) {
-                            if result["status"] != "accepted" {
-                                tracing::warn!(
-                                    cursor = %item.cursor,
-                                    error = ?result["error"],
-                                    "security event rejected by ingress"
-                                );
-                            }
-                        }
+    // Retry buffers can grow far past the ingress's 100-item/512-KiB limit.
+    // Send bounded chunks and checkpoint only each acknowledged prefix.
+    while !buffer.is_empty() {
+        let batch_len = buffer.len().min(DEFAULT_BATCH_MAX_ITEMS);
+        let envelopes: Vec<&SensorEnvelope> = buffer[..batch_len]
+            .iter()
+            .map(|item| &item.envelope)
+            .collect();
+        let response = client
+            .post(format!("{ingress_url}/internal/security-events/batch"))
+            .bearer_auth(credential)
+            .json(&envelopes)
+            .send()
+            .await;
+        match response {
+            Ok(response) if response.status().is_success() => {
+                let body = match response.json::<serde_json::Value>().await {
+                    Ok(body) => body,
+                    Err(error) => {
+                        metrics.send_errors_total.fetch_add(1, Ordering::Relaxed);
+                        tracing::warn!(%error, "could not parse ingress response body");
+                        break;
+                    }
+                };
+                let Some(results) = body["data"]["results"].as_array() else {
+                    metrics.send_errors_total.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!("ingress response has no per-item results");
+                    break;
+                };
+                if results.len() != batch_len {
+                    metrics.send_errors_total.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(
+                        expected = batch_len,
+                        actual = results.len(),
+                        "ingress response item count mismatch"
+                    );
+                    break;
+                }
+                let accepted = body["data"]["accepted"].as_u64().unwrap_or(0);
+                let rejected = body["data"]["rejected"].as_u64().unwrap_or(0);
+                for (item, result) in buffer[..batch_len].iter().zip(results) {
+                    if result["status"] != "accepted" {
+                        tracing::warn!(
+                            cursor = %item.cursor,
+                            error = ?result["error"],
+                            "security event rejected by ingress"
+                        );
                     }
                 }
-                Err(error) => tracing::warn!(%error, "could not parse ingress response body"),
-            }
-            if let Some(last) = buffer.last() {
-                if let Err(error) = save_checkpoint(checkpoint_path, &last.cursor).await {
+                if let Err(error) =
+                    save_checkpoint(checkpoint_path, &buffer[batch_len - 1].cursor).await
+                {
+                    metrics.send_errors_total.fetch_add(1, Ordering::Relaxed);
                     tracing::warn!(%error, "could not persist journald checkpoint");
+                    break;
                 }
+                metrics
+                    .accepted_total
+                    .fetch_add(accepted, Ordering::Relaxed);
+                metrics
+                    .rejected_total
+                    .fetch_add(rejected, Ordering::Relaxed);
+                buffer.drain(..batch_len);
+                metrics
+                    .buffered
+                    .store(buffer.len() as u64, Ordering::Relaxed);
             }
-            buffer.clear();
-            metrics.buffered.store(0, Ordering::Relaxed);
-            return;
-        }
-        Ok(response) => {
-            metrics.send_errors_total.fetch_add(1, Ordering::Relaxed);
-            tracing::warn!(status = %response.status(), "security event batch rejected by ingress transport");
-        }
-        Err(error) => {
-            metrics.send_errors_total.fetch_add(1, Ordering::Relaxed);
-            tracing::warn!(%error, "could not reach security event ingress endpoint");
+            Ok(response) => {
+                metrics.send_errors_total.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(status = %response.status(), "security event batch rejected by ingress transport");
+                break;
+            }
+            Err(error) => {
+                metrics.send_errors_total.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(%error, "could not reach security event ingress endpoint");
+                break;
+            }
         }
     }
     if buffer.len() > MAX_BUFFERED_RETRY {
@@ -514,6 +542,69 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{http::StatusCode, routing::post};
+    use std::sync::Mutex;
+
+    async fn accept_test_batch(
+        State(batch_sizes): State<Arc<Mutex<Vec<usize>>>>,
+        Json(items): Json<Vec<serde_json::Value>>,
+    ) -> (StatusCode, Json<serde_json::Value>) {
+        batch_sizes.lock().unwrap().push(items.len());
+        let results: Vec<_> = (0..items.len())
+            .map(|index| serde_json::json!({"index": index, "status": "accepted"}))
+            .collect();
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "data": {"accepted": items.len(), "rejected": 0, "results": results}
+            })),
+        )
+    }
+
+    #[tokio::test]
+    async fn retry_backlog_uses_bounded_batches() {
+        let batch_sizes = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new()
+            .route("/internal/security-events/batch", post(accept_test_batch))
+            .with_state(batch_sizes.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let checkpoint = std::env::temp_dir().join(format!(
+            "clawforge-haproxy-sensor-checkpoint-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_micros()
+        ));
+        let mut buffer: Vec<_> = (0..101)
+            .map(|index| {
+                let mut envelope = clawforge_security_events::fixtures::http_anomaly();
+                envelope.dedupe_key = format!("test-{index}");
+                QueuedEvent {
+                    envelope,
+                    cursor: format!("cursor-{index}"),
+                }
+            })
+            .collect();
+        let metrics = Metrics::default();
+        flush(
+            &mut buffer,
+            &reqwest::Client::new(),
+            &url,
+            "test-credential",
+            checkpoint.to_str().unwrap(),
+            &metrics,
+        )
+        .await;
+        assert_eq!(*batch_sizes.lock().unwrap(), vec![50, 50, 1]);
+        assert!(buffer.is_empty());
+        assert_eq!(
+            tokio::fs::read_to_string(&checkpoint).await.unwrap(),
+            "cursor-100"
+        );
+        assert_eq!(metrics.accepted_total.load(Ordering::Relaxed), 101);
+        tokio::fs::remove_file(checkpoint).await.unwrap();
+        server.abort();
+    }
 
     #[test]
     fn parses_a_standard_httplog_error_line() {
