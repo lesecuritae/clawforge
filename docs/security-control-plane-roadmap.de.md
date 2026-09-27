@@ -623,6 +623,17 @@ liefert TTL-/Rollback-Receipt. PostgreSQL-Rollentest und Replay-Test decken
 die neue Kette ab. **Kein Go-Away-Live-Deployment und keine automatische
 reale Aktion**; Gate 7A bleibt offen.
 
+Live-Prozess-Test auf `srv19680` (2026-09-27): Die gepinnte Go-Away-Version
+lief auf `127.0.0.1:18090` vor einem lokalen Test-Backend. Das aktuelle
+Clawforge-Adapter-Testbinary bestand alle drei echten Apply-/Read-back-/
+Rollback-Tests: HTTP wechselte für die Testadresse von `200` auf die
+Challenge (`418`) und nach Rollback zurück auf `200`. Der Go-Away-Prozess
+überstand die Reloads ohne Neustart; die verwaltete Netzliste war danach
+leer. Testprozesse und temporäre Dateien wurden entfernt. **Das war kein
+Test des öffentlichen Ingress, kein Production-Deployment und keine
+Freigabe für automatische oder reale Produktionsaktionen.** Gate 7A bleibt
+offen.
+
 Exit-Gate A: Dry-Run rendert und validiert Regeln, verändert aber nichts.
 Exit-Gate B: zeitlich befristete Einzel-IP-Sperre nur im Lab, mit Read-back und
 erfolgreichem automatischem Rollback. Produktion bleibt deaktiviert.
