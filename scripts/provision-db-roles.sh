@@ -141,6 +141,8 @@ GRANT SELECT ON TABLE _sqlx_migrations, security_policies, security_assessments,
   security_policy_decisions, incidents, runtime_status TO clawforge_policy_engine;
 GRANT INSERT, UPDATE ON TABLE security_policy_decisions, runtime_status
   TO clawforge_policy_engine;
+GRANT EXECUTE ON FUNCTION clawforge_enqueue_goaway_shadow_challenge(UUID)
+  TO clawforge_policy_engine;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO clawforge_policy_engine;
 
 -- Promotion also backfills alerts.incident_id for alerts that were created

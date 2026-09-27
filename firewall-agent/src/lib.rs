@@ -1664,6 +1664,12 @@ impl FirewallAdapter for GoAwayAdapter {
         dry_run: bool,
     ) -> Result<ApplyResult, AdapterError> {
         action.target.validate()?;
+        if dry_run && matches!(action.target, FirewallTarget::IncidentSource { .. }) {
+            return Ok(ApplyResult {
+                receipt: self.render(action)?,
+                observed_state: None,
+            });
+        }
         require_resolved_target(&action.target)?;
         check_never_block(&self.never_block, &action.target)?;
         let element = element_reference(&action.target)?;
@@ -2603,12 +2609,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn goaway_apply_verify_rollback_all_refuse_an_unresolved_incident_source() {
+    async fn goaway_unresolved_incident_source_is_renderable_only_in_dry_run() {
         let adapter = goaway_adapter_with_temp_file();
         let action = action_for(FirewallTarget::IncidentSource {
             pseudonym: "ip-pseudonym:never-resolved".into(),
         });
-        assert!(adapter.apply(&action, true).await.is_err());
+        let preview = adapter.apply(&action, true).await.unwrap();
+        assert!(preview.receipt.is_dry_run);
+        assert!(
+            format!("{:?}", preview.receipt.rendered_commands).contains("<resolved-at-apply-time:")
+        );
+        assert!(!std::path::Path::new(&adapter.policy_file).exists());
+        assert!(adapter.apply(&action, false).await.is_err());
         assert!(adapter.verify(&action.target).await.is_err());
         assert!(adapter.rollback(&action).await.is_err());
     }

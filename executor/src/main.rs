@@ -312,6 +312,20 @@ fn dry_run_from_env() -> bool {
         .unwrap_or(true)
 }
 
+/// Shadow requests carry an immutable marker inside approval_context.target.
+/// Even if a future release opens the global live gate, a queued shadow
+/// request can never turn into a real action after a restart or long lease.
+fn request_requires_dry_run(target: Option<&serde_json::Value>) -> bool {
+    target
+        .and_then(|value| value.get("simulation_only"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn dispatch_dry_run(claimed: &ClaimedExecutionRequest) -> bool {
+    dry_run_from_env() || request_requires_dry_run(claimed.target.as_ref())
+}
+
 /// `target` (`{"kind":"threat_intel_indicator",...}` /
 /// `{"kind":"incident_source",...}`) plus an optional `ttl_seconds` -
 /// carried alongside the target rather than as a `FirewallTarget` field,
@@ -637,7 +651,7 @@ async fn dispatch_multi_adapter(
         Ok(action) => action,
         Err(error) => return (false, None, Some(error.to_string()), Vec::new()),
     };
-    let dry_run = dry_run_from_env();
+    let dry_run = dispatch_dry_run(claimed);
     let mut receipts = Vec::new();
     let mut summaries = Vec::new();
     let mut mandatory_error = None;
@@ -735,7 +749,7 @@ async fn dispatch_tailscale(
         reason: format!("execution_request {}", claimed.id),
     };
     let adapter = TailscaleAdapter::new();
-    let dry_run = dry_run_from_env();
+    let dry_run = dispatch_dry_run(claimed);
     match adapter.apply(&action, dry_run).await {
         Ok(applied) => {
             let verification_result = if dry_run {
@@ -818,7 +832,7 @@ async fn dispatch(
         Ok(action) => action,
         Err(error) => return (false, None, Some(error.to_string()), Vec::new()),
     };
-    let dry_run = dry_run_from_env();
+    let dry_run = dispatch_dry_run(claimed);
     match apply_single_adapter(adapter.as_ref(), &action, dry_run).await {
         Ok((summary, receipt)) => (true, Some(summary), None, vec![receipt]),
         Err(error) => (false, None, Some(error), Vec::new()),
@@ -869,7 +883,7 @@ async fn main() -> anyhow::Result<()> {
                         let budget = firewall_mass_block_budget_exceeded(
                             &store,
                             &claimed.action_name,
-                            dry_run_from_env(),
+                            dispatch_dry_run(&claimed),
                         )
                         .await;
                         let refusal = match budget {
@@ -895,7 +909,7 @@ async fn main() -> anyhow::Result<()> {
                         let mut inflight_ids = Vec::new();
                         let mut concurrency_refusal = None;
                         if refusal.is_none()
-                            && firewall_budget_applies(&claimed.action_name, dry_run_from_env())
+                            && firewall_budget_applies(&claimed.action_name, dispatch_dry_run(&claimed))
                         {
                             for adapter in adapters_touched_by(&claimed.action_name) {
                                 match try_begin_inflight(&store, &adapter).await {
@@ -1040,6 +1054,15 @@ mod tests {
         // binary reads/writes this specific env var.
         std::env::remove_var("CLAWFORGE_EXECUTOR_DRY_RUN");
         assert!(dry_run_from_env());
+    }
+
+    #[test]
+    fn shadow_request_remains_dry_run_independent_of_global_gate() {
+        let shadow = serde_json::json!({"simulation_only": true});
+        assert!(request_requires_dry_run(Some(&shadow)));
+        let ordinary = serde_json::json!({"simulation_only": false});
+        assert!(!request_requires_dry_run(Some(&ordinary)));
+        assert!(!request_requires_dry_run(None));
     }
 
     #[test]
@@ -1209,6 +1232,36 @@ mod tests {
             receipt.verification_result.is_none(),
             "a dry run has nothing to verify"
         );
+    }
+
+    #[tokio::test]
+    async fn a_goaway_shadow_challenge_produces_a_ttl_and_rollback_receipt() {
+        let request = claimed(
+            "goaway.challenge_incident_source",
+            Some(serde_json::json!({
+                "kind": "incident_source",
+                "pseudonym": "ip-pseudonym:shadow-test",
+                "ttl_seconds": 300,
+                "simulation_only": true,
+            })),
+        );
+        let (success, summary, error, receipts) = dispatch(&request).await;
+        assert!(success, "dispatch failed: {error:?}");
+        assert!(summary.unwrap().contains("dry_run=true"));
+        assert_eq!(receipts.len(), 1);
+        let receipt = &receipts[0];
+        assert_eq!(receipt.adapter, "goaway");
+        assert!(receipt.is_dry_run);
+        assert_eq!(receipt.ttl_seconds, 300);
+        assert!(receipt.verification_result.is_none());
+        assert!(receipt
+            .rollback_plan
+            .to_string()
+            .contains("yaml-prefix-remove"));
+        assert!(receipt
+            .rendered_commands
+            .to_string()
+            .contains("<resolved-at-apply-time:ip-pseudonym:shadow-test>"));
     }
 
     #[tokio::test]

@@ -614,6 +614,15 @@ Pflichtgates vor der ersten verändernden Lab-Testaktion:
   Rollback-p95, Drift-Erkennungszeit und erlaubte verwaiste Regeln (`0`) werden
   vor dem Labtest quantifiziert
 
+Go-Away-Zwischenschritt (2026-09-27): Der Challenge-Adapter ist im isolierten
+Echtprozess-Lab getestet. Migration `0046` registriert seine Aktion nur
+deaktiviert. Eine gespeicherte Shadow-`challenge`-Entscheidung für ein
+IP-Pseudonym kann idempotent eine unveränderliche Simulationsanfrage erzeugen;
+der Executor erzwingt dafür Dry-Run unabhängig vom globalen Schalter und
+liefert TTL-/Rollback-Receipt. PostgreSQL-Rollentest und Replay-Test decken
+die neue Kette ab. **Kein Go-Away-Live-Deployment und keine automatische
+reale Aktion**; Gate 7A bleibt offen.
+
 Exit-Gate A: Dry-Run rendert und validiert Regeln, verändert aber nichts.
 Exit-Gate B: zeitlich befristete Einzel-IP-Sperre nur im Lab, mit Read-back und
 erfolgreichem automatischem Rollback. Produktion bleibt deaktiviert.

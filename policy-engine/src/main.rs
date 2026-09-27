@@ -1,10 +1,7 @@
 //! `clawforge-policy-engine` (roadmap phase 5, "Policy Engine"), **Shadow
-//! Mode only** - every decision this service makes is recorded, never
-//! executed. That is not a configuration flag it happens to default to:
-//! roadmap phase 6 ("Firewall Action Layer") does not exist yet, so there
-//! is no action layer this service could call even if it wanted to. Shadow
-//! mode here is a property of the current architecture, not a promise this
-//! service makes and could break.
+//! Mode only** - decisions are recorded and Challenge decisions may enqueue
+//! an immutable simulation-only Go-Away request. No decision from this
+//! service can cause a real firewall action.
 //!
 //! ## What it does
 //!
@@ -26,8 +23,8 @@
 //! doc comment for why the check has to happen there and can only ever
 //! store a category flag, never the IP). A single evidence source can
 //! still never reach `Block` - that has not changed - but a corroborated
-//! one now genuinely can, still only as a shadow decision: no action layer
-//! exists to execute one.
+//! one now genuinely can, still only as a shadow decision. Only `Challenge`
+//! may enqueue a simulation-only Go-Away request; none executes live.
 //!
 //! ## Replay
 //!
@@ -269,7 +266,7 @@ async fn evaluate_assessment(
         });
         let hash = evidence_hash(policy.id, policy.version, &evidence_snapshot);
         let dedupe_key = format!("{}:{}:{}", policy.id, policy.version, assessment.id);
-        store
+        let decision_id = store
             .persist_security_policy_decision(
                 &dedupe_key,
                 SecurityPolicyDecisionUpsert {
@@ -287,6 +284,9 @@ async fn evaluate_assessment(
                 },
             )
             .await?;
+        if outcome.decision == Decision::Challenge {
+            store.enqueue_goaway_shadow_challenge(decision_id).await?;
+        }
     }
     Ok(())
 }
@@ -801,6 +801,79 @@ mod tests {
         .await?;
         assert_eq!(decision_count, 1);
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires provisioned roles in an isolated PostgreSQL test container"]
+    async fn challenge_decision_enqueues_only_one_simulation_request_on_replay() -> Result<()> {
+        let owner =
+            PostgresStore::connect_runtime(&env::var("CLAWFORGE_TEST_DATABASE_URL")?).await?;
+        let engine = PostgresStore::connect_runtime(&env::var(
+            "CLAWFORGE_TEST_SECURITY_ENGINE_DATABASE_URL",
+        )?)
+        .await?;
+        let policy_engine =
+            PostgresStore::connect_runtime(&env::var("CLAWFORGE_TEST_POLICY_ENGINE_DATABASE_URL")?)
+                .await?;
+        let resource = format!("ip-pseudonym:challenge-{}", uuid::Uuid::new_v4());
+        let now = chrono::Utc::now();
+        let assessment_id = engine
+            .persist_security_assessment(clawforge_storage::SecurityAssessmentUpsert {
+                rule_id: "ssh_bruteforce",
+                rule_version: "1",
+                engine_version: "test",
+                dedupe_key: &format!("challenge-test:{resource}"),
+                resource: &resource,
+                severity: "medium",
+                confidence: 50,
+                summary: "test fixture",
+                event_count: 5,
+                window_seconds: 300,
+                bucket_start: now,
+                first_seen: now,
+                last_seen: now,
+                event_ids: &[],
+                threat_intel: None,
+            })
+            .await?;
+        let assessment = policy_engine
+            .list_security_assessments(None, 500)
+            .await?
+            .into_iter()
+            .find(|value| value.id == assessment_id)
+            .expect("fixture assessment must be visible");
+        evaluate_assessment(&policy_engine, &assessment).await?;
+        evaluate_assessment(&policy_engine, &assessment).await?;
+
+        let rows: Vec<(uuid::Uuid, String, bool, serde_json::Value)> = sqlx::query_as(
+            "SELECT e.id,a.name,a.enabled,e.approval_context FROM execution_requests e \
+             JOIN actions a ON a.id=e.action_id \
+             WHERE e.approval_context->>'security_policy_decision_id' = \
+                   (SELECT id::text FROM security_policy_decisions WHERE assessment_id=$1)",
+        )
+        .bind(assessment_id)
+        .fetch_all(owner.pool())
+        .await?;
+        assert_eq!(rows.len(), 1, "replay must not queue duplicate executions");
+        let (request_id, action_name, enabled, context) = &rows[0];
+        assert_eq!(action_name, "goaway.challenge_incident_source");
+        assert!(!enabled);
+        assert_eq!(context["target"]["simulation_only"], true);
+        assert_eq!(context["target"]["pseudonym"], resource);
+
+        sqlx::query("DELETE FROM execution_requests WHERE id=$1")
+            .bind(request_id)
+            .execute(owner.pool())
+            .await?;
+        sqlx::query("DELETE FROM security_policy_decisions WHERE assessment_id=$1")
+            .bind(assessment_id)
+            .execute(owner.pool())
+            .await?;
+        sqlx::query("DELETE FROM security_assessments WHERE id=$1")
+            .bind(assessment_id)
+            .execute(owner.pool())
+            .await?;
         Ok(())
     }
 }

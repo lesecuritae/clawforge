@@ -15,6 +15,142 @@ fn runtime_url(name: &str) -> anyhow::Result<String> {
 
 #[tokio::test]
 #[ignore = "requires provisioned roles in an isolated PostgreSQL test container"]
+async fn goaway_shadow_challenge_queues_only_an_immutable_simulation() -> anyhow::Result<()> {
+    let owner = PostgresStore::connect(&std::env::var("CLAWFORGE_TEST_DATABASE_URL")?).await?;
+    let policy_role = PostgresStore::connect_runtime(&runtime_url("policy_engine")?).await?;
+    let suffix = uuid::Uuid::new_v4();
+    let resource = format!("ip-pseudonym:goaway-shadow-{suffix}");
+    let assessment_id = owner
+        .persist_security_assessment(clawforge_storage::SecurityAssessmentUpsert {
+            rule_id: "ssh_bruteforce",
+            rule_version: "1",
+            engine_version: "test",
+            dedupe_key: &format!("goaway-shadow-{suffix}"),
+            resource: &resource,
+            severity: "high",
+            confidence: 80,
+            summary: "test fixture",
+            event_count: 5,
+            window_seconds: 300,
+            bucket_start: Utc::now(),
+            first_seen: Utc::now(),
+            last_seen: Utc::now(),
+            event_ids: &[],
+            threat_intel: None,
+        })
+        .await?;
+    let policy_id = uuid::Uuid::new_v4();
+    sqlx::query("INSERT INTO security_policies (id,name,version,status,class,rule_id,min_severity) VALUES ($1,$2,1,'active','observe','ssh_bruteforce','medium')")
+        .bind(policy_id)
+        .bind(format!("goaway-shadow-{suffix}"))
+        .execute(owner.pool())
+        .await?;
+    let evidence_hash = "a".repeat(64);
+    let decision_id = policy_role
+        .persist_security_policy_decision(
+            &format!("goaway-shadow-{suffix}"),
+            clawforge_storage::SecurityPolicyDecisionUpsert {
+                policy_id,
+                policy_version: 1,
+                assessment_id,
+                incident_id: None,
+                decision: "challenge",
+                risk_score: 80,
+                evidence_sources: 1,
+                corroborated: false,
+                rationale: "test",
+                evidence_snapshot: json!({"resource":resource}),
+                evidence_hash: &evidence_hash,
+            },
+        )
+        .await?;
+
+    let request_id = policy_role
+        .enqueue_goaway_shadow_challenge(decision_id)
+        .await?
+        .expect("a persisted shadow Challenge must enqueue a request");
+    assert_eq!(
+        policy_role
+            .enqueue_goaway_shadow_challenge(decision_id)
+            .await?,
+        Some(request_id),
+        "replaying the same evidence must be idempotent"
+    );
+    let (action_name, enabled, context): (String, bool, serde_json::Value) =
+        sqlx::query_as("SELECT a.name,a.enabled,e.approval_context FROM execution_requests e JOIN actions a ON a.id=e.action_id WHERE e.id=$1")
+            .bind(request_id)
+            .fetch_one(owner.pool())
+            .await?;
+    assert_eq!(action_name, "goaway.challenge_incident_source");
+    assert!(!enabled, "normal execution must stay disabled");
+    let action_id: uuid::Uuid =
+        sqlx::query_scalar("SELECT id FROM actions WHERE name='goaway.challenge_incident_source'")
+            .fetch_one(owner.pool())
+            .await?;
+    assert!(
+        owner
+            .create_execution_request(&clawforge_storage::ExecutionRequestInput {
+                action_id,
+                workflow_run_id: None,
+                decision_id: None,
+                requested_by: "ordinary-api-test".into(),
+                requested_by_id: None,
+                idempotency_key: None,
+                target: Some(json!({"kind":"incident_source","pseudonym":resource})),
+            })
+            .await
+            .is_err(),
+        "the disabled action must be rejected by the normal request path"
+    );
+    assert_eq!(context["target"]["simulation_only"], true);
+    assert_eq!(context["target"]["pseudonym"], resource);
+    assert_eq!(context["target"]["ttl_seconds"], 3600);
+    assert!(
+        sqlx::query("UPDATE execution_requests SET approval_context='{}'::jsonb WHERE id=$1")
+            .bind(request_id)
+            .execute(owner.pool())
+            .await
+            .is_err(),
+        "the simulation marker must be immutable"
+    );
+    assert!(sqlx::query("INSERT INTO execution_requests (id,action_id,requested_by,status) SELECT $1,id,'policy-engine-bypass','pending' FROM actions WHERE name='goaway.challenge_incident_source'")
+        .bind(uuid::Uuid::new_v4())
+        .execute(policy_role.pool())
+        .await
+        .is_err(), "policy-engine must not have direct INSERT rights");
+    sqlx::query("UPDATE security_policy_decisions SET decision='observe' WHERE id=$1")
+        .bind(decision_id)
+        .execute(owner.pool())
+        .await?;
+    assert!(
+        policy_role
+            .enqueue_goaway_shadow_challenge(decision_id)
+            .await?
+            .is_none(),
+        "only a current Challenge decision may enqueue"
+    );
+
+    sqlx::query("DELETE FROM execution_requests WHERE id=$1")
+        .bind(request_id)
+        .execute(owner.pool())
+        .await?;
+    sqlx::query("DELETE FROM security_policy_decisions WHERE id=$1")
+        .bind(decision_id)
+        .execute(owner.pool())
+        .await?;
+    sqlx::query("DELETE FROM security_policies WHERE id=$1")
+        .bind(policy_id)
+        .execute(owner.pool())
+        .await?;
+    sqlx::query("DELETE FROM security_assessments WHERE id=$1")
+        .bind(assessment_id)
+        .execute(owner.pool())
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires provisioned roles in an isolated PostgreSQL test container"]
 async fn runtime_roles_enforce_service_boundaries() -> anyhow::Result<()> {
     let api = PostgresStore::connect_runtime(&runtime_url("api")?).await?;
     api.healthcheck().await?;

@@ -676,9 +676,20 @@ merge snippet rules. Clawforge therefore never edits the main policy.
 an isolated container and proves that apply changes the actual HTTP
 response, rollback restores it, and SIGHUP reloads without a restart.
 The adapter is routed under `goaway.*` and accounted for in the executor's
-mass-block and concurrency budgets, but no production action is registered
-or enabled. The executor remains hard-gated to dry-run. Provisioning a
+mass-block and concurrency budgets, but no production action is enabled.
+The executor remains hard-gated to dry-run. Provisioning a
 Go-Away main policy or enabling live actions is outside this lab step.
+
+Migration `0046` registers `goaway.challenge_incident_source` **disabled**.
+The policy engine may enqueue a request only through a narrowly scoped
+database function for a persisted shadow `challenge` decision with an IP
+pseudonym. The request's immutable target contains `simulation_only: true`;
+the executor enforces that marker independently of its global Dry-Run gate.
+Replays are idempotent per decision ID. Normal execution
+request creation still rejects the disabled action. Dry-run dispatch writes
+an action receipt with TTL and rollback plan but never writes a Go-Away
+snippet, reloads Go-Away, or resolves a raw IP. This is an observation drill,
+not permission to enable the action or deploy Go-Away in production.
 
 ## What's deliberately not built yet
 

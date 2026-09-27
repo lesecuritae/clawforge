@@ -2,8 +2,8 @@
 //! Engine"), Shadow Mode only. A policy (`security_policies`, versioned,
 //! status-gated) is evaluated against `clawforge-security-engine`'s
 //! persisted assessments; the resulting decision is recorded in
-//! `security_policy_decisions`, never executed - there is no action layer
-//! yet (roadmap phase 6) for a shadow decision to be wired to.
+//! `security_policy_decisions`, never executed live. Challenge decisions
+//! may enqueue immutable simulation-only Go-Away requests for observation.
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -38,6 +38,19 @@ pub struct SecurityPolicyDecisionUpsert<'a> {
 }
 
 impl PostgresStore {
+    /// Enqueue a simulation-only Go-Away challenge for a persisted shadow
+    /// decision. The database function validates the decision, target, and
+    /// disabled action and is the policy-engine role's sole write path into
+    /// execution requests. Replaying a decision is idempotent by decision ID,
+    /// so a busy attack cannot create one request per changing event count.
+    pub async fn enqueue_goaway_shadow_challenge(&self, decision_id: Uuid) -> Result<Option<Uuid>> {
+        let id = sqlx::query_scalar("SELECT clawforge_enqueue_goaway_shadow_challenge($1)")
+            .bind(decision_id)
+            .fetch_one(self.pool())
+            .await?;
+        Ok(id)
+    }
+
     /// Every `active` policy for one rule - a `draft`/`retired` policy is
     /// never evaluated, and `valid_from`/`valid_until` bound when an active
     /// one actually applies (a policy scheduled for the future, or one
@@ -78,8 +91,8 @@ impl PostgresStore {
     /// filling, updates this same row in place - this is exactly what makes
     /// "Policies können gegen historische Incidents replayed werden"
     /// (the phase 5 exit gate) safe to actually do, not just a claim.
-    /// `is_shadow` is always `TRUE` today - there is no action layer yet to
-    /// ever set it otherwise.
+    /// `is_shadow` is always `TRUE`; the optional downstream Go-Away request
+    /// is simulation-only and does not change this decision's status.
     pub async fn persist_security_policy_decision(
         &self,
         dedupe_key: &str,
