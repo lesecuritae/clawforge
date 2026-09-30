@@ -114,6 +114,13 @@ Source of Truth und wird nicht durch Grafana oder Prometheus verändert.
 
 ## CI/CD und Abhängigkeitsscans
 
+Das schreibbare Entwicklungsrepository liegt auf Forgejo unter
+`https://forgejo.barking-hake.ts.net/lesecuritae/Clawforge`. Änderungen werden
+zuerst dorthin gepusht. Forgejo spiegelt `main` bei neuen Commits nach GitHub;
+der öffentliche GitHub-Klon bleibt für Installationen verfügbar. Änderungen
+direkt auf GitHub würden beim nächsten Spiegelabgleich überschrieben und
+gehören deshalb zuerst nach Forgejo.
+
 `.github/workflows/ci.yml` führt bei Pushes und Pull Requests Formatprüfung,
 Workspace-Tests, Clippy, Frontend-Test/Build, npm Audit, Trivy-Dateiscan,
 Compose-Validierung und Docker-Builds aus. `cargo audit` meldet derzeit nur
