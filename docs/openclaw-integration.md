@@ -96,6 +96,10 @@ vor der Agent-API entfernt. Das Admin-UI nutzt weiterhin seinen getrennten
 Rollenpfad. Der Agent kann keine Firewall-Aktion ausführen oder freigeben.
 Die Drift-Liste ist auf 100 Eintraege begrenzt; `expired_total` und
 `expired_truncated` zeigen an, ob weitere Eintraege vorhanden sind.
+Der MCP-Adapter verweigert `get_firewall_status`, wenn die Agent-API noch
+keine kompatible `projection_version: 1` mit den bekannten Feldern liefert.
+Damit gibt ein verfrueht aktivierter MCP-Server die alte rohe Antwort nicht
+an OpenClaw weiter.
 
 1. Gegen eine leere Testinstanz (`openclaw mcp probe` verband sich live
    gegen den laufenden `clawforge-mcp`-Dienst und meldete alle 42
