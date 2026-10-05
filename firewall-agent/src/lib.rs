@@ -113,6 +113,7 @@
 //! cover - see `docs/firewall-agent.md`'s own remaining list.
 
 pub mod quarantine;
+pub mod proxmox;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
