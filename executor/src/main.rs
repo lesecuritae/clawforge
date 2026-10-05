@@ -758,6 +758,7 @@ async fn dispatch_tailscale(
             "already_quarantined": pf.already_quarantined,
             "current_tags": pf.current_tags,
             "rollback_requires_reauth": pf.rollback_requires_reauth,
+            "protected": pf.protected,
         }),
         Err(error) => {
             tracing::warn!(%error, "tailscale quarantine preflight read failed; recording empty preflight");
