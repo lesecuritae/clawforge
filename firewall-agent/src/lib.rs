@@ -2997,6 +2997,60 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires isolated nftables lab with iproute2 (NET_ADMIN/NET_RAW)"]
+    async fn nftables_blocks_real_tcp_traffic_and_rollback_restores_it() {
+        use tokio::net::{TcpListener, TcpSocket};
+        use tokio::time::{timeout, Duration};
+
+        // A documentation address exists only in the disposable lab namespace.
+        let source: std::net::SocketAddr = "203.0.113.218:0".parse().unwrap();
+        let added = tokio::process::Command::new("ip")
+            .args(["addr", "add", "203.0.113.218/32", "dev", "lo"])
+            .output()
+            .await
+            .expect("iproute2 must be installed in the isolated lab");
+        assert!(added.status.success(), "lab address setup failed");
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let destination = listener.local_addr().unwrap();
+        let connect = || async {
+            let socket = TcpSocket::new_v4()?;
+            socket.bind(source)?;
+            socket.connect(destination).await
+        };
+        timeout(Duration::from_secs(2), connect())
+            .await
+            .expect("baseline TCP connection must succeed")
+            .expect("baseline TCP connection failed");
+
+        let adapter = lab_adapter().await;
+        let action = action_for(indicator("203.0.113.218"));
+        adapter.apply(&action, false).await.unwrap();
+        assert_eq!(
+            adapter.verify(&action.target).await.unwrap(),
+            VerificationResult::Verified
+        );
+        assert!(
+            timeout(Duration::from_secs(1), connect()).await.is_err(),
+            "an applied block must drop actual TCP traffic, not just appear in a set"
+        );
+        adapter.rollback(&action).await.unwrap();
+        assert_eq!(
+            adapter.verify(&action.target).await.unwrap(),
+            VerificationResult::NotPresent
+        );
+        timeout(Duration::from_secs(2), connect())
+            .await
+            .expect("rollback must restore TCP connectivity")
+            .expect("TCP connection after rollback failed");
+        let removed = tokio::process::Command::new("ip")
+            .args(["addr", "del", "203.0.113.218/32", "dev", "lo"])
+            .status()
+            .await
+            .unwrap();
+        assert!(removed.success());
+    }
+
+    #[tokio::test]
     #[ignore = "requires nftables (NET_ADMIN/NET_RAW) - run via scripts/test-firewall-lab.sh"]
     async fn apply_verify_rollback_round_trip_for_ipv6() {
         let adapter = lab_adapter().await;

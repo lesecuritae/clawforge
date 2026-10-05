@@ -9820,6 +9820,40 @@ mod tests {
             );
         }
 
+        // Even a token with every Phase-10 read scope cannot perform an
+        // operator action. Use a valid body so rejection is due to identity,
+        // not a malformed JSON request. No kill-switch row may be inserted.
+        let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM firewall_kill_switch_requests")
+            .fetch_one(store.pool())
+            .await?;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/firewall/kill-switch")
+            .header(header::AUTHORIZATION, format!("Bearer {full_credential}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "adapter": "nftables",
+                    "target_fingerprint": target_fingerprint,
+                    "target_json": {"kind": "threat_intel_indicator", "cidr": "203.0.113.0/24", "source": "test"},
+                })
+                .to_string(),
+            ))?;
+        let response = app.clone().oneshot(request).await?;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM firewall_kill_switch_requests")
+            .fetch_one(store.pool())
+            .await?;
+        assert_eq!(before, after, "read identity must not create an action");
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/v1/firewall/status")
+            .header(header::AUTHORIZATION, format!("Bearer {full_credential}"))
+            .body(Body::empty())?;
+        let response = app.oneshot(request).await?;
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+
         Ok(())
     }
 }

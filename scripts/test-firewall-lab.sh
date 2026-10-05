@@ -23,7 +23,7 @@ docker run --rm \
   sh -c '
     set -eu
     apt-get update -qq >/dev/null
-    apt-get install -y -qq nftables >/dev/null
+    apt-get install -y -qq nftables iproute2 >/dev/null
     sh scripts/nftables-clawforge-provision.sh
     # --skip haproxy: this container has no haproxy running (it only
     # needs nftables) - the HAProxy Runtime API tests are their own
@@ -35,5 +35,6 @@ docker run --rm \
     # less container deliberately never has those, so it is run manually,
     # outside of CI, only against a device an operator has explicitly
     # authorized for the test.
-    cargo test -p clawforge-firewall-agent -- --ignored --test-threads=1 --skip haproxy --skip tailscale
+    # Go-Away uses its own process/config lab, not this nftables namespace.
+    cargo test -p clawforge-firewall-agent -- --ignored --test-threads=1 --skip haproxy --skip tailscale --skip goaway
   '
