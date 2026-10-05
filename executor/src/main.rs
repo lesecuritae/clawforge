@@ -397,6 +397,48 @@ async fn rollback_target(
             .await
             .map_err(|error| anyhow::anyhow!(error.to_string()));
     }
+    if adapter_name == "proxmox" {
+        let node = target_json
+            .get("node")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| anyhow::anyhow!("proxmox target_json is missing node"))?;
+        let vmid = target_json
+            .get("vmid")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| anyhow::anyhow!("proxmox target_json is missing vmid"))?;
+        let vmid = u32::try_from(vmid).map_err(|_| anyhow::anyhow!("proxmox vmid out of range"))?;
+        let target = QuarantineTarget::Proxmox {
+            node: node.to_string(),
+            vmid,
+        };
+        return ProxmoxAdapter::new()
+            .rollback(&target)
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()));
+    }
+    if adapter_name == "docker" {
+        let container_id = target_json
+            .get("container_id")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| anyhow::anyhow!("docker target_json is missing container_id"))?;
+        let networks: Vec<String> = target_json
+            .get("networks")
+            .and_then(serde_json::Value::as_array)
+            .map(|array| {
+                array
+                    .iter()
+                    .filter_map(|value| value.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let target = QuarantineTarget::Docker {
+            container_id: container_id.to_string(),
+        };
+        return DockerAdapter::new()
+            .rollback(&target, &networks)
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()));
+    }
     let Some(adapter) = adapter_for(adapter_name) else {
         anyhow::bail!("unrecognized adapter {:?}", adapter_name);
     };
@@ -1179,6 +1221,21 @@ async fn main() -> anyhow::Result<()> {
                         // `success` - a sibling adapter's real state change
                         // still needs tracking even if another one failed.
                         for receipt in receipts {
+                            // The TTL sweep rolls back from the receipt's target_json. Docker
+                            // needs the disconnected networks (which are not in the action
+                            // target) to reconnect, so fold them in from the rollback plan.
+                            let target_json = if receipt.adapter == "docker" {
+                                let mut target =
+                                    claimed.target.clone().unwrap_or_else(|| serde_json::json!({}));
+                                if let (Some(object), Some(networks)) =
+                                    (target.as_object_mut(), receipt.rollback_plan.get("networks"))
+                                {
+                                    object.insert("networks".to_string(), networks.clone());
+                                }
+                                Some(target)
+                            } else {
+                                claimed.target.clone()
+                            };
                             if let Err(error) = store
                                 .record_firewall_action_receipt(FirewallActionReceiptInput {
                                     execution_id: Some(claimed.id),
@@ -1193,7 +1250,7 @@ async fn main() -> anyhow::Result<()> {
                                     is_dry_run: receipt.is_dry_run,
                                     receipt_kind: "apply",
                                     target_fingerprint: Some(&receipt.target_fingerprint),
-                                    target_json: claimed.target.clone(),
+                                    target_json,
                                 })
                                 .await
                             {
