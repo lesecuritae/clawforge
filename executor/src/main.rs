@@ -750,6 +750,20 @@ async fn dispatch_tailscale(
     };
     let adapter = TailscaleAdapter::new();
     let dry_run = dispatch_dry_run(claimed);
+    // Read-only quarantine preflight, recorded on the receipt. Best-effort: a
+    // transient Admin-API read (or missing credentials) must never block the
+    // dispatch, which is itself still dry-run-gated.
+    let preflight_state = match adapter.preflight(&action.target).await {
+        Ok(pf) => serde_json::json!({
+            "already_quarantined": pf.already_quarantined,
+            "current_tags": pf.current_tags,
+            "rollback_requires_reauth": pf.rollback_requires_reauth,
+        }),
+        Err(error) => {
+            tracing::warn!(%error, "tailscale quarantine preflight read failed; recording empty preflight");
+            serde_json::json!({})
+        }
+    };
     match adapter.apply(&action, dry_run).await {
         Ok(applied) => {
             let verification_result = if dry_run {
@@ -767,7 +781,7 @@ async fn dispatch_tailscale(
             );
             let receipt = FirewallDispatchReceipt {
                 adapter: applied.receipt.adapter,
-                preflight_state: serde_json::json!({}),
+                preflight_state,
                 rendered_commands: serde_json::json!([applied.receipt.described_call]),
                 observed_state: None,
                 verification_result,
