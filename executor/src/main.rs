@@ -21,6 +21,8 @@
 //! IP/CIDR - see `TailscaleTarget`'s own doc comment in
 //! `clawforge-firewall-agent`).
 
+use clawforge_firewall_agent::proxmox::ProxmoxAdapter;
+use clawforge_firewall_agent::quarantine::QuarantineTarget;
 use clawforge_firewall_agent::{
     FirewallAction, FirewallAdapter, FirewallTarget, TailscaleAction, TailscaleAdapter,
     TailscaleTarget, VerificationResult,
@@ -116,6 +118,7 @@ fn is_firewall_action(action_name: &str) -> bool {
         || action_name.starts_with("goaway.")
         || action_name.starts_with(FIREWALL_MULTI_ADAPTER_PREFIX)
         || action_name.starts_with(TAILSCALE_ACTION_PREFIX)
+        || action_name.starts_with(PROXMOX_ACTION_PREFIX)
 }
 
 /// Which adapters a `firewall.*` action fans out to -
@@ -173,6 +176,9 @@ fn adapters_touched_by(action_name: &str) -> Vec<String> {
     }
     if action_name.starts_with(TAILSCALE_ACTION_PREFIX) {
         return vec!["tailscale".to_string()];
+    }
+    if action_name.starts_with(PROXMOX_ACTION_PREFIX) {
+        return vec!["proxmox".to_string()];
     }
     if action_name.starts_with("haproxy_ratelimit.") {
         return vec!["haproxy_ratelimit".to_string()];
@@ -690,6 +696,8 @@ async fn dispatch_multi_adapter(
 }
 
 const TAILSCALE_ACTION_PREFIX: &str = "tailscale.";
+const PROXMOX_ACTION_PREFIX: &str = "proxmox.";
+const DEFAULT_PROXMOX_ACTION_TTL_SECONDS: u32 = 3600;
 /// `TailscaleAction` carries no `ttl_seconds` of its own (unlike
 /// `FirewallAction`) - used only for the receipt's own bookkeeping field,
 /// not for any TTL-sweep auto-rollback (see `dispatch_tailscale`'s own
@@ -800,6 +808,99 @@ async fn dispatch_tailscale(
     }
 }
 
+/// Dispatches a `proxmox.*` VM quarantine. Target JSON is `{"node": "<node>",
+/// "vmid": <positive int>}`. Mirrors `dispatch_tailscale`: a read-only preflight
+/// is recorded on the receipt, the apply is dry-run-gated, and a protected VM
+/// (never-quarantine list) is refused by the adapter itself.
+async fn dispatch_proxmox(
+    claimed: &ClaimedExecutionRequest,
+) -> (
+    bool,
+    Option<String>,
+    Option<String>,
+    Vec<FirewallDispatchReceipt>,
+) {
+    let Some(target) = claimed.target.as_ref() else {
+        return (
+            false,
+            None,
+            Some(format!("proxmox action {:?} has no target", claimed.action_name)),
+            Vec::new(),
+        );
+    };
+    let node = target.get("node").and_then(|value| value.as_str());
+    let vmid = target.get("vmid").and_then(|value| value.as_u64());
+    let (node, vmid) = match (node, vmid) {
+        (Some(node), Some(vmid))
+            if !node.trim().is_empty() && vmid > 0 && vmid <= u64::from(u32::MAX) =>
+        {
+            (node.to_string(), vmid as u32)
+        }
+        _ => {
+            return (
+                false,
+                None,
+                Some("proxmox target needs a node (string) and a positive vmid".to_string()),
+                Vec::new(),
+            );
+        }
+    };
+    let qtarget = QuarantineTarget::Proxmox {
+        node: node.clone(),
+        vmid,
+    };
+    let adapter = ProxmoxAdapter::new();
+    let dry_run = dispatch_dry_run(claimed);
+    // Read-only preflight on the receipt; best-effort so a transient API read
+    // never blocks the (dry-run-gated) dispatch.
+    let preflight_state = match adapter.preflight(&qtarget).await {
+        Ok(pf) => serde_json::json!({
+            "node": pf.node,
+            "vmid": pf.vmid,
+            "net0": pf.net0,
+            "currently_quarantined": pf.currently_quarantined,
+            "protected": pf.protected,
+        }),
+        Err(error) => {
+            tracing::warn!(%error, "proxmox quarantine preflight read failed; recording empty preflight");
+            serde_json::json!({})
+        }
+    };
+    match adapter.apply(&qtarget, dry_run).await {
+        Ok(summary_text) => {
+            let verification_result = if dry_run {
+                None
+            } else {
+                match adapter.verify(&qtarget).await {
+                    Ok(VerificationResult::Verified) => Some("verified"),
+                    Ok(VerificationResult::NotPresent) => Some("mismatch"),
+                    Err(_) => Some("failed"),
+                }
+            };
+            let receipt = FirewallDispatchReceipt {
+                adapter: "proxmox",
+                preflight_state,
+                rendered_commands: serde_json::json!([summary_text]),
+                observed_state: None,
+                verification_result,
+                ttl_seconds: DEFAULT_PROXMOX_ACTION_TTL_SECONDS,
+                rollback_plan: serde_json::json!({
+                    "note": "removes net0 link_down=1 to restore connectivity - see ProxmoxAdapter::rollback"
+                }),
+                is_dry_run: dry_run,
+                target_fingerprint: format!("{node}/{vmid}"),
+            };
+            (
+                true,
+                Some(format!("adapter=proxmox dry_run={dry_run} target={node}/{vmid}")),
+                None,
+                vec![receipt],
+            )
+        }
+        Err(error) => (false, None, Some(error.to_string()), Vec::new()),
+    }
+}
+
 /// Dispatches one claimed request. Returns `(success, result_summary,
 /// error_summary, receipts)` for the caller to persist via
 /// `complete_execution_dispatch` (always) and `record_firewall_action_receipt`
@@ -823,6 +924,9 @@ async fn dispatch(
     }
     if claimed.action_name.starts_with(TAILSCALE_ACTION_PREFIX) {
         return dispatch_tailscale(claimed).await;
+    }
+    if claimed.action_name.starts_with(PROXMOX_ACTION_PREFIX) {
+        return dispatch_proxmox(claimed).await;
     }
     let Some(adapter) = adapter_for(&claimed.action_name) else {
         return (
