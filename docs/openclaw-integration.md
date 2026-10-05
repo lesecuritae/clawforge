@@ -87,6 +87,20 @@ Roadmap Phase 10 hat seither drei weitere read-only Tools ergänzt
 Postgres-Suite und die MCP-Integrationstests verifiziert **und
 zusätzlich am 2026-09-25 zweifach live bestätigt**:
 
+`get_firewall_status` liefert im Agent-Pfad eine versionierte, eingeschränkte
+Projektion (`projection_version: 1`): Receipt-IDs, Adapter, Apply/Rollback,
+Dry-Run-/Verifikationsstatus und Zeitangaben sowie Drift- und Kill-Switch-
+Status. Rohe Zielwerte (`target_json`, `target_fingerprint`), gerenderte
+Befehle, Rollback-Pläne, beobachtete Rohzustände und Operator-Freitext werden
+vor der Agent-API entfernt. Das Admin-UI nutzt weiterhin seinen getrennten
+Rollenpfad. Der Agent kann keine Firewall-Aktion ausführen oder freigeben.
+Die Drift-Liste ist auf 100 Eintraege begrenzt; `expired_total` und
+`expired_truncated` zeigen an, ob weitere Eintraege vorhanden sind.
+Der MCP-Adapter verweigert `get_firewall_status`, wenn die Agent-API noch
+keine kompatible `projection_version: 1` mit den bekannten Feldern liefert.
+Damit gibt ein verfrueht aktivierter MCP-Server die alte rohe Antwort nicht
+an OpenClaw weiter.
+
 1. Gegen eine leere Testinstanz (`openclaw mcp probe` verband sich live
    gegen den laufenden `clawforge-mcp`-Dienst und meldete alle 42
    Tools; ein echter Agent-Turn, Modell

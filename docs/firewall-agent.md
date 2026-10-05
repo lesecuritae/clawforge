@@ -220,11 +220,13 @@ re-running the full lab suite.
 
 ## The isolated network lab
 
-`scripts/test-firewall-lab.sh` runs the 9 `#[ignore]`-gated real-`nft`
+`scripts/test-firewall-lab.sh` runs the 12 `#[ignore]`-gated real-`nft`
 tests (round-trip apply/verify/rollback for IPv4 and IPv6, dry-run
 never touching the real set, idempotent double-apply, resolved-source
 apply, unresolved-source fails closed, rollback-of-never-applied fails
-cleanly, IPv4-mapped-IPv6 normalization, and the break-glass drill below)
+cleanly, IPv4-mapped-IPv6 normalization, concurrent applies, drift detection,
+actual TCP traffic being dropped and restored after rollback, and the
+break-glass drill below)
 inside a disposable `rust:1.98-bookworm` container
 (`--cap-add=NET_ADMIN --cap-add=NET_RAW`), never against srv19680 or any
 other real host - the container's network namespace is created fresh by
@@ -235,6 +237,12 @@ self-lockout confirmation against a *provisioned* host's real management
 path (SSH, HAProxy admin, etc.) - this container has no equivalent of
 that at all. That confirmation is still an open item before ever
 applying for real against a live host.
+
+The TCP test uses a documentation source address assigned only to the lab's
+loopback device (`iproute2` is required). It proves connectivity before apply,
+a connection timeout while the real nftables rule is applied, and connectivity
+after rollback. Go-Away, HAProxy and Tailscale tests are excluded from this
+script because they use separate adapter environments.
 
 ## Break-glass procedure
 

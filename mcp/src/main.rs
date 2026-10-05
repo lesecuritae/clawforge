@@ -543,6 +543,61 @@ fn redact(value: Value) -> Value {
     }
 }
 
+// Phase 10 must fail closed if the MCP server is enabled before the API has
+// the restricted firewall projection. The old route includes raw target JSON
+// and operator text; checking only the upstream HTTP status would expose it.
+fn safe_firewall_status_projection(data: &Value) -> bool {
+    fn only_fields(value: &Value, allowed: &[&str]) -> bool {
+        value
+            .as_object()
+            .is_some_and(|object| object.keys().all(|key| allowed.contains(&key.as_str())))
+    }
+    let Some(data) = data.as_object() else {
+        return false;
+    };
+    if data.get("projection_version").and_then(Value::as_u64) != Some(1)
+        || !data.keys().all(|key| {
+            [
+                "projection_version",
+                "expired_total",
+                "expired_truncated",
+                "receipts",
+                "expired",
+                "kill_switch",
+            ]
+            .contains(&key.as_str())
+        })
+    {
+        return false;
+    }
+    let fields = [
+        (
+            "receipts",
+            &[
+                "id",
+                "execution_id",
+                "adapter",
+                "receipt_kind",
+                "is_dry_run",
+                "verification_result",
+                "ttl_seconds",
+                "expires_at",
+                "created_at",
+            ][..],
+        ),
+        ("expired", &["receipt_id", "adapter"][..]),
+        (
+            "kill_switch",
+            &["id", "adapter", "created_at", "processed_at"][..],
+        ),
+    ];
+    fields.iter().all(|(name, allowed)| {
+        data.get(*name)
+            .and_then(Value::as_array)
+            .is_some_and(|rows| rows.iter().all(|row| only_fields(row, allowed)))
+    })
+}
+
 fn bearer(headers: &HeaderMap) -> Option<&str> {
     headers
         .get(header::AUTHORIZATION)
@@ -1141,10 +1196,16 @@ impl McpServer {
         &self,
         Parameters(_args): Parameters<EmptyArgs>,
     ) -> Result<Json<ToolResponse>, ErrorData> {
-        Ok(Json(
-            self.get(SCOPE_FIREWALL, "/api/v1/firewall/status", &[])
-                .await?,
-        ))
+        let response = self
+            .get(SCOPE_FIREWALL, "/api/v1/firewall/status", &[])
+            .await?;
+        if !safe_firewall_status_projection(&response.data) {
+            return Err(ErrorData::internal_error(
+                "Firewall status projection incompatible",
+                None,
+            ));
+        }
+        Ok(Json(response))
     }
 
     #[tool(
@@ -1961,6 +2022,29 @@ mod tests {
             json!({"payload":{"token":"secret"},"metadata":{"raw_feed":"x"},"node_identities":["node"],"status":"Verified"}),
         );
         assert_eq!(value, json!({"status":"Verified"}));
+    }
+
+    #[test]
+    fn firewall_tool_rejects_legacy_or_expanded_api_projection() {
+        let current = json!({
+            "projection_version": 1,
+            "expired_total": 0,
+            "expired_truncated": false,
+            "receipts": [{"id": "safe-id", "adapter": "nftables", "is_dry_run": true}],
+            "expired": [],
+            "kill_switch": [],
+        });
+        assert!(safe_firewall_status_projection(&current));
+        let legacy = json!({
+            "receipts": [{"target_fingerprint": "internal-target"}],
+            "expired": [],
+            "kill_switch": [],
+        });
+        assert!(!safe_firewall_status_projection(&legacy));
+        let mut expanded = current;
+        expanded["expired"] =
+            json!([{"receipt_id": "safe-id", "target_json": {"ip": "internal-target"}}]);
+        assert!(!safe_firewall_status_projection(&expanded));
     }
 
     #[test]
