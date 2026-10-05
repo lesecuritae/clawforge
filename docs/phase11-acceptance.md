@@ -61,8 +61,15 @@ on the never-quarantine list and never touched.
   must clear the existing context-bound approval flow (`required_approvals >= 2`
   for two-person release, surfaced by `execution_approval_detail`) before it is
   claimed and dispatched. The executor only ever executes already-approved,
-  claimed requests. Classifying the quarantine action names as dual-approval in
-  the approval/policy layer is the remaining integration step.
+  claimed requests. The quarantine action rows (`proxmox.quarantine_vm`,
+  `docker.quarantine_container`, and the existing `tailscale.quarantine_device`)
+  must be seeded in the `actions` table with `risk_level='critical'` and
+  `requires_approval=TRUE` so `create_execution_request` derives
+  `required_approvals=2` from `approval_policies` (`critical` → two-person,
+  `high` → two operators). That seed is a database migration and is **not added
+  here**: it falls in the 0046/0047 migration-fork range that CLAUDE.md marks a
+  hard boundary (prod/main diverge; 0049–0051 live only in a stash). It must be
+  added as a reviewed migration **after** that fork is reconciled — see below.
 - **Data ownership.** `QuarantinePreflight` refuses to construct without a
   non-blank `data_owner`, `snapshot_restore_reference` and
   `management_network_plan`; it proves no live state, only that the operator
@@ -71,11 +78,30 @@ on the never-quarantine list and never touched.
 ## Remaining, explicitly not authorized here
 
 - No production rollout. Live quarantine against a real production target still
-  needs the dual-approval classification wired in, and the same real-host
-  management-path / never-block confirmation that phase 10 leaves open.
-- TTL-driven auto-rollback is not wired into the executor sweep for quarantine
-  receipts yet (the receipt records the rollback plan; the sweep does not act on
-  it).
+  needs the same real-host management-path / never-block confirmation that phase
+  10 leaves open, plus the dual-approval seed below.
+- Dual-approval seed is deferred behind the migration-fork hard boundary. Once
+  reconciled, add a reviewed migration seeding the quarantine actions, e.g.:
+
+  ```sql
+  INSERT INTO actions (id, connector_id, name, type, description, risk_level,
+                       required_scope, requires_approval, enabled)
+  VALUES
+    (gen_random_uuid(), <connector>, 'proxmox.quarantine_vm', 'connector_action',
+     'Isolate a VM NIC (net0 link_down) - reversible.', 'critical',
+     'agent:action:read', TRUE, FALSE),
+    (gen_random_uuid(), <connector>, 'docker.quarantine_container', 'connector_action',
+     'Disconnect a container from its networks - reversible.', 'critical',
+     'agent:action:read', TRUE, FALSE)
+  ON CONFLICT (name) DO UPDATE SET description = EXCLUDED.description;
+  ```
+
+  `enabled=FALSE` until the live go-live checks pass, mirroring how
+  `tailscale.quarantine_device` was seeded in migration 0037.
+- TTL-driven auto-rollback **is** wired: the executor sweep un-quarantines
+  expired, real (non-dry-run) proxmox/docker/tailscale receipts via
+  `rollback_target` (docker's disconnected networks are folded into the
+  receipt's `target_json` so the sweep can reconnect them).
 - Credentials used for the lab tests are operator-managed 0600 files; no secret
   is committed. Forgejo Actions is disabled, so the checks above are real local
   acceptance runs, not CI.
