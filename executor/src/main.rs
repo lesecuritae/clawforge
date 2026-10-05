@@ -21,6 +21,7 @@
 //! IP/CIDR - see `TailscaleTarget`'s own doc comment in
 //! `clawforge-firewall-agent`).
 
+use clawforge_firewall_agent::docker::DockerAdapter;
 use clawforge_firewall_agent::proxmox::ProxmoxAdapter;
 use clawforge_firewall_agent::quarantine::QuarantineTarget;
 use clawforge_firewall_agent::{
@@ -119,6 +120,7 @@ fn is_firewall_action(action_name: &str) -> bool {
         || action_name.starts_with(FIREWALL_MULTI_ADAPTER_PREFIX)
         || action_name.starts_with(TAILSCALE_ACTION_PREFIX)
         || action_name.starts_with(PROXMOX_ACTION_PREFIX)
+        || action_name.starts_with(DOCKER_ACTION_PREFIX)
 }
 
 /// Which adapters a `firewall.*` action fans out to -
@@ -179,6 +181,9 @@ fn adapters_touched_by(action_name: &str) -> Vec<String> {
     }
     if action_name.starts_with(PROXMOX_ACTION_PREFIX) {
         return vec!["proxmox".to_string()];
+    }
+    if action_name.starts_with(DOCKER_ACTION_PREFIX) {
+        return vec!["docker".to_string()];
     }
     if action_name.starts_with("haproxy_ratelimit.") {
         return vec!["haproxy_ratelimit".to_string()];
@@ -698,6 +703,10 @@ async fn dispatch_multi_adapter(
 const TAILSCALE_ACTION_PREFIX: &str = "tailscale.";
 const PROXMOX_ACTION_PREFIX: &str = "proxmox.";
 const DEFAULT_PROXMOX_ACTION_TTL_SECONDS: u32 = 3600;
+// Specific to quarantine: `docker.restart_container` and other docker.* actions
+// are deliberately NOT firewall actions and must keep their non-firewall no-op.
+const DOCKER_ACTION_PREFIX: &str = "docker.quarantine";
+const DEFAULT_DOCKER_ACTION_TTL_SECONDS: u32 = 3600;
 /// `TailscaleAction` carries no `ttl_seconds` of its own (unlike
 /// `FirewallAction`) - used only for the receipt's own bookkeeping field,
 /// not for any TTL-sweep auto-rollback (see `dispatch_tailscale`'s own
@@ -901,6 +910,101 @@ async fn dispatch_proxmox(
     }
 }
 
+/// Dispatches a `docker.*` container quarantine. Target JSON is
+/// `{"container_id": "<id>"}`. The disconnected networks are recorded on the
+/// receipt so a rollback can reconnect them; a protected container is refused
+/// by the adapter's never-quarantine guard.
+async fn dispatch_docker(
+    claimed: &ClaimedExecutionRequest,
+) -> (
+    bool,
+    Option<String>,
+    Option<String>,
+    Vec<FirewallDispatchReceipt>,
+) {
+    let Some(target) = claimed.target.as_ref() else {
+        return (
+            false,
+            None,
+            Some(format!("docker action {:?} has no target", claimed.action_name)),
+            Vec::new(),
+        );
+    };
+    let container_id = target
+        .get("container_id")
+        .or_else(|| target.get("container"))
+        .and_then(|value| value.as_str());
+    let container_id = match container_id {
+        Some(id) if !id.trim().is_empty() => id.to_string(),
+        _ => {
+            return (
+                false,
+                None,
+                Some("docker target needs a container_id (string)".to_string()),
+                Vec::new(),
+            );
+        }
+    };
+    let qtarget = QuarantineTarget::Docker {
+        container_id: container_id.clone(),
+    };
+    let adapter = DockerAdapter::new();
+    let dry_run = dispatch_dry_run(claimed);
+    let preflight_state = match adapter.preflight(&qtarget).await {
+        Ok(pf) => serde_json::json!({
+            "container_id": pf.container_id,
+            "networks": pf.networks,
+            "currently_quarantined": pf.currently_quarantined,
+            "protected": pf.protected,
+        }),
+        Err(error) => {
+            tracing::warn!(%error, "docker quarantine preflight read failed; recording empty preflight");
+            serde_json::json!({})
+        }
+    };
+    match adapter.apply(&qtarget, dry_run).await {
+        Ok(networks) => {
+            let verification_result = if dry_run {
+                None
+            } else {
+                match adapter.verify(&qtarget).await {
+                    Ok(VerificationResult::Verified) => Some("verified"),
+                    Ok(VerificationResult::NotPresent) => Some("mismatch"),
+                    Err(_) => Some("failed"),
+                }
+            };
+            let count = networks.len();
+            let commands: Vec<String> = networks
+                .iter()
+                .map(|network| format!("docker network disconnect {network} {container_id}"))
+                .collect();
+            let receipt = FirewallDispatchReceipt {
+                adapter: "docker",
+                preflight_state,
+                rendered_commands: serde_json::json!(commands),
+                observed_state: Some(serde_json::json!({ "disconnected_networks": networks.clone() })),
+                verification_result,
+                ttl_seconds: DEFAULT_DOCKER_ACTION_TTL_SECONDS,
+                rollback_plan: serde_json::json!({
+                    "note": "reconnect the container to disconnected_networks - see DockerAdapter::rollback",
+                    "networks": networks,
+                }),
+                is_dry_run: dry_run,
+                target_fingerprint: container_id.clone(),
+            };
+            (
+                true,
+                Some(format!(
+                    "adapter=docker dry_run={dry_run} container={container_id} networks={count}"
+                )),
+                None,
+                vec![receipt],
+            )
+        }
+        Err(error) => (false, None, Some(error.to_string()), Vec::new()),
+    }
+}
+
 /// Dispatches one claimed request. Returns `(success, result_summary,
 /// error_summary, receipts)` for the caller to persist via
 /// `complete_execution_dispatch` (always) and `record_firewall_action_receipt`
@@ -927,6 +1031,9 @@ async fn dispatch(
     }
     if claimed.action_name.starts_with(PROXMOX_ACTION_PREFIX) {
         return dispatch_proxmox(claimed).await;
+    }
+    if claimed.action_name.starts_with(DOCKER_ACTION_PREFIX) {
+        return dispatch_docker(claimed).await;
     }
     let Some(adapter) = adapter_for(&claimed.action_name) else {
         return (
