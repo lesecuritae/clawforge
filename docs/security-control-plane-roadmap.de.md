@@ -842,6 +842,12 @@ sehen.
 
 ## Phase 10: OpenClaw Security Integration
 
+Stand 2026-10-05: sichere API-/MCP-Projektion und fokussierte Tests implementiert;
+lokale Abnahme einschließlich echter Adapter-Labortests und begrenztem
+OpenClaw-Bericht erfolgreich. Belege, Modellgrenzen und offene produktive
+Pilot-Gates: [Phase-10-Abnahme](phase10-acceptance.md). Repository-Integration
+ist getrennt zu prüfen; diese Abnahme aktiviert keinen produktiven Vollzug.
+
 Ziel: Analyse und Berichte ohne neue Ausführungsprivilegien.
 
 - bestehende read-only MCP-Grenze beibehalten
