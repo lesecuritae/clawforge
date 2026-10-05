@@ -114,6 +114,7 @@
 
 pub mod quarantine;
 pub mod proxmox;
+pub mod docker;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
