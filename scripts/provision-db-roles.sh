@@ -77,6 +77,9 @@ GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO clawforge_api;
 REVOKE INSERT, UPDATE, DELETE ON TABLE _sqlx_migrations FROM clawforge_api;
 REVOKE UPDATE, DELETE ON TABLE audit_events FROM clawforge_api;
 REVOKE DELETE ON TABLE audit_outbox FROM clawforge_api;
+-- API can inspect journal generations, but only the executor owns transitions.
+REVOKE INSERT, UPDATE, DELETE ON TABLE firewall_action_intents FROM clawforge_api;
+REVOKE UPDATE, DELETE ON TABLE firewall_action_receipts FROM clawforge_api;
 
 -- incident_relations: list_incidents (called from evaluate_decisions on
 -- every worker tick) joins it to compute each incident's event_sources/
@@ -177,6 +180,11 @@ GRANT INSERT, UPDATE ON TABLE execution_requests, execution_leases,
 -- query (recent_real_firewall_apply_count) - that is a count, never a
 -- row-by-row read-back of past receipts.
 GRANT INSERT, SELECT ON TABLE firewall_action_receipts TO clawforge_executor;
+-- Recovery journal: prepare and complete an intent; retain every row for audit.
+GRANT SELECT, INSERT, UPDATE ON TABLE firewall_action_intents TO clawforge_executor;
+-- Revalidate context-bound distinct approvals at dispatch; never grant approval writes.
+GRANT SELECT ON TABLE execution_approvals, approval_policies TO clawforge_executor;
+GRANT EXECUTE ON FUNCTION clawforge_lock_quarantine_approval(UUID) TO clawforge_executor;
 -- Kill-switch intent queue (migration 0042): the executor's sweep reads
 -- pending rows and marks them processed once rolled back - it never
 -- inserts one itself (clawforge-api does that, via its own blanket

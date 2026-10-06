@@ -112,6 +112,10 @@
 //! roadmap's remaining mandatory gates beyond what this crate's own tests
 //! cover - see `docs/firewall-agent.md`'s own remaining list.
 
+pub mod docker;
+pub mod proxmox;
+pub mod quarantine;
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -1866,6 +1870,9 @@ const TAILSCALE_CLIENT_SECRET_VAR: &str = "CLAWFORGE_TAILSCALE_OAUTH_CLIENT_SECR
 /// `autogroup:member`. See the module doc comment on
 /// [`TailscaleAdapter`] for the full mechanism.
 const TAILSCALE_DEFAULT_QUARANTINE_TAG: &str = "tag:clawforge-quarantine";
+/// Comma-separated device IDs the quarantine must never isolate (management /
+/// control nodes) - the quarantine counterpart to the firewall never-block list.
+const TAILSCALE_NEVER_QUARANTINE_VAR: &str = "CLAWFORGE_TAILSCALE_NEVER_QUARANTINE";
 const TAILSCALE_API_BASE: &str = "https://api.tailscale.com/api/v2";
 
 struct TailscaleCredentials {
@@ -1896,6 +1903,58 @@ struct TailscaleTagsRequest<'a> {
 pub struct TailscaleApplyResult {
     pub receipt: TailscaleActionReceipt,
     pub applied: bool,
+}
+
+/// Read-only quarantine preflight, the Tailscale counterpart to
+/// [`Preflight`]: it reports a device's current quarantine state without
+/// mutating anything. It also surfaces whether an automatic rollback would be
+/// possible at all - Tailscale refuses to remove a device's *last* tag without
+/// device-side reauth (see [`TailscaleAdapter::rollback`]), so quarantining a
+/// device that has no other tags is effectively one-way until the device
+/// reauths. An operator should see that *before* isolating.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TailscalePreflight {
+    pub already_quarantined: bool,
+    pub current_tags: Vec<String>,
+    /// True when the quarantine tag is (or would become) the device's only
+    /// tag, so `rollback` cannot complete automatically and needs reauth.
+    pub rollback_requires_reauth: bool,
+    /// True when the device is on the never-quarantine protection list, so
+    /// `apply` refuses to quarantine it (the self-lockout guard).
+    pub protected: bool,
+}
+
+/// Pure decision from a device's current tag list, kept separate from the
+/// async Admin-API read so the logic is unit-testable without the network.
+fn quarantine_preflight(
+    current_tags: &[String],
+    quarantine_tag: &str,
+    protected: bool,
+) -> TailscalePreflight {
+    let already_quarantined = current_tags.iter().any(|tag| tag == quarantine_tag);
+    // Rollback removes only the quarantine tag; if nothing else remains,
+    // Tailscale rejects the untag without device reauth.
+    let has_other_tag = current_tags.iter().any(|tag| tag != quarantine_tag);
+    TailscalePreflight {
+        already_quarantined,
+        current_tags: current_tags.to_vec(),
+        rollback_requires_reauth: !has_other_tag,
+        protected,
+    }
+}
+
+/// Parses `CLAWFORGE_TAILSCALE_NEVER_QUARANTINE` (comma-separated device IDs
+/// that must never be quarantined - the operator's own management/control
+/// nodes). Whitespace-only entries are dropped; unset/empty is an empty list.
+/// Infallible, matching the adapter's infallible constructor.
+fn never_quarantine_from_configured(configured: Option<&str>) -> Vec<String> {
+    configured
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// Tailscale's own second increment: `apply`/`verify`/`rollback` now
@@ -1947,6 +2006,7 @@ pub struct TailscaleApplyResult {
 pub struct TailscaleAdapter {
     credentials: Result<TailscaleCredentials, String>,
     quarantine_tag: String,
+    never_quarantine: Vec<String>,
     http: reqwest::Client,
 }
 
@@ -1977,6 +2037,11 @@ impl TailscaleAdapter {
             credentials,
             quarantine_tag: std::env::var("CLAWFORGE_TAILSCALE_QUARANTINE_TAG")
                 .unwrap_or_else(|_| TAILSCALE_DEFAULT_QUARANTINE_TAG.to_string()),
+            never_quarantine: never_quarantine_from_configured(
+                std::env::var(TAILSCALE_NEVER_QUARANTINE_VAR)
+                    .ok()
+                    .as_deref(),
+            ),
             http: reqwest::Client::new(),
         }
     }
@@ -2077,9 +2142,8 @@ impl TailscaleAdapter {
             })?;
         if !response.status().is_success() {
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
             return Err(AdapterError::Apply(format!(
-                "tailscale set-tags rejected: HTTP {status}: {body}"
+                "tailscale set-tags rejected: HTTP {status}"
             )));
         }
         Ok(())
@@ -2091,6 +2155,29 @@ impl TailscaleAdapter {
     /// adapter's `apply` already has). `dry_run: false` reads the
     /// device's current tags, adds the quarantine tag if not already
     /// present (idempotent - a repeat apply is a no-op past the first
+    /// Read-only quarantine preflight: inspects the device's current tag
+    /// state via the Admin API without changing anything (the quarantine
+    /// counterpart to [`FirewallAdapter::preflight`]). Never applies a tag, so
+    /// it is safe to call before an operator decides to isolate a device, and
+    /// it reports whether an automatic rollback would even be possible.
+    pub async fn preflight(
+        &self,
+        target: &TailscaleTarget,
+    ) -> Result<TailscalePreflight, AdapterError> {
+        target.validate()?;
+        // A protected device is never quarantined, so there is nothing to read
+        // and no credentials are needed - report it as protected directly.
+        if self.is_protected(&target.device_id) {
+            return Ok(quarantine_preflight(&[], &self.quarantine_tag, true));
+        }
+        let tags = self.device_tags(&target.device_id).await?;
+        Ok(quarantine_preflight(&tags, &self.quarantine_tag, false))
+    }
+
+    fn is_protected(&self, device_id: &str) -> bool {
+        self.never_quarantine.iter().any(|id| id == device_id)
+    }
+
     /// one), and writes the merged list back.
     pub async fn apply(
         &self,
@@ -2098,6 +2185,14 @@ impl TailscaleAdapter {
         dry_run: bool,
     ) -> Result<TailscaleApplyResult, AdapterError> {
         action.target.validate()?;
+        // Self-lockout guard: never quarantine a protected device, not even as
+        // a dry run - the action is simply not permitted for it.
+        if self.is_protected(&action.target.device_id) {
+            return Err(AdapterError::InvalidTarget(format!(
+                "device {} is on the never-quarantine protection list ({}); refusing to quarantine",
+                action.target.device_id, TAILSCALE_NEVER_QUARANTINE_VAR
+            )));
+        }
         let receipt = self.render(action)?;
         if dry_run {
             return Ok(TailscaleApplyResult {
@@ -2194,6 +2289,76 @@ impl Default for TailscaleAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const QTAG: &str = "tag:clawforge-quarantine";
+
+    #[test]
+    fn quarantine_preflight_flags_an_already_quarantined_device() {
+        let p = quarantine_preflight(&[QTAG.to_string()], QTAG, false);
+        assert!(p.already_quarantined);
+        // The quarantine tag is its only tag, so an un-quarantine needs reauth.
+        assert!(p.rollback_requires_reauth);
+        assert!(!p.protected);
+    }
+
+    #[test]
+    fn quarantine_preflight_warns_untagged_device_cannot_auto_rollback() {
+        // A device with no tags is not quarantined, but quarantining it would
+        // make the quarantine tag its only tag - rollback then needs reauth.
+        let p = quarantine_preflight(&[], QTAG, false);
+        assert!(!p.already_quarantined);
+        assert!(p.rollback_requires_reauth);
+    }
+
+    #[test]
+    fn quarantine_preflight_device_with_other_tags_is_reversible() {
+        let p = quarantine_preflight(&["tag:server".to_string()], QTAG, false);
+        assert!(!p.already_quarantined);
+        assert!(!p.rollback_requires_reauth);
+        assert_eq!(p.current_tags, vec!["tag:server".to_string()]);
+    }
+
+    #[test]
+    fn quarantine_preflight_already_quarantined_with_other_tags_is_reversible() {
+        let p = quarantine_preflight(&[QTAG.to_string(), "tag:server".to_string()], QTAG, false);
+        assert!(p.already_quarantined);
+        assert!(!p.rollback_requires_reauth);
+    }
+
+    #[test]
+    fn quarantine_preflight_marks_a_protected_device() {
+        let p = quarantine_preflight(&[], QTAG, true);
+        assert!(p.protected);
+    }
+
+    #[test]
+    fn never_quarantine_list_parses_trims_and_drops_empty_entries() {
+        let list = never_quarantine_from_configured(Some(" dev-a , , dev-b "));
+        assert_eq!(list, vec!["dev-a".to_string(), "dev-b".to_string()]);
+        assert!(never_quarantine_from_configured(None).is_empty());
+        assert!(never_quarantine_from_configured(Some("   ")).is_empty());
+    }
+
+    #[tokio::test]
+    async fn apply_refuses_a_never_quarantine_device_even_as_a_dry_run() {
+        let adapter = TailscaleAdapter {
+            credentials: Err("unused: refused before any API call".to_string()),
+            quarantine_tag: QTAG.to_string(),
+            never_quarantine: vec!["dev-protected".to_string()],
+            http: reqwest::Client::new(),
+        };
+        let action = TailscaleAction {
+            target: TailscaleTarget {
+                device_id: "dev-protected".to_string(),
+            },
+            reason: "test".to_string(),
+        };
+        let error = adapter.apply(&action, true).await.unwrap_err();
+        assert!(
+            matches!(error, AdapterError::InvalidTarget(message) if message.contains("never-quarantine")),
+            "a protected device must be refused with a never-quarantine target error",
+        );
+    }
 
     /// `CLAWFORGE_TAILSCALE_QUARANTINE_TAG` is mutated by exactly one test
     /// (`tailscale_quarantine_tag_defaults_but_is_configurable`) and read
