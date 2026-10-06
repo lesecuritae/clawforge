@@ -129,3 +129,19 @@ trends, a redacted security briefing, and a service/provider dependency graph.
 The MCP adapter maps these four read-only resources without direct storage access;
 all new scopes are checked by both adapter and API. The dashboard renders the
 same contracts and never performs new risk or correlation calculations.
+
+## Quarantine durability (Phase 11 review, 2026-10-06)
+
+The storage layer extends native `firewall_action_intents` (0047/0054), with
+immutable approved targets, restore snapshots and generation ownership.
+`storage/src/quarantine_intents.rs` provides preparation, guarded revalidation,
+atomic receipt completion and verified rollback resolution. Executor
+`quarantine_runtime` coordinates adapter IO while holding the generation lock;
+unknown completion retains ownership and requires manual review. Generic leases
+cannot replay these requests. Kill switches reference exact generations.
+
+`migration_compat` selects exact reviewed historical SQL sources for the known
+0046 fork. Additive 0052/0053 converge capabilities and disabled critical actions;
+readiness checks full checksums. Runtime roles do not write migration history or
+approval policy. Production live quarantine remains closed. See
+[acceptance and test map](phase11-acceptance.md) for evidence, limitations and rollback.

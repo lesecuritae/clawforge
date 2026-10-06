@@ -22,6 +22,7 @@ run_cargo() {
     -e CARGO_TARGET_DIR=/tmp/clawforge-target \
     -e DATABASE_URL \
     -e CLAWFORGE_TEST_DATABASE_URL \
+    -e CLAWFORGE_TEST_MIGRATION_URL \
     -e CLAWFORGE_TEST_API_DATABASE_URL \
     -e CLAWFORGE_TEST_WORKER_DATABASE_URL \
     -e CLAWFORGE_TEST_CORRELATION_DATABASE_URL \
@@ -42,7 +43,7 @@ docker run --rm -d --name "$container" \
   -e POSTGRES_DB=clawforge_test \
   -e POSTGRES_USER=clawforge \
   -e POSTGRES_PASSWORD=test-password-012345 \
-  -p 55432:5432 postgres:16-alpine >/dev/null
+  -p 127.0.0.1:55432:5432 postgres:16-alpine >/dev/null
 
 until docker exec "$container" pg_isready -U clawforge -d clawforge_test >/dev/null 2>&1; do sleep 1; done
 
@@ -116,3 +117,17 @@ CLAWFORGE_ANALYZER_IP_HMAC_KEY="test-only-ip-hmac-key-0123456789-not-for-product
 CLAWFORGE_TEST_DATABASE_URL="$owner_url" \
 CLAWFORGE_ANALYZER_IP_HMAC_KEY="test-only-ip-hmac-key-0123456789-not-for-production" \
   run_cargo test -p clawforge-api --bin clawforge-api -- --ignored --test-threads=1
+
+# Both reviewed historical migration lineages and quarantine release invariants.
+export CLAWFORGE_TEST_MIGRATION_URL="$owner_url"
+export CLAWFORGE_TEST_DATABASE_URL="$owner_url"
+export CLAWFORGE_TEST_API_DATABASE_URL="$(cat "$secret_dir/database_api_url")"
+export CLAWFORGE_TEST_EXECUTOR_DATABASE_URL="$(cat "$secret_dir/database_executor_url")"
+run_cargo test -p clawforge-storage --test migration_lineages -- --ignored --test-threads=1
+run_cargo test -p clawforge-storage --test quarantine_approval -- --ignored --test-threads=1
+
+export CLAWFORGE_TEST_QUARANTINE_DATABASE_URL="$owner_url"
+run_cargo test -p clawforge-storage --test quarantine_intents -- --ignored --test-threads=1
+run_cargo test -p clawforge-storage --test quarantine_lease -- --ignored --test-threads=1
+
+run_cargo test -p clawforge-executor native_controller_writeahead_recovery_and_stale_generation_lab -- --ignored --test-threads=1

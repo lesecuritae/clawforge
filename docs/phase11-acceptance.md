@@ -1,107 +1,115 @@
-# Phase 11 acceptance: quarantine (Tailscale / Proxmox / Docker)
+# Phase 11 acceptance: quarantine
 
-Scope: reversible, approval- and dry-run-gated quarantine of a Tailscale
-device, a Proxmox VM and a Docker container. This records the Phase 11
-exit-gate evidence — an exclusively lab-proven end-to-end restore, data
-ownership, and the dual-approval requirement. **No production rollout is
-authorized by this acceptance.**
+## Current status (2026-10-06)
 
-## What was built
+Development hardening continues on Forgejo PR #2. **Production quarantine is
+closed. This document does not authorize rollout or mark the full exit gate met.**
+Claude's earlier disposable Proxmox/Docker trials cover the earlier adapter;
+they do not establish acceptance of the changed TLS/task/recovery controller.
 
-- `firewall-agent` `quarantine` module (plan-only, no IO): validated
-  `QuarantineTarget` (Docker full-id / Proxmox node+vmid), bounded
-  owner/snapshot/network-plan metadata, and a never-quarantine protection list
-  (`QuarantineTarget::parse`, `never_quarantine_from_configured`, `is_protected`)
-  that fails closed on a malformed entry.
-- `TailscaleAdapter::preflight` (read-only) and a never-quarantine guard
-  (`CLAWFORGE_TAILSCALE_NEVER_QUARANTINE`); the quarantine preflight is recorded
-  on the executor receipt.
-- `proxmox::ProxmoxAdapter`: isolates a VM's `net0` NIC via `link_down=1` over
-  the Proxmox config API (ticket auth), reversible, MAC/bridge preserved.
-- `docker::DockerAdapter`: isolates a container by disconnecting it from all its
-  networks (recorded for reconnect) via the `docker` CLI with explicit argv.
-- Executor dispatch for `proxmox.*` and `docker.quarantine*` (mirrors the
-  tailscale path): read-only preflight on the receipt, dry-run-gated apply,
-  verify, and a protected target refused by the adapter. `docker.restart_container`
-  and other `docker.*` actions deliberately remain non-firewall no-ops.
+## Implemented safety boundaries
 
-Unit coverage: 87 firewall-agent + 17 executor tests pass; `cargo clippy` clean
-on both; `cargo check --workspace` green.
+- Exact action dispatch: `docker.quarantine_container`, `proxmox.quarantine_vm`,
+  `tailscale.quarantine_device`. Unrelated actions cannot reach quarantine.
+- Canonical immutable Docker identity and validated Proxmox node/VM identity.
+  Invalid protection lists refuse execution; real adapters require a nonempty
+  management protection list. Owner, restore reference and management plan are
+  required metadata, not proof that backups or management connectivity work.
+- Docker uses bounded network-only inspection and explicit argv. Durable restore
+  snapshots include network IDs, aliases, configured static addresses, links,
+  driver options and gateway priority. Failed partial isolation attempts restore
+  original attachments. Readback requires original attachment settings; additional
+  operator attachments/aliases are preserved, so this is not a claim that every
+  aspect of Docker state equals an earlier snapshot.
+- Proxmox verifies TLS by default (`CLAWFORGE_PROXMOX_CA_FILE` for trusted private
+  CA), validates host authorities, rejects multiple NICs, uses digest CAS, waits
+  for the correct `qmconfig` task to finish successfully, and verifies readback.
+  Rollback restores the exact original `net0`, including an explicit `link_down=0`.
+  Operator drift, failed/missing task IDs and uncertain completion are failures.
+- Both adapters compare current metadata with the durable prepared snapshot
+  before applying. Verification failure cannot be reported as success.
+- Creation, both claim paths and native preparation enforce current critical
+  policy, at least two distinct context-bound approvers excluding the requester,
+  and unexpired approval. Revalidation under the generation guard precedes IO.
+- Executor startup still requires dry-run. A separate hard-coded live quarantine
+  gate stays closed; an environment variable cannot open it.
 
-## Lab end-to-end restore (the exit gate)
+## Native durability and generations
 
-Every mechanism was exercised **apply → verify → rollback → verify** against
-real infrastructure, reversibly, with nothing production isolated.
+Migration 0054 extends the existing `firewall_action_intents`; there is no second
+journal. Before mutation, native preparation commits the approved target,
+canonical fingerprint, read-only preflight, rollback snapshot, TTL and deadline.
+The approved target is unchanged and must contain `kind` matching the adapter.
+An active generation owns `(adapter, fingerprint)` until verified resolution.
 
-| Mechanism | Lab target | Result |
-|---|---|---|
-| HAProxy ACL (phase 10 adapter path) | VPS `srv19680`, dummy `203.0.113.7` (RFC 5737 TEST-NET) | `show acl` empty → `add acl` → present → `del acl` → absent; list restored exactly. |
-| Proxmox NIC `link_down` | disposable VM `IT13/9000` (created and destroyed for the test) | `ProxmoxAdapter` live: preflight → apply (`link_down=1`) → verify **Verified** → rollback → verify **NotPresent**; `net0` restored (MAC/bridge intact). |
-| Docker network disconnect | disposable local container | `DockerAdapter` live: preflight → apply (disconnect all) → verify **Verified** → rollback (reconnect) → verify **NotPresent**; container removed. |
+A transaction guard locks that exact generation across mutation/readback and
+atomic receipt completion. Snapshots are immutable and resolved generations
+cannot revive. Native leases, retries and both claim paths cannot replay an owned
+operation. A failed receipt transaction leaves durable prepared ownership.
 
-The Proxmox and Docker live cycles are driven by the real adapter code through
-`#[ignore]` integration tests (`proxmox::tests::live_quarantine_cycle_*`,
-`docker::tests::live_quarantine_cycle_*`), run with the operator's credentials
-and a disposable target. The production VMs (`IT13/100`, `IT13/101`) were placed
-on the never-quarantine list and never touched.
+Completed expired generations restore their stored snapshot under the same
+fence and atomically write a generation-linked rollback receipt. Kill switches
+capture the active generation when requested; old requests cannot restore a later
+generation. Historical native receipts/kill requests lacking ownership require
+manual reconciliation. Legacy non-quarantine firewall rollback remains separate.
 
-## Safety and gates
+Prepared or uncertain async completion becomes `recovery_required`, retaining
+ownership. No automatic replay or blind reconnect is permitted: a delayed remote
+operation may still arrive. Manual cases do not occupy the automatic sweep batch.
+An operator must establish remote task completion and authoritative state before
+an explicitly reviewed recovery; there is currently no generic manual resolver UI.
 
-- **Dry-run gate (from phase 10) intact.** The executor refuses to start unless
-  `CLAWFORGE_EXECUTOR_DRY_RUN=true`, and `dispatch_dry_run` gates every apply —
-  quarantine included. The lab live cycles opened the gate only for a single
-  disposable target.
-- **Self-lockout protection.** Never-quarantine lists exist for all three
-  adapters (`CLAWFORGE_{TAILSCALE,DOCKER,PROXMOX}_NEVER_QUARANTINE`). The node
-  and VMID that Clawforge itself runs on, and the operator's own management
-  path, belong there; a protected target is refused by `apply` even as a dry
-  run. This VM (`production`) is itself a guest on the Proxmox host, so its own
-  VMID must always be protected.
-- **Dual-approval.** Quarantine is a controlled action: an execution request
-  must clear the existing context-bound approval flow (`required_approvals >= 2`
-  for two-person release, surfaced by `execution_approval_detail`) before it is
-  claimed and dispatched. The executor only ever executes already-approved,
-  claimed requests. The quarantine action rows (`proxmox.quarantine_vm`,
-  `docker.quarantine_container`, and the existing `tailscale.quarantine_device`)
-  must be seeded in the `actions` table with `risk_level='critical'` and
-  `requires_approval=TRUE` so `create_execution_request` derives
-  `required_approvals=2` from `approval_policies` (`critical` → two-person,
-  `high` → two operators). That seed is a database migration and is **not added
-  here**: it falls in the 0046/0047 migration-fork range that CLAUDE.md marks a
-  hard boundary (prod/main diverge; 0049–0051 live only in a stash). It must be
-  added as a reviewed migration **after** that fork is reconciled — see below.
-- **Data ownership.** `QuarantinePreflight` refuses to construct without a
-  non-blank `data_owner`, `snapshot_restore_reference` and
-  `management_network_plan`; it proves no live state, only that the operator
-  supplied the required context.
+Runtime executor roles cannot mutate approval policy. A narrowly scoped locking-only
+SECURITY DEFINER function locks quarantine approval rows for revalidation; it
+writes nothing, has a fixed search path, and public execution is revoked.
+API roles can read generations but cannot write/delete them or alter receipts.
 
-## Remaining, explicitly not authorized here
+## Migration lineage and rollback
 
-- No production rollout. Live quarantine against a real production target still
-  needs the same real-host management-path / never-block confirmation that phase
-  10 leaves open, plus the dual-approval seed below.
-- Dual-approval seed is deferred behind the migration-fork hard boundary. Once
-  reconciled, add a reviewed migration seeding the quarantine actions, e.g.:
+- Main's original 0046 stays unchanged. The exact known production 0046 source is
+  archived under `migration-history/`, outside automatic migration discovery.
+- The native SQLx migration source selects only that exact reviewed historical
+  source when its checksum matches. It never rewrites `_sqlx_migrations` or accepts
+  arbitrary mismatches; readiness validates the entire applied history.
+- Shared 0047 is byte-identical to production's native intents migration.
+- Additive 0052 converges GoAway capabilities while preserving existing actions,
+  user flags, requests and approvals. 0053 supplies disabled critical quarantine
+  actions and two-person policy. 0054 supplies native generation ownership.
+- Both historical paths are tested on disposable PostgreSQL databases, including
+  preserved ledger checksums and existing approvals. The old stash reconciliation
+  is not used.
 
-  ```sql
-  INSERT INTO actions (id, connector_id, name, type, description, risk_level,
-                       required_scope, requires_approval, enabled)
-  VALUES
-    (gen_random_uuid(), <connector>, 'proxmox.quarantine_vm', 'connector_action',
-     'Isolate a VM NIC (net0 link_down) - reversible.', 'critical',
-     'agent:action:read', TRUE, FALSE),
-    (gen_random_uuid(), <connector>, 'docker.quarantine_container', 'connector_action',
-     'Disconnect a container from its networks - reversible.', 'critical',
-     'agent:action:read', TRUE, FALSE)
-  ON CONFLICT (name) DO UPDATE SET description = EXCLUDED.description;
-  ```
+Use `clawforge-migrate` from the reviewed build, not a raw SQLx CLI migration of
+this divergent historical installation. Before a production migration, retain a
+verified database backup, the matching application image/commit and role config.
+Restore that backup with its matching application if rollback is needed; do not
+edit checksums or drop active journals. A rollback while remote mutations are
+outstanding needs explicit reconciliation first. No production migration has
+been performed during this review.
 
-  `enabled=FALSE` until the live go-live checks pass, mirroring how
-  `tailscale.quarantine_device` was seeded in migration 0037.
-- TTL-driven auto-rollback **is** wired: the executor sweep un-quarantines
-  expired, real (non-dry-run) proxmox/docker/tailscale receipts via
-  `rollback_target` (docker's disconnected networks are folded into the
-  receipt's `target_json` so the sweep can reconnect them).
-- Credentials used for the lab tests are operator-managed 0600 files; no secret
-  is committed. Forgejo Actions is disabled, so the checks above are real local
-  acceptance runs, not CI.
+## Evidence and remaining gates
+
+- Docker adapter lab: two disposable networks, static IPs and aliases, restoration
+  and repeated rollback verified. Resources removed.
+- Secure Proxmox HTTPS fixture covers trusted/untrusted CA, hostname mismatch,
+  CAS conflict, NIC drift, delayed async completion and task failures/timeouts.
+  Runner: `python3 firewall-agent/tests/proxmox_https_fixture.py --evidence <private-file>`.
+- Required PostgreSQL checks run through `scripts/test-postgres.sh`: both migration
+  histories, dual approvals, restricted roles, immutable native journals, actual
+  expiry and generic lease recovery. Executor controller lab has a separate ignored
+  test using an explicit disposable database and its own Docker resources.
+- Concrete counts and reviewed commit are recorded in the review handoff after the
+  final test run; an unknown or failing required test is not complete.
+
+Open gates: current secure adapter/controller test against a disposable real
+Proxmox VM (192.168.0.8 is unreachable from this host), trusted management and
+restore proof for a production pilot, reviewed manual reconciliation UX, and
+Tailscale reversible identity/tag plus actual ACL-isolation proof. A quarantine
+tag alone is not evidence of isolation under additive ACLs. Tailscale live native
+controller refuses execution pending those guarantees.
+
+Proxmox protocol references:
+[config update implementation](https://github.com/proxmox/qemu-server/blob/master/src/PVE/API2/Qemu.pm)
+and [task status implementation](https://github.com/proxmox/pve-manager/blob/master/PVE/API2/Tasks.pm).
+
+Review findings and reusable rules: [Phase-11 lessons](phase11-review-lessons.md).

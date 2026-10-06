@@ -21,7 +21,10 @@
 //! IP/CIDR - see `TailscaleTarget`'s own doc comment in
 //! `clawforge-firewall-agent`).
 
-use clawforge_firewall_agent::docker::DockerAdapter;
+mod quarantine_gate;
+mod quarantine_runtime;
+
+use clawforge_firewall_agent::docker::{DockerAdapter, NetworkAttachment};
 use clawforge_firewall_agent::proxmox::ProxmoxAdapter;
 use clawforge_firewall_agent::quarantine::QuarantineTarget;
 use clawforge_firewall_agent::{
@@ -118,9 +121,9 @@ fn is_firewall_action(action_name: &str) -> bool {
         || action_name.starts_with("haproxy.")
         || action_name.starts_with("goaway.")
         || action_name.starts_with(FIREWALL_MULTI_ADAPTER_PREFIX)
-        || action_name.starts_with(TAILSCALE_ACTION_PREFIX)
-        || action_name.starts_with(PROXMOX_ACTION_PREFIX)
-        || action_name.starts_with(DOCKER_ACTION_PREFIX)
+        || action_name == TAILSCALE_ACTION_PREFIX
+        || action_name == PROXMOX_QUARANTINE_ACTION
+        || action_name == DOCKER_QUARANTINE_ACTION
 }
 
 /// Which adapters a `firewall.*` action fans out to -
@@ -176,13 +179,13 @@ fn adapters_touched_by(action_name: &str) -> Vec<String> {
     if action_name.starts_with(FIREWALL_MULTI_ADAPTER_PREFIX) {
         return configured_multi_adapters();
     }
-    if action_name.starts_with(TAILSCALE_ACTION_PREFIX) {
+    if action_name == TAILSCALE_ACTION_PREFIX {
         return vec!["tailscale".to_string()];
     }
-    if action_name.starts_with(PROXMOX_ACTION_PREFIX) {
+    if action_name == PROXMOX_QUARANTINE_ACTION {
         return vec!["proxmox".to_string()];
     }
-    if action_name.starts_with(DOCKER_ACTION_PREFIX) {
+    if action_name == DOCKER_QUARANTINE_ACTION {
         return vec!["docker".to_string()];
     }
     if action_name.starts_with("haproxy_ratelimit.") {
@@ -412,7 +415,13 @@ async fn rollback_target(
             vmid,
         };
         return ProxmoxAdapter::new()
-            .rollback(&target)
+            .rollback(
+                &target,
+                target_json
+                    .get("original_net0")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("original Proxmox NIC snapshot missing"))?,
+            )
             .await
             .map_err(|error| anyhow::anyhow!(error.to_string()));
     }
@@ -421,16 +430,8 @@ async fn rollback_target(
             .get("container_id")
             .and_then(|value| value.as_str())
             .ok_or_else(|| anyhow::anyhow!("docker target_json is missing container_id"))?;
-        let networks: Vec<String> = target_json
-            .get("networks")
-            .and_then(serde_json::Value::as_array)
-            .map(|array| {
-                array
-                    .iter()
-                    .filter_map(|value| value.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let networks: Vec<NetworkAttachment> = serde_json::from_value(target_json.get("networks").cloned().ok_or_else(|| anyhow::anyhow!("Docker rollback snapshot is missing"))?)
+            .map_err(|_| anyhow::anyhow!("Docker rollback snapshot is invalid or legacy names-only; operator recovery required"))?;
         let target = QuarantineTarget::Docker {
             container_id: container_id.to_string(),
         };
@@ -473,6 +474,12 @@ async fn sweep_expired_firewall_targets(store: &PostgresStore) {
         }
     };
     for target in expired {
+        // Older receipts have no immutable generation ownership. Reconnecting by
+        // target alone could undo a later operation; require operator review.
+        if matches!(target.adapter.as_str(), "docker" | "proxmox" | "tailscale") {
+            tracing::warn!(receipt_id=%target.receipt_id, "legacy quarantine expiry lacks generation ownership; manual reconciliation required");
+            continue;
+        }
         let inflight_id = match try_begin_inflight(store, &target.adapter).await {
             Ok(Some(id)) => id,
             Ok(None) => {
@@ -557,6 +564,33 @@ async fn sweep_kill_switch_requests(store: &PostgresStore) {
         }
     };
     for request in pending {
+        if let Some(intent_id) = request.quarantine_intent_id {
+            match quarantine_runtime::recover(store, intent_id).await {
+                Ok(
+                    quarantine_runtime::RecoveryOutcome::Restored
+                    | quarantine_runtime::RecoveryOutcome::Resolved,
+                ) => {
+                    if store
+                        .mark_firewall_kill_switch_request_processed(request.request_id)
+                        .await
+                        .is_err()
+                    {
+                        tracing::warn!(request_id=%request.request_id, "generation kill-switch result could not be persisted; safe retry pending");
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    tracing::warn!(request_id=%request.request_id, "generation kill-switch recovery failed; request remains pending")
+                }
+            }
+            continue;
+        }
+        // Never use target-only legacy rollback for an unbound quarantine request.
+        // A delayed legacy request could otherwise undo a newer generation.
+        if matches!(request.adapter.as_str(), "docker" | "proxmox" | "tailscale") {
+            tracing::warn!(request_id=%request.request_id, "unbound quarantine kill-switch requires operator reconciliation");
+            continue;
+        }
         let inflight_id = match try_begin_inflight(store, &request.adapter).await {
             Ok(Some(id)) => id,
             Ok(None) => {
@@ -742,35 +776,31 @@ async fn dispatch_multi_adapter(
     }
 }
 
-const TAILSCALE_ACTION_PREFIX: &str = "tailscale.";
-const PROXMOX_ACTION_PREFIX: &str = "proxmox.";
-const DEFAULT_PROXMOX_ACTION_TTL_SECONDS: u32 = 3600;
+const TAILSCALE_ACTION_PREFIX: &str = "tailscale.quarantine_device";
+const PROXMOX_QUARANTINE_ACTION: &str = "proxmox.quarantine_vm";
 // Specific to quarantine: `docker.restart_container` and other docker.* actions
 // are deliberately NOT firewall actions and must keep their non-firewall no-op.
-const DOCKER_ACTION_PREFIX: &str = "docker.quarantine";
-const DEFAULT_DOCKER_ACTION_TTL_SECONDS: u32 = 3600;
-/// `TailscaleAction` carries no `ttl_seconds` of its own (unlike
-/// `FirewallAction`) - used only for the receipt's own bookkeeping field,
-/// not for any TTL-sweep auto-rollback (see `dispatch_tailscale`'s own
-/// doc comment for why tailscale quarantines are deliberately excluded
-/// from that).
-const DEFAULT_TAILSCALE_ACTION_TTL_SECONDS: u32 = 3600;
+const DOCKER_QUARANTINE_ACTION: &str = "docker.quarantine_container";
+/// Validate operator context and enforce the hard live gate before legacy
+/// dry-run quarantine adapters are called. Native live mutations also require
+/// the generation journal and remain disabled in quarantine_runtime.
+fn checked_quarantine_context(
+    claimed: &ClaimedExecutionRequest,
+) -> anyhow::Result<quarantine_gate::QuarantineContext> {
+    let target = claimed
+        .target
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("quarantine action has no target"))?;
+    let dry_run = dispatch_dry_run(claimed);
+    let context = quarantine_gate::validate_context(&claimed.action_name, target, dry_run)?;
+    quarantine_gate::ensure_live_dispatch_disabled(dry_run)?;
+    // Metadata is checked context, not a proof of a reachable management path.
+    if !dry_run && (context.preflight.is_none() || !context.ready_for_live) {
+        anyhow::bail!("quarantine live readiness has not been proven");
+    }
+    Ok(context)
+}
 
-/// Dispatches a `tailscale.*` action - `TailscaleAdapter` is not a
-/// `FirewallAdapter` (a device ID is a different resource shape from an
-/// IP/CIDR, see `TailscaleTarget`'s own doc comment), so this is its own
-/// path rather than going through `apply_single_adapter`/`adapter_for`.
-/// Target JSON contract: `{"device_id": "..."}`.
-///
-/// **Deliberately not part of the TTL sweep's auto-expiry the way
-/// nftables/HAProxy targets are**: nothing prevents a tailscale receipt
-/// from getting an `expires_at` (the storage layer doesn't distinguish),
-/// but `rollback_target` handles it via `TailscaleAdapter::
-/// rollback` the same as any other manual rollback - the real constraint
-/// is that rollback for a previously-untagged device cannot complete via
-/// the API at all (see `TailscaleAdapter::rollback`'s own doc comment),
-/// so an unattended sweep retrying it forever produces the exact
-/// documented "will fail until fixed by hand" behavior, not a hidden gap.
 async fn dispatch_tailscale(
     claimed: &ClaimedExecutionRequest,
 ) -> (
@@ -779,27 +809,17 @@ async fn dispatch_tailscale(
     Option<String>,
     Vec<FirewallDispatchReceipt>,
 ) {
-    let Some(target) = claimed.target.as_ref() else {
+    let context = match checked_quarantine_context(claimed) {
+        Ok(context) => context,
+        Err(error) => return (false, None, Some(error.to_string()), Vec::new()),
+    };
+    let quarantine_gate::QuarantineIdentity::Tailscale { device_id } = context.target else {
         return (
             false,
             None,
-            Some(format!(
-                "firewall action {:?} has no target",
-                claimed.action_name
-            )),
+            Some("incorrect Tailscale target kind".into()),
             Vec::new(),
         );
-    };
-    let device_id = match target.get("device_id").and_then(|value| value.as_str()) {
-        Some(device_id) if !device_id.trim().is_empty() => device_id.to_string(),
-        _ => {
-            return (
-                false,
-                None,
-                Some("tailscale target is missing device_id".to_string()),
-                Vec::new(),
-            )
-        }
     };
     let action = TailscaleAction {
         target: TailscaleTarget {
@@ -845,7 +865,7 @@ async fn dispatch_tailscale(
                 rendered_commands: serde_json::json!([applied.receipt.described_call]),
                 observed_state: None,
                 verification_result,
-                ttl_seconds: DEFAULT_TAILSCALE_ACTION_TTL_SECONDS,
+                ttl_seconds: context.ttl_seconds,
                 rollback_plan: serde_json::json!({
                     "note": "removes the quarantine tag - may require device-side reauth if \
                              it is the device's only tag, see TailscaleAdapter::rollback"
@@ -853,7 +873,13 @@ async fn dispatch_tailscale(
                 is_dry_run: !applied.applied,
                 target_fingerprint: device_id,
             };
-            (true, Some(summary), None, vec![receipt])
+            let success = dry_run || verification_result == Some("verified");
+            (
+                success,
+                Some(summary),
+                (!success).then(|| "quarantine verification failed; recovery required".to_string()),
+                vec![receipt],
+            )
         }
         Err(error) => (false, None, Some(error.to_string()), Vec::new()),
     }
@@ -871,30 +897,17 @@ async fn dispatch_proxmox(
     Option<String>,
     Vec<FirewallDispatchReceipt>,
 ) {
-    let Some(target) = claimed.target.as_ref() else {
+    let context = match checked_quarantine_context(claimed) {
+        Ok(context) => context,
+        Err(error) => return (false, None, Some(error.to_string()), Vec::new()),
+    };
+    let quarantine_gate::QuarantineIdentity::Proxmox { node, vmid } = context.target else {
         return (
             false,
             None,
-            Some(format!("proxmox action {:?} has no target", claimed.action_name)),
+            Some("incorrect Proxmox target kind".into()),
             Vec::new(),
         );
-    };
-    let node = target.get("node").and_then(|value| value.as_str());
-    let vmid = target.get("vmid").and_then(|value| value.as_u64());
-    let (node, vmid) = match (node, vmid) {
-        (Some(node), Some(vmid))
-            if !node.trim().is_empty() && vmid > 0 && vmid <= u64::from(u32::MAX) =>
-        {
-            (node.to_string(), vmid as u32)
-        }
-        _ => {
-            return (
-                false,
-                None,
-                Some("proxmox target needs a node (string) and a positive vmid".to_string()),
-                Vec::new(),
-            );
-        }
     };
     let qtarget = QuarantineTarget::Proxmox {
         node: node.clone(),
@@ -918,7 +931,7 @@ async fn dispatch_proxmox(
         }
     };
     match adapter.apply(&qtarget, dry_run).await {
-        Ok(summary_text) => {
+        Ok(applied) => {
             let verification_result = if dry_run {
                 None
             } else {
@@ -931,20 +944,24 @@ async fn dispatch_proxmox(
             let receipt = FirewallDispatchReceipt {
                 adapter: "proxmox",
                 preflight_state,
-                rendered_commands: serde_json::json!([summary_text]),
+                rendered_commands: serde_json::json!([applied.summary]),
                 observed_state: None,
                 verification_result,
-                ttl_seconds: DEFAULT_PROXMOX_ACTION_TTL_SECONDS,
+                ttl_seconds: context.ttl_seconds,
                 rollback_plan: serde_json::json!({
-                    "note": "removes net0 link_down=1 to restore connectivity - see ProxmoxAdapter::rollback"
+                    "note": "restore the exact original net0 using the current config digest",
+                    "original_net0": applied.original_net0
                 }),
                 is_dry_run: dry_run,
                 target_fingerprint: format!("{node}/{vmid}"),
             };
             (
-                true,
-                Some(format!("adapter=proxmox dry_run={dry_run} target={node}/{vmid}")),
-                None,
+                dry_run || verification_result == Some("verified"),
+                Some(format!(
+                    "adapter=proxmox dry_run={dry_run} target={node}/{vmid}"
+                )),
+                (verification_result.is_some_and(|v| v != "verified"))
+                    .then(|| "quarantine verification failed; recovery required".to_string()),
                 vec![receipt],
             )
         }
@@ -964,28 +981,17 @@ async fn dispatch_docker(
     Option<String>,
     Vec<FirewallDispatchReceipt>,
 ) {
-    let Some(target) = claimed.target.as_ref() else {
+    let context = match checked_quarantine_context(claimed) {
+        Ok(context) => context,
+        Err(error) => return (false, None, Some(error.to_string()), Vec::new()),
+    };
+    let quarantine_gate::QuarantineIdentity::Docker { container_id } = context.target else {
         return (
             false,
             None,
-            Some(format!("docker action {:?} has no target", claimed.action_name)),
+            Some("incorrect Docker target kind".into()),
             Vec::new(),
         );
-    };
-    let container_id = target
-        .get("container_id")
-        .or_else(|| target.get("container"))
-        .and_then(|value| value.as_str());
-    let container_id = match container_id {
-        Some(id) if !id.trim().is_empty() => id.to_string(),
-        _ => {
-            return (
-                false,
-                None,
-                Some("docker target needs a container_id (string)".to_string()),
-                Vec::new(),
-            );
-        }
     };
     let qtarget = QuarantineTarget::Docker {
         container_id: container_id.clone(),
@@ -1018,15 +1024,22 @@ async fn dispatch_docker(
             let count = networks.len();
             let commands: Vec<String> = networks
                 .iter()
-                .map(|network| format!("docker network disconnect {network} {container_id}"))
+                .map(|network| {
+                    format!(
+                        "docker network disconnect {} {container_id}",
+                        network.network_id
+                    )
+                })
                 .collect();
             let receipt = FirewallDispatchReceipt {
                 adapter: "docker",
                 preflight_state,
                 rendered_commands: serde_json::json!(commands),
-                observed_state: Some(serde_json::json!({ "disconnected_networks": networks.clone() })),
+                observed_state: Some(
+                    serde_json::json!({ "disconnected_networks": networks.clone() }),
+                ),
                 verification_result,
-                ttl_seconds: DEFAULT_DOCKER_ACTION_TTL_SECONDS,
+                ttl_seconds: context.ttl_seconds,
                 rollback_plan: serde_json::json!({
                     "note": "reconnect the container to disconnected_networks - see DockerAdapter::rollback",
                     "networks": networks,
@@ -1035,11 +1048,12 @@ async fn dispatch_docker(
                 target_fingerprint: container_id.clone(),
             };
             (
-                true,
+                dry_run || verification_result == Some("verified"),
                 Some(format!(
                     "adapter=docker dry_run={dry_run} container={container_id} networks={count}"
                 )),
-                None,
+                (verification_result.is_some_and(|v| v != "verified"))
+                    .then(|| "quarantine verification failed; recovery required".to_string()),
                 vec![receipt],
             )
         }
@@ -1068,13 +1082,13 @@ async fn dispatch(
     {
         return dispatch_multi_adapter(claimed).await;
     }
-    if claimed.action_name.starts_with(TAILSCALE_ACTION_PREFIX) {
+    if claimed.action_name == TAILSCALE_ACTION_PREFIX {
         return dispatch_tailscale(claimed).await;
     }
-    if claimed.action_name.starts_with(PROXMOX_ACTION_PREFIX) {
+    if claimed.action_name == PROXMOX_QUARANTINE_ACTION {
         return dispatch_proxmox(claimed).await;
     }
-    if claimed.action_name.starts_with(DOCKER_ACTION_PREFIX) {
+    if claimed.action_name == DOCKER_QUARANTINE_ACTION {
         return dispatch_docker(claimed).await;
     }
     let Some(adapter) = adapter_for(&claimed.action_name) else {
@@ -1143,6 +1157,7 @@ async fn main() -> anyhow::Result<()> {
             _ = ticks.tick() => {
                 if let Err(error) = store.set_runtime_status("executor", "running", None).await { tracing::warn!(%error, "executor heartbeat failed"); }
                 if let Err(error) = store.heartbeat_execution_worker(worker_id, "healthy", 0, None).await { tracing::warn!(%error, "executor worker heartbeat failed"); }
+                quarantine_runtime::sweep(&store).await;
                 sweep_expired_firewall_targets(&store).await;
                 sweep_kill_switch_requests(&store).await;
                 let started = std::time::Instant::now();
@@ -1204,7 +1219,7 @@ async fn main() -> anyhow::Result<()> {
                                 tracing::warn!(execution_id = %claimed.id, action = %claimed.action_name, reason = %reason, "refusing dispatch");
                                 (false, None, Some(reason), Vec::new())
                             } else {
-                                dispatch(&claimed).await
+                                quarantine_runtime::dispatch(&store, &claimed).await
                             };
                         // Release every reserved slot regardless of how
                         // dispatch turned out - a partial reservation
@@ -1232,6 +1247,10 @@ async fn main() -> anyhow::Result<()> {
                                 {
                                     object.insert("networks".to_string(), networks.clone());
                                 }
+                                Some(target)
+                            } else if receipt.adapter == "proxmox" {
+                                let mut target=claimed.target.clone().unwrap_or_else(|| serde_json::json!({}));
+                                if let (Some(object),Some(original))=(target.as_object_mut(),receipt.rollback_plan.get("original_net0")) { object.insert("original_net0".into(),original.clone()); }
                                 Some(target)
                             } else {
                                 claimed.target.clone()
@@ -1369,6 +1388,28 @@ mod tests {
         assert!(
             !firewall_budget_applies("docker.restart_container", false),
             "only recognized firewall-action prefixes are bounded"
+        );
+    }
+
+    #[tokio::test]
+    async fn unrelated_proxmox_and_similar_docker_actions_never_quarantine() {
+        for action in [
+            "proxmox.restart_vm",
+            "proxmox.snapshot_vm",
+            "docker.quarantine_container_extra",
+        ] {
+            assert!(adapters_touched_by(action).is_empty());
+            let result = dispatch(&claimed(action, None)).await;
+            assert!(result.0);
+            assert!(result.3.is_empty());
+        }
+        assert_eq!(
+            adapters_touched_by("proxmox.quarantine_vm"),
+            vec!["proxmox"]
+        );
+        assert_eq!(
+            adapters_touched_by("docker.quarantine_container"),
+            vec!["docker"]
         );
     }
 

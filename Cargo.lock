@@ -374,6 +374,7 @@ dependencies = [
  "clawforge-firewall-agent",
  "clawforge-storage",
  "serde_json",
+ "sqlx",
  "tokio",
  "tracing",
  "tracing-subscriber",

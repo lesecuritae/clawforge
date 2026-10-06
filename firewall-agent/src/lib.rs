@@ -112,9 +112,9 @@
 //! roadmap's remaining mandatory gates beyond what this crate's own tests
 //! cover - see `docs/firewall-agent.md`'s own remaining list.
 
-pub mod quarantine;
-pub mod proxmox;
 pub mod docker;
+pub mod proxmox;
+pub mod quarantine;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -2038,7 +2038,9 @@ impl TailscaleAdapter {
             quarantine_tag: std::env::var("CLAWFORGE_TAILSCALE_QUARANTINE_TAG")
                 .unwrap_or_else(|_| TAILSCALE_DEFAULT_QUARANTINE_TAG.to_string()),
             never_quarantine: never_quarantine_from_configured(
-                std::env::var(TAILSCALE_NEVER_QUARANTINE_VAR).ok().as_deref(),
+                std::env::var(TAILSCALE_NEVER_QUARANTINE_VAR)
+                    .ok()
+                    .as_deref(),
             ),
             http: reqwest::Client::new(),
         }
@@ -2140,9 +2142,8 @@ impl TailscaleAdapter {
             })?;
         if !response.status().is_success() {
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
             return Err(AdapterError::Apply(format!(
-                "tailscale set-tags rejected: HTTP {status}: {body}"
+                "tailscale set-tags rejected: HTTP {status}"
             )));
         }
         Ok(())

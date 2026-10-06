@@ -873,6 +873,21 @@ ist nicht Teil der ersten Implementierung.
 Exit-Gate: ausschließlich im Lab nachgewiesener End-to-End-Restore, klare
 Dateneigentümerschaft und zwei-Personen-Freigabe.
 
+### Prüfstand 2026-10-06
+
+Phase 11 ist noch **nicht produktiv freigegeben**. Die Weiterentwicklung ergänzt
+native, persistente Quarantäne-Generationen, atomare Receipts, Lease-/Retry-Schutz,
+generationgebundene TTL/Kill-Switch-Rücknahmen und aktuelle Zwei-Personen-Freigaben.
+Migrationen 0052–0054 sind additive Entwicklungsänderungen; der bekannte 0046-Fork
+wird über exakt geprüfte historische SQL-Quellen behandelt, ohne Ledger-Umschreiben.
+
+Docker-Lab und sichere HTTPS-Proxmox-Fixtures ergänzen die PostgreSQL-Tests.
+Ein erneuter Test gegen eine echte Wegwerf-VM ist durch die fehlende Erreichbarkeit
+des Proxmox-Hosts blockiert. Tailscale benötigt zusätzlich nachgewiesene reversible
+Identität und effektive ACL-Isolation. Unbekannte Remote-Ausführung wird manuell
+abgeklärt, niemals automatisch wiederholt. Details und offene Gates stehen in
+[Phase-11-Acceptance](phase11-acceptance.md).
+
 ## Empfohlene erste Pull Requests
 
 1. `deployment-secret-hardening` (umgesetzt): Beispiel-Secrets entkoppeln,

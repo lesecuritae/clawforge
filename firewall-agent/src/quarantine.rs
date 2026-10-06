@@ -166,6 +166,20 @@ impl QuarantinePreflight {
 }
 
 impl QuarantineTarget {
+    /// Public enum variants still need validation at every execution boundary.
+    pub fn validate(&self) -> Result<(), PreflightError> {
+        match self {
+            Self::Docker { container_id } => validate_container_id(container_id),
+            Self::Proxmox { node, vmid } => {
+                validate_node(node)?;
+                if *vmid == 0 {
+                    return Err(PreflightError::InvalidVmid);
+                }
+                Ok(())
+            }
+        }
+    }
+
     /// Parses one never-quarantine entry: `docker:<64-hex id>` or
     /// `proxmox:<node>/<vmid>`, using the same strict identity rules as
     /// `QuarantinePreflight`. This is how the operator protects its own control
@@ -186,7 +200,10 @@ impl QuarantineTarget {
                 .ok_or_else(|| PreflightError::UnrecognizedEntry(entry.to_string()))?;
             let node = node.trim();
             validate_node(node)?;
-            let vmid: u32 = vmid.trim().parse().map_err(|_| PreflightError::InvalidVmid)?;
+            let vmid: u32 = vmid
+                .trim()
+                .parse()
+                .map_err(|_| PreflightError::InvalidVmid)?;
             if vmid == 0 {
                 return Err(PreflightError::InvalidVmid);
             }
@@ -251,7 +268,9 @@ mod tests {
     #[test]
     fn never_quarantine_is_empty_and_drops_blank_entries() {
         assert!(never_quarantine_from_configured("").unwrap().is_empty());
-        assert!(never_quarantine_from_configured("  ,  ").unwrap().is_empty());
+        assert!(never_quarantine_from_configured("  ,  ")
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

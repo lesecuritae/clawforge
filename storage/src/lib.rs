@@ -17,6 +17,9 @@ use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 use std::env;
 use uuid::Uuid;
 
+mod migration_compat;
+mod quarantine_intents;
+pub use quarantine_intents::{QuarantineGuard, QuarantineIntent};
 mod security_assessments;
 mod security_events;
 mod security_policies;
@@ -148,6 +151,8 @@ pub struct ExpiredFirewallTarget {
 #[derive(Debug, Clone)]
 pub struct PendingKillSwitchRequest {
     pub request_id: Uuid,
+    /// Immutable generation captured at request creation, never resolved by target later.
+    pub quarantine_intent_id: Option<Uuid>,
     pub adapter: String,
     pub target_fingerprint: String,
     pub target_json: serde_json::Value,
@@ -169,7 +174,8 @@ impl PostgresStore {
     pub async fn connect(database_url: &str) -> Result<Self> {
         let store = Self::open(database_url).await?;
         store.reject_newer_schema().await?;
-        MIGRATOR
+        migration_compat::migrator(&store.migration_history().await?)
+            .await?
             .run(&store.pool)
             .await
             .context("run database migrations")?;
@@ -249,6 +255,23 @@ impl PostgresStore {
         Ok(())
     }
 
+    async fn migration_history(&self) -> Result<Vec<(i64, Vec<u8>, bool)>> {
+        let table: Option<String> =
+            sqlx::query_scalar("SELECT to_regclass('public._sqlx_migrations')::text")
+                .fetch_one(&self.pool)
+                .await?;
+        if table.is_none() {
+            return Ok(Vec::new());
+        }
+        Ok(
+            sqlx::query_as(
+                "SELECT version,checksum,success FROM _sqlx_migrations ORDER BY version",
+            )
+            .fetch_all(&self.pool)
+            .await?,
+        )
+    }
+
     pub async fn readiness(&self) -> Result<MigrationStatus> {
         self.healthcheck().await?;
         let row = sqlx::query(
@@ -258,6 +281,8 @@ impl PostgresStore {
         .await?;
         let applied = row.get::<i64, _>("count") as usize;
         let latest = row.get::<i64, _>("latest");
+        let history = self.migration_history().await?;
+        migration_compat::resolve_history(&history)?;
         let expected = MIGRATOR.iter().count();
         let expected_latest = MIGRATOR
             .iter()
@@ -2853,6 +2878,18 @@ impl PostgresStore {
             anyhow::bail!("action is disabled")
         }
         let requires_approval = action.get::<bool, _>("requires_approval");
+        if matches!(
+            action.get::<String, _>("name").as_str(),
+            "docker.quarantine_container" | "proxmox.quarantine_vm" | "tailscale.quarantine_device"
+        ) && (!requires_approval
+            || action.get::<String, _>("risk_level") != "critical"
+            || action
+                .get::<Option<i32>, _>("required_approvals")
+                .unwrap_or(0)
+                < 2)
+        {
+            anyhow::bail!("quarantine requires a critical action and a two-person approval policy");
+        }
         let required_approvals = if requires_approval {
             action
                 .get::<Option<i32>, _>("required_approvals")
@@ -3203,13 +3240,16 @@ impl PostgresStore {
     /// failed-but-retryable ones - the maintenance sweep every claim path
     /// runs first, factored out so `process_one_dry_run_for_worker` and
     /// `claim_execution_request_for_dispatch` share exactly one copy of it
-    /// rather than two that could drift apart.
+    /// rather than two that could drift apart. Durable quarantine ownership
+    /// blocks generic reclaim, timeout and retry: an external mutation may
+    /// have happened even when the worker cannot publish its final receipt.
+    /// The generation recovery path must resolve that ownership first.
     async fn run_execution_maintenance(&self) -> Result<()> {
         let mut maintenance_tx = self.pool.begin().await?;
         sqlx::query("UPDATE execution_leases SET status='expired',updated_at=NOW() WHERE status='active' AND expires_at<=NOW()")
             .execute(&mut *maintenance_tx)
             .await?;
-        let reclaimed: Vec<Uuid> = sqlx::query_scalar("UPDATE execution_requests SET status='queued',started_at=NULL,next_retry_at=NULL,error_summary='worker lease expired; request reclaimed' WHERE id IN (SELECT execution_id FROM execution_leases WHERE status='expired') AND status IN ('starting','running') RETURNING id")
+        let reclaimed: Vec<Uuid> = sqlx::query_scalar("UPDATE execution_requests SET status='queued',started_at=NULL,next_retry_at=NULL,error_summary='worker lease expired; request reclaimed' WHERE id IN (SELECT execution_id FROM execution_leases WHERE status='expired') AND status IN ('starting','running') AND NOT EXISTS (SELECT 1 FROM firewall_action_intents qi WHERE qi.execution_id=execution_requests.id AND qi.target_fingerprint IS NOT NULL AND qi.status IN ('prepared','completed','recovery_required')) RETURNING id")
             .fetch_all(&mut *maintenance_tx).await?;
         for id in &reclaimed {
             Self::insert_audit_outbox(
@@ -3221,7 +3261,7 @@ impl PostgresStore {
             )
             .await?;
         }
-        let timed_out: Vec<Uuid> = sqlx::query_scalar("UPDATE execution_requests SET status='timeout',finished_at=NOW(),error_summary='execution timeout' WHERE status IN ('starting','running') AND started_at IS NOT NULL AND started_at < NOW() - (timeout_seconds * INTERVAL '1 second') RETURNING id")
+        let timed_out: Vec<Uuid> = sqlx::query_scalar("UPDATE execution_requests SET status='timeout',finished_at=NOW(),error_summary='execution timeout' WHERE status IN ('starting','running') AND started_at IS NOT NULL AND started_at < NOW() - (timeout_seconds * INTERVAL '1 second') AND NOT EXISTS (SELECT 1 FROM firewall_action_intents qi WHERE qi.execution_id=execution_requests.id AND qi.target_fingerprint IS NOT NULL AND qi.status IN ('prepared','completed','recovery_required')) RETURNING id")
             .fetch_all(&mut *maintenance_tx)
             .await?;
         for id in &timed_out {
@@ -3234,7 +3274,7 @@ impl PostgresStore {
             )
             .await?;
         }
-        let retryable: Vec<Uuid> = sqlx::query_scalar("UPDATE execution_requests SET status='queued',retry_count=retry_count+1,next_retry_at=NULL WHERE status='failed' AND retry_count < max_retries AND (next_retry_at IS NULL OR next_retry_at<=NOW()) RETURNING id")
+        let retryable: Vec<Uuid> = sqlx::query_scalar("UPDATE execution_requests SET status='queued',retry_count=retry_count+1,next_retry_at=NULL WHERE status='failed' AND retry_count < max_retries AND (next_retry_at IS NULL OR next_retry_at<=NOW()) AND NOT EXISTS (SELECT 1 FROM firewall_action_intents qi WHERE qi.execution_id=execution_requests.id AND qi.target_fingerprint IS NOT NULL AND qi.status IN ('prepared','completed','recovery_required')) RETURNING id")
             .fetch_all(&mut *maintenance_tx)
             .await?;
         for id in &retryable {
@@ -3259,7 +3299,21 @@ impl PostgresStore {
         self.run_execution_maintenance().await?;
 
         let mut claim_tx = self.pool.begin().await?;
-        let id: Option<Uuid> = sqlx::query_scalar("UPDATE execution_requests SET status='starting',started_at=NOW() WHERE id=(SELECT id FROM execution_requests WHERE status IN ('approved','pending','queued') ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1) RETURNING id").fetch_optional(&mut *claim_tx).await?;
+        let id: Option<Uuid> = sqlx::query_scalar("UPDATE execution_requests SET status='starting',started_at=NOW() WHERE id=(
+            SELECT e.id FROM execution_requests e JOIN actions a ON a.id=e.action_id
+            LEFT JOIN approval_policies p ON p.risk_level=a.risk_level
+            WHERE e.status IN ('approved','pending','queued')
+              AND NOT EXISTS (SELECT 1 FROM firewall_action_intents qi WHERE qi.execution_id=e.id
+                  AND qi.target_fingerprint IS NOT NULL AND qi.status IN ('prepared','completed','recovery_required'))
+              AND (
+                a.name NOT IN ('docker.quarantine_container','proxmox.quarantine_vm','tailscale.quarantine_device') OR (
+                    a.enabled AND a.requires_approval AND a.risk_level='critical'
+                    AND p.required_approvals >= 2 AND e.required_approvals >= 2
+                    AND e.requested_by_id IS NOT NULL AND e.approval_expires_at > NOW()
+                    AND (SELECT COUNT(DISTINCT ea.approver_id) FROM execution_approvals ea
+                        WHERE ea.execution_id=e.id AND ea.context_hash=e.approval_context_hash
+                        AND ea.approver_id<>e.requested_by_id) >= GREATEST(e.required_approvals,p.required_approvals)
+                )) ORDER BY e.created_at FOR UPDATE OF e SKIP LOCKED LIMIT 1) RETURNING id").fetch_optional(&mut *claim_tx).await?;
         if let Some(id) = id {
             if let Some(worker_id) = worker_id {
                 sqlx::query("INSERT INTO execution_leases (id,execution_id,worker_id,expires_at) VALUES ($1,$2,$3,NOW()+INTERVAL '2 minutes') ON CONFLICT (execution_id) DO UPDATE SET worker_id=$3,status='active',expires_at=NOW()+INTERVAL '2 minutes',updated_at=NOW()")
@@ -3313,8 +3367,8 @@ impl PostgresStore {
     /// (`clawforge-executor`) to actually dispatch. Pair with
     /// `complete_execution_dispatch` once dispatch finishes, success or not -
     /// a claimed request that is never completed stays `starting` until the
-    /// same lease-expiry reclaim path used by every other stuck request picks
-    /// it back up.
+    /// lease-expiry reclaim path picks it back up only if no durable quarantine
+    /// generation owns its external effect. Owned generations require recovery.
     pub async fn claim_execution_request_for_dispatch(
         &self,
         worker_id: Option<Uuid>,
@@ -3322,7 +3376,21 @@ impl PostgresStore {
         self.run_execution_maintenance().await?;
 
         let mut claim_tx = self.pool.begin().await?;
-        let id: Option<Uuid> = sqlx::query_scalar("UPDATE execution_requests SET status='starting',started_at=NOW() WHERE id=(SELECT id FROM execution_requests WHERE status IN ('approved','pending','queued') ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1) RETURNING id").fetch_optional(&mut *claim_tx).await?;
+        let id: Option<Uuid> = sqlx::query_scalar("UPDATE execution_requests SET status='starting',started_at=NOW() WHERE id=(
+            SELECT e.id FROM execution_requests e JOIN actions a ON a.id=e.action_id
+            LEFT JOIN approval_policies p ON p.risk_level=a.risk_level
+            WHERE e.status IN ('approved','pending','queued')
+              AND NOT EXISTS (SELECT 1 FROM firewall_action_intents qi WHERE qi.execution_id=e.id
+                  AND qi.target_fingerprint IS NOT NULL AND qi.status IN ('prepared','completed','recovery_required'))
+              AND (
+                a.name NOT IN ('docker.quarantine_container','proxmox.quarantine_vm','tailscale.quarantine_device') OR (
+                    a.enabled AND a.requires_approval AND a.risk_level='critical'
+                    AND p.required_approvals >= 2 AND e.required_approvals >= 2
+                    AND e.requested_by_id IS NOT NULL AND e.approval_expires_at > NOW()
+                    AND (SELECT COUNT(DISTINCT ea.approver_id) FROM execution_approvals ea
+                        WHERE ea.execution_id=e.id AND ea.context_hash=e.approval_context_hash
+                        AND ea.approver_id<>e.requested_by_id) >= GREATEST(e.required_approvals,p.required_approvals)
+                )) ORDER BY e.created_at FOR UPDATE OF e SKIP LOCKED LIMIT 1) RETURNING id").fetch_optional(&mut *claim_tx).await?;
         let Some(id) = id else {
             claim_tx.commit().await?;
             let _ = self.flush_audit_outbox(100).await;
@@ -3465,6 +3533,7 @@ impl PostgresStore {
              FROM firewall_action_receipts a \
              WHERE a.receipt_kind = 'apply' AND a.is_dry_run = FALSE \
                AND a.target_fingerprint IS NOT NULL AND a.target_json IS NOT NULL \
+               AND a.intent_id IS NULL \
                AND a.expires_at < NOW() \
                AND NOT EXISTS ( \
                  SELECT 1 FROM firewall_action_receipts r \
@@ -3503,7 +3572,7 @@ impl PostgresStore {
         limit: i64,
     ) -> Result<Vec<serde_json::Value>> {
         let rows = sqlx::query(
-            "SELECT id,execution_id,adapter,action_name,receipt_kind,target_fingerprint, \
+            "SELECT id,intent_id,execution_id,adapter,action_name,receipt_kind,target_fingerprint, \
                     is_dry_run,verification_result,ttl_seconds,expires_at,created_at, \
                     rendered_commands,rollback_plan,observed_state \
              FROM firewall_action_receipts \
@@ -3522,6 +3591,7 @@ impl PostgresStore {
                 serde_json::json!({
                     "id": r.get::<Uuid, _>("id"),
                     "execution_id": r.get::<Option<Uuid>, _>("execution_id"),
+                    "intent_id": r.get::<Option<Uuid>, _>("intent_id"),
                     "adapter": r.get::<String, _>("adapter"),
                     "action_name": r.get::<String, _>("action_name"),
                     "receipt_kind": r.get::<String, _>("receipt_kind"),
@@ -3581,20 +3651,33 @@ impl PostgresStore {
             anyhow::bail!("target_fingerprint must not be empty");
         }
         let id = Uuid::new_v4();
+        let mut tx = self.pool.begin().await?;
+        let native_quarantine = matches!(adapter, "docker" | "proxmox" | "tailscale");
+        let generation = if native_quarantine {
+            sqlx::query("SELECT id,target_json FROM firewall_action_intents WHERE adapter=$1 AND target_fingerprint=$2 AND status IN ('prepared','completed','recovery_required')")
+                .bind(adapter).bind(target_fingerprint).fetch_optional(&mut *tx).await?
+        } else {
+            None
+        };
+        if native_quarantine && generation.is_none() {
+            anyhow::bail!("no active quarantine generation for kill switch");
+        }
+        let intent_id = generation.as_ref().map(|row| row.get::<Uuid, _>("id"));
+        // The immutable snapshot is authoritative; caller-supplied restore metadata
+        // must not redirect an operator request to a different target.
+        let stored_target = generation
+            .as_ref()
+            .map(|row| row.get::<serde_json::Value, _>("target_json"));
         sqlx::query(
             "INSERT INTO firewall_kill_switch_requests \
-             (id,adapter,target_fingerprint,target_json,reason,requested_by,requested_by_id) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7)",
+             (id,adapter,target_fingerprint,target_json,reason,requested_by,requested_by_id,quarantine_intent_id) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
         )
-        .bind(id)
-        .bind(adapter)
-        .bind(target_fingerprint)
-        .bind(target_json)
-        .bind(reason)
-        .bind(requested_by)
-        .bind(requested_by_id)
-        .execute(&self.pool)
-        .await?;
+        .bind(id).bind(adapter).bind(target_fingerprint)
+        .bind(stored_target.as_ref().unwrap_or(target_json))
+        .bind(reason).bind(requested_by).bind(requested_by_id).bind(intent_id)
+        .execute(&mut *tx).await?;
+        tx.commit().await?;
         Ok(id)
     }
 
@@ -3604,7 +3687,7 @@ impl PostgresStore {
         &self,
     ) -> Result<Vec<PendingKillSwitchRequest>> {
         let rows = sqlx::query(
-            "SELECT id, adapter, target_fingerprint, target_json, reason \
+            "SELECT id, adapter, target_fingerprint, target_json, reason, quarantine_intent_id \
              FROM firewall_kill_switch_requests \
              WHERE processed_at IS NULL \
              ORDER BY created_at",
@@ -3615,6 +3698,7 @@ impl PostgresStore {
             .into_iter()
             .map(|row| PendingKillSwitchRequest {
                 request_id: row.get("id"),
+                quarantine_intent_id: row.get("quarantine_intent_id"),
                 adapter: row.get("adapter"),
                 target_fingerprint: row.get("target_fingerprint"),
                 target_json: row.get("target_json"),
@@ -3653,7 +3737,7 @@ impl PostgresStore {
     ) -> Result<Vec<serde_json::Value>> {
         let rows = sqlx::query(
             "SELECT id, adapter, target_fingerprint, target_json, reason, requested_by, \
-                    created_at, processed_at \
+                    created_at, processed_at, quarantine_intent_id \
              FROM firewall_kill_switch_requests \
              ORDER BY created_at DESC LIMIT $1",
         )
@@ -3666,6 +3750,7 @@ impl PostgresStore {
                 serde_json::json!({
                     "id": r.get::<Uuid, _>("id"),
                     "adapter": r.get::<String, _>("adapter"),
+                    "quarantine_intent_id": r.get::<Option<Uuid>, _>("quarantine_intent_id"),
                     "target_fingerprint": r.get::<String, _>("target_fingerprint"),
                     "target_json": r.get::<serde_json::Value, _>("target_json"),
                     "reason": r.get::<Option<String>, _>("reason"),
