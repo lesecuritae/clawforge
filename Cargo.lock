@@ -371,6 +371,7 @@ name = "clawforge-executor"
 version = "1.0.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "clawforge-firewall-agent",
  "clawforge-storage",
  "serde_json",

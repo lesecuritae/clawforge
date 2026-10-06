@@ -11,12 +11,12 @@
 //! Any action whose name is not a recognized firewall action (`nftables.`/
 //! `haproxy.`/`haproxy_ratelimit.`/`tailscale.` prefix, one specific
 //! adapter each, or `firewall.`, every configured `FirewallAdapter`-based
-//! adapter at once - see `dispatch_multi_adapter`) keeps the exact prior
+//! adapter at once - see `dispatch_multi_with_adapters`) keeps the exact prior
 //! behavior: claimed, marked `running`, then immediately completed with
 //! `"dry_run: no external operation executed"` - this module changes
 //! nothing about docker/github/proxmox actions. `tailscale.*` is
 //! dispatched via its own path (`dispatch_tailscale`), not
-//! `dispatch_multi_adapter`'s fan-out - `TailscaleAdapter` is not a
+//! `dispatch_multi_with_adapters`'s fan-out - `TailscaleAdapter` is not a
 //! `FirewallAdapter` (a device ID is a different resource shape from an
 //! IP/CIDR - see `TailscaleTarget`'s own doc comment in
 //! `clawforge-firewall-agent`).
@@ -57,7 +57,7 @@ const DEFAULT_FIREWALL_MAX_CONCURRENT_APPLIES_PER_ADAPTER: i64 = 5;
 const DEFAULT_FIREWALL_INFLIGHT_STALE_SECONDS: i64 = 120;
 /// A `firewall.*` action (as opposed to `nftables.*`/`haproxy.*`/
 /// `haproxy_ratelimit.*`) fans out to every configured adapter - see
-/// `dispatch_multi_adapter`'s own doc comment.
+/// `dispatch_multi_with_adapters`'s own doc comment.
 const FIREWALL_MULTI_ADAPTER_PREFIX: &str = "firewall.";
 /// The one adapter a `firewall.*` action always includes, regardless of
 /// `CLAWFORGE_FIREWALL_ADAPTERS` - the host-wide, per-source-IP block that
@@ -113,7 +113,7 @@ fn firewall_budget_applies(action_name: &str, dry_run: bool) -> bool {
 /// adapter (or adapters) - `nftables.*`/`haproxy.*`/`haproxy_ratelimit.*`/
 /// `goaway.*`/`tailscale.*` (one specific adapter each) or `firewall.*` (every
 /// configured `FirewallAdapter`-based adapter at once - see
-/// `dispatch_multi_adapter`; `tailscale.*` is never part of that fan-out,
+/// `dispatch_multi_with_adapters`; `tailscale.*` is never part of that fan-out,
 /// since `TailscaleAdapter` is not a `FirewallAdapter`).
 fn is_firewall_action(action_name: &str) -> bool {
     action_name.starts_with("nftables.")
@@ -288,7 +288,7 @@ async fn try_begin_inflight(store: &PostgresStore, adapter: &str) -> Result<Opti
     Ok(Some(id))
 }
 
-/// Everything `dispatch()` gathers for a successful firewall apply, for
+/// Everything `dispatch()` gathers for a known firewall apply, for
 /// `main()`'s loop (the only place with a `store`) to persist as an Action
 /// Receipt via `record_firewall_action_receipt`. `dispatch()` itself stays
 /// DB-free on purpose - its existing unit tests call it directly with no
@@ -657,38 +657,131 @@ async fn sweep_kill_switch_requests(store: &PostgresStore) {
 /// Runs preflight (best-effort) + apply + (if a real apply) verify against
 /// one adapter, and builds the receipt for it - the single-adapter logic
 /// shared by both `dispatch()`'s plain single-adapter path and
-/// `dispatch_multi_adapter()`'s fan-out, so the two can never build a
+/// `dispatch_multi_with_adapters()`'s fan-out, so the two can never build a
 /// receipt differently for the same adapter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DispatchCompletion {
+    Success,
+    Failed,
+    RecoveryRequired,
+}
+
+struct GenericDispatchOutcome {
+    completion: DispatchCompletion,
+    result_summary: Option<String>,
+    error_summary: Option<String>,
+    receipts: Vec<FirewallDispatchReceipt>,
+}
+
+impl GenericDispatchOutcome {
+    fn failed(reason: &str) -> Self {
+        Self {
+            completion: DispatchCompletion::Failed,
+            result_summary: None,
+            error_summary: Some(reason.into()),
+            receipts: Vec::new(),
+        }
+    }
+
+    fn receipt_persistence_failed(&mut self, dry_run: bool) {
+        self.completion = if dry_run {
+            DispatchCompletion::Failed
+        } else {
+            DispatchCompletion::RecoveryRequired
+        };
+        self.error_summary =
+            Some("firewall receipt persistence failed; reconciliation required".into());
+    }
+
+    fn into_legacy(
+        self,
+    ) -> (
+        bool,
+        Option<String>,
+        Option<String>,
+        Vec<FirewallDispatchReceipt>,
+    ) {
+        (
+            self.completion == DispatchCompletion::Success,
+            self.result_summary,
+            self.error_summary,
+            self.receipts,
+        )
+    }
+
+    fn from_legacy(
+        value: (
+            bool,
+            Option<String>,
+            Option<String>,
+            Vec<FirewallDispatchReceipt>,
+        ),
+    ) -> Self {
+        Self {
+            completion: if value.0 {
+                DispatchCompletion::Success
+            } else {
+                DispatchCompletion::Failed
+            },
+            result_summary: value.1,
+            error_summary: value.2,
+            receipts: value.3,
+        }
+    }
+}
+
+/// A failed real apply may have mutated remote state. It must never be
+/// converted into a retryable failure or a fabricated successful receipt.
 async fn apply_single_adapter(
     adapter: &dyn FirewallAdapter,
     action: &FirewallAction,
     dry_run: bool,
-) -> Result<(String, FirewallDispatchReceipt), String> {
-    // Best-effort: preflight is read-only enrichment for the receipt, not
-    // a gate - a preflight failure (e.g. no NET_ADMIN/no HAProxy socket in
-    // this environment) is recorded as-is and apply is still attempted,
-    // since apply's own success/failure is what actually determines the
-    // outcome here.
+) -> GenericDispatchOutcome {
     let preflight_state = match adapter.preflight(&action.target).await {
         Ok(preflight) => adapter_state_json(&preflight.raw_set_json),
-        Err(error) => serde_json::json!({"error": error.to_string()}),
+        Err(_) if !dry_run => {
+            return GenericDispatchOutcome::failed("adapter preflight failed; apply refused")
+        }
+        Err(_) => serde_json::json!({"status": "preflight_unavailable", "mode": "dry_run"}),
     };
-    let result = adapter
-        .apply(action, dry_run)
-        .await
-        .map_err(|error| error.to_string())?;
+    let result = match adapter.apply(action, dry_run).await {
+        Ok(result) => result,
+        Err(_) if dry_run => {
+            return GenericDispatchOutcome::failed("adapter dry-run planning failed")
+        }
+        Err(_) => {
+            let presence = match adapter.verify(&action.target).await {
+                Ok(VerificationResult::Verified) => "present",
+                Ok(VerificationResult::NotPresent) => "absent",
+                Err(_) => "unknown",
+            };
+            return GenericDispatchOutcome {
+                completion: DispatchCompletion::RecoveryRequired,
+                result_summary: Some(format!("adapter={} apply outcome uncertain; observed_presence={presence}", adapter.name())),
+                error_summary: Some("real apply failed; manual reconciliation required; presence does not prove ownership".into()),
+                receipts: Vec::new(),
+            };
+        }
+    };
     let verification_result = if dry_run {
         None
     } else {
-        match adapter.verify(&action.target).await {
-            Ok(VerificationResult::Verified) => Some("verified"),
-            Ok(VerificationResult::NotPresent) => Some("mismatch"),
-            Err(_) => Some("failed"),
-        }
+        Some(match adapter.verify(&action.target).await {
+            Ok(VerificationResult::Verified) => "verified",
+            Ok(VerificationResult::NotPresent) => "mismatch",
+            Err(_) => "failed",
+        })
+    };
+    let completion = if dry_run || verification_result == Some("verified") {
+        DispatchCompletion::Success
+    } else {
+        DispatchCompletion::RecoveryRequired
     };
     let summary = format!(
-        "adapter={} dry_run={} commands={:?}",
-        result.receipt.adapter, result.receipt.is_dry_run, result.receipt.rendered_commands
+        "adapter={} dry_run={} verification={}",
+        adapter.name(),
+        dry_run,
+        verification_result.unwrap_or("not_attempted")
     );
     let receipt = FirewallDispatchReceipt {
         adapter: result.receipt.adapter,
@@ -701,79 +794,97 @@ async fn apply_single_adapter(
         is_dry_run: result.receipt.is_dry_run,
         target_fingerprint: result.receipt.target_fingerprint,
     };
-    Ok((summary, receipt))
+    GenericDispatchOutcome {
+        completion,
+        result_summary: Some(summary),
+        error_summary: (completion == DispatchCompletion::RecoveryRequired)
+            .then(|| "real apply could not be verified; manual reconciliation required".into()),
+        receipts: vec![receipt],
+    }
 }
 
-/// A `firewall.*` action fans out to *every* configured adapter instead of
-/// one - see `configured_multi_adapters`'s own doc comment for which ones
-/// and why `nftables` is always among them. Every adapter is attempted
-/// regardless of another one's failure (defense in depth: a HAProxy-layer
-/// block succeeding is still worth having even if the host-wide one
-/// somehow failed, and vice versa) - overall `success` is `true` iff the
-/// *mandatory* `nftables` adapter succeeded, since that is the "any
-/// external service on this host" guarantee a `firewall.*` action exists
-/// to make. A receipt is persisted for every adapter that succeeded,
-/// regardless of overall success - a real state change happened and must
-/// be tracked (audit, TTL) even if a sibling adapter failed.
-async fn dispatch_multi_adapter(
-    claimed: &ClaimedExecutionRequest,
-) -> (
-    bool,
-    Option<String>,
-    Option<String>,
-    Vec<FirewallDispatchReceipt>,
-) {
+/// Retain all known receipts, and fence any uncertain real effect even
+/// when it belongs to an optional adapter. Safe optional refusals degrade
+/// the summary without negating a verified mandatory adapter.
+async fn dispatch_multi_with_adapters(
+    action: &FirewallAction,
+    dry_run: bool,
+    adapters: Vec<Box<dyn FirewallAdapter>>,
+) -> GenericDispatchOutcome {
+    let mut outcome = GenericDispatchOutcome::failed("mandatory nftables adapter missing");
+    let mut mandatory_seen = false;
+    let mut mandatory_success = false;
+    let mut uncertain = false;
+    let mut summaries = Vec::new();
+    let mut errors = Vec::new();
+    for adapter in adapters {
+        let name = adapter.name();
+        let result = apply_single_adapter(adapter.as_ref(), action, dry_run).await;
+        if name == MANDATORY_MULTI_ADAPTER {
+            mandatory_seen = true;
+            mandatory_success = result.completion == DispatchCompletion::Success;
+        }
+        uncertain |= result.completion == DispatchCompletion::RecoveryRequired;
+        if let Some(summary) = result.result_summary {
+            summaries.push(summary);
+        }
+        if let Some(error) = result.error_summary {
+            errors.push(format!("{name}: {error}"));
+        }
+        outcome.receipts.extend(result.receipts);
+    }
+    outcome.completion = if uncertain {
+        DispatchCompletion::RecoveryRequired
+    } else if mandatory_seen && mandatory_success {
+        DispatchCompletion::Success
+    } else if !dry_run && outcome.receipts.iter().any(|receipt| !receipt.is_dry_run) {
+        DispatchCompletion::RecoveryRequired
+    } else {
+        DispatchCompletion::Failed
+    };
+    if !mandatory_seen {
+        errors.push("mandatory nftables adapter missing".into());
+    }
+    outcome.result_summary = Some(summaries.join("; "));
+    outcome.error_summary = (!errors.is_empty()).then(|| errors.join("; "));
+    outcome
+}
+
+async fn try_dispatch_generic(claimed: &ClaimedExecutionRequest) -> Option<GenericDispatchOutcome> {
+    let multi = claimed
+        .action_name
+        .starts_with(FIREWALL_MULTI_ADAPTER_PREFIX);
+    let single = if multi {
+        None
+    } else {
+        adapter_for(&claimed.action_name)
+    };
+    if !multi && single.is_none() {
+        return None;
+    }
     let Some(target) = claimed.target.as_ref() else {
-        return (
-            false,
-            None,
-            Some(format!(
-                "firewall action {:?} has no target",
-                claimed.action_name
-            )),
-            Vec::new(),
-        );
+        return Some(GenericDispatchOutcome::failed(
+            "firewall action has no target",
+        ));
     };
     let action = match parse_firewall_action(claimed.id, target) {
         Ok(action) => action,
-        Err(error) => return (false, None, Some(error.to_string()), Vec::new()),
+        Err(_) => {
+            return Some(GenericDispatchOutcome::failed(
+                "invalid firewall action target",
+            ))
+        }
     };
     let dry_run = dispatch_dry_run(claimed);
-    let mut receipts = Vec::new();
-    let mut summaries = Vec::new();
-    let mut mandatory_error = None;
-    for name in configured_multi_adapters() {
-        // configured_multi_adapters() only ever returns recognized names,
-        // so this is always Some - the fallback keeps this loop body
-        // total rather than relying on that invariant silently.
-        let Some(adapter) = adapter_for(&name) else {
-            continue;
-        };
-        match apply_single_adapter(adapter.as_ref(), &action, dry_run).await {
-            Ok((summary, receipt)) => {
-                summaries.push(summary);
-                receipts.push(receipt);
-            }
-            Err(error) => {
-                if name == MANDATORY_MULTI_ADAPTER {
-                    mandatory_error = Some(error.clone());
-                }
-                summaries.push(format!("{name}: failed: {error}"));
-            }
-        }
-    }
-    let combined_summary = Some(summaries.join("; "));
-    match mandatory_error {
-        Some(error) => (
-            false,
-            combined_summary,
-            Some(format!(
-                "mandatory {MANDATORY_MULTI_ADAPTER} adapter failed: {error}"
-            )),
-            receipts,
-        ),
-        None => (true, combined_summary, None, receipts),
-    }
+    Some(if multi {
+        let adapters = configured_multi_adapters()
+            .iter()
+            .filter_map(|name| adapter_for(name))
+            .collect();
+        dispatch_multi_with_adapters(&action, dry_run, adapters).await
+    } else {
+        apply_single_adapter(single.unwrap().as_ref(), &action, dry_run).await
+    })
 }
 
 const TAILSCALE_ACTION_PREFIX: &str = "tailscale.quarantine_device";
@@ -1076,11 +1187,8 @@ async fn dispatch(
     Option<String>,
     Vec<FirewallDispatchReceipt>,
 ) {
-    if claimed
-        .action_name
-        .starts_with(FIREWALL_MULTI_ADAPTER_PREFIX)
-    {
-        return dispatch_multi_adapter(claimed).await;
+    if let Some(outcome) = try_dispatch_generic(claimed).await {
+        return outcome.into_legacy();
     }
     if claimed.action_name == TAILSCALE_ACTION_PREFIX {
         return dispatch_tailscale(claimed).await;
@@ -1091,34 +1199,12 @@ async fn dispatch(
     if claimed.action_name == DOCKER_QUARANTINE_ACTION {
         return dispatch_docker(claimed).await;
     }
-    let Some(adapter) = adapter_for(&claimed.action_name) else {
-        return (
-            true,
-            Some("dry_run: no external operation executed".to_string()),
-            None,
-            Vec::new(),
-        );
-    };
-    let Some(target) = claimed.target.as_ref() else {
-        return (
-            false,
-            None,
-            Some(format!(
-                "firewall action {:?} has no target",
-                claimed.action_name
-            )),
-            Vec::new(),
-        );
-    };
-    let action = match parse_firewall_action(claimed.id, target) {
-        Ok(action) => action,
-        Err(error) => return (false, None, Some(error.to_string()), Vec::new()),
-    };
-    let dry_run = dispatch_dry_run(claimed);
-    match apply_single_adapter(adapter.as_ref(), &action, dry_run).await {
-        Ok((summary, receipt)) => (true, Some(summary), None, vec![receipt]),
-        Err(error) => (false, None, Some(error), Vec::new()),
-    }
+    (
+        true,
+        Some("dry_run: no external operation executed".to_string()),
+        None,
+        Vec::new(),
+    )
 }
 
 #[tokio::main]
@@ -1214,12 +1300,14 @@ async fn main() -> anyhow::Result<()> {
                             }
                         }
                         let refusal = refusal.or(concurrency_refusal);
-                        let (success, result_summary, error_summary, receipts) =
+                        let mut outcome =
                             if let Some(reason) = refusal {
                                 tracing::warn!(execution_id = %claimed.id, action = %claimed.action_name, reason = %reason, "refusing dispatch");
-                                (false, None, Some(reason), Vec::new())
+                                GenericDispatchOutcome::failed(&reason)
+                            } else if let Some(outcome) = try_dispatch_generic(&claimed).await {
+                                outcome
                             } else {
-                                quarantine_runtime::dispatch(&store, &claimed).await
+                                GenericDispatchOutcome::from_legacy(quarantine_runtime::dispatch(&store, &claimed).await)
                             };
                         // Release every reserved slot regardless of how
                         // dispatch turned out - a partial reservation
@@ -1235,7 +1323,7 @@ async fn main() -> anyhow::Result<()> {
                         // at most one. Persisted regardless of overall
                         // `success` - a sibling adapter's real state change
                         // still needs tracking even if another one failed.
-                        for receipt in receipts {
+                        for receipt in std::mem::take(&mut outcome.receipts) {
                             // The TTL sweep rolls back from the receipt's target_json. Docker
                             // needs the disconnected networks (which are not in the action
                             // target) to reconnect, so fold them in from the rollback plan.
@@ -1273,28 +1361,25 @@ async fn main() -> anyhow::Result<()> {
                                 })
                                 .await
                             {
-                                // Best-effort: a receipt is an audit record of
-                                // an already-decided outcome, not a gate on it
-                                // - losing one must not turn a completed
-                                // dispatch into a failed one.
-                                tracing::warn!(%error, execution_id = %claimed.id, adapter = receipt.adapter, "could not persist firewall action receipt");
+                                outcome.receipt_persistence_failed(dispatch_dry_run(&claimed));
+                                tracing::warn!(execution_id = %claimed.id, adapter = receipt.adapter, "could not persist firewall action receipt");
+                                let _ = error;
                             }
                         }
-                        if let Err(error) = store
-                            .complete_execution_dispatch(
-                                claimed.id,
-                                Some(worker_id),
-                                started,
-                                success,
-                                result_summary.as_deref(),
-                                error_summary.as_deref(),
-                            )
-                            .await
+                        let success = outcome.completion == DispatchCompletion::Success;
+                        let completion = if outcome.completion == DispatchCompletion::RecoveryRequired {
+                            store.complete_execution_dispatch_for_recovery(claimed.id, Some(worker_id), started,
+                                outcome.result_summary.as_deref(), outcome.error_summary.as_deref()).await
+                        } else {
+                            store.complete_execution_dispatch(claimed.id, Some(worker_id), started, success,
+                                outcome.result_summary.as_deref(), outcome.error_summary.as_deref()).await
+                        };
+                        if let Err(error) = completion
                         {
                             tracing::warn!(%error, execution_id = %claimed.id, "could not persist dispatch completion");
                             let _ = store.heartbeat_execution_worker(worker_id, "degraded", 0, Some(&error.to_string())).await;
                         } else if !success {
-                            tracing::warn!(execution_id = %claimed.id, action = %claimed.action_name, error = ?error_summary, "dispatch failed");
+                            tracing::warn!(execution_id = %claimed.id, action = %claimed.action_name, error = ?outcome.error_summary, "dispatch failed");
                         }
                     }
                     Ok(None) => {}
@@ -1544,7 +1629,11 @@ mod tests {
         assert!(success, "dispatch failed: {error:?}");
         let summary = summary.unwrap();
         assert!(summary.contains("dry_run=true"));
-        assert!(summary.contains("203.0.113.0/24"));
+        // Targets remain in the restricted receipt, not the summary.
+        assert!(receipts[0]
+            .rendered_commands
+            .to_string()
+            .contains("203.0.113.0/24"));
         assert_eq!(
             receipts.len(),
             1,
@@ -1771,3 +1860,6 @@ mod tests {
         assert_eq!(action.ttl_seconds, 120);
     }
 }
+
+#[cfg(test)]
+mod dispatch_tests;

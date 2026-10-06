@@ -3244,6 +3244,9 @@ impl PostgresStore {
     /// blocks generic reclaim, timeout and retry: an external mutation may
     /// have happened even when the worker cannot publish its final receipt.
     /// The generation recovery path must resolve that ownership first.
+    /// `rollback_required` is deliberately absent from every reclaim, timeout
+    /// and retry predicate, including generic firewall actions without an
+    /// intent. Uncertain external mutations need explicit recovery, not replay.
     async fn run_execution_maintenance(&self) -> Result<()> {
         let mut maintenance_tx = self.pool.begin().await?;
         sqlx::query("UPDATE execution_leases SET status='expired',updated_at=NOW() WHERE status='active' AND expires_at<=NOW()")
@@ -3440,6 +3443,51 @@ impl PostgresStore {
         result_summary: Option<&str>,
         error_summary: Option<&str>,
     ) -> Result<()> {
+        self.complete_execution_dispatch_with_status(
+            id,
+            worker_id,
+            started,
+            if success { "success" } else { "failed" },
+            result_summary,
+            error_summary,
+        )
+        .await
+    }
+
+    /// Completes an uncertain external dispatch without permitting generic retry.
+    /// A partial mutation requires explicit recovery; only an operator/recovery
+    /// controller may resolve `rollback_required`. The existing metric schema
+    /// records this unsuccessful outcome as `failed`; the audit retains the
+    /// precise request status. No receipt or rollback evidence is discarded.
+    pub async fn complete_execution_dispatch_for_recovery(
+        &self,
+        id: Uuid,
+        worker_id: Option<Uuid>,
+        started: std::time::Instant,
+        result_summary: Option<&str>,
+        error_summary: Option<&str>,
+    ) -> Result<()> {
+        self.complete_execution_dispatch_with_status(
+            id,
+            worker_id,
+            started,
+            "rollback_required",
+            result_summary,
+            error_summary,
+        )
+        .await
+    }
+
+    async fn complete_execution_dispatch_with_status(
+        &self,
+        id: Uuid,
+        worker_id: Option<Uuid>,
+        started: std::time::Instant,
+        terminal_status: &str,
+        result_summary: Option<&str>,
+        error_summary: Option<&str>,
+    ) -> Result<()> {
+        let success = terminal_status == "success";
         // The claim left the request in `starting` (see
         // `claim_execution_request_for_dispatch`) - the transition table only
         // allows a terminal status from `running`, so this mirrors the same
@@ -3449,7 +3497,7 @@ impl PostgresStore {
             .await?;
         self.update_execution_status(
             id,
-            if success { "success" } else { "failed" },
+            terminal_status,
             "executor",
             result_summary,
             error_summary,
