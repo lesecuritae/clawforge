@@ -131,3 +131,5 @@ run_cargo test -p clawforge-storage --test quarantine_intents -- --ignored --tes
 run_cargo test -p clawforge-storage --test quarantine_lease -- --ignored --test-threads=1
 
 run_cargo test -p clawforge-executor native_controller_writeahead_recovery_and_stale_generation_lab -- --ignored --test-threads=1
+
+run_cargo test -p clawforge-storage --test dispatch_recovery -- --ignored --test-threads=1
