@@ -79,18 +79,44 @@ const incidentA = {
   updated_at: "2026-09-25T10:05:00Z",
 };
 
-test("Firewall Status: navigates via the sidebar and renders receipts, drift, and kill-switch data", async ({ page }) => {
+const quarantineGeneration = {
+  generation_id: "gen-e2e-1",
+  execution_id: "exec-7",
+  adapter: "docker",
+  action_name: "docker.quarantine_container",
+  status: "recovery_required",
+  lifecycle: "recovery_required",
+  owns_target: true,
+  open_recovery: true,
+  is_expired: false,
+  target_fingerprint: "b".repeat(64),
+  target_json: { kind: "docker", container_id: "b".repeat(64) },
+  ttl_seconds: 7200,
+  expires_at: "2026-10-06T12:00:00Z",
+  created_at: "2026-10-06T11:00:00Z",
+  completed_at: null,
+  error_summary: "external quarantine state requires verified recovery",
+  apply_receipt: { id: "apply-e2e-1", verification_result: "verified", created_at: "2026-10-06T11:05:00Z" },
+  rollback_receipt: null,
+};
+
+test("Firewall Status: navigates via the sidebar and renders receipts, drift, kill-switch, and quarantine generations", async ({ page }) => {
   await login(page, {
     "/firewall/receipts": [receipt],
     "/firewall/expired": [],
     "/firewall/kill-switch": [],
+    "/firewall/quarantine/generations": [quarantineGeneration],
   });
 
   await page.getByRole("navigation").getByText("Firewall Status").click();
 
   await expect(page.getByRole("heading", { name: "Firewall Status" })).toBeVisible();
   await expect(page.getByText("203.0.113.7")).toBeVisible();
-  await expect(page.getByText("verified")).toBeVisible();
+  // Both the receipt and the generation's apply receipt verify, so scope to the first.
+  await expect(page.getByText("verified").first()).toBeVisible();
+  // Quarantine generations section (Q1): the generation id and its lifecycle.
+  await expect(page.getByText("gen-e2e-1")).toBeVisible();
+  await expect(page.getByText("recovery_required")).toBeVisible();
 });
 
 test("Live Security: navigates via the sidebar and renders the attack/assessment/incident pipeline", async ({ page }) => {

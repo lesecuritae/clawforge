@@ -282,6 +282,125 @@ impl PostgresStore {
         Ok(sqlx::query("SELECT * FROM firewall_action_intents WHERE target_fingerprint IS NOT NULL AND (status='prepared' OR (status='completed' AND expires_at<=NOW())) ORDER BY created_at,id LIMIT 100")
             .fetch_all(&self.pool).await?.into_iter().map(decode).collect())
     }
+
+    /// Read-only, paginated operator view of quarantine generations (Q1).
+    ///
+    /// Stable sort `created_at DESC, id DESC`, SQL-level pagination and an
+    /// accurate `total` so pages beyond the first are not silently empty. Each
+    /// row carries the durable status, an operator lifecycle label, the apply
+    /// and rollback receipt lineage and whether verified recovery is still open.
+    ///
+    /// This is deliberately the *operator* surface (session auth + role), so it
+    /// may show internal `target_json`. It performs no mutation and exposes no
+    /// adapter/rollback command; the agent/MCP projection stays separate and
+    /// sanitized. Returns the page rows and the total generation count.
+    pub async fn list_quarantine_generations(
+        &self,
+        page: i64,
+        page_size: i64,
+    ) -> Result<(Vec<Value>, i64)> {
+        let page = page.max(1);
+        let page_size = page_size.clamp(1, 200);
+        let offset = (page - 1) * page_size;
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM firewall_action_intents WHERE target_fingerprint IS NOT NULL",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        // The unique (intent_id, receipt_kind) index guarantees at most one
+        // apply and one rollback receipt per generation, so these joins never
+        // fan the generation row out.
+        let rows = sqlx::query(
+            "SELECT i.id,i.execution_id,i.adapter,i.action_name,i.status,i.target_fingerprint, \
+                    i.target_json,i.ttl_seconds,i.expires_at,i.created_at,i.completed_at,i.error_summary, \
+                    (i.expires_at<=NOW()) AS is_expired, \
+                    ar.id AS apply_receipt_id,ar.verification_result AS apply_verification,ar.created_at AS apply_created_at, \
+                    rr.id AS rollback_receipt_id,rr.verification_result AS rollback_verification,rr.created_at AS rollback_created_at \
+             FROM firewall_action_intents i \
+             LEFT JOIN firewall_action_receipts ar ON ar.intent_id=i.id AND ar.receipt_kind='apply' \
+             LEFT JOIN firewall_action_receipts rr ON rr.intent_id=i.id AND rr.receipt_kind='rollback' \
+             WHERE i.target_fingerprint IS NOT NULL \
+             ORDER BY i.created_at DESC,i.id DESC LIMIT $1 OFFSET $2",
+        )
+        .bind(page_size)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+        let values = rows
+            .into_iter()
+            .map(|r| {
+                let status: String = r.get("status");
+                let is_expired: bool = r.get("is_expired");
+                let apply_receipt = r.get::<Option<Uuid>, _>("apply_receipt_id").map(|id| {
+                    json!({
+                        "id": id,
+                        "verification_result": r.get::<Option<String>, _>("apply_verification"),
+                        "created_at": r.get::<Option<DateTime<Utc>>, _>("apply_created_at"),
+                    })
+                });
+                let rollback_receipt = r.get::<Option<Uuid>, _>("rollback_receipt_id").map(|id| {
+                    json!({
+                        "id": id,
+                        "verification_result": r.get::<Option<String>, _>("rollback_verification"),
+                        "created_at": r.get::<Option<DateTime<Utc>>, _>("rollback_created_at"),
+                    })
+                });
+                json!({
+                    "generation_id": r.get::<Uuid, _>("id"),
+                    "execution_id": r.get::<Uuid, _>("execution_id"),
+                    "adapter": r.get::<String, _>("adapter"),
+                    "action_name": r.get::<String, _>("action_name"),
+                    "status": status,
+                    "lifecycle": quarantine_lifecycle(&status, is_expired),
+                    "owns_target": owns_quarantine_target(&status),
+                    "open_recovery": quarantine_recovery_open(&status, is_expired),
+                    "is_expired": is_expired,
+                    "target_fingerprint": r.get::<String, _>("target_fingerprint"),
+                    "target_json": r.get::<Value, _>("target_json"),
+                    "ttl_seconds": r.get::<i32, _>("ttl_seconds"),
+                    "expires_at": r.get::<DateTime<Utc>, _>("expires_at"),
+                    "created_at": r.get::<DateTime<Utc>, _>("created_at"),
+                    "completed_at": r.get::<Option<DateTime<Utc>>, _>("completed_at"),
+                    "error_summary": r.get::<Option<String>, _>("error_summary"),
+                    "apply_receipt": apply_receipt,
+                    "rollback_receipt": rollback_receipt,
+                })
+            })
+            .collect();
+        Ok((values, total))
+    }
+}
+
+/// Operator-facing lifecycle label derived from the durable status and TTL.
+///
+/// This never widens ownership or terminal semantics (those are enforced by the
+/// DB transition trigger); it only groups statuses so an operator view can tell
+/// an expired block still awaiting verified recovery apart from a verified
+/// restore. `completed` means a verified apply, NOT the end of quarantine.
+pub fn quarantine_lifecycle(status: &str, is_expired: bool) -> &'static str {
+    match status {
+        "prepared" => "prepared",
+        "completed" if is_expired => "expired_pending_recovery",
+        "completed" => "active",
+        "recovery_required" => "recovery_required",
+        "not_applied" => "not_applied",
+        "rolled_back" => "verified_restored",
+        _ => "unknown",
+    }
+}
+
+/// A generation still exclusively owns its `(adapter, fingerprint)` target while
+/// prepared, completed or recovery_required; only `not_applied` and
+/// `rolled_back` release it. Mirrors the active-generation unique index.
+pub fn owns_quarantine_target(status: &str) -> bool {
+    matches!(status, "prepared" | "completed" | "recovery_required")
+}
+
+/// Whether this generation still needs verified recovery: an explicit
+/// `recovery_required`, or a `completed` block whose TTL has passed and which
+/// the sweep has not yet restored. Terminal states never report open recovery.
+pub fn quarantine_recovery_open(status: &str, is_expired: bool) -> bool {
+    status == "recovery_required" || (status == "completed" && is_expired)
 }
 
 /// Generation fence. Keep this guard alive from before mutation through authoritative readback.
@@ -439,5 +558,49 @@ impl QuarantineGuard {
         }
         self.transition("not_applied", Some("verified no external mutation"))
             .await
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn lifecycle_distinguishes_expired_from_restored() {
+        assert_eq!(quarantine_lifecycle("prepared", false), "prepared");
+        assert_eq!(quarantine_lifecycle("completed", false), "active");
+        assert_eq!(
+            quarantine_lifecycle("completed", true),
+            "expired_pending_recovery"
+        );
+        assert_eq!(
+            quarantine_lifecycle("recovery_required", false),
+            "recovery_required"
+        );
+        assert_eq!(quarantine_lifecycle("not_applied", false), "not_applied");
+        assert_eq!(
+            quarantine_lifecycle("rolled_back", false),
+            "verified_restored"
+        );
+        // An expired terminal state is still terminal, not pending recovery.
+        assert_eq!(
+            quarantine_lifecycle("rolled_back", true),
+            "verified_restored"
+        );
+    }
+
+    #[test]
+    fn ownership_and_recovery_match_generation_fence() {
+        for s in ["prepared", "completed", "recovery_required"] {
+            assert!(owns_quarantine_target(s), "{s} must own its target");
+        }
+        for s in ["not_applied", "rolled_back"] {
+            assert!(!owns_quarantine_target(s), "{s} must release its target");
+        }
+        assert!(quarantine_recovery_open("recovery_required", false));
+        assert!(quarantine_recovery_open("completed", true));
+        assert!(!quarantine_recovery_open("completed", false));
+        assert!(!quarantine_recovery_open("rolled_back", true));
+        assert!(!quarantine_recovery_open("prepared", true));
     }
 }
