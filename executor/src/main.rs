@@ -730,12 +730,30 @@ impl GenericDispatchOutcome {
     }
 }
 
+/// Durable write-ahead journal for a real generic firewall rule apply (F2).
+/// Binds one generation to `(adapter, scope, rule_fingerprint)` in
+/// `firewall_action_intents` before the mutation and resolves it after, so a
+/// crash between a real `apply()` and its receipt leaves a durably owned,
+/// visible generation that is reconciled, never blindly replayed. The scope is
+/// the adapter name today (one ruleset per adapter); a per-set scope is a later
+/// refinement. Only used for a real (non-dry-run) apply; dry-run never journals.
+struct RuleJournal<'a> {
+    store: &'a PostgresStore,
+    execution_id: Uuid,
+    action_name: &'a str,
+}
+
 /// A failed real apply may have mutated remote state. It must never be
 /// converted into a retryable failure or a fabricated successful receipt.
+/// With a `journal` (a real apply), ownership is committed before the mutation
+/// and resolved atomically after; the receipt is then persisted by `finish`, so
+/// the returned `receipts` is empty. Without one (dry-run, or store-free unit
+/// tests), the F1 behavior is unchanged and the in-memory receipt is returned.
 async fn apply_single_adapter(
     adapter: &dyn FirewallAdapter,
     action: &FirewallAction,
     dry_run: bool,
+    journal: Option<&RuleJournal<'_>>,
 ) -> GenericDispatchOutcome {
     let preflight_state = match adapter.preflight(&action.target).await {
         Ok(preflight) => adapter_state_json(&preflight.raw_set_json),
@@ -744,12 +762,59 @@ async fn apply_single_adapter(
         }
         Err(_) => serde_json::json!({"status": "preflight_unavailable", "mode": "dry_run"}),
     };
+    // Write-ahead: commit the immutable rule snapshot BEFORE the real apply.
+    let prepared = match (dry_run, journal) {
+        (false, Some(journal)) => {
+            let rendered = match adapter.render(action) {
+                Ok(rendered) => rendered,
+                Err(_) => {
+                    return GenericDispatchOutcome::failed("adapter render failed; apply refused")
+                }
+            };
+            let fingerprint = rendered.target_fingerprint.clone();
+            let target_json = serde_json::json!({"target_fingerprint": fingerprint});
+            let rollback_plan = serde_json::json!({"commands": rendered.rollback_commands});
+            match journal
+                .store
+                .prepare_firewall_rule_intent(
+                    journal.execution_id,
+                    adapter.name(),
+                    journal.action_name,
+                    adapter.name(),
+                    &fingerprint,
+                    &target_json,
+                    &preflight_state,
+                    &rollback_plan,
+                    rendered.ttl_seconds,
+                )
+                .await
+            {
+                Ok(id) => Some((
+                    id,
+                    fingerprint,
+                    target_json,
+                    rollback_plan,
+                    rendered.ttl_seconds,
+                )),
+                Err(_) => return GenericDispatchOutcome::failed(
+                    "firewall rule already owned by an active generation; reconcile before reapply",
+                ),
+            }
+        }
+        _ => None,
+    };
     let result = match adapter.apply(action, dry_run).await {
         Ok(result) => result,
         Err(_) if dry_run => {
             return GenericDispatchOutcome::failed("adapter dry-run planning failed")
         }
         Err(_) => {
+            if let (Some((id, ..)), Some(journal)) = (&prepared, journal) {
+                let _ = journal
+                    .store
+                    .mark_firewall_rule_recovery_required(*id)
+                    .await;
+            }
             let presence = match adapter.verify(&action.target).await {
                 Ok(VerificationResult::Verified) => "present",
                 Ok(VerificationResult::NotPresent) => "absent",
@@ -772,6 +837,74 @@ async fn apply_single_adapter(
             Err(_) => "failed",
         })
     };
+    // Journaled real path: atomic finish on verified, recovery otherwise. The
+    // receipt is written by `finish`, so no in-memory receipt is returned.
+    if let (Some((id, fingerprint, target_json, rollback_plan, ttl)), Some(journal)) =
+        (&prepared, journal)
+    {
+        if verification_result == Some("verified") {
+            let input = FirewallActionReceiptInput {
+                execution_id: Some(journal.execution_id),
+                adapter: result.receipt.adapter,
+                action_name: journal.action_name,
+                preflight_state: preflight_state.clone(),
+                rendered_commands: serde_json::json!(result.receipt.rendered_commands),
+                observed_state: result.observed_state.as_deref().map(adapter_state_json),
+                verification_result: Some("verified"),
+                ttl_seconds: *ttl,
+                rollback_plan: rollback_plan.clone(),
+                is_dry_run: false,
+                receipt_kind: "apply",
+                target_fingerprint: Some(fingerprint),
+                target_json: Some(target_json.clone()),
+            };
+            return match journal.store.finish_firewall_rule_intent(*id, &input).await {
+                Ok(_) => GenericDispatchOutcome {
+                    completion: DispatchCompletion::Success,
+                    result_summary: Some(format!(
+                        "adapter={} dry_run=false verification=verified journaled",
+                        adapter.name()
+                    )),
+                    error_summary: None,
+                    receipts: Vec::new(),
+                },
+                Err(_) => {
+                    let _ = journal
+                        .store
+                        .mark_firewall_rule_recovery_required(*id)
+                        .await;
+                    GenericDispatchOutcome {
+                        completion: DispatchCompletion::RecoveryRequired,
+                        result_summary: Some(format!(
+                            "adapter={} applied but receipt persistence failed",
+                            adapter.name()
+                        )),
+                        error_summary: Some(
+                            "firewall receipt persistence failed; reconciliation required".into(),
+                        ),
+                        receipts: Vec::new(),
+                    }
+                }
+            };
+        }
+        let _ = journal
+            .store
+            .mark_firewall_rule_recovery_required(*id)
+            .await;
+        return GenericDispatchOutcome {
+            completion: DispatchCompletion::RecoveryRequired,
+            result_summary: Some(format!(
+                "adapter={} verification={}",
+                adapter.name(),
+                verification_result.unwrap_or("not_attempted")
+            )),
+            error_summary: Some(
+                "real apply could not be verified; manual reconciliation required".into(),
+            ),
+            receipts: Vec::new(),
+        };
+    }
+    // Non-journaled path (dry-run, or store-free unit tests): F1 behavior.
     let completion = if dry_run || verification_result == Some("verified") {
         DispatchCompletion::Success
     } else {
@@ -810,6 +943,7 @@ async fn dispatch_multi_with_adapters(
     action: &FirewallAction,
     dry_run: bool,
     adapters: Vec<Box<dyn FirewallAdapter>>,
+    journal: Option<&RuleJournal<'_>>,
 ) -> GenericDispatchOutcome {
     let mut outcome = GenericDispatchOutcome::failed("mandatory nftables adapter missing");
     let mut mandatory_seen = false;
@@ -819,7 +953,7 @@ async fn dispatch_multi_with_adapters(
     let mut errors = Vec::new();
     for adapter in adapters {
         let name = adapter.name();
-        let result = apply_single_adapter(adapter.as_ref(), action, dry_run).await;
+        let result = apply_single_adapter(adapter.as_ref(), action, dry_run, journal).await;
         if name == MANDATORY_MULTI_ADAPTER {
             mandatory_seen = true;
             mandatory_success = result.completion == DispatchCompletion::Success;
@@ -850,7 +984,10 @@ async fn dispatch_multi_with_adapters(
     outcome
 }
 
-async fn try_dispatch_generic(claimed: &ClaimedExecutionRequest) -> Option<GenericDispatchOutcome> {
+async fn try_dispatch_generic(
+    store: Option<&PostgresStore>,
+    claimed: &ClaimedExecutionRequest,
+) -> Option<GenericDispatchOutcome> {
     let multi = claimed
         .action_name
         .starts_with(FIREWALL_MULTI_ADAPTER_PREFIX);
@@ -876,14 +1013,21 @@ async fn try_dispatch_generic(claimed: &ClaimedExecutionRequest) -> Option<Gener
         }
     };
     let dry_run = dispatch_dry_run(claimed);
+    // Durable write-ahead ownership for real applies (F2). Dry-run never
+    // journals; store-free callers (unit tests) pass None and get F1 behavior.
+    let journal = store.map(|store| RuleJournal {
+        store,
+        execution_id: claimed.id,
+        action_name: &claimed.action_name,
+    });
     Some(if multi {
         let adapters = configured_multi_adapters()
             .iter()
             .filter_map(|name| adapter_for(name))
             .collect();
-        dispatch_multi_with_adapters(&action, dry_run, adapters).await
+        dispatch_multi_with_adapters(&action, dry_run, adapters, journal.as_ref()).await
     } else {
-        apply_single_adapter(single.unwrap().as_ref(), &action, dry_run).await
+        apply_single_adapter(single.unwrap().as_ref(), &action, dry_run, journal.as_ref()).await
     })
 }
 
@@ -1180,6 +1324,7 @@ async fn dispatch_docker(
 /// panics, every adapter/parse error becomes a failed completion with a
 /// clear `error_summary` instead.
 async fn dispatch(
+    store: Option<&PostgresStore>,
     claimed: &ClaimedExecutionRequest,
 ) -> (
     bool,
@@ -1187,7 +1332,7 @@ async fn dispatch(
     Option<String>,
     Vec<FirewallDispatchReceipt>,
 ) {
-    if let Some(outcome) = try_dispatch_generic(claimed).await {
+    if let Some(outcome) = try_dispatch_generic(store, claimed).await {
         return outcome.into_legacy();
     }
     if claimed.action_name == TAILSCALE_ACTION_PREFIX {
@@ -1304,7 +1449,7 @@ async fn main() -> anyhow::Result<()> {
                             if let Some(reason) = refusal {
                                 tracing::warn!(execution_id = %claimed.id, action = %claimed.action_name, reason = %reason, "refusing dispatch");
                                 GenericDispatchOutcome::failed(&reason)
-                            } else if let Some(outcome) = try_dispatch_generic(&claimed).await {
+                            } else if let Some(outcome) = try_dispatch_generic(Some(&store), &claimed).await {
                                 outcome
                             } else {
                                 GenericDispatchOutcome::from_legacy(quarantine_runtime::dispatch(&store, &claimed).await)
@@ -1484,7 +1629,7 @@ mod tests {
             "docker.quarantine_container_extra",
         ] {
             assert!(adapters_touched_by(action).is_empty());
-            let result = dispatch(&claimed(action, None)).await;
+            let result = dispatch(None, &claimed(action, None)).await;
             assert!(result.0);
             assert!(result.3.is_empty());
         }
@@ -1578,7 +1723,7 @@ mod tests {
     #[tokio::test]
     async fn non_firewall_actions_keep_the_original_dry_run_success_behavior() {
         let request = claimed("docker.restart_container", None);
-        let (success, summary, error, receipts) = dispatch(&request).await;
+        let (success, summary, error, receipts) = dispatch(None, &request).await;
         assert!(success);
         assert_eq!(
             summary.as_deref(),
@@ -1594,7 +1739,7 @@ mod tests {
     #[tokio::test]
     async fn a_firewall_action_without_a_target_fails_with_a_clear_error() {
         let request = claimed("nftables.block_indicator", None);
-        let (success, _summary, error, receipts) = dispatch(&request).await;
+        let (success, _summary, error, receipts) = dispatch(None, &request).await;
         assert!(!success);
         assert!(error.unwrap().contains("no target"));
         assert!(receipts.is_empty());
@@ -1606,7 +1751,7 @@ mod tests {
             "nftables.block_indicator",
             Some(serde_json::json!({"kind": "not-a-real-kind"})),
         );
-        let (success, _summary, error, receipts) = dispatch(&request).await;
+        let (success, _summary, error, receipts) = dispatch(None, &request).await;
         assert!(!success);
         assert!(error.is_some());
         assert!(receipts.is_empty());
@@ -1625,7 +1770,7 @@ mod tests {
                 "source": "spamhaus_drop",
             })),
         );
-        let (success, summary, error, receipts) = dispatch(&request).await;
+        let (success, summary, error, receipts) = dispatch(None, &request).await;
         assert!(success, "dispatch failed: {error:?}");
         let summary = summary.unwrap();
         assert!(summary.contains("dry_run=true"));
@@ -1658,7 +1803,7 @@ mod tests {
                 "simulation_only": true,
             })),
         );
-        let (success, summary, error, receipts) = dispatch(&request).await;
+        let (success, summary, error, receipts) = dispatch(None, &request).await;
         assert!(success, "dispatch failed: {error:?}");
         assert!(summary.unwrap().contains("dry_run=true"));
         assert_eq!(receipts.len(), 1);
@@ -1693,7 +1838,7 @@ mod tests {
                 "source": "spamhaus_drop",
             })),
         );
-        let (success, summary, error, receipts) = dispatch(&request).await;
+        let (success, summary, error, receipts) = dispatch(None, &request).await;
         assert!(success, "dispatch failed: {error:?}");
         let summary = summary.unwrap();
         assert!(summary.contains("adapter=haproxy"));
@@ -1717,7 +1862,7 @@ mod tests {
                 "source": "spamhaus_drop",
             })),
         );
-        let (success, summary, error, receipts) = dispatch(&request).await;
+        let (success, summary, error, receipts) = dispatch(None, &request).await;
         assert!(success, "dispatch failed: {error:?}");
         let summary = summary.unwrap();
         assert!(summary.contains("adapter=haproxy_ratelimit"));
@@ -1730,7 +1875,7 @@ mod tests {
     #[tokio::test]
     async fn a_tailscale_action_without_a_target_fails_with_a_clear_error() {
         let request = claimed("tailscale.quarantine_device", None);
-        let (success, _summary, error, receipts) = dispatch(&request).await;
+        let (success, _summary, error, receipts) = dispatch(None, &request).await;
         assert!(!success);
         assert!(error.unwrap().contains("no target"));
         assert!(receipts.is_empty());
@@ -1742,7 +1887,7 @@ mod tests {
             "tailscale.quarantine_device",
             Some(serde_json::json!({"not_device_id": "whatever"})),
         );
-        let (success, _summary, error, receipts) = dispatch(&request).await;
+        let (success, _summary, error, receipts) = dispatch(None, &request).await;
         assert!(!success);
         assert!(error.unwrap().contains("device_id"));
         assert!(receipts.is_empty());
@@ -1758,7 +1903,7 @@ mod tests {
             "tailscale.quarantine_device",
             Some(serde_json::json!({"device_id": "n123456CNTRL"})),
         );
-        let (success, summary, error, receipts) = dispatch(&request).await;
+        let (success, summary, error, receipts) = dispatch(None, &request).await;
         assert!(success, "dispatch failed: {error:?}");
         let summary = summary.unwrap();
         assert!(summary.contains("adapter=tailscale"));
@@ -1795,7 +1940,7 @@ mod tests {
 
         // No CLAWFORGE_FIREWALL_ADAPTERS set - defaults to nftables alone.
         std::env::remove_var("CLAWFORGE_FIREWALL_ADAPTERS");
-        let (success, summary, error, receipts) = dispatch(&request()).await;
+        let (success, summary, error, receipts) = dispatch(None, &request()).await;
         assert!(success, "dispatch failed: {error:?}");
         assert_eq!(
             receipts.len(),
@@ -1810,7 +1955,7 @@ mod tests {
             "CLAWFORGE_FIREWALL_ADAPTERS",
             "nftables,haproxy,haproxy_ratelimit",
         );
-        let (success, _summary, error, receipts) = dispatch(&request()).await;
+        let (success, _summary, error, receipts) = dispatch(None, &request()).await;
         assert!(success, "dispatch failed: {error:?}");
         let mut adapters: Vec<&str> = receipts.iter().map(|r| r.adapter).collect();
         adapters.sort_unstable();
@@ -1820,7 +1965,7 @@ mod tests {
         // it - the host-wide "any external service" guarantee cannot be
         // configured away.
         std::env::set_var("CLAWFORGE_FIREWALL_ADAPTERS", "haproxy");
-        let (success, _summary, error, receipts) = dispatch(&request()).await;
+        let (success, _summary, error, receipts) = dispatch(None, &request()).await;
         assert!(success, "dispatch failed: {error:?}");
         assert!(
             receipts.iter().any(|r| r.adapter == "nftables"),
@@ -1831,7 +1976,7 @@ mod tests {
         // An unrecognized name is dropped, not fatal - nftables (the core
         // guarantee) still runs regardless.
         std::env::set_var("CLAWFORGE_FIREWALL_ADAPTERS", "not-a-real-adapter");
-        let (success, _summary, error, receipts) = dispatch(&request()).await;
+        let (success, _summary, error, receipts) = dispatch(None, &request()).await;
         assert!(success, "dispatch failed: {error:?}");
         assert_eq!(receipts.len(), 1);
         assert_eq!(receipts[0].adapter, "nftables");

@@ -66,11 +66,32 @@ Zweck ist Durability der Apply-/Rollback-Lifecycle, kein Freigabe-Gate):
 - `concurrent_prepare_yields_exactly_one_owner`: genau ein paralleler Besitzer.
 - `migration_lineages`: 0055 konvergiert in beiden Historien ohne Ledger-Rewrite.
 
+## Executor-Verdrahtung (dieses Inkrement, erledigt)
+
+`executor/src/main.rs`: `apply_single_adapter` bekommt ein optionales
+`RuleJournal` (store + execution_id + action_name). Bei einem realen Apply mit
+Journal:
+1. `preflight` + `render` (pure) liefern den Snapshot (Fingerprint, rollback_plan, ttl).
+2. `prepare_firewall_rule_intent` committet die Generation **vor** `adapter.apply()`.
+   Ist die Regel bereits von einer aktiven Generation besessen, wird der Apply
+   fail-closed verweigert (keine Mutation).
+3. `adapter.apply()` → `verify`: nur `Verified` schließt via `finish` atomar ab
+   (Receipt + completed in einer TX); Apply-Fehler, Mismatch oder Verify-Fehler
+   setzen `recovery_required` (Generation bleibt besessen, kein Replay).
+- Der Receipt wird von `finish` geschrieben, daher gibt der journaled Pfad eine
+  **leere** In-Memory-Receiptliste zurück → die Hauptschleife persistiert nicht
+  doppelt. Dry-run und store-freie Unit-Tests (`journal = None`) behalten exakt
+  das F1-Verhalten; alle 36 store-freien Dispatch-Unit-Tests bleiben grün.
+- Scope = Adaptername (ein Ruleset pro Adapter); ein Scope pro konkretem Set ist
+  eine spätere Verfeinerung. Multi-Adapter-Fan-out journalt je Adapter-Generation.
+- Integrationstest `write_ahead_journal_owns_before_apply_and_resolves_atomically`
+  (echtes PostgreSQL): verifizierter Apply → completed + Apply-Receipt; besessene
+  Regel → fail-closed ohne Mutation; Drift nach Rollback → `recovery_required`.
+
 ## Offen (nächste Inkremente)
 
-- Executor-Verdrahtung: `apply_single_adapter` prepariert die Generation vor
-  `adapter.apply()` und schließt sie atomar ab; unklare Wirkung →
-  `recovery_required`. Multi-Adapter-Fan-out je Adapter-Generation.
 - Vorhandene Operator-Regeln niemals als eigenen Apply adoptieren oder beim
-  Rollback löschen (Adapter-/Executor-Ebene).
+  Rollback löschen (Adapter-Ebene; derzeit bindet die Generation adapter+scope+ziel).
+- Scope-Verfeinerung auf den konkreten Set-/ACL-/Table-Namen statt Adaptername.
+- TTL-/Recovery-Sweep für Regel-Generationen (analog Quarantäne-Sweep).
 - F3: atomare Mass-/Concurrency-Budgets. Kein Live-Gate wird hier geöffnet.
