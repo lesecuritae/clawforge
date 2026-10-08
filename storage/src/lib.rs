@@ -3242,9 +3242,11 @@ impl PostgresStore {
     /// failed-but-retryable ones - the maintenance sweep every claim path
     /// runs first, factored out so `process_one_dry_run_for_worker` and
     /// `claim_execution_request_for_dispatch` share exactly one copy of it
-    /// rather than two that could drift apart. Durable quarantine ownership
-    /// blocks generic reclaim, timeout and retry: an external mutation may
-    /// have happened even when the worker cannot publish its final receipt.
+    /// rather than two that could drift apart. Durable ownership by an active
+    /// generation (quarantine `target_fingerprint`, or a generic firewall rule
+    /// `fw_rule_fingerprint`, with status prepared/completed/recovery_required)
+    /// blocks generic reclaim, timeout and retry: an external mutation may have
+    /// happened even when the worker cannot publish its final receipt.
     /// The generation recovery path must resolve that ownership first.
     /// `rollback_required` is deliberately absent from every reclaim, timeout
     /// and retry predicate, including generic firewall actions without an
@@ -3254,7 +3256,7 @@ impl PostgresStore {
         sqlx::query("UPDATE execution_leases SET status='expired',updated_at=NOW() WHERE status='active' AND expires_at<=NOW()")
             .execute(&mut *maintenance_tx)
             .await?;
-        let reclaimed: Vec<Uuid> = sqlx::query_scalar("UPDATE execution_requests SET status='queued',started_at=NULL,next_retry_at=NULL,error_summary='worker lease expired; request reclaimed' WHERE id IN (SELECT execution_id FROM execution_leases WHERE status='expired') AND status IN ('starting','running') AND NOT EXISTS (SELECT 1 FROM firewall_action_intents qi WHERE qi.execution_id=execution_requests.id AND qi.target_fingerprint IS NOT NULL AND qi.status IN ('prepared','completed','recovery_required')) RETURNING id")
+        let reclaimed: Vec<Uuid> = sqlx::query_scalar("UPDATE execution_requests SET status='queued',started_at=NULL,next_retry_at=NULL,error_summary='worker lease expired; request reclaimed' WHERE id IN (SELECT execution_id FROM execution_leases WHERE status='expired') AND status IN ('starting','running') AND NOT EXISTS (SELECT 1 FROM firewall_action_intents qi WHERE qi.execution_id=execution_requests.id AND (qi.target_fingerprint IS NOT NULL OR qi.fw_rule_fingerprint IS NOT NULL) AND qi.status IN ('prepared','completed','recovery_required')) RETURNING id")
             .fetch_all(&mut *maintenance_tx).await?;
         for id in &reclaimed {
             Self::insert_audit_outbox(
@@ -3266,7 +3268,7 @@ impl PostgresStore {
             )
             .await?;
         }
-        let timed_out: Vec<Uuid> = sqlx::query_scalar("UPDATE execution_requests SET status='timeout',finished_at=NOW(),error_summary='execution timeout' WHERE status IN ('starting','running') AND started_at IS NOT NULL AND started_at < NOW() - (timeout_seconds * INTERVAL '1 second') AND NOT EXISTS (SELECT 1 FROM firewall_action_intents qi WHERE qi.execution_id=execution_requests.id AND qi.target_fingerprint IS NOT NULL AND qi.status IN ('prepared','completed','recovery_required')) RETURNING id")
+        let timed_out: Vec<Uuid> = sqlx::query_scalar("UPDATE execution_requests SET status='timeout',finished_at=NOW(),error_summary='execution timeout' WHERE status IN ('starting','running') AND started_at IS NOT NULL AND started_at < NOW() - (timeout_seconds * INTERVAL '1 second') AND NOT EXISTS (SELECT 1 FROM firewall_action_intents qi WHERE qi.execution_id=execution_requests.id AND (qi.target_fingerprint IS NOT NULL OR qi.fw_rule_fingerprint IS NOT NULL) AND qi.status IN ('prepared','completed','recovery_required')) RETURNING id")
             .fetch_all(&mut *maintenance_tx)
             .await?;
         for id in &timed_out {
@@ -3279,7 +3281,7 @@ impl PostgresStore {
             )
             .await?;
         }
-        let retryable: Vec<Uuid> = sqlx::query_scalar("UPDATE execution_requests SET status='queued',retry_count=retry_count+1,next_retry_at=NULL WHERE status='failed' AND retry_count < max_retries AND (next_retry_at IS NULL OR next_retry_at<=NOW()) AND NOT EXISTS (SELECT 1 FROM firewall_action_intents qi WHERE qi.execution_id=execution_requests.id AND qi.target_fingerprint IS NOT NULL AND qi.status IN ('prepared','completed','recovery_required')) RETURNING id")
+        let retryable: Vec<Uuid> = sqlx::query_scalar("UPDATE execution_requests SET status='queued',retry_count=retry_count+1,next_retry_at=NULL WHERE status='failed' AND retry_count < max_retries AND (next_retry_at IS NULL OR next_retry_at<=NOW()) AND NOT EXISTS (SELECT 1 FROM firewall_action_intents qi WHERE qi.execution_id=execution_requests.id AND (qi.target_fingerprint IS NOT NULL OR qi.fw_rule_fingerprint IS NOT NULL) AND qi.status IN ('prepared','completed','recovery_required')) RETURNING id")
             .fetch_all(&mut *maintenance_tx)
             .await?;
         for id in &retryable {
@@ -3309,7 +3311,7 @@ impl PostgresStore {
             LEFT JOIN approval_policies p ON p.risk_level=a.risk_level
             WHERE e.status IN ('approved','pending','queued')
               AND NOT EXISTS (SELECT 1 FROM firewall_action_intents qi WHERE qi.execution_id=e.id
-                  AND qi.target_fingerprint IS NOT NULL AND qi.status IN ('prepared','completed','recovery_required'))
+                  AND (qi.target_fingerprint IS NOT NULL OR qi.fw_rule_fingerprint IS NOT NULL) AND qi.status IN ('prepared','completed','recovery_required'))
               AND (
                 a.name NOT IN ('docker.quarantine_container','proxmox.quarantine_vm','tailscale.quarantine_device') OR (
                     a.enabled AND a.requires_approval AND a.risk_level='critical'
@@ -3386,7 +3388,7 @@ impl PostgresStore {
             LEFT JOIN approval_policies p ON p.risk_level=a.risk_level
             WHERE e.status IN ('approved','pending','queued')
               AND NOT EXISTS (SELECT 1 FROM firewall_action_intents qi WHERE qi.execution_id=e.id
-                  AND qi.target_fingerprint IS NOT NULL AND qi.status IN ('prepared','completed','recovery_required'))
+                  AND (qi.target_fingerprint IS NOT NULL OR qi.fw_rule_fingerprint IS NOT NULL) AND qi.status IN ('prepared','completed','recovery_required'))
               AND (
                 a.name NOT IN ('docker.quarantine_container','proxmox.quarantine_vm','tailscale.quarantine_device') OR (
                     a.enabled AND a.requires_approval AND a.risk_level='critical'
