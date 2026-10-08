@@ -248,7 +248,9 @@ async fn recoverable_sweep_set_covers_prepared_and_expired_only() -> Result<()> 
     store
         .finish_firewall_rule_intent(
             fresh,
-            &receipt(execution, adapter, action, &fp_fresh, &t_fresh, &state, &plan),
+            &receipt(
+                execution, adapter, action, &fp_fresh, &t_fresh, &state, &plan,
+            ),
         )
         .await?;
 
@@ -272,10 +274,12 @@ async fn recoverable_sweep_set_covers_prepared_and_expired_only() -> Result<()> 
     )
     .execute(store.pool())
     .await?;
-    sqlx::query("UPDATE firewall_action_intents SET fw_expires_at=NOW()-INTERVAL '1 second' WHERE id=$1")
-        .bind(expired)
-        .execute(store.pool())
-        .await?;
+    sqlx::query(
+        "UPDATE firewall_action_intents SET fw_expires_at=NOW()-INTERVAL '1 second' WHERE id=$1",
+    )
+    .bind(expired)
+    .execute(store.pool())
+    .await?;
     sqlx::query(
         "ALTER TABLE firewall_action_intents ENABLE TRIGGER firewall_rule_intent_snapshot_immutable",
     )
