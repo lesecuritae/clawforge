@@ -202,6 +202,7 @@ impl PostgresStore {
             .await?
             .ok_or_else(|| anyhow::anyhow!("quarantine generation is resolved or busy"))?;
         if !allowed.contains(&guard.intent.status.as_str()) {
+            guard.abort().await;
             bail!("quarantine intent transition refused");
         }
         guard.transition(status, error).await
@@ -283,23 +284,37 @@ impl QuarantineGuard {
         Ok(())
     }
 
+    /// Release the held generation row lock synchronously. The guard's
+    /// transaction holds a FOR UPDATE lock; letting it drop rolls back only on a
+    /// deferred, best-effort basis, which can briefly leave the row locked and
+    /// make an immediately following `acquire_quarantine_guard`
+    /// (FOR UPDATE SKIP LOCKED) spuriously skip it as "busy". Every path that
+    /// abandons a guard without committing must call this first.
+    async fn abort(self) {
+        let _ = self.tx.rollback().await;
+    }
+
     pub async fn finish(mut self, input: &FirewallActionReceiptInput<'_>) -> Result<Uuid> {
-        let intent = &self.intent;
-        if intent.status != "prepared"
-            || input.execution_id != Some(intent.execution_id)
-            || input.adapter != intent.adapter
-            || input.action_name != intent.action_name
-            || input.target_fingerprint != Some(intent.target_fingerprint.as_str())
-            || input.target_json.as_ref() != Some(&intent.target_json)
-            || input.preflight_state != intent.preflight_state
-            || input.rollback_plan != intent.rollback_plan
-            || input.ttl_seconds != intent.ttl_seconds as u32
-            || input.is_dry_run
-            || input.receipt_kind != "apply"
-            || input.verification_result != Some("verified")
-        {
+        let mismatched = {
+            let intent = &self.intent;
+            intent.status != "prepared"
+                || input.execution_id != Some(intent.execution_id)
+                || input.adapter != intent.adapter
+                || input.action_name != intent.action_name
+                || input.target_fingerprint != Some(intent.target_fingerprint.as_str())
+                || input.target_json.as_ref() != Some(&intent.target_json)
+                || input.preflight_state != intent.preflight_state
+                || input.rollback_plan != intent.rollback_plan
+                || input.ttl_seconds != intent.ttl_seconds as u32
+                || input.is_dry_run
+                || input.receipt_kind != "apply"
+                || input.verification_result != Some("verified")
+        };
+        if mismatched {
+            self.abort().await;
             bail!("receipt does not match prepared verified quarantine generation");
         }
+        let intent = &self.intent;
         let receipt = Uuid::new_v4();
         sqlx::query("INSERT INTO firewall_action_receipts (id,intent_id,execution_id,adapter,action_name,preflight_state,rendered_commands,observed_state,verification_result,ttl_seconds,rollback_plan,is_dry_run,expires_at,receipt_kind,target_fingerprint,target_json) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,FALSE,$12,'apply',$13,$14)")
             .bind(receipt).bind(intent.id).bind(intent.execution_id).bind(input.adapter).bind(input.action_name)
@@ -354,6 +369,7 @@ impl QuarantineGuard {
     /// Call only after authoritative proof that no mutation occurred.
     pub async fn not_applied(self) -> Result<()> {
         if self.intent.status != "prepared" {
+            self.abort().await;
             bail!("ambiguous mutation cannot be declared unapplied");
         }
         self.transition("not_applied", Some("verified no external mutation"))
