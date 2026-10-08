@@ -587,20 +587,31 @@ fn set_contains_target(raw_set_json: &str, addr: IpAddr, prefix: Option<u8>) -> 
         return false;
     };
     let addr_str = addr.to_string();
-    elements.iter().any(|element| match element {
-        serde_json::Value::String(value) => prefix.is_none() && *value == addr_str,
-        serde_json::Value::Object(_) => {
-            let Some(prefix_obj) = element.get("prefix") else {
-                return false;
-            };
-            let element_addr = prefix_obj.get("addr").and_then(|a| a.as_str());
-            let element_len = prefix_obj.get("len").and_then(|l| l.as_u64());
-            match (element_addr, element_len, prefix) {
-                (Some(a), Some(l), Some(p)) => a == addr_str && l == u64::from(p),
-                _ => false,
+    elements.iter().any(|element| {
+        // P7-4: an element that carries a native `timeout` is wrapped by nft
+        // as `{"elem": {"val": <X>, "timeout": n, "expires": m}}`, where <X> is
+        // then the plain-IP string or `{"prefix": {...}}` object an untimed
+        // element would be directly. Unwrap to that inner value so verify works
+        // the same whether or not the block has a timeout.
+        let value = element
+            .get("elem")
+            .and_then(|elem| elem.get("val"))
+            .unwrap_or(element);
+        match value {
+            serde_json::Value::String(s) => prefix.is_none() && *s == addr_str,
+            serde_json::Value::Object(_) => {
+                let Some(prefix_obj) = value.get("prefix") else {
+                    return false;
+                };
+                let element_addr = prefix_obj.get("addr").and_then(|a| a.as_str());
+                let element_len = prefix_obj.get("len").and_then(|l| l.as_u64());
+                match (element_addr, element_len, prefix) {
+                    (Some(a), Some(l), Some(p)) => a == addr_str && l == u64::from(p),
+                    _ => false,
+                }
             }
+            _ => false,
         }
-        _ => false,
     })
 }
 
@@ -3484,6 +3495,40 @@ mod tests {
         ));
     }
 
+    /// P7-4 regression: once a block carries a native `timeout`, nft wraps each
+    /// element as `{"elem": {"val": <X>, "timeout": n, "expires": m}}`. verify
+    /// must still find the address, or every timed block reads back as
+    /// NotPresent (the real-nftables lab caught exactly this). This is the
+    /// actual `nft -j list set` output for a timed set with one host and one
+    /// CIDR element.
+    #[test]
+    fn set_contains_target_matches_timeout_annotated_elements() {
+        const TIMED: &str = r#"{"nftables":[{"metainfo":{"version":"1.0.6","json_schema_version":1}},{"set":{"family":"inet","name":"blocklist","table":"clawforge","type":"ipv4_addr","handle":1,"flags":["interval","timeout"],"elem":[{"elem":{"val":{"prefix":{"addr":"198.51.100.0","len":24}},"timeout":3600,"expires":3599}},{"elem":{"val":"203.0.113.5","timeout":3600,"expires":3599}}]}}]}"#;
+        // Timed plain host.
+        assert!(set_contains_target(
+            TIMED,
+            "203.0.113.5".parse().unwrap(),
+            None
+        ));
+        // Timed CIDR element at its real prefix length, but not another.
+        assert!(set_contains_target(
+            TIMED,
+            "198.51.100.0".parse().unwrap(),
+            Some(24)
+        ));
+        assert!(!set_contains_target(
+            TIMED,
+            "198.51.100.0".parse().unwrap(),
+            Some(25)
+        ));
+        // An address not in the timed set.
+        assert!(!set_contains_target(
+            TIMED,
+            "203.0.113.99".parse().unwrap(),
+            None
+        ));
+    }
+
     // --- Real-nftables tests below: require NET_ADMIN/NET_RAW and a
     // provisioned lab table (scripts/test-firewall-lab.sh), never run
     // against any real deployment host - see that script and the module
@@ -3866,10 +3911,13 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires nftables (NET_ADMIN/NET_RAW) - run via scripts/test-firewall-lab.sh"]
-    async fn rolling_back_an_element_that_was_never_applied_fails_cleanly() {
-        // Simulates a crash-before-apply / lease-loss recovery path
-        // attempting a rollback it does not actually need to perform -
-        // must fail with a clear error, not panic or silently succeed.
+    async fn rolling_back_an_element_that_was_never_applied_is_idempotent() {
+        // P7-4: a rollback of an element that is not in the set must SUCCEED,
+        // not error - the element being gone is exactly the rollback's goal.
+        // This is the crash-before-apply / lease-loss recovery path and, more
+        // importantly, the dead-man path where the kernel's own `timeout`
+        // already expired the block before the sweep ran. Matches the
+        // haproxy_ratelimit adapter's own idempotent rollback.
         let adapter = lab_adapter().await;
         let action = FirewallAction {
             target: indicator("203.0.113.206"),
@@ -3877,7 +3925,10 @@ mod tests {
             reason: "lab test".into(),
         };
         let result = adapter.rollback(&action).await;
-        assert!(result.is_err());
+        assert!(
+            result.is_ok(),
+            "rolling back an absent element must be an idempotent success: {result:?}"
+        );
     }
 
     /// Real-HAProxy tests below, run via scripts/test-haproxy-lab.sh
