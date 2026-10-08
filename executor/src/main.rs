@@ -263,29 +263,20 @@ async fn firewall_mass_block_budget_exceeded(
 /// release via `store.end_firewall_inflight_operation` once the real work
 /// is done - `Ok(None)` means "refused, nothing to release".
 ///
-/// Deliberately insert-then-check rather than a hard lock (e.g.
-/// `pg_advisory_lock`): like the mass-block budget, this accepts a small,
-/// bounded race (two replicas reserving at nearly the same instant could
-/// both pass the check and briefly push the live count one over the
-/// limit) as the cost of a budget, not a safety invariant the way the
-/// never-block exclusion list is - the same trade-off this codebase
-/// already makes for the rate budget above.
+/// F3: a HARD concurrency bound. Delegates to the storage-side atomic
+/// reservation (`try_reserve_firewall_inflight`), which serializes the
+/// count-and-insert per adapter with a transaction-scoped advisory lock, so the
+/// configured limit can never be exceeded even when several executor replicas
+/// reserve at the same instant - closing the previously-accepted insert-then-
+/// check race (two replicas both passing the check and briefly pushing the live
+/// count one over the limit). `Ok(None)` means "refused, nothing to release".
 async fn try_begin_inflight(store: &PostgresStore, adapter: &str) -> Result<Option<Uuid>, String> {
-    let id = store
-        .begin_firewall_inflight_operation(adapter, None)
-        .await
-        .map_err(|error| error.to_string())?;
     let max = firewall_max_concurrent_applies_per_adapter();
     let stale = firewall_inflight_stale_seconds();
-    let count = store
-        .firewall_inflight_operation_count(adapter, stale)
+    store
+        .try_reserve_firewall_inflight(adapter, max, stale, None)
         .await
-        .map_err(|error| error.to_string())?;
-    if count > max {
-        let _ = store.end_firewall_inflight_operation(id).await;
-        return Ok(None);
-    }
-    Ok(Some(id))
+        .map_err(|error| error.to_string())
 }
 
 /// Everything `dispatch()` gathers for a known firewall apply, for

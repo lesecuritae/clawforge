@@ -2479,6 +2479,77 @@ async fn firewall_inflight_operation_count_reflects_reservations_and_ignores_sta
     Ok(())
 }
 
+/// F3: `try_reserve_firewall_inflight` is a HARD concurrency bound. Firing more
+/// attempts than `max` concurrently must grant exactly `max` and refuse the
+/// rest, and the live count must never exceed `max` - the per-adapter advisory
+/// lock serializes count+insert so the earlier insert-then-check race (which
+/// could briefly push the count one over) cannot happen.
+#[tokio::test]
+#[ignore = "requires an isolated PostgreSQL test container"]
+async fn try_reserve_firewall_inflight_enforces_a_hard_concurrency_limit() -> anyhow::Result<()> {
+    let url =
+        std::env::var("CLAWFORGE_TEST_DATABASE_URL").or_else(|_| std::env::var("DATABASE_URL"))?;
+    let store = std::sync::Arc::new(PostgresStore::connect(&url).await?);
+    let adapter = format!("test-atomic-inflight-{}", uuid::Uuid::new_v4());
+    let max: i64 = 3;
+    let attempts = 8;
+
+    // All attempts race at once; only `max` may win.
+    let mut handles = Vec::new();
+    for _ in 0..attempts {
+        let store = store.clone();
+        let adapter = adapter.clone();
+        handles.push(tokio::spawn(async move {
+            store
+                .try_reserve_firewall_inflight(&adapter, max, 60, None)
+                .await
+        }));
+    }
+    let mut granted = Vec::new();
+    for handle in handles {
+        if let Some(id) = handle.await?? {
+            granted.push(id);
+        }
+    }
+    assert_eq!(
+        granted.len() as i64,
+        max,
+        "exactly max concurrent reservations may be granted"
+    );
+    assert_eq!(
+        store
+            .firewall_inflight_operation_count(&adapter, 60)
+            .await?,
+        max,
+        "the live count equals the hard limit and is never pushed over it"
+    );
+
+    // Already at the limit: a further reservation is refused, nothing to release.
+    assert!(
+        store
+            .try_reserve_firewall_inflight(&adapter, max, 60, None)
+            .await?
+            .is_none(),
+        "an adapter already at the limit refuses further reservations"
+    );
+
+    // Releasing one frees exactly one slot for a fresh reservation.
+    store.end_firewall_inflight_operation(granted[0]).await?;
+    assert!(
+        store
+            .try_reserve_firewall_inflight(&adapter, max, 60, None)
+            .await?
+            .is_some(),
+        "a freed slot can be reserved again"
+    );
+
+    sqlx::query("DELETE FROM firewall_inflight_operations WHERE adapter = $1")
+        .bind(&adapter)
+        .execute(store.pool())
+        .await?;
+    Ok(())
+}
+
 #[tokio::test]
 #[ignore = "requires an isolated PostgreSQL test container"]
 async fn firewall_inflight_operation_count_rejects_non_positive_staleness_window(
