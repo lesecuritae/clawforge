@@ -3711,6 +3711,40 @@ impl PostgresStore {
         Ok(count)
     }
 
+    /// Security hardening (after a bypass attempt that registered a firewall
+    /// action with `requires_approval=FALSE` to apply without a gate): a REAL
+    /// firewall-enforcement apply must be backed by a genuine approval. Returns
+    /// true only when the request's action is approval-gated AND enough
+    /// distinct, context-bound approvals exist - each bound to the request's
+    /// `approval_context_hash` (so changing the target invalidates them), by an
+    /// approver other than the requester, not expired, meeting the greater of
+    /// the request's and the policy's required count. A `requires_approval=FALSE`
+    /// action can never satisfy this, so a live firewall apply on it is refused
+    /// upstream (fail-closed). Dry-run and shadow requests never call this.
+    pub async fn firewall_request_live_authorized(&self, execution_id: Uuid) -> Result<bool> {
+        let ok: Option<bool> = sqlx::query_scalar(
+            "SELECT COALESCE( \
+                 a.requires_approval \
+                 AND e.requested_by_id IS NOT NULL \
+                 AND e.approval_expires_at IS NOT NULL AND e.approval_expires_at > NOW() \
+                 AND ( \
+                     SELECT COUNT(DISTINCT ea.approver_id) FROM execution_approvals ea \
+                     WHERE ea.execution_id = e.id \
+                       AND ea.context_hash = e.approval_context_hash \
+                       AND ea.approver_id <> e.requested_by_id \
+                 ) >= GREATEST(e.required_approvals, COALESCE(p.required_approvals, 1)) \
+             , FALSE) \
+             FROM execution_requests e \
+             JOIN actions a ON a.id = e.action_id \
+             LEFT JOIN approval_policies p ON p.risk_level = a.risk_level \
+             WHERE e.id = $1",
+        )
+        .bind(execution_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(ok.unwrap_or(false))
+    }
+
     /// P7-3 pilot evidence: rollback-latency percentiles computed from the
     /// apply and rollback receipts already persisted, so the roadmap's
     /// "Rollback-p95" pilot metric can be checked against real evidence rather

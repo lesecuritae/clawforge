@@ -1730,6 +1730,44 @@ async fn main() -> anyhow::Result<()> {
                                 Some(format!("could not check mass-block budget: {error}"))
                             }
                         };
+                        // Security hardening: a REAL firewall-enforcement apply
+                        // must be backed by a genuine approval. A
+                        // requires_approval=FALSE action - or an unapproved
+                        // request - can never apply live. This closes the gap
+                        // where a firewall action bypassed the approval gate the
+                        // quarantine actions already enforce. Dry-run/shadow are
+                        // unaffected (firewall_budget_applies is false then).
+                        let refusal = if refusal.is_none()
+                            && firewall_budget_applies(
+                                &claimed.action_name,
+                                dispatch_dry_run(&claimed),
+                            ) {
+                            match store.firewall_request_live_authorized(claimed.id).await {
+                                Ok(true) => None,
+                                Ok(false) => Some(format!(
+                                    "refused live firewall apply: execution {} is not backed by a \
+                                     genuine approval (a firewall action must be approval-gated \
+                                     and approved to apply for real)",
+                                    claimed.id
+                                )),
+                                Err(error) => {
+                                    tracing::warn!(%error, execution_id = %claimed.id, "could not check firewall live authorization");
+                                    let _ = store
+                                        .heartbeat_execution_worker(
+                                            worker_id,
+                                            "degraded",
+                                            0,
+                                            Some(&error.to_string()),
+                                        )
+                                        .await;
+                                    Some(format!(
+                                        "could not check firewall live authorization: {error}"
+                                    ))
+                                }
+                            }
+                        } else {
+                            refusal
+                        };
                         // Concurrency budget: reserve a slot in every
                         // adapter this action would touch *before*
                         // dispatching for real, so two replicas racing to
