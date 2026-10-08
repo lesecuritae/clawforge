@@ -857,7 +857,13 @@ impl NftablesAdapter {
         ]
     }
 
-    fn add_command(set_name: &str, element: &str) -> Vec<String> {
+    /// P7-4 lockout guard: the element carries a native nftables `timeout`, so
+    /// the kernel removes the block by itself once the TTL passes even if the
+    /// whole Clawforge stack is dead and the TTL sweep never runs. The sweep's
+    /// `delete_command` rollback still runs in the normal case; the timeout is
+    /// a dead-man backstop on top of it, not a replacement. Requires the set to
+    /// carry `flags timeout` (see `scripts/nftables-clawforge-provision.sh`).
+    fn add_command(set_name: &str, element: &str, ttl_seconds: u32) -> Vec<String> {
         vec![
             "nft".to_string(),
             "add".to_string(),
@@ -867,6 +873,8 @@ impl NftablesAdapter {
             set_name.to_string(),
             "{".to_string(),
             element.to_string(),
+            "timeout".to_string(),
+            format!("{ttl_seconds}s"),
             "}".to_string(),
         ]
     }
@@ -883,6 +891,15 @@ impl NftablesAdapter {
             element.to_string(),
             "}".to_string(),
         ]
+    }
+
+    /// P7-4: `nft delete element` on a missing element (or set) reports
+    /// "No such file or directory". For a rollback that is success, not
+    /// failure - the element is already gone, which is exactly the goal (e.g.
+    /// the kernel's own `timeout` expired the block before the sweep ran).
+    fn nft_delete_reports_already_absent(stderr: &str) -> bool {
+        let s = stderr.to_ascii_lowercase();
+        s.contains("no such file or directory") || s.contains("does not exist")
     }
 
     async fn run(args: &[String]) -> Result<std::process::Output, String> {
@@ -964,7 +981,7 @@ impl FirewallAdapter for NftablesAdapter {
             .unwrap_or(NFTABLES_BLOCKLIST_SET_V4);
         Ok(FirewallActionReceipt {
             adapter: self.name(),
-            rendered_commands: vec![Self::add_command(set_name, &element)],
+            rendered_commands: vec![Self::add_command(set_name, &element, action.ttl_seconds)],
             rollback_commands: vec![Self::delete_command(set_name, &element)],
             is_dry_run: true,
             ttl_seconds: action.ttl_seconds,
@@ -992,8 +1009,8 @@ impl FirewallAdapter for NftablesAdapter {
                     .into(),
             )
         })?;
-        let add = Self::add_command(set_name, &element);
-        let receipt_add = Self::add_command(set_name, &receipt_element);
+        let add = Self::add_command(set_name, &element, action.ttl_seconds);
+        let receipt_add = Self::add_command(set_name, &receipt_element, action.ttl_seconds);
         let receipt_delete = Self::delete_command(set_name, &receipt_element);
         if dry_run {
             return Ok(ApplyResult {
@@ -1066,10 +1083,16 @@ impl FirewallAdapter for NftablesAdapter {
         let delete = Self::delete_command(set_name, &element);
         let output = Self::run(&delete).await.map_err(AdapterError::Rollback)?;
         if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // P7-4: an already-absent element is a successful rollback - the
+            // block is gone, which is the goal (the kernel's own timeout may
+            // have expired it first). Any other nft failure is still an error.
+            if Self::nft_delete_reports_already_absent(&stderr) {
+                return Ok(());
+            }
             return Err(AdapterError::Rollback(format!(
                 "nft exited with {}: {}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr)
+                output.status, stderr
             )));
         }
         Ok(())
@@ -2859,6 +2882,48 @@ mod tests {
     }
 
     #[test]
+    fn nftables_add_command_carries_a_native_timeout_matching_the_ttl() {
+        // P7-4: the block element must expire on its own via nftables' kernel
+        // timeout, so a dead executor can never leave a block hanging forever.
+        let adapter = NftablesAdapter::new();
+        let mut action = action_for(indicator("203.0.113.7"));
+        action.ttl_seconds = 900;
+        let receipt = adapter.render(&action).unwrap();
+        let rendered = format!("{:?}", receipt.rendered_commands);
+        assert!(
+            rendered.contains("add") && rendered.contains("element"),
+            "still an add-element: {rendered}"
+        );
+        assert!(
+            rendered.contains("timeout") && rendered.contains("900s"),
+            "the add must carry a native timeout matching the ttl: {rendered}"
+        );
+        // The rollback stays a plain delete - the TTL sweep still runs in the
+        // normal case; the timeout is a dead-man backstop, not a replacement.
+        let rollback = format!("{:?}", receipt.rollback_commands);
+        assert!(
+            rollback.contains("delete") && !rollback.contains("timeout"),
+            "rollback stays a plain delete: {rollback}"
+        );
+    }
+
+    #[test]
+    fn nft_delete_reports_already_absent_treats_a_missing_element_as_done() {
+        // An already-gone element makes a rollback a success, not a failure.
+        assert!(NftablesAdapter::nft_delete_reports_already_absent(
+            "Error: Could not process rule: No such file or directory"
+        ));
+        assert!(NftablesAdapter::nft_delete_reports_already_absent(
+            "set element does not exist"
+        ));
+        // Any other nft failure must still be treated as a real error.
+        assert!(!NftablesAdapter::nft_delete_reports_already_absent(
+            "Error: syntax error, unexpected newline"
+        ));
+        assert!(!NftablesAdapter::nft_delete_reports_already_absent(""));
+    }
+
+    #[test]
     fn haproxy_table_key_is_flagged_matches_a_nonzero_gpc0_for_the_right_key() {
         let response =
             "key=203.0.113.5 use=1 exp=59000 gpc0=1\nkey=203.0.113.6 use=1 exp=59000 gpc0=0\n";
@@ -3317,6 +3382,8 @@ mod tests {
                 "blocklist",
                 "{",
                 "203.0.113.0/24",
+                "timeout",
+                "3600s",
                 "}"
             ]
         );
