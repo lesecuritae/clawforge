@@ -178,6 +178,14 @@ impl PostgresStore {
         Ok(sqlx::query("SELECT * FROM firewall_action_intents WHERE fw_rule_fingerprint IS NOT NULL AND (status IN ('prepared','recovery_required') OR (status='completed' AND fw_expires_at<=NOW())) ORDER BY created_at,id LIMIT 100")
             .fetch_all(&self.pool).await?.into_iter().map(decode).collect())
     }
+    /// Sweep variant: prepared plus completed-and-expired, but NOT
+    /// recovery_required (manual cases must not starve the automatic rollback).
+    /// Mirrors [`Self::recoverable_quarantine_intents`]; the firewall-rule sweep
+    /// consumes this and never blindly replays a prepared generation.
+    pub async fn recoverable_firewall_rule_intents(&self) -> Result<Vec<FirewallRuleIntent>> {
+        Ok(sqlx::query("SELECT * FROM firewall_action_intents WHERE fw_rule_fingerprint IS NOT NULL AND (status='prepared' OR (status='completed' AND fw_expires_at<=NOW())) ORDER BY created_at,id LIMIT 100")
+            .fetch_all(&self.pool).await?.into_iter().map(decode).collect())
+    }
 }
 
 /// Generation fence for a firewall rule. Keep alive from before mutation

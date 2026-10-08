@@ -211,3 +211,125 @@ async fn concurrent_prepare_yields_exactly_one_owner() -> Result<()> {
     store.mark_firewall_rule_not_applied(a.or(b)?).await?;
     Ok(())
 }
+
+/// The sweep candidate set is prepared + completed-and-expired, and deliberately
+/// excludes recovery_required (manual cases must not starve the auto-rollback),
+/// unexpired completed generations, and terminal rolled_back ones.
+#[tokio::test]
+#[ignore = "requires an isolated firewall-rule PostgreSQL fixture with schema 0055"]
+async fn recoverable_sweep_set_covers_prepared_and_expired_only() -> Result<()> {
+    let store = store().await?;
+    let adapter = "nftables";
+    let action = "nftables.block_indicator";
+    let scope = "clawforge_sweep_v4";
+    let execution = execution(&store, action).await?;
+    let state = json!({"set_present": false});
+    let plan = json!({"commands": [["nft", "delete", "element", "..."]]});
+    // Distinct concrete rules so per-rule unique ownership never collides.
+    let mk = |n: u32| format!("192.0.2.{n}/32");
+
+    // 1. prepared -> swept.
+    let fp_prep = mk(11);
+    let t_prep = json!({"cidr": fp_prep, "scope": scope});
+    let prepared = store
+        .prepare_firewall_rule_intent(
+            execution, adapter, action, scope, &fp_prep, &t_prep, &state, &plan, 3600,
+        )
+        .await?;
+
+    // 2. completed but unexpired (fw_expires_at = NOW()+3600) -> NOT swept.
+    let fp_fresh = mk(12);
+    let t_fresh = json!({"cidr": fp_fresh, "scope": scope});
+    let fresh = store
+        .prepare_firewall_rule_intent(
+            execution, adapter, action, scope, &fp_fresh, &t_fresh, &state, &plan, 3600,
+        )
+        .await?;
+    store
+        .finish_firewall_rule_intent(
+            fresh,
+            &receipt(execution, adapter, action, &fp_fresh, &t_fresh, &state, &plan),
+        )
+        .await?;
+
+    // 3. completed and expired -> swept. fw_expires_at is immutable under the
+    // snapshot trigger, so disable it only to simulate elapsed TTL in the lab.
+    let fp_exp = mk(13);
+    let t_exp = json!({"cidr": fp_exp, "scope": scope});
+    let expired = store
+        .prepare_firewall_rule_intent(
+            execution, adapter, action, scope, &fp_exp, &t_exp, &state, &plan, 3600,
+        )
+        .await?;
+    store
+        .finish_firewall_rule_intent(
+            expired,
+            &receipt(execution, adapter, action, &fp_exp, &t_exp, &state, &plan),
+        )
+        .await?;
+    sqlx::query(
+        "ALTER TABLE firewall_action_intents DISABLE TRIGGER firewall_rule_intent_snapshot_immutable",
+    )
+    .execute(store.pool())
+    .await?;
+    sqlx::query("UPDATE firewall_action_intents SET fw_expires_at=NOW()-INTERVAL '1 second' WHERE id=$1")
+        .bind(expired)
+        .execute(store.pool())
+        .await?;
+    sqlx::query(
+        "ALTER TABLE firewall_action_intents ENABLE TRIGGER firewall_rule_intent_snapshot_immutable",
+    )
+    .execute(store.pool())
+    .await?;
+
+    // 4. recovery_required -> NOT swept (manual reconciliation).
+    let fp_rec = mk(14);
+    let t_rec = json!({"cidr": fp_rec, "scope": scope});
+    let rec = store
+        .prepare_firewall_rule_intent(
+            execution, adapter, action, scope, &fp_rec, &t_rec, &state, &plan, 3600,
+        )
+        .await?;
+    store.mark_firewall_rule_recovery_required(rec).await?;
+
+    // 5. rolled_back -> NOT swept (terminal).
+    let fp_rb = mk(15);
+    let t_rb = json!({"cidr": fp_rb, "scope": scope});
+    let rb = store
+        .prepare_firewall_rule_intent(
+            execution, adapter, action, scope, &fp_rb, &t_rb, &state, &plan, 3600,
+        )
+        .await?;
+    store
+        .finish_firewall_rule_intent(
+            rb,
+            &receipt(execution, adapter, action, &fp_rb, &t_rb, &state, &plan),
+        )
+        .await?;
+    store.resolve_firewall_rule_rollback(rb).await?;
+
+    let swept: Vec<Uuid> = store
+        .recoverable_firewall_rule_intents()
+        .await?
+        .into_iter()
+        .map(|i| i.id)
+        .collect();
+    assert!(swept.contains(&prepared), "a prepared generation is swept");
+    assert!(
+        swept.contains(&expired),
+        "a completed-and-expired generation is swept"
+    );
+    assert!(
+        !swept.contains(&fresh),
+        "an unexpired completed generation is not swept"
+    );
+    assert!(
+        !swept.contains(&rec),
+        "recovery_required must not starve the auto-rollback"
+    );
+    assert!(
+        !swept.contains(&rb),
+        "a rolled_back generation is terminal, not swept"
+    );
+    Ok(())
+}
