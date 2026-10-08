@@ -3875,6 +3875,60 @@ impl PostgresStore {
         Ok(count)
     }
 
+    /// Atomic concurrency reservation (F3). Unlike the earlier
+    /// `begin_firewall_inflight_operation` + `firewall_inflight_operation_count`
+    /// insert-then-check (which deliberately accepted a small race that could
+    /// briefly push the live count one over the limit), this serializes the
+    /// count-and-insert per adapter with a transaction-scoped advisory lock, so
+    /// `max` is a HARD bound even across concurrent executor replicas: no two
+    /// reservations for the same adapter can both observe "under limit" and both
+    /// insert. Returns the reservation id to release with
+    /// `end_firewall_inflight_operation`, or `None` if the adapter is already at
+    /// `max` (nothing to release). Stale rows (older than `stale_after_seconds`)
+    /// are not counted, so a crashed replica's leaked slot still ages out.
+    pub async fn try_reserve_firewall_inflight(
+        &self,
+        adapter: &str,
+        max: i64,
+        stale_after_seconds: i64,
+        execution_id: Option<Uuid>,
+    ) -> Result<Option<Uuid>> {
+        if max <= 0 || stale_after_seconds <= 0 {
+            anyhow::bail!("max and stale_after_seconds must be positive");
+        }
+        let mut tx = self.pool.begin().await?;
+        // Transaction-scoped: auto-released at COMMIT/ROLLBACK, so a crash cannot
+        // leak the lock. Keyed on the adapter, so different adapters never block
+        // each other.
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext('clawforge_fw_inflight:' || $1))")
+            .bind(adapter)
+            .execute(&mut *tx)
+            .await?;
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM firewall_inflight_operations \
+             WHERE adapter = $1 AND started_at > NOW() - ($2 * INTERVAL '1 second')",
+        )
+        .bind(adapter)
+        .bind(stale_after_seconds)
+        .fetch_one(&mut *tx)
+        .await?;
+        if count >= max {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+        let id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO firewall_inflight_operations (id,adapter,execution_id) VALUES ($1,$2,$3)",
+        )
+        .bind(id)
+        .bind(adapter)
+        .bind(execution_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(Some(id))
+    }
+
     pub async fn record_connector_health(
         &self,
         connector_id: Uuid,
