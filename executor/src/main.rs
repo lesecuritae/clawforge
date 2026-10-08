@@ -101,6 +101,40 @@ fn firewall_inflight_stale_seconds() -> i64 {
         .unwrap_or(DEFAULT_FIREWALL_INFLIGHT_STALE_SECONDS)
 }
 
+/// P7-2: the hard ceiling on a *real* firewall apply's TTL. A block that
+/// cannot self-expire within a bounded window is the core self-lockout risk,
+/// so this is a pre-apply gate, not advice. Defaults to the default action TTL
+/// (a conservative draft value, not an operator approval - the reviewed pilot
+/// ceiling is set via the env var below once P7-5's limits are signed off).
+const DEFAULT_FIREWALL_MAX_TTL_SECONDS: u32 = DEFAULT_FIREWALL_ACTION_TTL_SECONDS;
+
+fn firewall_max_ttl_seconds() -> u32 {
+    env::var("CLAWFORGE_FIREWALL_MAX_TTL_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_FIREWALL_MAX_TTL_SECONDS)
+}
+
+/// Pure core of the TTL-ceiling gate (no env), split out so it is testable
+/// without mutating process env. A dry-run is never gated (nothing persists or
+/// mutates); a real apply whose TTL exceeds `max_ttl_seconds` yields a refusal
+/// reason so a block always self-expires within a bounded window.
+fn ttl_over_live_ceiling(ttl_seconds: u32, max_ttl_seconds: u32, dry_run: bool) -> Option<String> {
+    if dry_run || ttl_seconds <= max_ttl_seconds {
+        return None;
+    }
+    Some(format!(
+        "firewall action TTL {ttl_seconds}s exceeds the live ceiling {max_ttl_seconds}s \
+         (CLAWFORGE_FIREWALL_MAX_TTL_SECONDS); refused so a real block always self-expires \
+         within a bounded window"
+    ))
+}
+
+fn firewall_ttl_over_live_ceiling(ttl_seconds: u32, dry_run: bool) -> Option<String> {
+    ttl_over_live_ceiling(ttl_seconds, firewall_max_ttl_seconds(), dry_run)
+}
+
 /// Whether a claimed request needs a mass-block budget check at all - a
 /// dry run or a non-firewall action never does, so
 /// `firewall_mass_block_budget_exceeded` can skip touching the database
@@ -1271,6 +1305,14 @@ async fn try_dispatch_generic(
         }
     };
     let dry_run = dispatch_dry_run(claimed);
+    // P7-2: refuse a real apply whose TTL exceeds the live ceiling before
+    // anything is journaled or applied - a bounded self-expiry is the core
+    // guard against a block that outlives its intent and locks someone out.
+    // Central here so both the single-adapter and `firewall.*` fan-out paths
+    // are covered by one gate; dry-runs are never affected.
+    if let Some(reason) = firewall_ttl_over_live_ceiling(action.ttl_seconds, dry_run) {
+        return Some(GenericDispatchOutcome::failed(&reason));
+    }
     // Durable write-ahead ownership for real applies (F2). Dry-run never
     // journals; store-free callers (unit tests) pass None and get F1 behavior.
     let journal = store.map(|store| RuleJournal {
@@ -1967,6 +2009,43 @@ mod tests {
             !firewall_budget_applies("docker.restart_container", false),
             "only recognized firewall-action prefixes are bounded"
         );
+    }
+
+    #[test]
+    fn ttl_ceiling_never_gates_a_dry_run() {
+        // A dry-run persists and mutates nothing, so even an absurd TTL is fine.
+        assert!(ttl_over_live_ceiling(u32::MAX, 3600, true).is_none());
+    }
+
+    #[test]
+    fn ttl_ceiling_allows_a_real_apply_within_the_limit() {
+        assert!(ttl_over_live_ceiling(3600, 3600, false).is_none());
+        assert!(ttl_over_live_ceiling(900, 3600, false).is_none());
+        assert!(ttl_over_live_ceiling(1, 3600, false).is_none());
+    }
+
+    #[test]
+    fn ttl_ceiling_refuses_a_real_apply_over_the_limit() {
+        let reason = ttl_over_live_ceiling(7200, 3600, false).expect("over the ceiling");
+        assert!(reason.contains("exceeds the live ceiling"));
+        assert!(reason.contains("7200"));
+        assert!(reason.contains("3600"));
+    }
+
+    #[test]
+    fn firewall_max_ttl_seconds_reads_env_or_falls_back_to_the_default() {
+        // One test owns this process-wide var so two env-touching tests never
+        // race under the default parallel runner.
+        std::env::set_var("CLAWFORGE_FIREWALL_MAX_TTL_SECONDS", "900");
+        assert_eq!(firewall_max_ttl_seconds(), 900);
+        // A zero/invalid value falls back to the safe default rather than
+        // disabling the ceiling.
+        std::env::set_var("CLAWFORGE_FIREWALL_MAX_TTL_SECONDS", "0");
+        assert_eq!(firewall_max_ttl_seconds(), DEFAULT_FIREWALL_MAX_TTL_SECONDS);
+        std::env::set_var("CLAWFORGE_FIREWALL_MAX_TTL_SECONDS", "not-a-number");
+        assert_eq!(firewall_max_ttl_seconds(), DEFAULT_FIREWALL_MAX_TTL_SECONDS);
+        std::env::remove_var("CLAWFORGE_FIREWALL_MAX_TTL_SECONDS");
+        assert_eq!(firewall_max_ttl_seconds(), DEFAULT_FIREWALL_MAX_TTL_SECONDS);
     }
 
     #[tokio::test]
