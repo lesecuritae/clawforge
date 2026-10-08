@@ -541,6 +541,96 @@ async fn sweep_expired_firewall_targets(store: &PostgresStore) {
     }
 }
 
+/// Reconcile a single durable firewall *rule* generation (F2, migration 0055).
+/// Mirrors `quarantine_runtime::recover` for ordinary rules: a `prepared`
+/// generation may have crashed after a real adapter mutation, so it is never
+/// blindly replayed - ownership is retained as `recovery_required`. A
+/// `completed` generation past its TTL is rolled back through the adapter and
+/// resolved only on verified adapter success; any failure keeps exclusive
+/// ownership for manual reconciliation. The row lock is held across the remote
+/// rollback, so a competing sweep skips a busy generation.
+async fn recover_firewall_rule_generation(
+    store: &PostgresStore,
+    intent_id: Uuid,
+) -> quarantine_runtime::RecoveryOutcome {
+    use quarantine_runtime::RecoveryOutcome;
+    let guard = match store.acquire_firewall_rule_guard(intent_id).await {
+        Ok(Some(guard)) => guard,
+        // Already resolved, or locked by another worker: nothing to do here.
+        Ok(None) => return RecoveryOutcome::Busy,
+        Err(error) => {
+            tracing::warn!(%error, intent_id=%intent_id, "could not acquire firewall rule generation guard");
+            return RecoveryOutcome::Busy;
+        }
+    };
+    if guard.intent().status == "prepared" {
+        if let Err(error) = guard.recovery_required().await {
+            tracing::warn!(%error, intent_id=%intent_id, "could not retain prepared firewall rule generation for recovery");
+        }
+        return RecoveryOutcome::ManualReview;
+    }
+    // Only completed-and-expired generations reach here (the sweep query excludes
+    // the rest). Roll the concrete rule back and resolve only on real success.
+    let adapter = guard.intent().adapter.clone();
+    let target_json = guard.intent().target_json.clone();
+    let inflight_id = match try_begin_inflight(store, &adapter).await {
+        Ok(Some(inflight)) => inflight,
+        // Concurrency budget full: leave the generation owned, retry next tick.
+        Ok(None) => return RecoveryOutcome::Busy,
+        Err(error) => {
+            tracing::warn!(%error, intent_id=%intent_id, adapter=%adapter, "could not check concurrency budget for rule rollback");
+            return RecoveryOutcome::Busy;
+        }
+    };
+    let result = rollback_target(
+        &adapter,
+        &target_json,
+        format!("firewall rule generation {intent_id} ttl rollback"),
+    )
+    .await;
+    let _ = store.end_firewall_inflight_operation(inflight_id).await;
+    if let Err(error) = result {
+        tracing::warn!(%error, intent_id=%intent_id, adapter=%adapter, "firewall rule generation rollback failed; ownership retained");
+        if let Err(error) = guard.recovery_required().await {
+            tracing::warn!(%error, intent_id=%intent_id, "could not retain firewall rule generation for recovery");
+        }
+        return RecoveryOutcome::ManualReview;
+    }
+    if let Err(error) = guard.resolve_rollback().await {
+        tracing::warn!(%error, intent_id=%intent_id, "rule rollback succeeded but resolution could not be recorded; retained for next tick");
+        return RecoveryOutcome::ManualReview;
+    }
+    RecoveryOutcome::Restored
+}
+
+/// TTL/recovery sweep for durable firewall rule generations, run once per poll
+/// tick alongside `quarantine_runtime::sweep` and `sweep_expired_firewall_targets`.
+/// Consumes `recoverable_firewall_rule_intents` (prepared + completed-and-expired);
+/// a durable `recovery_required` is deliberately not retried every tick.
+async fn sweep_firewall_rule_generations(store: &PostgresStore) {
+    let intents = match store.recoverable_firewall_rule_intents().await {
+        Ok(intents) => intents,
+        Err(error) => {
+            tracing::warn!(%error, "firewall rule generation recovery lookup failed");
+            return;
+        }
+    };
+    for intent in intents {
+        if intent.status == "recovery_required" {
+            continue;
+        }
+        match recover_firewall_rule_generation(store, intent.id).await {
+            quarantine_runtime::RecoveryOutcome::Restored => {
+                tracing::info!(intent_id=%intent.id, adapter=%intent.adapter, "expired firewall rule generation rolled back and resolved")
+            }
+            quarantine_runtime::RecoveryOutcome::ManualReview => {
+                tracing::warn!(intent_id=%intent.id, "firewall rule generation completion unknown; ownership retained for manual reconciliation")
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Kill-switch: rolls back every target an operator has explicitly
 /// requested an immediate rollback for, independent of its TTL - the
 /// roadmap's "Kill-Switch pro Ziel" gate. `clawforge-api` only ever
@@ -1391,6 +1481,7 @@ async fn main() -> anyhow::Result<()> {
                 quarantine_runtime::sweep(&store).await;
                 sweep_expired_firewall_targets(&store).await;
                 sweep_kill_switch_requests(&store).await;
+                sweep_firewall_rule_generations(&store).await;
                 let started = std::time::Instant::now();
                 match store.claim_execution_request_for_dispatch(Some(worker_id)).await {
                     Ok(Some(claimed)) => {
@@ -2003,6 +2094,74 @@ mod tests {
         });
         let action = parse_firewall_action(id, &explicit_target).unwrap();
         assert_eq!(action.ttl_seconds, 120);
+    }
+
+    /// F2 TTL/recovery sweep safety: a durable firewall rule generation whose
+    /// completion is uncertain is never blindly replayed. A `prepared`
+    /// generation (it may have crashed after a real adapter mutation) is
+    /// retained as `recovery_required`, and the sweep does not retry that
+    /// durable state. Isolated schema-0055 PostgreSQL fixture; no real firewall.
+    #[tokio::test]
+    #[ignore = "requires an isolated firewall-rule PostgreSQL fixture with schema 0055"]
+    async fn firewall_rule_recovery_retains_ownership_without_blind_replay() -> anyhow::Result<()> {
+        let store = PostgresStore::connect_runtime(&std::env::var(
+            "CLAWFORGE_TEST_FIREWALL_RULE_DATABASE_URL",
+        )?)
+        .await?;
+        let adapter = "nftables";
+        let action = "nftables.block_indicator";
+        let scope = "clawforge_recover_v4";
+        let fp = format!("203.0.113.{}/32", Uuid::new_v4().as_u128() % 250 + 1);
+        let target = serde_json::json!({"cidr": fp, "scope": scope});
+        let state = serde_json::json!({"set_present": false});
+        let plan = serde_json::json!({"commands": [["nft", "delete", "element", "..."]]});
+
+        // Minimal execution request: rule intents carry no approval gate, the FK
+        // just needs to exist.
+        let action_id: Uuid = sqlx::query_scalar("INSERT INTO actions(id,name,type,risk_level,required_scope,requires_approval,enabled) VALUES($1,$2,'connector_action','low','agent:action:read',FALSE,TRUE) ON CONFLICT(name) DO UPDATE SET enabled=TRUE RETURNING id")
+            .bind(Uuid::new_v4()).bind(action).fetch_one(store.pool()).await?;
+        let requester_name = format!("rule-recover-{}", Uuid::new_v4());
+        let requester = store
+            .create_admin_user(&requester_name, "Administrator", "test-hash")
+            .await?;
+        let execution = store
+            .create_execution_request(&clawforge_storage::ExecutionRequestInput {
+                action_id,
+                workflow_run_id: None,
+                decision_id: None,
+                requested_by: requester_name,
+                requested_by_id: Some(requester),
+                idempotency_key: None,
+                target: Some(target.clone()),
+            })
+            .await?;
+
+        // A prepared generation that may have crashed after a real mutation must
+        // be retained for recovery, never auto-applied or auto-resolved.
+        let id = store
+            .prepare_firewall_rule_intent(
+                execution, adapter, action, scope, &fp, &target, &state, &plan, 3600,
+            )
+            .await?;
+        let outcome = recover_firewall_rule_generation(&store, id).await;
+        assert!(matches!(
+            outcome,
+            quarantine_runtime::RecoveryOutcome::ManualReview
+        ));
+        assert_eq!(
+            store.firewall_rule_intent(id).await?.unwrap().status,
+            "recovery_required",
+            "a prepared generation is retained, never blindly replayed"
+        );
+
+        // The sweep deliberately does not retry a durable recovery_required.
+        sweep_firewall_rule_generations(&store).await;
+        assert_eq!(
+            store.firewall_rule_intent(id).await?.unwrap().status,
+            "recovery_required",
+            "recovery_required is not retried by the sweep"
+        );
+        Ok(())
     }
 }
 

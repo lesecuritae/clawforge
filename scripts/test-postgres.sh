@@ -133,3 +133,7 @@ run_cargo test -p clawforge-storage --test quarantine_lease -- --ignored --test-
 run_cargo test -p clawforge-executor native_controller_writeahead_recovery_and_stale_generation_lab -- --ignored --test-threads=1
 
 run_cargo test -p clawforge-storage --test dispatch_recovery -- --ignored --test-threads=1
+
+export CLAWFORGE_TEST_FIREWALL_RULE_DATABASE_URL="$owner_url"
+run_cargo test -p clawforge-storage --test firewall_rule_intents -- --ignored --test-threads=1
+run_cargo test -p clawforge-executor firewall_rule_recovery_retains_ownership_without_blind_replay -- --ignored --test-threads=1
