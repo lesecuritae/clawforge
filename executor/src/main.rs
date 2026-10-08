@@ -763,8 +763,37 @@ enum DispatchCompletion {
     RecoveryRequired,
 }
 
+/// The actual durable effect of a dispatch, distinct from `receipts`: a journaled
+/// apply persists its receipt inside `finish`, so a verified-and-owned outcome
+/// returns an *empty* receipt vector - which must never be read as "no mutation
+/// happened". R5: carry the effect (and the owning generation) explicitly so the
+/// multi-adapter fan-out and the caller can tell an owned generation apart from a
+/// genuine no-op, and never retry an owned-but-uncertain apply as a plain failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FirewallEffect {
+    /// Nothing was applied: a refusal, a preflight failure, or a dry-run plan.
+    NoMutation,
+    /// A real journaled apply was verified and is owned by this generation.
+    VerifiedOwned(Uuid),
+    /// A real journaled apply whose effect is uncertain; the generation retains
+    /// ownership for recovery and must not be retried as a plain failure.
+    UncertainOwned(Uuid),
+    /// A store-free / non-journaled dispatch (dry-run or unit test): any effect
+    /// is reflected by `receipts`, not by a durable generation.
+    NonJournaled,
+}
+
+impl FirewallEffect {
+    /// A durable generation is owned (verified or uncertain), so the request
+    /// must not be re-dispatched even if no in-memory receipt was returned.
+    fn is_owned(self) -> bool {
+        matches!(self, Self::VerifiedOwned(_) | Self::UncertainOwned(_))
+    }
+}
+
 struct GenericDispatchOutcome {
     completion: DispatchCompletion,
+    effect: FirewallEffect,
     result_summary: Option<String>,
     error_summary: Option<String>,
     receipts: Vec<FirewallDispatchReceipt>,
@@ -774,6 +803,7 @@ impl GenericDispatchOutcome {
     fn failed(reason: &str) -> Self {
         Self {
             completion: DispatchCompletion::Failed,
+            effect: FirewallEffect::NoMutation,
             result_summary: None,
             error_summary: Some(reason.into()),
             receipts: Vec::new(),
@@ -820,6 +850,7 @@ impl GenericDispatchOutcome {
             } else {
                 DispatchCompletion::Failed
             },
+            effect: FirewallEffect::NonJournaled,
             result_summary: value.1,
             error_summary: value.2,
             receipts: value.3,
@@ -931,12 +962,15 @@ async fn apply_single_adapter(
             return GenericDispatchOutcome::failed("adapter dry-run planning failed")
         }
         Err(_) => {
-            if let (Some((id, ..)), Some(journal)) = (&prepared, journal) {
+            let effect = if let (Some((id, ..)), Some(journal)) = (&prepared, journal) {
                 let _ = journal
                     .store
                     .mark_firewall_rule_recovery_required(*id)
                     .await;
-            }
+                FirewallEffect::UncertainOwned(*id)
+            } else {
+                FirewallEffect::NonJournaled
+            };
             let presence = match adapter.verify(&action.target).await {
                 Ok(VerificationResult::Verified) => "present",
                 Ok(VerificationResult::NotPresent) => "absent",
@@ -944,6 +978,7 @@ async fn apply_single_adapter(
             };
             return GenericDispatchOutcome {
                 completion: DispatchCompletion::RecoveryRequired,
+                effect,
                 result_summary: Some(format!("adapter={} apply outcome uncertain; observed_presence={presence}", adapter.name())),
                 error_summary: Some("real apply failed; manual reconciliation required; presence does not prove ownership".into()),
                 receipts: Vec::new(),
@@ -983,6 +1018,7 @@ async fn apply_single_adapter(
             return match journal.store.finish_firewall_rule_intent(*id, &input).await {
                 Ok(_) => GenericDispatchOutcome {
                     completion: DispatchCompletion::Success,
+                    effect: FirewallEffect::VerifiedOwned(*id),
                     result_summary: Some(format!(
                         "adapter={} dry_run=false verification=verified journaled",
                         adapter.name()
@@ -997,6 +1033,7 @@ async fn apply_single_adapter(
                         .await;
                     GenericDispatchOutcome {
                         completion: DispatchCompletion::RecoveryRequired,
+                        effect: FirewallEffect::UncertainOwned(*id),
                         result_summary: Some(format!(
                             "adapter={} applied but receipt persistence failed",
                             adapter.name()
@@ -1015,6 +1052,7 @@ async fn apply_single_adapter(
             .await;
         return GenericDispatchOutcome {
             completion: DispatchCompletion::RecoveryRequired,
+            effect: FirewallEffect::UncertainOwned(*id),
             result_summary: Some(format!(
                 "adapter={} verification={}",
                 adapter.name(),
@@ -1051,6 +1089,7 @@ async fn apply_single_adapter(
     };
     GenericDispatchOutcome {
         completion,
+        effect: FirewallEffect::NonJournaled,
         result_summary: Some(summary),
         error_summary: (completion == DispatchCompletion::RecoveryRequired)
             .then(|| "real apply could not be verified; manual reconciliation required".into()),
@@ -1071,6 +1110,12 @@ async fn dispatch_multi_with_adapters(
     let mut mandatory_seen = false;
     let mut mandatory_success = false;
     let mut uncertain = false;
+    // Track whether any adapter owns a durable generation. A journaled verified
+    // apply returns an EMPTY receipt vector (its receipt is persisted inside
+    // `finish`), so the receipt-based check below cannot see it - without this an
+    // owned optional adapter whose mandatory peer failed would be reported as a
+    // plain Failed and the request retried, colliding with the owned generation.
+    let mut aggregate_effect = FirewallEffect::NoMutation;
     let mut summaries = Vec::new();
     let mut errors = Vec::new();
     for adapter in adapters {
@@ -1081,6 +1126,15 @@ async fn dispatch_multi_with_adapters(
             mandatory_success = result.completion == DispatchCompletion::Success;
         }
         uncertain |= result.completion == DispatchCompletion::RecoveryRequired;
+        // Prefer an uncertain generation; otherwise record the first owned one.
+        match (aggregate_effect, result.effect) {
+            (_, effect @ FirewallEffect::UncertainOwned(_)) => aggregate_effect = effect,
+            (
+                FirewallEffect::NoMutation | FirewallEffect::NonJournaled,
+                effect @ FirewallEffect::VerifiedOwned(_),
+            ) => aggregate_effect = effect,
+            _ => {}
+        }
         if let Some(summary) = result.result_summary {
             summaries.push(summary);
         }
@@ -1089,11 +1143,15 @@ async fn dispatch_multi_with_adapters(
         }
         outcome.receipts.extend(result.receipts);
     }
+    outcome.effect = aggregate_effect;
     outcome.completion = if uncertain {
         DispatchCompletion::RecoveryRequired
     } else if mandatory_seen && mandatory_success {
         DispatchCompletion::Success
-    } else if !dry_run && outcome.receipts.iter().any(|receipt| !receipt.is_dry_run) {
+    } else if !dry_run
+        && (outcome.receipts.iter().any(|receipt| !receipt.is_dry_run)
+            || aggregate_effect.is_owned())
+    {
         DispatchCompletion::RecoveryRequired
     } else {
         DispatchCompletion::Failed

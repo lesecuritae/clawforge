@@ -401,3 +401,73 @@ async fn journaled_apply_refuses_to_adopt_an_already_present_rule() {
         "no generation is created when adoption is refused"
     );
 }
+
+// R5: a journaled verified apply persists its receipt inside finish and returns
+// an EMPTY receipt vector. When the mandatory adapter fails with no mutation but
+// an optional adapter has an owned generation, the fan-out must fence the
+// request as RecoveryRequired (not retryable Failed), because the owned
+// generation would collide with any retry. Before R5 the empty receipts made
+// this look like "no mutation" -> Failed.
+#[tokio::test]
+#[ignore = "requires an isolated firewall-rule PostgreSQL fixture with schema 0055"]
+async fn fan_out_fences_an_owned_optional_apply_when_mandatory_fails() {
+    let store = PostgresStore::connect_runtime(
+        &std::env::var("CLAWFORGE_TEST_FIREWALL_RULE_DATABASE_URL").unwrap(),
+    )
+    .await
+    .unwrap();
+    let action_name = "firewall.block_indicator";
+    let action_id: Uuid = sqlx::query_scalar("INSERT INTO actions(id,name,type,risk_level,required_scope,requires_approval,enabled) VALUES($1,$2,'connector_action','low','agent:action:read',FALSE,TRUE) ON CONFLICT(name) DO UPDATE SET enabled=TRUE RETURNING id")
+        .bind(Uuid::new_v4()).bind(action_name).fetch_one(store.pool()).await.unwrap();
+    let requester = store
+        .create_admin_user(&format!("req-{}", Uuid::new_v4()), "Administrator", "h")
+        .await
+        .unwrap();
+    let execution = store
+        .create_execution_request(&clawforge_storage::ExecutionRequestInput {
+            action_id,
+            workflow_run_id: None,
+            decision_id: None,
+            requested_by: "req".into(),
+            requested_by_id: Some(requester),
+            idempotency_key: None,
+            target: Some(serde_json::json!({"cidr": "203.0.113.7"})),
+        })
+        .await
+        .unwrap();
+    let journal = RuleJournal {
+        store: &store,
+        execution_id: execution,
+        action_name,
+    };
+
+    // Mandatory nftables fails before any mutation (no generation, NoMutation);
+    // optional haproxy applies and verifies, owning a generation with an empty
+    // in-memory receipt.
+    let mut mandatory = FakeAdapter::new(MANDATORY_MULTI_ADAPTER);
+    mandatory.preflight_fails = true;
+    let optional = FakeAdapter::new("haproxy");
+    let adapters: Vec<Box<dyn FirewallAdapter>> = vec![Box::new(mandatory), Box::new(optional)];
+    let outcome = dispatch_multi_with_adapters(&action(), false, adapters, Some(&journal)).await;
+
+    assert_eq!(
+        outcome.completion,
+        DispatchCompletion::RecoveryRequired,
+        "an owned optional apply must fence the request, never report a retryable failure"
+    );
+    assert!(
+        outcome.effect.is_owned(),
+        "the aggregate effect reflects the owned optional generation"
+    );
+    let owned: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM firewall_action_intents WHERE execution_id=$1 AND fw_rule_fingerprint IS NOT NULL AND status IN ('prepared','completed','recovery_required')",
+    )
+    .bind(execution)
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    assert!(
+        owned >= 1,
+        "the optional adapter's generation is durably owned"
+    );
+}
