@@ -471,3 +471,93 @@ async fn fan_out_fences_an_owned_optional_apply_when_mandatory_fails() {
         "the optional adapter's generation is durably owned"
     );
 }
+
+// R4 (kill-switch): an operator kill-switch for a journaled generic rule must be
+// routed through its owning generation (its own rollback + atomic resolution),
+// never a silent target-only rollback that bypasses generation ownership.
+#[tokio::test]
+#[ignore = "requires an isolated firewall-rule PostgreSQL fixture with schema 0055"]
+async fn kill_switch_for_a_journaled_rule_routes_through_its_generation() {
+    let store = PostgresStore::connect_runtime(
+        &std::env::var("CLAWFORGE_TEST_FIREWALL_RULE_DATABASE_URL").unwrap(),
+    )
+    .await
+    .unwrap();
+    let action_name = "nftables.block_indicator";
+    let action_id: Uuid = sqlx::query_scalar("INSERT INTO actions(id,name,type,risk_level,required_scope,requires_approval,enabled) VALUES($1,$2,'connector_action','low','agent:action:read',FALSE,TRUE) ON CONFLICT(name) DO UPDATE SET enabled=TRUE RETURNING id")
+        .bind(Uuid::new_v4()).bind(action_name).fetch_one(store.pool()).await.unwrap();
+    let requester = store
+        .create_admin_user(&format!("req-{}", Uuid::new_v4()), "Administrator", "h")
+        .await
+        .unwrap();
+    let execution = store
+        .create_execution_request(&clawforge_storage::ExecutionRequestInput {
+            action_id,
+            workflow_run_id: None,
+            decision_id: None,
+            requested_by: "req".into(),
+            requested_by_id: Some(requester),
+            idempotency_key: None,
+            target: Some(serde_json::json!({"cidr": "203.0.113.9"})),
+        })
+        .await
+        .unwrap();
+    let adapter = "nftables";
+    let scope = "nftables";
+    let fp = format!("203.0.113.{}/32", Uuid::new_v4().as_u128() % 250 + 1);
+    let target = serde_json::json!({"cidr": fp, "scope": scope});
+    let generation = store
+        .prepare_firewall_rule_intent(
+            execution,
+            adapter,
+            action_name,
+            scope,
+            &fp,
+            &target,
+            &serde_json::json!({}),
+            &serde_json::json!({}),
+            3600,
+        )
+        .await
+        .unwrap();
+
+    // Generic adapter -> no quarantine binding; the request carries only the target.
+    store
+        .create_firewall_kill_switch_request(
+            adapter,
+            &fp,
+            &target,
+            Some("operator"),
+            "op",
+            Some(requester),
+        )
+        .await
+        .unwrap();
+
+    sweep_kill_switch_requests(&store).await;
+
+    // Routed through the owning generation: a prepared generation with no live
+    // lease is retained as recovery_required (recover ran), not target-only
+    // rolled back.
+    assert_eq!(
+        store
+            .firewall_rule_intent(generation)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "recovery_required",
+        "a journaled rule kill-switch must route through its generation"
+    );
+    let legacy_rollbacks: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM firewall_action_receipts WHERE action_name='kill-switch-rollback' AND target_fingerprint=$1",
+    )
+    .bind(&fp)
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        legacy_rollbacks, 0,
+        "no silent target-only kill-switch rollback for a journaled rule"
+    );
+}
