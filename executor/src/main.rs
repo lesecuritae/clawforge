@@ -979,7 +979,7 @@ async fn apply_single_adapter(
                     journal.execution_id,
                     adapter.name(),
                     journal.action_name,
-                    adapter.name(),
+                    &adapter.rule_scope(&action.target),
                     &fingerprint,
                     &target_json,
                     &preflight_state,

@@ -760,6 +760,16 @@ pub trait FirewallAdapter: Send + Sync {
     /// Pure and synchronous: rendering what an apply *would* do never
     /// needs to touch the network, the filesystem, or `nft` itself.
     fn render(&self, action: &FirewallAction) -> Result<FirewallActionReceipt, AdapterError>;
+    /// The canonical ruleset this adapter mutates for `target`: the concrete
+    /// nftables set / HAProxy ACL file / stick-table, not merely the adapter
+    /// name. Used as the write-ahead generation's `fw_rule_scope` so ownership
+    /// is tracked per real ruleset rather than per adapter. Infallible: it is
+    /// only ever read after `render`/preflight already validated the target, so
+    /// any computation failure falls back to the adapter name. Defaults to the
+    /// adapter name for adapters that manage a single implicit scope.
+    fn rule_scope(&self, _target: &FirewallTarget) -> String {
+        self.name().to_string()
+    }
     /// `dry_run` is required, never defaulted - see the module doc
     /// comment. `dry_run: true` behaves exactly like `render` (nothing is
     /// executed); `dry_run: false` actually runs the rendered command.
@@ -894,6 +904,18 @@ impl Default for NftablesAdapter {
 impl FirewallAdapter for NftablesAdapter {
     fn name(&self) -> &'static str {
         "nftables"
+    }
+
+    fn rule_scope(&self, target: &FirewallTarget) -> String {
+        // Mirror `render`'s set selection: a target's fingerprint always maps
+        // to one address family, hence one set, so scoping ownership by the
+        // concrete set never splits a single rule across generations.
+        target
+            .set_name()
+            .ok()
+            .flatten()
+            .unwrap_or(NFTABLES_BLOCKLIST_SET_V4)
+            .to_string()
     }
 
     async fn preflight(&self, target: &FirewallTarget) -> Result<Preflight, AdapterError> {
@@ -1179,6 +1201,10 @@ impl FirewallAdapter for HaproxyAdapter {
         "haproxy"
     }
 
+    fn rule_scope(&self, _target: &FirewallTarget) -> String {
+        self.acl_file.clone()
+    }
+
     async fn preflight(&self, target: &FirewallTarget) -> Result<Preflight, AdapterError> {
         target.validate()?;
         if matches!(target, FirewallTarget::IncidentSource { .. }) {
@@ -1425,6 +1451,10 @@ impl Default for HaproxyRateLimitAdapter {
 impl FirewallAdapter for HaproxyRateLimitAdapter {
     fn name(&self) -> &'static str {
         "haproxy_ratelimit"
+    }
+
+    fn rule_scope(&self, _target: &FirewallTarget) -> String {
+        self.table.clone()
     }
 
     async fn preflight(&self, target: &FirewallTarget) -> Result<Preflight, AdapterError> {
@@ -2456,6 +2486,59 @@ impl TailscaleAdapter {
 impl Default for TailscaleAdapter {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod rule_scope_tests {
+    use super::*;
+
+    fn indicator(cidr: &str) -> FirewallTarget {
+        FirewallTarget::ThreatIntelIndicator {
+            cidr: cidr.to_string(),
+            source: "test".to_string(),
+        }
+    }
+
+    #[test]
+    fn nftables_scope_is_the_concrete_set_per_family() {
+        let adapter = NftablesAdapter::new();
+        assert_eq!(
+            adapter.rule_scope(&indicator("203.0.113.7")),
+            NFTABLES_BLOCKLIST_SET_V4
+        );
+        assert_eq!(
+            adapter.rule_scope(&indicator("2001:db8::1")),
+            NFTABLES_BLOCKLIST_SET_V6
+        );
+    }
+
+    #[test]
+    fn nftables_scope_falls_back_to_v4_set_when_no_family_is_known() {
+        // IncidentSource has no address yet, so `set_name` yields `None`; the
+        // scope must still be a valid, non-empty ruleset name (matching
+        // `render`'s own `unwrap_or` fallback) rather than panic or empty.
+        let adapter = NftablesAdapter::new();
+        let target = FirewallTarget::IncidentSource {
+            pseudonym: "ip-pseudonym:deadbeef".to_string(),
+        };
+        assert_eq!(adapter.rule_scope(&target), NFTABLES_BLOCKLIST_SET_V4);
+    }
+
+    #[test]
+    fn haproxy_scopes_are_their_rulesets_not_the_adapter_name() {
+        // With a clean environment these resolve to the documented defaults;
+        // the point is that the scope is the ACL file / stick-table identity,
+        // which is distinct from the bare adapter name used before R1-3.
+        let haproxy = HaproxyAdapter::new();
+        let scope = haproxy.rule_scope(&indicator("203.0.113.7"));
+        assert_ne!(scope, haproxy.name());
+        assert!(!scope.is_empty() && scope.len() <= 256);
+
+        let ratelimit = HaproxyRateLimitAdapter::new();
+        let rl_scope = ratelimit.rule_scope(&indicator("203.0.113.7"));
+        assert_ne!(rl_scope, ratelimit.name());
+        assert!(!rl_scope.is_empty() && rl_scope.len() <= 256);
     }
 }
 
