@@ -3183,6 +3183,21 @@ impl PostgresStore {
         Ok(())
     }
 
+    /// R3: does this execution still hold a live worker lease? A prepared
+    /// firewall-rule generation whose owner is still live is an in-flight apply
+    /// (the apply worker does not hold the generation row lock across its
+    /// external IO), not a crash, so the recovery sweep must not steal it. A
+    /// `status='active'` lease with a future `expires_at` is the same liveness
+    /// signal `run_execution_maintenance` uses to expire stale leases.
+    pub async fn execution_has_active_lease(&self, execution_id: Uuid) -> Result<bool> {
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM execution_leases WHERE execution_id=$1 AND status='active' AND expires_at>NOW())",
+        )
+        .bind(execution_id)
+        .fetch_one(&self.pool)
+        .await?)
+    }
+
     pub async fn list_execution_workers(&self) -> Result<Vec<serde_json::Value>> {
         let rows = sqlx::query(
             "SELECT id,name,status,capacity,current_jobs,last_heartbeat_at,last_error,created_at,updated_at FROM execution_workers ORDER BY name",

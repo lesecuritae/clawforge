@@ -555,6 +555,22 @@ async fn recover_firewall_rule_generation(
         }
     };
     if guard.intent().status == "prepared" {
+        // R3: a prepared generation whose owning execution still holds a live
+        // worker lease is an IN-FLIGHT apply (the apply worker does not hold the
+        // generation row lock across its external IO), not a crash - never steal
+        // it; let the owner finish. Only a generation whose owner's lease is gone
+        // or expired is genuinely orphaned and retained for recovery.
+        match store
+            .execution_has_active_lease(guard.intent().execution_id)
+            .await
+        {
+            Ok(true) => return RecoveryOutcome::Busy,
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!(%error, intent_id=%intent_id, "could not check owner lease; leaving the generation untouched this tick");
+                return RecoveryOutcome::Busy;
+            }
+        }
         if let Err(error) = guard.recovery_required().await {
             tracing::warn!(%error, intent_id=%intent_id, "could not retain prepared firewall rule generation for recovery");
         }
@@ -2139,6 +2155,37 @@ mod tests {
                 execution, adapter, action, scope, &fp, &target, &state, &plan, 3600,
             )
             .await?;
+        // R3: while the owning execution holds a LIVE lease, the prepared
+        // generation is an in-flight apply - the sweep must skip it (Busy),
+        // never steal it into recovery_required.
+        let worker = Uuid::new_v4();
+        sqlx::query("INSERT INTO execution_workers(id,name) VALUES($1,$2)")
+            .bind(worker)
+            .bind(format!("recover-worker-{worker}"))
+            .execute(store.pool())
+            .await?;
+        sqlx::query("INSERT INTO execution_leases(id,execution_id,worker_id,expires_at) VALUES($1,$2,$3,NOW()+INTERVAL '2 minutes')")
+            .bind(Uuid::new_v4())
+            .bind(execution)
+            .bind(worker)
+            .execute(store.pool())
+            .await?;
+        assert!(matches!(
+            recover_firewall_rule_generation(&store, id).await,
+            quarantine_runtime::RecoveryOutcome::Busy
+        ));
+        assert_eq!(
+            store.firewall_rule_intent(id).await?.unwrap().status,
+            "prepared",
+            "an in-flight prepared generation (live owner lease) must not be stolen"
+        );
+
+        // Owner lease gone/expired -> the generation is genuinely orphaned and is
+        // retained for recovery, never blindly replayed.
+        sqlx::query("UPDATE execution_leases SET status='expired' WHERE execution_id=$1")
+            .bind(execution)
+            .execute(store.pool())
+            .await?;
         let outcome = recover_firewall_rule_generation(&store, id).await;
         assert!(matches!(
             outcome,
@@ -2147,7 +2194,7 @@ mod tests {
         assert_eq!(
             store.firewall_rule_intent(id).await?.unwrap().status,
             "recovery_required",
-            "a prepared generation is retained, never blindly replayed"
+            "an orphaned prepared generation is retained, never blindly replayed"
         );
 
         // The sweep deliberately does not retry a durable recovery_required.
