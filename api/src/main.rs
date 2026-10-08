@@ -5225,10 +5225,17 @@ async fn agent_security_decisions(
 // operator free text. Keep those out of the agent route: its output may be
 // sent to an external model. An allowlist also prevents new storage fields
 // from silently becoming agent-visible later.
+/// The trailing window the firewall-status projection reports rollback-latency
+/// percentiles over (P7-3 pilot evidence). Seven days comfortably spans a
+/// typical pilot's duration; it is a read-only display window, not an
+/// enforcement limit, so it carries no operator-approval weight.
+const FIREWALL_PILOT_LATENCY_WINDOW_SECONDS: i64 = 7 * 24 * 60 * 60;
+
 fn agent_firewall_status_view(
     receipts: Vec<serde_json::Value>,
     expired: Vec<clawforge_storage::ExpiredFirewallTarget>,
     kill_switch: Vec<serde_json::Value>,
+    rollback_latency: clawforge_storage::FirewallRollbackLatency,
 ) -> serde_json::Value {
     fn adapter_name(value: Option<&str>) -> &'static str {
         match value {
@@ -5290,6 +5297,16 @@ fn agent_firewall_status_view(
             "created_at": value.get("created_at"),
             "processed_at": value.get("processed_at"),
         })).collect::<Vec<_>>(),
+        // P7-3 pilot evidence: rollback-latency percentiles over the trailing
+        // window, derived from the apply/rollback receipts above. Pure
+        // aggregate numbers (no raw targets), so safe in this redacted view.
+        "rollback_latency": {
+            "window_seconds": rollback_latency.window_seconds,
+            "sample_count": rollback_latency.sample_count,
+            "p50_seconds": rollback_latency.p50_seconds,
+            "p95_seconds": rollback_latency.p95_seconds,
+            "max_seconds": rollback_latency.max_seconds,
+        },
     })
 }
 
@@ -5309,10 +5326,13 @@ async fn agent_firewall_status(
 ) -> ApiResult<Json<ApiEnvelope<serde_json::Value>>> {
     let principal = authenticate_agent(&state, &headers).await?;
     require_agent_scope(&principal, AGENT_SCOPE_FIREWALL_READ)?;
-    let (receipts, expired, kill_switch) = tokio::try_join!(
+    let (receipts, expired, kill_switch, rollback_latency) = tokio::try_join!(
         state.store.list_firewall_action_receipts(None, None, 100),
         state.store.expired_unrolled_back_firewall_targets(),
         state.store.list_firewall_kill_switch_requests(100),
+        state
+            .store
+            .firewall_rollback_latency(FIREWALL_PILOT_LATENCY_WINDOW_SECONDS),
     )
     .map_err(|_| {
         api_error(
@@ -5328,7 +5348,7 @@ async fn agent_firewall_status(
     )
     .await;
     Ok(envelope(
-        agent_firewall_status_view(receipts, expired, kill_switch),
+        agent_firewall_status_view(receipts, expired, kill_switch, rollback_latency),
         None,
     ))
 }
@@ -9582,6 +9602,13 @@ mod tests {
                 "reason": marker,
                 "requested_by": marker,
             })],
+            clawforge_storage::FirewallRollbackLatency {
+                window_seconds: 604_800,
+                sample_count: 3,
+                p50_seconds: 1.5,
+                p95_seconds: 4.0,
+                max_seconds: 9.0,
+            },
         );
         assert_eq!(view["receipts"][0]["adapter"], "unknown");
         assert_eq!(view["expired"][0]["receipt_id"], receipt_id.to_string());
@@ -9590,6 +9617,10 @@ mod tests {
         assert_eq!(view["expired_truncated"], false);
         assert_eq!(view["kill_switch"][0]["adapter"], "unknown");
         assert!(!view.to_string().contains(marker));
+        // P7-3 pilot evidence: rollback-latency percentiles are surfaced.
+        assert_eq!(view["rollback_latency"]["window_seconds"], 604_800);
+        assert_eq!(view["rollback_latency"]["sample_count"], 3);
+        assert_eq!(view["rollback_latency"]["p95_seconds"], 4.0);
     }
 
     /// Roadmap phase 10 "OpenClaw Security Integration": the three new

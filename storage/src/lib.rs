@@ -127,6 +127,21 @@ pub struct FirewallActionReceiptInput<'a> {
     pub target_json: Option<serde_json::Value>,
 }
 
+/// P7-3 pilot evidence: rollback-latency percentiles over a trailing window,
+/// derived from the apply/rollback receipts already persisted (see
+/// `firewall_rollback_latency`). Pure aggregate numbers, safe to surface in
+/// the redacted firewall-status projection.
+#[derive(Debug, Clone)]
+pub struct FirewallRollbackLatency {
+    /// The window these percentiles were computed over.
+    pub window_seconds: i64,
+    /// How many real apply receipts in the window had a matching rollback.
+    pub sample_count: i64,
+    pub p50_seconds: f64,
+    pub p95_seconds: f64,
+    pub max_seconds: f64,
+}
+
 /// One row `expired_unrolled_back_firewall_targets` found - a real block
 /// whose TTL has passed with no later rollback receipt.
 #[derive(Debug, Clone)]
@@ -3694,6 +3709,54 @@ impl PostgresStore {
         .fetch_one(&self.pool)
         .await?;
         Ok(count)
+    }
+
+    /// P7-3 pilot evidence: rollback-latency percentiles computed from the
+    /// apply and rollback receipts already persisted, so the roadmap's
+    /// "Rollback-p95" pilot metric can be checked against real evidence rather
+    /// than a new parallel telemetry store. A rollback is matched to its apply
+    /// by `(adapter, target_fingerprint)` and the first rollback receipt
+    /// recorded after it - the same correlation
+    /// `expired_unrolled_back_firewall_targets` uses. Dry-runs are excluded;
+    /// an apply with no matching rollback contributes no sample. Percentiles
+    /// are computed in SQL (`percentile_cont`) over the trailing window.
+    pub async fn firewall_rollback_latency(
+        &self,
+        window_seconds: i64,
+    ) -> Result<FirewallRollbackLatency> {
+        if window_seconds <= 0 {
+            anyhow::bail!("window_seconds must be positive");
+        }
+        let row = sqlx::query(
+            "WITH pairs AS ( \
+                 SELECT EXTRACT(EPOCH FROM ( \
+                     (SELECT MIN(r.created_at) FROM firewall_action_receipts r \
+                        WHERE r.receipt_kind = 'rollback' AND r.adapter = a.adapter \
+                          AND r.target_fingerprint = a.target_fingerprint \
+                          AND r.created_at > a.created_at) \
+                     - a.created_at))::float8 AS latency \
+                 FROM firewall_action_receipts a \
+                 WHERE a.receipt_kind = 'apply' AND a.is_dry_run = FALSE \
+                   AND a.target_fingerprint IS NOT NULL \
+                   AND a.created_at > NOW() - ($1 * INTERVAL '1 second') \
+             ) \
+             SELECT COUNT(latency)::bigint AS n, \
+                    COALESCE(percentile_cont(0.5) WITHIN GROUP (ORDER BY latency), 0)::float8 AS p50, \
+                    COALESCE(percentile_cont(0.95) WITHIN GROUP (ORDER BY latency), 0)::float8 AS p95, \
+                    COALESCE(MAX(latency), 0)::float8 AS mx \
+             FROM pairs \
+             WHERE latency IS NOT NULL",
+        )
+        .bind(window_seconds)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(FirewallRollbackLatency {
+            window_seconds,
+            sample_count: row.get::<i64, _>("n"),
+            p50_seconds: row.get::<f64, _>("p50"),
+            p95_seconds: row.get::<f64, _>("p95"),
+            max_seconds: row.get::<f64, _>("mx"),
+        })
     }
 
     /// Records an operator's intent to immediately roll back one specific

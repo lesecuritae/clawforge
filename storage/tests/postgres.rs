@@ -2142,6 +2142,93 @@ async fn recent_real_firewall_apply_count_only_counts_real_applies_in_the_window
     Ok(())
 }
 
+/// P7-3 pilot evidence: `firewall_rollback_latency` derives rollback-latency
+/// percentiles from the apply/rollback receipts already persisted. Proves it
+/// matches a rollback to its apply by (adapter, target_fingerprint) and
+/// computes the elapsed time. The query aggregates globally over the window,
+/// so assertions are parallel-safe: a `>=` delta for "this pair is counted"
+/// plus a deterministic `max >= our known latency`, never an exact count.
+#[tokio::test]
+#[ignore = "requires an isolated PostgreSQL test container"]
+async fn firewall_rollback_latency_measures_apply_to_rollback_from_receipts() -> anyhow::Result<()>
+{
+    let url =
+        std::env::var("CLAWFORGE_TEST_DATABASE_URL").or_else(|_| std::env::var("DATABASE_URL"))?;
+    let store = PostgresStore::connect(&url).await?;
+
+    let fingerprint = format!("p73-latency-{}", uuid::Uuid::new_v4());
+    let action_name = "test.rollback-latency";
+    let receipt = |kind: &'static str| clawforge_storage::FirewallActionReceiptInput {
+        execution_id: None,
+        adapter: "nftables",
+        action_name,
+        preflight_state: json!({}),
+        rendered_commands: json!([]),
+        observed_state: None,
+        verification_result: None,
+        ttl_seconds: 60,
+        rollback_plan: json!({}),
+        is_dry_run: false,
+        receipt_kind: kind,
+        target_fingerprint: Some(fingerprint.as_str()),
+        target_json: None,
+    };
+
+    let before = store.firewall_rollback_latency(3600).await?;
+    assert_eq!(before.window_seconds, 3600, "the window is echoed back");
+
+    // An apply with no later rollback must contribute no latency sample.
+    let apply_id = store
+        .record_firewall_action_receipt(receipt("apply"))
+        .await?;
+    sqlx::query(
+        "UPDATE firewall_action_receipts SET created_at = NOW() - INTERVAL '60 seconds' WHERE id=$1",
+    )
+    .bind(apply_id)
+    .execute(store.pool())
+    .await?;
+
+    // Now record its rollback exactly 20s after the apply -> a 20s sample.
+    let rollback_id = store
+        .record_firewall_action_receipt(receipt("rollback"))
+        .await?;
+    sqlx::query(
+        "UPDATE firewall_action_receipts \
+         SET created_at = (SELECT created_at FROM firewall_action_receipts WHERE id=$1) \
+                          + INTERVAL '20 seconds' \
+         WHERE id=$2",
+    )
+    .bind(apply_id)
+    .bind(rollback_id)
+    .execute(store.pool())
+    .await?;
+
+    let after = store.firewall_rollback_latency(3600).await?;
+    assert!(
+        after.sample_count > before.sample_count,
+        "the apply/rollback pair must be counted (before={}, after={})",
+        before.sample_count,
+        after.sample_count
+    );
+    assert!(
+        after.max_seconds >= 20.0 - 1e-3,
+        "the 20s pair must be reflected in the max latency, got {}",
+        after.max_seconds
+    );
+    // Percentiles are structurally ordered.
+    assert!(after.p50_seconds <= after.p95_seconds + 1e-9);
+    assert!(after.p95_seconds <= after.max_seconds + 1e-9);
+
+    // A non-positive window is rejected.
+    assert!(store.firewall_rollback_latency(0).await.is_err());
+
+    sqlx::query("DELETE FROM firewall_action_receipts WHERE action_name=$1")
+        .bind(action_name)
+        .execute(store.pool())
+        .await?;
+    Ok(())
+}
+
 /// `expired_unrolled_back_firewall_targets` backs `clawforge-executor`'s
 /// TTL-driven auto-rollback sweep - proves an expired, real apply with no
 /// later rollback shows up, and that recording a matching rollback
