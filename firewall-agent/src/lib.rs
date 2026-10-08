@@ -1364,8 +1364,19 @@ fn haproxy_set_table_gpc0_command(table: &str, key: &str) -> String {
     format!("set table {table} key {key} data.gpc0 1")
 }
 
-fn haproxy_clear_table_command(table: &str, key: &str) -> String {
-    format!("clear table {table} key {key}")
+/// Rollback for a `gpc0`-flag apply: reset only `gpc0` to 0 rather than
+/// `clear table ... key ...` the whole entry. A stick-table key stores more
+/// than `gpc0` (HAProxy's own `conn_rate`, `http_req_rate`, byte counters,
+/// ...) and an operator's rate-limiting ACLs may read those; `clear`ing the
+/// key would destroy that live tracking as collateral. Because `apply` is
+/// refused when the key is already flagged (preflight `already_blocked`), the
+/// flag clawforge owns is always the 0 -> 1 transition it made itself, so
+/// resetting to 0 is its exact inverse. For a key that did not exist before
+/// the apply this leaves a harmless `gpc0=0` entry (unflagged, so it denies
+/// nothing and expires with the table's own `expire`) instead of removing it -
+/// the safe trade against ever wiping a pre-existing counter.
+fn haproxy_reset_table_gpc0_command(table: &str, key: &str) -> String {
+    format!("set table {table} key {key} data.gpc0 0")
 }
 
 /// Whether `key` appears in a `show table <table>` response with a
@@ -1488,7 +1499,10 @@ impl FirewallAdapter for HaproxyRateLimitAdapter {
         Ok(FirewallActionReceipt {
             adapter: self.name(),
             rendered_commands: vec![vec![haproxy_set_table_gpc0_command(&self.table, &element)]],
-            rollback_commands: vec![vec![haproxy_clear_table_command(&self.table, &element)]],
+            rollback_commands: vec![vec![haproxy_reset_table_gpc0_command(
+                &self.table,
+                &element,
+            )]],
             is_dry_run: true,
             ttl_seconds: action.ttl_seconds,
             target_fingerprint: element,
@@ -1507,7 +1521,7 @@ impl FirewallAdapter for HaproxyRateLimitAdapter {
         let receipt_element = redacted_element_reference(&action.target)?;
         let set = haproxy_set_table_gpc0_command(&self.table, &element);
         let receipt_set = haproxy_set_table_gpc0_command(&self.table, &receipt_element);
-        let receipt_clear = haproxy_clear_table_command(&self.table, &receipt_element);
+        let receipt_clear = haproxy_reset_table_gpc0_command(&self.table, &receipt_element);
         if dry_run {
             return Ok(ApplyResult {
                 receipt: FirewallActionReceipt {
@@ -1564,14 +1578,14 @@ impl FirewallAdapter for HaproxyRateLimitAdapter {
         action.target.validate()?;
         require_resolved_target(&action.target)?;
         let element = element_reference(&action.target)?;
-        let clear = haproxy_clear_table_command(&self.table, &element);
+        let reset = haproxy_reset_table_gpc0_command(&self.table, &element);
         let response = self
-            .run_command(&clear)
+            .run_command(&reset)
             .await
             .map_err(AdapterError::Rollback)?;
         if !response.trim().is_empty() {
             return Err(AdapterError::Rollback(format!(
-                "haproxy runtime API rejected {clear:?}: {}",
+                "haproxy runtime API rejected {reset:?}: {}",
                 response.trim()
             )));
         }
@@ -2897,6 +2911,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn haproxy_ratelimit_rollback_resets_gpc0_rather_than_clearing_the_key() {
+        // R4-follow(b): the rollback must undo only clawforge's gpc0 flag and
+        // never `clear table ... key ...`, which would wipe HAProxy's own
+        // conn_rate/http_req_rate counters stored under the same key. Assert
+        // the rendered rollback is `set ... data.gpc0 0`, not `clear table`.
+        let adapter = HaproxyRateLimitAdapter::new();
+        let receipt = adapter
+            .render(&action_for(indicator("203.0.113.11")))
+            .unwrap();
+        let rollback = format!("{:?}", receipt.rollback_commands);
+        assert!(
+            rollback.contains("set table") && rollback.contains("data.gpc0 0"),
+            "rollback must reset gpc0 to 0: {rollback}"
+        );
+        assert!(
+            !rollback.contains("clear table"),
+            "rollback must never clear the whole stick-table key: {rollback}"
+        );
+        assert!(rollback.contains("203.0.113.11"));
+
+        // The apply (dry-run) carries the same reset-to-0 rollback, redacted.
+        let dry = adapter
+            .apply(
+                &action_for(FirewallTarget::ResolvedIncidentSource {
+                    raw_ip: "203.0.113.12".into(),
+                    pseudonym: "ip-pseudonym:feedface".into(),
+                }),
+                true,
+            )
+            .await
+            .unwrap();
+        let incident_rollback = format!("{:?}", dry.receipt.rollback_commands);
+        assert!(
+            incident_rollback.contains("data.gpc0 0") && !incident_rollback.contains("clear table"),
+            "dry-run apply rollback must also reset gpc0 to 0: {incident_rollback}"
+        );
+    }
+
+    #[tokio::test]
     async fn haproxy_ratelimit_apply_verify_rollback_all_refuse_an_unresolved_incident_source() {
         let adapter = HaproxyRateLimitAdapter::new();
         let action = action_for(FirewallTarget::IncidentSource {
@@ -4018,18 +4071,19 @@ mod tests {
         assert_eq!(
             adapter.verify(&action.target).await.unwrap(),
             VerificationResult::NotPresent,
-            "one rollback must be enough - set/clear semantics are not additive the way HAProxy's own acl entries are"
+            "one rollback must be enough - set/reset-to-0 semantics are not additive the way HAProxy's own acl entries are"
         );
     }
 
     /// Unlike `del acl` (`haproxy_rolling_back_an_element_that_was_never_
-    /// applied_fails_cleanly`, above), HAProxy's `clear table ... key ...`
-    /// is idempotent - clearing a key that was never set (or already
-    /// cleared) succeeds with an empty response rather than erroring.
-    /// Confirmed live against the real Runtime API, not assumed: an
-    /// earlier version of this test asserted the opposite (mirroring the
-    /// ACL adapter's own behavior) and failed here, which is what caught
-    /// the real semantic difference between the two HAProxy mechanisms.
+    /// applied_fails_cleanly`, above), the rate-limit rollback is a
+    /// `set table ... data.gpc0 0` (see `haproxy_reset_table_gpc0_command`):
+    /// on a key that was never set it creates a fresh, unflagged `gpc0=0`
+    /// entry and returns an empty response rather than erroring. That is the
+    /// deliberate trade for never wiping a pre-existing counter with
+    /// `clear table` - the zero entry denies nothing and expires on its own.
+    /// It is also idempotent: a second rollback sets `gpc0` to 0 again, so
+    /// repeating it neither errors nor changes the end state.
     #[tokio::test]
     #[ignore = "requires a real HAProxy Runtime API socket - run via scripts/test-haproxy-lab.sh"]
     async fn haproxy_ratelimit_rolling_back_an_element_that_was_never_applied_is_idempotent() {
@@ -4038,7 +4092,14 @@ mod tests {
         let result = adapter.rollback(&action).await;
         assert!(
             result.is_ok(),
-            "clear table on an absent key must succeed, not error: {result:?}"
+            "resetting gpc0 to 0 on an absent key must succeed, not error: {result:?}"
+        );
+        // The key is left unflagged - a rollback must never leave a target
+        // looking blocked, whether or not it was applied first.
+        assert_eq!(
+            adapter.verify(&action.target).await.unwrap(),
+            VerificationResult::NotPresent,
+            "a rolled-back key must read as not blocked (gpc0 == 0)"
         );
     }
 
@@ -4611,7 +4672,7 @@ mod tests {
                         haproxy_add_acl_command(&acl_file, &key),
                         haproxy_del_acl_command(&acl_file, &key),
                         haproxy_set_table_gpc0_command(&table, &key),
-                        haproxy_clear_table_command(&table, &key),
+                        haproxy_reset_table_gpc0_command(&table, &key),
                     ] {
                         prop_assert_eq!(command.lines().count(), 1);
                     }
