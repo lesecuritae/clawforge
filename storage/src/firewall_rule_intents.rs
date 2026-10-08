@@ -187,6 +187,25 @@ impl PostgresStore {
         Ok(sqlx::query("SELECT * FROM firewall_action_intents WHERE fw_rule_fingerprint IS NOT NULL AND (status='prepared' OR (status='completed' AND fw_expires_at<=NOW())) ORDER BY created_at,id LIMIT 100")
             .fetch_all(&self.pool).await?.into_iter().map(decode).collect())
     }
+
+    /// The single active generation (prepared/completed/recovery_required) that
+    /// owns this concrete rule, if any. Lets an operator kill-switch for a
+    /// journaled rule route through its generation instead of a target-only
+    /// rollback that would bypass ownership. The `firewall_rule_active_generation`
+    /// unique index guarantees at most one active owner.
+    pub async fn active_firewall_rule_generation_for(
+        &self,
+        adapter: &str,
+        fingerprint: &str,
+    ) -> Result<Option<Uuid>> {
+        Ok(sqlx::query_scalar(
+            "SELECT id FROM firewall_action_intents WHERE adapter=$1 AND fw_rule_fingerprint=$2 AND status IN ('prepared','completed','recovery_required')",
+        )
+        .bind(adapter)
+        .bind(fingerprint)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
 }
 
 /// Generation fence for a firewall rule. Keep alive from before mutation

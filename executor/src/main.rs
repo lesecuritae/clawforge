@@ -547,8 +547,20 @@ async fn recover_firewall_rule_generation(
     use quarantine_runtime::RecoveryOutcome;
     let guard = match store.acquire_firewall_rule_guard(intent_id).await {
         Ok(Some(guard)) => guard,
-        // Already resolved, or locked by another worker: nothing to do here.
-        Ok(None) => return RecoveryOutcome::Busy,
+        // The row is either terminal (resolved) or locked by a competing worker.
+        // Distinguish them: a terminal generation is Resolved, so an operator
+        // kill-switch for an already-rolled-back target completes instead of
+        // retrying forever; a locked one is Busy and retried next tick.
+        Ok(None) => {
+            return match store.firewall_rule_intent(intent_id).await {
+                Ok(Some(intent))
+                    if matches!(intent.status.as_str(), "rolled_back" | "not_applied") =>
+                {
+                    RecoveryOutcome::Resolved
+                }
+                _ => RecoveryOutcome::Busy,
+            };
+        }
         Err(error) => {
             tracing::warn!(%error, intent_id=%intent_id, "could not acquire firewall rule generation guard");
             return RecoveryOutcome::Busy;
@@ -687,6 +699,40 @@ async fn sweep_kill_switch_requests(store: &PostgresStore) {
         if matches!(request.adapter.as_str(), "docker" | "proxmox" | "tailscale") {
             tracing::warn!(request_id=%request.request_id, "unbound quarantine kill-switch requires operator reconciliation");
             continue;
+        }
+        // R4: if a journaled rule generation currently owns this target, route
+        // the kill-switch through that generation - its own rollback plan and
+        // atomic resolution - rather than a silent target-only rollback that
+        // would bypass ownership (and could otherwise undo a newer generation).
+        // Only a target with no active generation falls through to the legacy
+        // target-only path below.
+        match store
+            .active_firewall_rule_generation_for(&request.adapter, &request.target_fingerprint)
+            .await
+        {
+            Ok(Some(intent_id)) => {
+                match recover_firewall_rule_generation(store, intent_id).await {
+                    quarantine_runtime::RecoveryOutcome::Restored
+                    | quarantine_runtime::RecoveryOutcome::Resolved => {
+                        if store
+                            .mark_firewall_kill_switch_request_processed(request.request_id)
+                            .await
+                            .is_err()
+                        {
+                            tracing::warn!(request_id=%request.request_id, "rule-generation kill-switch result could not be persisted; safe retry pending");
+                        }
+                    }
+                    _ => {
+                        tracing::warn!(request_id=%request.request_id, intent_id=%intent_id, "rule-generation kill-switch could not complete; request remains pending")
+                    }
+                }
+                continue;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(%error, request_id=%request.request_id, "could not check for an owning rule generation; will retry next tick");
+                continue;
+            }
         }
         let inflight_id = match try_begin_inflight(store, &request.adapter).await {
             Ok(Some(id)) => id,
