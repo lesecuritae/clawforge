@@ -852,16 +852,36 @@ async fn apply_single_adapter(
     dry_run: bool,
     journal: Option<&RuleJournal<'_>>,
 ) -> GenericDispatchOutcome {
-    let preflight_state = match adapter.preflight(&action.target).await {
-        Ok(preflight) => adapter_state_json(&preflight.raw_set_json),
+    let (preflight_state, already_blocked) = match adapter.preflight(&action.target).await {
+        Ok(preflight) => (
+            adapter_state_json(&preflight.raw_set_json),
+            preflight.already_blocked,
+        ),
         Err(_) if !dry_run => {
             return GenericDispatchOutcome::failed("adapter preflight failed; apply refused")
         }
-        Err(_) => serde_json::json!({"status": "preflight_unavailable", "mode": "dry_run"}),
+        Err(_) => (
+            serde_json::json!({"status": "preflight_unavailable", "mode": "dry_run"}),
+            false,
+        ),
     };
     // Write-ahead: commit the immutable rule snapshot BEFORE the real apply.
     let prepared = match (dry_run, journal) {
         (false, Some(journal)) => {
+            // R4: the rule is already present at preflight. We do not own it via
+            // an active generation (otherwise `prepare_firewall_rule_intent`
+            // below would refuse), so it is pre-existing - typically an
+            // operator-owned rule. Never adopt it: applying would claim
+            // delete-ownership of a rule we did not create, and a later TTL
+            // rollback would then remove the operator's own rule. Refuse without
+            // mutating or taking ownership. (A rule added by a racing operator
+            // *after* this preflight is not caught here; closing that needs a
+            // clawforge-exclusive ruleset - a documented remaining boundary.)
+            if already_blocked {
+                return GenericDispatchOutcome::failed(
+                    "rule already present at preflight; refusing to adopt pre-existing (possibly operator-owned) state - no apply, no ownership",
+                );
+            }
             let rendered = match adapter.render(action) {
                 Ok(rendered) => rendered,
                 Err(_) => {

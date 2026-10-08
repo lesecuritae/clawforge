@@ -6,6 +6,7 @@ const SENSITIVE: &str = "sensitive-error-marker";
 struct FakeAdapter {
     name: &'static str,
     preflight_fails: bool,
+    already_blocked: bool,
     apply_fails: bool,
     verification: Option<VerificationResult>,
     calls: Arc<Mutex<Vec<&'static str>>>,
@@ -15,6 +16,7 @@ impl FakeAdapter {
         Self {
             name,
             preflight_fails: false,
+            already_blocked: false,
             apply_fails: false,
             verification: Some(VerificationResult::Verified),
             calls: Default::default(),
@@ -32,7 +34,7 @@ impl FirewallAdapter for FakeAdapter {
             Err(AdapterError::Preflight(SENSITIVE.into()))
         } else {
             Ok(Preflight {
-                already_blocked: false,
+                already_blocked: self.already_blocked,
                 raw_set_json: "{\"before\":true}".into(),
             })
         }
@@ -342,4 +344,60 @@ async fn write_ahead_journal_owns_before_apply_and_resolves_atomically() {
     let (_gen3, status3): (Uuid, String) =
         sqlx::query_as(owned).fetch_one(store.pool()).await.unwrap();
     assert_eq!(status3, "recovery_required");
+}
+
+// R4: a real journaled apply must refuse to adopt a rule that already exists at
+// preflight (operator-owned) - no apply, no generation, no delete-ownership.
+#[tokio::test]
+#[ignore = "requires an isolated firewall-rule PostgreSQL fixture with schema 0055"]
+async fn journaled_apply_refuses_to_adopt_an_already_present_rule() {
+    let store = PostgresStore::connect_runtime(
+        &std::env::var("CLAWFORGE_TEST_FIREWALL_RULE_DATABASE_URL").unwrap(),
+    )
+    .await
+    .unwrap();
+    let action_name = "nftables.block_indicator";
+    let action_id: Uuid = sqlx::query_scalar("INSERT INTO actions(id,name,type,risk_level,required_scope,requires_approval,enabled) VALUES($1,$2,'connector_action','low','agent:action:read',FALSE,TRUE) ON CONFLICT(name) DO UPDATE SET enabled=TRUE RETURNING id")
+        .bind(Uuid::new_v4()).bind(action_name).fetch_one(store.pool()).await.unwrap();
+    let requester = store
+        .create_admin_user(&format!("req-{}", Uuid::new_v4()), "Administrator", "h")
+        .await
+        .unwrap();
+    let execution = store
+        .create_execution_request(&clawforge_storage::ExecutionRequestInput {
+            action_id,
+            workflow_run_id: None,
+            decision_id: None,
+            requested_by: "req".into(),
+            requested_by_id: Some(requester),
+            idempotency_key: None,
+            target: Some(serde_json::json!({"cidr": "203.0.113.7"})),
+        })
+        .await
+        .unwrap();
+    let journal = RuleJournal {
+        store: &store,
+        execution_id: execution,
+        action_name,
+    };
+
+    let mut fake = FakeAdapter::new("nftables");
+    fake.already_blocked = true;
+    let outcome = apply_single_adapter(&fake, &action(), false, Some(&journal)).await;
+    assert_eq!(outcome.completion, DispatchCompletion::Failed);
+    assert!(
+        !fake.calls.lock().unwrap().contains(&"apply"),
+        "an already-present rule must never be applied"
+    );
+    let generations: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM firewall_action_intents WHERE execution_id=$1 AND fw_rule_fingerprint IS NOT NULL",
+    )
+    .bind(execution)
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        generations, 0,
+        "no generation is created when adoption is refused"
+    );
 }
