@@ -36,5 +36,10 @@ docker run --rm \
     # outside of CI, only against a device an operator has explicitly
     # authorized for the test.
     # Go-Away uses its own process/config lab, not this nftables namespace.
-    cargo test -p clawforge-firewall-agent -- --ignored --test-threads=1 --skip haproxy --skip tailscale --skip goaway
+    # --skip docker/proxmox: the quarantine adapters' live tests need a real
+    # docker daemon / a real Proxmox VE endpoint, which this nftables-only,
+    # daemonless container has no equivalent of - same reason as haproxy/
+    # tailscale above. They are run from their own labs, not this one.
+    cargo test -p clawforge-firewall-agent -- --ignored --test-threads=1 \
+      --skip haproxy --skip tailscale --skip goaway --skip docker --skip proxmox
   '
