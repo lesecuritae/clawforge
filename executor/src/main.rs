@@ -28,8 +28,8 @@ use clawforge_firewall_agent::docker::{DockerAdapter, NetworkAttachment};
 use clawforge_firewall_agent::proxmox::ProxmoxAdapter;
 use clawforge_firewall_agent::quarantine::QuarantineTarget;
 use clawforge_firewall_agent::{
-    FirewallAction, FirewallAdapter, FirewallTarget, TailscaleAction, TailscaleAdapter,
-    TailscaleTarget, VerificationResult,
+    FirewallAction, FirewallAdapter, FirewallTarget, RecoveryTarget, TailscaleAction,
+    TailscaleAdapter, TailscaleTarget, VerificationResult,
 };
 use clawforge_storage::{
     database_url_from_env, ClaimedExecutionRequest, FirewallActionReceiptInput, PostgresStore,
@@ -853,7 +853,12 @@ async fn apply_single_adapter(
                 }
             };
             let fingerprint = rendered.target_fingerprint.clone();
-            let target_json = serde_json::json!({"target_fingerprint": fingerprint});
+            // R1: persist the internal versioned recovery target (the exact
+            // identity bound at apply time) rather than a bare fingerprint, so
+            // TTL/crash recovery can reconstruct the real rollback target. The
+            // raw address stays in this access-restricted intent row, never in
+            // an agent projection.
+            let target_json = RecoveryTarget::new(adapter.name(), action.target.clone()).to_json();
             let rollback_plan = serde_json::json!({"commands": rendered.rollback_commands});
             match journal
                 .store

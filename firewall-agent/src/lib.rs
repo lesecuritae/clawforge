@@ -263,6 +263,179 @@ impl FirewallTarget {
     }
 }
 
+/// Internal, versioned recovery contract (R1). This is the identity actually
+/// bound when a firewall rule was applied, persisted with its owning generation
+/// so a TTL expiry or crash recovery reconstructs the *exact* rollback target
+/// instead of re-resolving a pseudonym later (which could by then map to a
+/// different host) or guessing from a bare fingerprint. Unlike the public
+/// [`FirewallTarget`] JSON parser (`TryFrom<&Value>`, which deliberately refuses
+/// a `ResolvedIncidentSource` supplied as foreign data), this internal form
+/// round-trips every variant, because it only ever deserializes the agent's own
+/// durably-stored generation row, never untrusted input. Raw addresses must
+/// stay in that access-restricted row and never reach an agent projection,
+/// prompt or log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryTarget {
+    /// The adapter scope the rule lives in. Today the adapter name; a concrete
+    /// set/ACL/table name is R1's follow-on refinement.
+    pub scope: String,
+    /// The exact target bound at apply time.
+    pub target: FirewallTarget,
+}
+
+impl RecoveryTarget {
+    /// Bumped whenever the persisted shape changes; [`RecoveryTarget::from_json`]
+    /// refuses any other version so an unreadable record forces verified manual
+    /// recovery rather than a guessed rollback.
+    pub const SCHEMA_VERSION: u64 = 1;
+
+    pub fn new(scope: impl Into<String>, target: FirewallTarget) -> Self {
+        Self {
+            scope: scope.into(),
+            target,
+        }
+    }
+
+    /// The access-restricted persisted form, stored in the generation's
+    /// `fw_target_json`. Carries the typed identity needed to reconstruct the
+    /// rollback; never rendered into an agent projection.
+    pub fn to_json(&self) -> serde_json::Value {
+        let mut obj = serde_json::Map::new();
+        obj.insert(
+            "schema_version".into(),
+            serde_json::json!(Self::SCHEMA_VERSION),
+        );
+        obj.insert("scope".into(), serde_json::json!(self.scope));
+        match &self.target {
+            FirewallTarget::ThreatIntelIndicator { cidr, source } => {
+                obj.insert(
+                    "variant".into(),
+                    serde_json::json!("threat_intel_indicator"),
+                );
+                obj.insert("cidr".into(), serde_json::json!(cidr));
+                obj.insert("source".into(), serde_json::json!(source));
+            }
+            FirewallTarget::IncidentSource { pseudonym } => {
+                obj.insert("variant".into(), serde_json::json!("incident_source"));
+                obj.insert("pseudonym".into(), serde_json::json!(pseudonym));
+            }
+            FirewallTarget::ResolvedIncidentSource { raw_ip, pseudonym } => {
+                obj.insert(
+                    "variant".into(),
+                    serde_json::json!("resolved_incident_source"),
+                );
+                obj.insert("raw_ip".into(), serde_json::json!(raw_ip));
+                obj.insert("pseudonym".into(), serde_json::json!(pseudonym));
+            }
+        }
+        serde_json::Value::Object(obj)
+    }
+
+    /// Reconstruct a recovery target from the persisted form. Returns `None` for
+    /// a legacy fingerprint-only record, an unrecognized or mismatched schema
+    /// version or variant, or a target that no longer validates - the caller
+    /// must then require verified manual recovery, never a guessed rollback.
+    /// Does not route through the external [`FirewallTarget`] parser, so it can
+    /// reconstruct a `ResolvedIncidentSource`, which that parser refuses.
+    pub fn from_json(value: &serde_json::Value) -> Option<Self> {
+        let obj = value.as_object()?;
+        if obj
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64)?
+            != Self::SCHEMA_VERSION
+        {
+            return None;
+        }
+        let scope = obj.get("scope").and_then(|v| v.as_str())?.to_string();
+        let field = |key: &str| obj.get(key).and_then(|v| v.as_str()).map(str::to_string);
+        let target = match obj.get("variant").and_then(|v| v.as_str())? {
+            "threat_intel_indicator" => FirewallTarget::ThreatIntelIndicator {
+                cidr: field("cidr")?,
+                source: field("source")?,
+            },
+            "incident_source" => FirewallTarget::IncidentSource {
+                pseudonym: field("pseudonym")?,
+            },
+            "resolved_incident_source" => FirewallTarget::ResolvedIncidentSource {
+                raw_ip: field("raw_ip")?,
+                pseudonym: field("pseudonym")?,
+            },
+            _ => return None,
+        };
+        target.validate().ok()?;
+        Some(Self { scope, target })
+    }
+}
+
+#[cfg(test)]
+mod recovery_target_tests {
+    use super::*;
+
+    #[test]
+    fn versioned_recovery_target_round_trips_every_variant() {
+        for target in [
+            FirewallTarget::ThreatIntelIndicator {
+                cidr: "203.0.113.7/32".into(),
+                source: "spamhaus_drop".into(),
+            },
+            FirewallTarget::IncidentSource {
+                pseudonym: "ip-pseudonym:abc123".into(),
+            },
+            FirewallTarget::ResolvedIncidentSource {
+                raw_ip: "198.51.100.9".into(),
+                pseudonym: "ip-pseudonym:abc123".into(),
+            },
+        ] {
+            let rt = RecoveryTarget::new("nftables", target.clone());
+            let round =
+                RecoveryTarget::from_json(&rt.to_json()).expect("recovery target round-trips");
+            assert_eq!(round, rt);
+            assert_eq!(round.target, target);
+        }
+    }
+
+    #[test]
+    fn from_json_reconstructs_a_resolved_incident_source_the_public_parser_refuses() {
+        let rt = RecoveryTarget::new(
+            "haproxy",
+            FirewallTarget::ResolvedIncidentSource {
+                raw_ip: "198.51.100.9".into(),
+                pseudonym: "ip-pseudonym:x9".into(),
+            },
+        );
+        // The internal recovery form reconstructs the already-resolved target...
+        assert!(RecoveryTarget::from_json(&rt.to_json()).is_some());
+        // ...while the external foreign-data parser still refuses the raw form.
+        assert!(FirewallTarget::try_from(&serde_json::json!({
+            "kind": "resolved_incident_source",
+            "raw_ip": "198.51.100.9",
+            "pseudonym": "ip-pseudonym:x9"
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn from_json_refuses_legacy_and_malformed_records() {
+        // Legacy fingerprint-only record (pre-R1): manual recovery, not a guess.
+        assert!(RecoveryTarget::from_json(
+            &serde_json::json!({"target_fingerprint": "203.0.113.7/32"})
+        )
+        .is_none());
+        // Unknown schema version.
+        assert!(RecoveryTarget::from_json(&serde_json::json!({
+            "schema_version": 999, "variant": "threat_intel_indicator",
+            "cidr": "203.0.113.7/32", "source": "s", "scope": "nftables"
+        }))
+        .is_none());
+        // A target that no longer validates must not reconstruct.
+        assert!(RecoveryTarget::from_json(&serde_json::json!({
+            "schema_version": 1, "variant": "threat_intel_indicator",
+            "cidr": "not-an-ip", "source": "s", "scope": "nftables"
+        }))
+        .is_none());
+    }
+}
+
 fn validate_pseudonym(pseudonym: &str) -> Result<(), AdapterError> {
     if !pseudonym.starts_with("ip-pseudonym:") || pseudonym.len() <= "ip-pseudonym:".len() {
         return Err(AdapterError::InvalidTarget(format!(
