@@ -145,7 +145,7 @@ pub(crate) async fn dispatch(
     if QuarantineKind::from_action_name(&claimed.action_name).is_none()
         || crate::dispatch_dry_run(claimed)
     {
-        return crate::dispatch(claimed).await;
+        return crate::dispatch(Some(store), claimed).await;
     }
     let result = async {
         quarantine_gate::ensure_live_dispatch_disabled(false)?;

@@ -20,6 +20,8 @@ use uuid::Uuid;
 mod migration_compat;
 mod quarantine_intents;
 pub use quarantine_intents::{QuarantineGuard, QuarantineIntent};
+mod firewall_rule_intents;
+pub use firewall_rule_intents::{FirewallRuleGuard, FirewallRuleIntent};
 mod security_assessments;
 mod security_events;
 mod security_policies;

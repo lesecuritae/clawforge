@@ -93,7 +93,7 @@ fn assert_redacted(outcome: &GenericDispatchOutcome) {
 async fn real_preflight_failure_never_applies() {
     let mut fake = FakeAdapter::new("nftables");
     fake.preflight_fails = true;
-    let outcome = apply_single_adapter(&fake, &action(), false).await;
+    let outcome = apply_single_adapter(&fake, &action(), false, None).await;
     assert_eq!(outcome.completion, DispatchCompletion::Failed);
     assert_eq!(*fake.calls.lock().unwrap(), vec!["preflight"]);
     assert!(outcome.receipts.is_empty());
@@ -103,7 +103,7 @@ async fn real_preflight_failure_never_applies() {
 async fn dry_run_can_plan_without_live_preflight_but_never_claims_verification() {
     let mut fake = FakeAdapter::new("nftables");
     fake.preflight_fails = true;
-    let outcome = apply_single_adapter(&fake, &action(), true).await;
+    let outcome = apply_single_adapter(&fake, &action(), true, None).await;
     assert_eq!(outcome.completion, DispatchCompletion::Success);
     assert_eq!(*fake.calls.lock().unwrap(), vec!["preflight", "apply"]);
     assert!(outcome.receipts[0].is_dry_run);
@@ -124,7 +124,7 @@ async fn unknown_apply_effect_is_fenced_regardless_of_readback() {
         let mut fake = FakeAdapter::new("nftables");
         fake.apply_fails = true;
         fake.verification = verification;
-        let outcome = apply_single_adapter(&fake, &action(), false).await;
+        let outcome = apply_single_adapter(&fake, &action(), false, None).await;
         assert_eq!(outcome.completion, DispatchCompletion::RecoveryRequired);
         assert!(outcome.receipts.is_empty(), "never invent an apply receipt");
         assert_eq!(
@@ -142,7 +142,7 @@ async fn verification_failure_preserves_known_apply_receipt_without_success() {
     ] {
         let mut fake = FakeAdapter::new("nftables");
         fake.verification = verification;
-        let outcome = apply_single_adapter(&fake, &action(), false).await;
+        let outcome = apply_single_adapter(&fake, &action(), false, None).await;
         assert_eq!(outcome.completion, DispatchCompletion::RecoveryRequired);
         assert_eq!(outcome.receipts.len(), 1);
         assert_eq!(outcome.receipts[0].verification_result, Some(label));
@@ -160,12 +160,12 @@ async fn verification_failure_preserves_known_apply_receipt_without_success() {
 #[tokio::test]
 async fn verified_real_apply_is_success_and_dry_planning_errors_do_not_verify() {
     let fake = FakeAdapter::new("nftables");
-    let outcome = apply_single_adapter(&fake, &action(), false).await;
+    let outcome = apply_single_adapter(&fake, &action(), false, None).await;
     assert_eq!(outcome.completion, DispatchCompletion::Success);
     assert_eq!(outcome.receipts[0].verification_result, Some("verified"));
     let mut fake = FakeAdapter::new("nftables");
     fake.apply_fails = true;
-    let outcome = apply_single_adapter(&fake, &action(), true).await;
+    let outcome = apply_single_adapter(&fake, &action(), true, None).await;
     assert_eq!(outcome.completion, DispatchCompletion::Failed);
     assert_eq!(*fake.calls.lock().unwrap(), vec!["preflight", "apply"]);
 }
@@ -177,6 +177,7 @@ async fn optional_uncertain_effect_overrides_mandatory_success() {
         &action(),
         false,
         vec![Box::new(FakeAdapter::new("nftables")), Box::new(optional)],
+        None,
     )
     .await;
     assert_eq!(outcome.completion, DispatchCompletion::RecoveryRequired);
@@ -191,11 +192,12 @@ async fn safe_optional_refusal_degrades_but_missing_mandatory_fails() {
         &action(),
         false,
         vec![Box::new(FakeAdapter::new("nftables")), Box::new(optional)],
+        None,
     )
     .await;
     assert_eq!(outcome.completion, DispatchCompletion::Success);
     assert!(outcome.error_summary.unwrap().contains("preflight"));
-    let outcome = dispatch_multi_with_adapters(&action(), false, vec![]).await;
+    let outcome = dispatch_multi_with_adapters(&action(), false, vec![], None).await;
     assert_eq!(outcome.completion, DispatchCompletion::Failed);
 }
 #[tokio::test]
@@ -206,6 +208,7 @@ async fn mandatory_failure_retains_optional_real_receipt_and_cannot_auto_retry_p
         &action(),
         false,
         vec![Box::new(mandatory), Box::new(FakeAdapter::new("haproxy"))],
+        None,
     )
     .await;
     assert_eq!(outcome.completion, DispatchCompletion::RecoveryRequired);
@@ -216,7 +219,7 @@ async fn mandatory_failure_retains_optional_real_receipt_and_cannot_auto_retry_p
 async fn lost_receipt_never_leaves_success_or_retries_a_real_effect() {
     for dry_run in [true, false] {
         let fake = FakeAdapter::new("nftables");
-        let mut outcome = apply_single_adapter(&fake, &action(), dry_run).await;
+        let mut outcome = apply_single_adapter(&fake, &action(), dry_run, None).await;
         assert_eq!(outcome.completion, DispatchCompletion::Success);
         outcome.receipt_persistence_failed(dry_run);
         assert_eq!(
@@ -234,4 +237,84 @@ async fn lost_receipt_never_leaves_success_or_retries_a_real_effect() {
         );
         assert!(!outcome.into_legacy().0);
     }
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated firewall-rule PostgreSQL fixture with schema 0055"]
+async fn write_ahead_journal_owns_before_apply_and_resolves_atomically() {
+    let store = PostgresStore::connect_runtime(
+        &std::env::var("CLAWFORGE_TEST_FIREWALL_RULE_DATABASE_URL").unwrap(),
+    )
+    .await
+    .unwrap();
+    // Seed a low-risk firewall execution (FK only; rule intents carry no approval gate).
+    let action_name = "nftables.block_indicator";
+    let action_id: Uuid = sqlx::query_scalar("INSERT INTO actions(id,name,type,risk_level,required_scope,requires_approval,enabled) VALUES($1,$2,'connector_action','low','agent:action:read',FALSE,TRUE) ON CONFLICT(name) DO UPDATE SET enabled=TRUE RETURNING id")
+        .bind(Uuid::new_v4()).bind(action_name).fetch_one(store.pool()).await.unwrap();
+    let requester = store
+        .create_admin_user(&format!("req-{}", Uuid::new_v4()), "Administrator", "h")
+        .await
+        .unwrap();
+    let execution = store
+        .create_execution_request(&clawforge_storage::ExecutionRequestInput {
+            action_id,
+            workflow_run_id: None,
+            decision_id: None,
+            requested_by: "req".into(),
+            requested_by_id: Some(requester),
+            idempotency_key: None,
+            target: Some(serde_json::json!({"cidr": "203.0.113.7"})),
+        })
+        .await
+        .unwrap();
+    let journal = RuleJournal {
+        store: &store,
+        execution_id: execution,
+        action_name,
+    };
+    let owned = "SELECT id,status FROM firewall_action_intents WHERE adapter='nftables' AND fw_rule_scope='nftables' AND fw_rule_fingerprint='test-target' AND status IN ('prepared','completed','recovery_required')";
+
+    // Verified real apply: completed generation + one apply receipt, persisted by
+    // finish (so no in-memory receipt is returned to the main loop).
+    let outcome = apply_single_adapter(
+        &FakeAdapter::new("nftables"),
+        &action(),
+        false,
+        Some(&journal),
+    )
+    .await;
+    assert_eq!(outcome.completion, DispatchCompletion::Success);
+    assert!(outcome.receipts.is_empty());
+    let (gen_id, status): (Uuid, String) =
+        sqlx::query_as(owned).fetch_one(store.pool()).await.unwrap();
+    assert_eq!(status, "completed");
+    let receipts: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM firewall_action_receipts WHERE intent_id=$1 AND receipt_kind='apply'",
+    )
+    .bind(gen_id)
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    assert_eq!(receipts, 1);
+
+    // The rule is owned: a second real apply refuses before any mutation.
+    let blocked = apply_single_adapter(
+        &FakeAdapter::new("nftables"),
+        &action(),
+        false,
+        Some(&journal),
+    )
+    .await;
+    assert_eq!(blocked.completion, DispatchCompletion::Failed);
+
+    // After a verified rollback, an uncertain verify leaves a NEW generation
+    // recovery_required (owned, never silently retried).
+    store.resolve_firewall_rule_rollback(gen_id).await.unwrap();
+    let mut drift = FakeAdapter::new("nftables");
+    drift.verification = Some(VerificationResult::NotPresent);
+    let uncertain = apply_single_adapter(&drift, &action(), false, Some(&journal)).await;
+    assert_eq!(uncertain.completion, DispatchCompletion::RecoveryRequired);
+    let (_gen3, status3): (Uuid, String) =
+        sqlx::query_as(owned).fetch_one(store.pool()).await.unwrap();
+    assert_eq!(status3, "recovery_required");
 }
