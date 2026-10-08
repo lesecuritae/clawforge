@@ -270,21 +270,39 @@ impl DockerAdapter {
     }
 
     async fn run(&self, args: &[&str]) -> Result<String, AdapterError> {
-        let output = tokio::time::timeout(
-            std::time::Duration::from_secs(15),
-            Command::new(&self.docker_bin)
-                .kill_on_drop(true)
-                .args(args)
-                .output(),
-        )
-        .await
-        .map_err(|_| AdapterError::Apply("Docker command timed out".into()))?
-        .map_err(|error| {
-            AdapterError::Apply(format!(
-                "docker {} failed to start: {error}",
-                args.first().copied().unwrap_or_default()
-            ))
-        })?;
+        // A just-written executable can briefly fail to exec with ETXTBSY
+        // ("text file busy", os error 26) when a concurrent subprocess fork
+        // elsewhere in the process still holds a write fd to it between fork and
+        // exec. A real `docker` binary never hits this; the firewall-agent test
+        // harness's freshly-written fake `docker` does under parallel load. It is
+        // transient, so retry the spawn a bounded number of times with a short
+        // backoff rather than surface a flaky failure.
+        let mut attempt = 0u32;
+        let output = loop {
+            let spawned = tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                Command::new(&self.docker_bin)
+                    .kill_on_drop(true)
+                    .args(args)
+                    .output(),
+            )
+            .await
+            .map_err(|_| AdapterError::Apply("Docker command timed out".into()))?;
+            match spawned {
+                Ok(output) => break output,
+                Err(error) if error.raw_os_error() == Some(26) && attempt < 20 => {
+                    attempt += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    continue;
+                }
+                Err(error) => {
+                    return Err(AdapterError::Apply(format!(
+                        "docker {} failed to start: {error}",
+                        args.first().copied().unwrap_or_default()
+                    )));
+                }
+            }
+        };
         if !output.status.success() {
             return Err(AdapterError::Apply(format!(
                 "docker {} failed: {}",
@@ -559,6 +577,38 @@ else:
         assert!(error.to_string().contains("snapshot changed"));
         let calls = std::fs::read_to_string(fake.0.join("calls")).unwrap();
         assert!(!calls.contains("disconnect"));
+    }
+
+    // Regression: a transient ETXTBSY ("text file busy", os error 26) when
+    // exec'ing a just-written binary must be ridden out by `run`'s bounded
+    // retry, not surfaced as a flaky failure. Holding a write fd open to the
+    // fake `docker` binary makes exec fail with ETXTBSY until the fd is
+    // dropped; the call must still succeed once it is.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_retries_past_a_transient_text_file_busy() {
+        let fake = FakeDocker::new(false);
+        let adapter = fake.adapter();
+        let docker_path = fake.0.join("docker");
+        // Open a write fd BEFORE the first exec, so the initial spawn hits
+        // ETXTBSY; release it well within `run`'s retry budget (20 x 5ms).
+        let write_fd = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&docker_path)
+            .unwrap();
+        let releaser = tokio::task::spawn_blocking(move || {
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            drop(write_fd);
+        });
+        let target = QuarantineTarget::Docker {
+            container_id: docker_id(),
+        };
+        let preflight = adapter
+            .preflight(&target)
+            .await
+            .expect("bounded retry must ride out a transient ETXTBSY");
+        assert!(!preflight.networks.is_empty());
+        releaser.await.unwrap();
     }
 
     #[cfg(unix)]
