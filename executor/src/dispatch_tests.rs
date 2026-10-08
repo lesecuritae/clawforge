@@ -297,6 +297,31 @@ async fn write_ahead_journal_owns_before_apply_and_resolves_atomically() {
     .unwrap();
     assert_eq!(receipts, 1);
 
+    // R1: the generation persisted the versioned recovery target (the exact
+    // bound identity), not a bare fingerprint, and it reconstructs.
+    let persisted: serde_json::Value =
+        sqlx::query_scalar("SELECT fw_target_json FROM firewall_action_intents WHERE id=$1")
+            .bind(gen_id)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        persisted
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64),
+        Some(clawforge_firewall_agent::RecoveryTarget::SCHEMA_VERSION),
+        "apply persists the versioned recovery target, not a bare fingerprint"
+    );
+    let recovered = clawforge_firewall_agent::RecoveryTarget::from_json(&persisted)
+        .expect("the persisted recovery target reconstructs");
+    assert_eq!(
+        recovered.target,
+        FirewallTarget::ThreatIntelIndicator {
+            cidr: "203.0.113.7".into(),
+            source: "test".into()
+        }
+    );
+
     // The rule is owned: a second real apply refuses before any mutation.
     let blocked = apply_single_adapter(
         &FakeAdapter::new("nftables"),
