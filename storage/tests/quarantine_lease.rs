@@ -149,3 +149,118 @@ async fn check_owned_generations(url: &str) -> Result<()> {
     );
     Ok(())
 }
+
+/// R2: an active *generic firewall rule* generation (not just a quarantine
+/// generation) must block the same five scheduler paths. Before R2 the guard
+/// only checked `target_fingerprint`, so a request owning a durable
+/// `fw_rule_fingerprint` generation could be reclaimed/timed-out/retried/claimed
+/// mid-recovery.
+#[tokio::test]
+#[ignore = "requires explicit isolated CLAWFORGE_TEST_QUARANTINE_DATABASE_URL with CREATE DATABASE"]
+async fn durable_firewall_rule_generations_block_claim_reclaim_timeout_and_retry() -> Result<()> {
+    let base = std::env::var("CLAWFORGE_TEST_QUARANTINE_DATABASE_URL")?;
+    let admin = PgPool::connect(&base).await?;
+    let database = format!("rule_lease_{}", Uuid::new_v4().simple());
+    let url = PgConnectOptions::from_str(&base)?
+        .database(&database)
+        .to_url_lossy()
+        .to_string();
+    sqlx::query(&format!("CREATE DATABASE {database}"))
+        .execute(&admin)
+        .await?;
+    let result = tokio::spawn(async move { check_owned_rule_generations(&url).await }).await;
+    let cleanup = sqlx::query(&format!("DROP DATABASE {database} WITH (FORCE)"))
+        .execute(&admin)
+        .await;
+    admin.close().await;
+    cleanup?;
+    result??;
+    Ok(())
+}
+
+async fn check_owned_rule_generations(url: &str) -> Result<()> {
+    let store = PostgresStore::connect(url).await?;
+    // A shared low-risk, non-quarantine action: claim is eligible unless an
+    // active generation blocks it.
+    let action = Uuid::new_v4();
+    sqlx::query("INSERT INTO actions(id,name,type,risk_level,required_scope,requires_approval,enabled) VALUES($1,$2,'connector_action','low','agent:action:read',FALSE,TRUE)")
+        .bind(action).bind(format!("rule-block-{action}")).execute(store.pool()).await?;
+    let worker = Uuid::new_v4();
+    sqlx::query("INSERT INTO execution_workers(id,name) VALUES($1,$2)")
+        .bind(worker)
+        .bind(format!("rule-lease-{worker}"))
+        .execute(store.pool())
+        .await?;
+    let mut owned = Vec::new();
+    for intent_status in ["prepared", "completed", "recovery_required"] {
+        for request_status in ["running", "failed", "queued"] {
+            let nonce = Uuid::new_v4();
+            let requester_name = format!("rule-requester-{nonce}");
+            let requester = store
+                .create_admin_user(&requester_name, "Administrator", "fixture-hash")
+                .await?;
+            let fp = format!("203.0.113.{}/32", (nonce.as_u128() % 250) + 1);
+            let scope = format!("nft-set-{}", nonce.simple());
+            let target = json!({"cidr": fp, "scope": scope});
+            let execution = store
+                .create_execution_request(&ExecutionRequestInput {
+                    action_id: action,
+                    workflow_run_id: None,
+                    decision_id: None,
+                    requested_by: requester_name,
+                    requested_by_id: Some(requester),
+                    idempotency_key: None,
+                    target: Some(target.clone()),
+                })
+                .await?;
+            sqlx::query("UPDATE execution_requests SET status='starting' WHERE id=$1")
+                .bind(execution)
+                .execute(store.pool())
+                .await?;
+            let intent = store
+                .prepare_firewall_rule_intent(
+                    execution,
+                    "nftables",
+                    "nftables.block_indicator",
+                    &scope,
+                    &fp,
+                    &target,
+                    &json!({}),
+                    &json!({}),
+                    60,
+                )
+                .await?;
+            if intent_status != "prepared" {
+                sqlx::query("UPDATE firewall_action_intents SET status=$2 WHERE id=$1")
+                    .bind(intent)
+                    .bind(intent_status)
+                    .execute(store.pool())
+                    .await?;
+            }
+            sqlx::query("UPDATE execution_requests SET status=$2,started_at=NOW()-INTERVAL '10 minutes',next_retry_at=NOW()-INTERVAL '1 minute' WHERE id=$1").bind(execution).bind(request_status).execute(store.pool()).await?;
+            sqlx::query("INSERT INTO execution_leases(id,execution_id,worker_id,expires_at) VALUES($1,$2,$3,NOW()-INTERVAL '1 minute')").bind(Uuid::new_v4()).bind(execution).bind(worker).execute(store.pool()).await?;
+            owned.push((execution, request_status));
+        }
+    }
+    assert!(
+        store
+            .claim_execution_request_for_dispatch(None)
+            .await?
+            .is_none(),
+        "an active generic rule generation must leave nothing claimable"
+    );
+    store.process_one_dry_run_for_worker(None).await?;
+    for (id, expected) in &owned {
+        let actual: (String, i32) =
+            sqlx::query_as("SELECT status,retry_count FROM execution_requests WHERE id=$1")
+                .bind(id)
+                .fetch_one(store.pool())
+                .await?;
+        assert_eq!(
+            actual,
+            (expected.to_string(), 0),
+            "rule-owned {id} was replayed, reclaimed, timed out or retried"
+        );
+    }
+    Ok(())
+}
