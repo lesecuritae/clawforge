@@ -21,6 +21,7 @@
 //! IP/CIDR - see `TailscaleTarget`'s own doc comment in
 //! `clawforge-firewall-agent`).
 
+mod live_authorization;
 mod quarantine_gate;
 mod quarantine_runtime;
 
@@ -328,7 +329,38 @@ fn request_requires_dry_run(target: Option<&serde_json::Value>) -> bool {
 }
 
 fn dispatch_dry_run(claimed: &ClaimedExecutionRequest) -> bool {
-    dry_run_from_env() || request_requires_dry_run(claimed.target.as_ref())
+    // Read the authorization from env at the decision point, mirroring
+    // `dry_run_from_env`, so this is the independent second check the module
+    // doc describes. A present-but-invalid authorization (`Err`) is discarded
+    // to `None` here and so forces dry-run (fail-closed); `main`'s startup gate
+    // separately refuses to launch at all on that same `Err`.
+    let auth = live_authorization::LiveAuthorization::from_env()
+        .ok()
+        .flatten();
+    resolve_dry_run(
+        dry_run_from_env(),
+        request_requires_dry_run(claimed.target.as_ref()),
+        auth.as_ref(),
+        &claimed.action_name,
+    )
+}
+
+/// Pure core of the live dry-run decision (no env, no I/O), separated so the
+/// gate is unit-testable without mutating process-wide env vars. Forces
+/// dry-run unless live mode is on, the request is not `simulation_only`, and an
+/// authorization explicitly allows this action's class. `auth == None` covers
+/// both "no authorization" and "invalid authorization" - both fail closed.
+fn resolve_dry_run(
+    env_dry_run: bool,
+    simulation_only: bool,
+    auth: Option<&live_authorization::LiveAuthorization>,
+    action_name: &str,
+) -> bool {
+    if env_dry_run || simulation_only {
+        return true;
+    }
+    // Live mode: dry-run unless an authorization explicitly allows this class.
+    !matches!(auth, Some(auth) if auth.allows_action(action_name))
 }
 
 /// `target` (`{"kind":"threat_intel_indicator",...}` /
@@ -1583,9 +1615,26 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .init();
-    if !dry_run_from_env() {
+    // P7-1: `from_env` returns `Err` for a *present but invalid* authorization;
+    // propagating it here refuses startup rather than silently ignoring a
+    // malformed approval (fail-closed and loud), whether or not DRY_RUN is set.
+    let live_authorization = live_authorization::LiveAuthorization::from_env()?;
+    if !dry_run_from_env() && live_authorization.is_none() {
         anyhow::bail!(
-            "productive execution is disabled; CLAWFORGE_EXECUTOR_DRY_RUN must remain true"
+            "productive execution requires an explicit live authorization \
+             (CLAWFORGE_EXECUTOR_LIVE_AUTHORIZATION); with none set, \
+             CLAWFORGE_EXECUTOR_DRY_RUN must remain true"
+        );
+    }
+    if let Some(auth) = &live_authorization {
+        tracing::warn!(
+            authorization_id = %auth.authorization_id,
+            approved_by = %auth.approved_by,
+            authorized_classes = ?auth.actions,
+            dry_run = dry_run_from_env(),
+            "live execution authorization loaded; only the listed firewall action \
+             classes may apply for real - quarantine stays closed and simulation_only \
+             still forces dry-run"
         );
     }
     let store = PostgresStore::connect_runtime(&database_url_from_env()?).await?;
@@ -1813,6 +1862,78 @@ mod tests {
         // binary reads/writes this specific env var.
         std::env::remove_var("CLAWFORGE_EXECUTOR_DRY_RUN");
         assert!(dry_run_from_env());
+    }
+
+    #[test]
+    fn resolve_dry_run_is_fail_closed_without_a_live_authorization() {
+        // Live mode on, not simulation_only, but no authorization at all -
+        // must still force dry-run. This is the invariant `main`'s startup gate
+        // depends on (DRY_RUN=false is only allowed with an authorization).
+        assert!(resolve_dry_run(
+            false,
+            false,
+            None,
+            "nftables.block_indicator"
+        ));
+        // The env default (DRY_RUN unset -> true) always forces dry-run too.
+        assert!(resolve_dry_run(
+            true,
+            false,
+            None,
+            "nftables.block_indicator"
+        ));
+    }
+
+    #[test]
+    fn resolve_dry_run_applies_only_authorized_classes_in_live_mode() {
+        let auth = live_authorization::LiveAuthorization::parse(
+            r#"{"version":1,"authorization_id":"pilot-7a","approved_by":"ops","actions":["nftables"]}"#,
+        )
+        .unwrap();
+        // Authorized class, live mode, not simulation_only -> real apply.
+        assert!(!resolve_dry_run(
+            false,
+            false,
+            Some(&auth),
+            "nftables.block_indicator"
+        ));
+        // A different, unauthorized class stays dry-run.
+        assert!(resolve_dry_run(
+            false,
+            false,
+            Some(&auth),
+            "haproxy.block_indicator"
+        ));
+        // A quarantine action can never be authorized, even in live mode.
+        assert!(resolve_dry_run(
+            false,
+            false,
+            Some(&auth),
+            PROXMOX_QUARANTINE_ACTION
+        ));
+    }
+
+    #[test]
+    fn resolve_dry_run_simulation_only_and_env_gate_override_a_live_authorization() {
+        let auth = live_authorization::LiveAuthorization::parse(
+            r#"{"version":1,"authorization_id":"pilot-7a","approved_by":"ops","actions":["nftables"]}"#,
+        )
+        .unwrap();
+        // simulation_only forces dry-run even for an authorized class.
+        assert!(resolve_dry_run(
+            false,
+            true,
+            Some(&auth),
+            "nftables.block_indicator"
+        ));
+        // The global env gate (DRY_RUN=true) forces dry-run even with an
+        // authorization present.
+        assert!(resolve_dry_run(
+            true,
+            false,
+            Some(&auth),
+            "nftables.block_indicator"
+        ));
     }
 
     #[test]

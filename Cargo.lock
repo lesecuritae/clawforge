@@ -374,6 +374,7 @@ dependencies = [
  "async-trait",
  "clawforge-firewall-agent",
  "clawforge-storage",
+ "serde",
  "serde_json",
  "sqlx",
  "tokio",
