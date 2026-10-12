@@ -2229,6 +2229,113 @@ async fn firewall_rollback_latency_measures_apply_to_rollback_from_receipts() ->
     Ok(())
 }
 
+/// Security hardening: `firewall_request_live_authorized` gates a REAL firewall
+/// apply on a genuine approval. Proves the exact bypass that was attempted -
+/// a `requires_approval=FALSE` firewall action - is never live-authorized, and
+/// that the legitimate path (approval-gated action + a distinct approval) is.
+#[tokio::test]
+#[ignore = "requires an isolated PostgreSQL test container"]
+async fn firewall_live_apply_requires_a_genuine_approval() -> anyhow::Result<()> {
+    let url =
+        std::env::var("CLAWFORGE_TEST_DATABASE_URL").or_else(|_| std::env::var("DATABASE_URL"))?;
+    let store = PostgresStore::connect(&url).await?;
+    let uniq = uuid::Uuid::new_v4();
+    let requester_name = format!("fw-req-{uniq}");
+    let requester = store
+        .create_admin_user(&requester_name, "Administrator", "test-hash")
+        .await?;
+    let target =
+        |ip: &str| json!({"kind":"threat_intel_indicator","cidr":ip,"source":"hardening-test"});
+
+    // Negative: the exact bypass attempt - a requires_approval=FALSE firewall
+    // action can NEVER be live-authorized.
+    let noapprove: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO actions(id,name,type,risk_level,required_scope,requires_approval,enabled) \
+         VALUES($1,$2,'connector_action','low','agent:action:read',FALSE,TRUE) RETURNING id",
+    )
+    .bind(uuid::Uuid::new_v4())
+    .bind(format!("nftables.block_noapprove_{uniq}"))
+    .fetch_one(store.pool())
+    .await?;
+    let req_no = store
+        .create_execution_request(&clawforge_storage::ExecutionRequestInput {
+            action_id: noapprove,
+            workflow_run_id: None,
+            decision_id: None,
+            requested_by: requester_name.clone(),
+            requested_by_id: Some(requester),
+            idempotency_key: None,
+            target: Some(target("203.0.113.90")),
+        })
+        .await?;
+    // Keep it out of the global dispatch queue (a parallel process_one_dry_run
+    // would otherwise claim it); firewall_request_live_authorized is
+    // status-agnostic, so this does not affect what it checks.
+    sqlx::query("UPDATE execution_requests SET status='cancelled' WHERE id=$1")
+        .bind(req_no)
+        .execute(store.pool())
+        .await?;
+    assert!(
+        !store.firewall_request_live_authorized(req_no).await?,
+        "a requires_approval=FALSE firewall request must never be live-authorized"
+    );
+
+    // Positive: an approval-gated action (medium -> 1 approval) that has one
+    // distinct approval IS live-authorized - the legitimate path (Option A).
+    let gated: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO actions(id,name,type,risk_level,required_scope,requires_approval,enabled) \
+         VALUES($1,$2,'connector_action','medium','agent:action:read',TRUE,TRUE) RETURNING id",
+    )
+    .bind(uuid::Uuid::new_v4())
+    .bind(format!("nftables.block_gated_{uniq}"))
+    .fetch_one(store.pool())
+    .await?;
+    let req_yes = store
+        .create_execution_request(&clawforge_storage::ExecutionRequestInput {
+            action_id: gated,
+            workflow_run_id: None,
+            decision_id: None,
+            requested_by: requester_name.clone(),
+            requested_by_id: Some(requester),
+            idempotency_key: None,
+            target: Some(target("203.0.113.91")),
+        })
+        .await?;
+    // req_yes stays in `waiting_approval`, which is already not claimable by
+    // the dispatch queue (only approved/pending/queued are) - so no cancel is
+    // needed, and that status is also what lets the approval be recorded below.
+    assert!(
+        !store.firewall_request_live_authorized(req_yes).await?,
+        "an approval-gated request is NOT authorized before it is approved"
+    );
+    // Approve via the real path (immutable approval records + triggers are
+    // respected). The approver name must match the admin user's own name.
+    let approver_name = format!("fw-apr-{uniq}");
+    let approver = store
+        .create_admin_user(&approver_name, "Administrator", "test-hash")
+        .await?;
+    store
+        .approve_execution_request(req_yes, approver, &approver_name)
+        .await?;
+    // approve promotes it to 'approved' (claimable); park it immediately so a
+    // parallel process_one_dry_run cannot pick it up. The authorization check
+    // is status-agnostic, so it still sees the recorded approval.
+    sqlx::query("UPDATE execution_requests SET status='cancelled' WHERE id=$1")
+        .bind(req_yes)
+        .execute(store.pool())
+        .await?;
+    assert!(
+        store.firewall_request_live_authorized(req_yes).await?,
+        "an approved, approval-gated firewall request must be live-authorized"
+    );
+
+    // No cleanup DELETE: the recorded approval is immutable (a BEFORE DELETE
+    // trigger forbids the cascade), and both requests are already parked as
+    // `cancelled` (never claimable) and uniquely tagged, so leaving them is
+    // harmless for other tests.
+    Ok(())
+}
+
 /// `expired_unrolled_back_firewall_targets` backs `clawforge-executor`'s
 /// TTL-driven auto-rollback sweep - proves an expired, real apply with no
 /// later rollback shows up, and that recording a matching rollback
