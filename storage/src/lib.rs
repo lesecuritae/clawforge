@@ -18,6 +18,7 @@ use std::env;
 use uuid::Uuid;
 
 mod learning;
+mod metrics;
 pub use learning::{
     LearningContext, LearningEvidence, LearningImportAuthorization, LearningLessonInput,
     LearningQuery, LearningReview, LearningTrustBinding,
@@ -39,6 +40,7 @@ static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../migrations");
 #[derive(Clone)]
 pub struct PostgresStore {
     pool: PgPool,
+    metrics_cache: std::sync::Arc<tokio::sync::Mutex<Option<metrics::CachedMetrics>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -233,7 +235,10 @@ impl PostgresStore {
             .connect(database_url)
             .await
             .context("connect to PostgreSQL")?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            metrics_cache: Default::default(),
+        })
     }
 
     async fn reject_newer_schema(&self) -> Result<()> {
@@ -2349,141 +2354,6 @@ impl PostgresStore {
             "last_analysis_at": summary.try_get::<chrono::DateTime<chrono::Utc>, _>("last_analysis").ok(),
             "error_status": "none"
         }))
-    }
-
-    pub async fn metrics_text(&self) -> Result<String> {
-        let providers: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM audit_events WHERE event_type = 'provider_sync'",
-        )
-        .fetch_one(&self.pool)
-        .await?;
-        let errors: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM audit_events WHERE event_type = 'provider_error'",
-        )
-        .fetch_one(&self.pool)
-        .await?;
-        let indicators: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM indicators")
-            .fetch_one(&self.pool)
-            .await?;
-        let risks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM risk_history")
-            .fetch_one(&self.pool)
-            .await?;
-        let bgp: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM audit_events WHERE event_type = 'bgp_change'")
-                .fetch_one(&self.pool)
-                .await?;
-        let incidents: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM incidents WHERE status NOT IN ('resolved','closed')",
-        )
-        .fetch_one(&self.pool)
-        .await?;
-        let alerts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM alerts WHERE status='open'")
-            .fetch_one(&self.pool)
-            .await?;
-        let correlations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM event_relationships")
-            .fetch_one(&self.pool)
-            .await?;
-        let provider_quality: f64 =
-            sqlx::query_scalar("SELECT COALESCE(AVG(quality_score), 0)::float8 FROM providers")
-                .fetch_one(&self.pool)
-                .await?;
-        let agent_access: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM audit_events WHERE actor LIKE 'agent:%' AND action = 'agent_api_read'",
-        )
-        .fetch_one(&self.pool)
-        .await?;
-        let worker_up: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runtime_status WHERE component = 'worker' AND state = 'running' AND last_heartbeat_at > NOW() - INTERVAL '2 minutes'")
-            .fetch_one(&self.pool).await?;
-        let execution_workers: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM execution_workers WHERE status IN ('healthy','degraded') AND last_heartbeat_at > NOW() - INTERVAL '2 minutes'")
-            .fetch_one(&self.pool).await?;
-        let actions_total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM execution_metrics")
-            .fetch_one(&self.pool)
-            .await?;
-        let actions_failed: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM execution_metrics WHERE status IN ('failed','timeout')",
-        )
-        .fetch_one(&self.pool)
-        .await?;
-        let action_duration: f64 = sqlx::query_scalar(
-            "SELECT COALESCE(AVG(duration_ms),0)::float8 FROM execution_metrics",
-        )
-        .fetch_one(&self.pool)
-        .await?;
-        let policy_denials: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_events WHERE action LIKE '%denied%' AND (resource LIKE '%action%' OR resource LIKE '%execution%')")
-            .fetch_one(&self.pool).await?;
-        let events_created: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events")
-            .fetch_one(&self.pool)
-            .await?;
-        let events_processed: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM event_delivery WHERE status='processed'")
-                .fetch_one(&self.pool)
-                .await?;
-        let events_failed: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM event_delivery WHERE status IN ('failed','dead')",
-        )
-        .fetch_one(&self.pool)
-        .await?;
-        let event_queue: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM event_delivery WHERE status IN ('pending','processing')",
-        )
-        .fetch_one(&self.pool)
-        .await?;
-        let event_processing_seconds: f64 = sqlx::query_scalar("SELECT COALESCE(AVG(EXTRACT(EPOCH FROM (processed_at - processing_started_at))), 0)::float8 FROM event_delivery WHERE status='processed' AND processed_at IS NOT NULL AND processing_started_at IS NOT NULL")
-            .fetch_one(&self.pool).await?;
-        let provider_rows = sqlx::query("SELECT p.id, COALESCE(s.state, 'never') AS state FROM providers p LEFT JOIN provider_status s ON s.provider_id = p.id ORDER BY p.id")
-            .fetch_all(&self.pool).await?;
-        let provider_status = provider_rows
-            .into_iter()
-            .map(|row| {
-                let provider = row
-                    .get::<String, _>("id")
-                    .replace('\\', "\\\\")
-                    .replace('"', "\\\"");
-                let state = row.get::<String, _>("state");
-                let value = if matches!(state.as_str(), "ok" | "running") {
-                    1
-                } else {
-                    0
-                };
-                format!("clawforge_provider_sync_status{{provider=\"{provider}\"}} {value}")
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        let consumer_rows = sqlx::query("SELECT name, CASE WHEN last_heartbeat_at > NOW() - INTERVAL '2 minutes' THEN 1 ELSE 0 END AS up FROM event_consumers ORDER BY name")
-            .fetch_all(&self.pool)
-            .await?;
-        let consumer_status = consumer_rows
-            .into_iter()
-            .map(|row| {
-                let consumer = row
-                    .get::<String, _>("name")
-                    .replace('\\', "\\\\")
-                    .replace('"', "\\\"");
-                format!(
-                    "clawforge_event_consumer_up{{consumer=\"{consumer}\"}} {}",
-                    row.get::<i32, _>("up")
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        let component_rows = sqlx::query("SELECT component, CASE WHEN state='running' AND updated_at > NOW() - INTERVAL '2 minutes' THEN 1 ELSE 0 END AS up FROM runtime_status ORDER BY component")
-            .fetch_all(&self.pool)
-            .await?;
-        let component_status = component_rows
-            .into_iter()
-            .map(|row| {
-                let component = row
-                    .get::<String, _>("component")
-                    .replace('\\', "\\\\")
-                    .replace('"', "\\\"");
-                format!(
-                    "clawforge_component_up{{component=\"{component}\"}} {}",
-                    row.get::<i32, _>("up")
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        Ok(format!("# TYPE clawforge_provider_sync_total counter\nclawforge_provider_sync_total {providers}\n# TYPE clawforge_provider_errors_total counter\nclawforge_provider_errors_total {errors}\n# TYPE clawforge_indicators_total gauge\nclawforge_indicators_total {indicators}\n# TYPE clawforge_risk_events_total counter\nclawforge_risk_events_total {risks}\n# TYPE clawforge_bgp_changes_total counter\nclawforge_bgp_changes_total {bgp}\n# TYPE clawforge_incidents_active gauge\nclawforge_incidents_active {incidents}\n# TYPE clawforge_alerts_open gauge\nclawforge_alerts_open {alerts}\n# TYPE clawforge_correlations_total gauge\nclawforge_correlations_total {correlations}\n# TYPE clawforge_provider_quality_average gauge\nclawforge_provider_quality_average {provider_quality}\n# TYPE clawforge_agent_api_access_total counter\nclawforge_agent_api_access_total {agent_access}\n# TYPE clawforge_events_created_total counter\nclawforge_events_created_total {events_created}\n# TYPE clawforge_events_processed_total counter\nclawforge_events_processed_total {events_processed}\n# TYPE clawforge_events_failed_total counter\nclawforge_events_failed_total {events_failed}\n# TYPE clawforge_event_queue_size gauge\nclawforge_event_queue_size {event_queue}\n# TYPE clawforge_event_processing_duration_seconds gauge\nclawforge_event_processing_duration_seconds {event_processing_seconds}\n# TYPE clawforge_worker_up gauge\nclawforge_worker_up {worker_up}\n# TYPE clawforge_execution_workers_healthy gauge\nclawforge_execution_workers_healthy {execution_workers}\n# TYPE clawforge_actions_total counter\nclawforge_actions_total {actions_total}\n# TYPE clawforge_action_errors_total counter\nclawforge_action_errors_total {actions_failed}\n# TYPE clawforge_execution_duration gauge\nclawforge_execution_duration {action_duration}\n# TYPE clawforge_policy_denials_total counter\nclawforge_policy_denials_total {policy_denials}\n# TYPE clawforge_database_up gauge\nclawforge_database_up 1\n# TYPE clawforge_provider_sync_status gauge\n{provider_status}\n# TYPE clawforge_event_consumer_up gauge\n{consumer_status}\n# TYPE clawforge_component_up gauge\n{component_status}\n"))
     }
 
     pub async fn set_runtime_status(
