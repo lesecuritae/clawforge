@@ -1,0 +1,84 @@
+{
+  "checked_at": "2026-10-11T15:13:25.594430+00:00",
+  "base_commit": "960f4d567e9968394bd4a43d736089583e9d0d46",
+  "status": "candidate_ci_passed_pending_root_integration",
+  "production_schema_changed": false,
+  "merged": false,
+  "pushed": false,
+  "isolated_postgres_fixture": "fresh throwaway CI fixture @ loopback:55432 (removed by tested script cleanup); targeted reviewer fixture learning_review_test @ loopback:55436",
+  "schema_version": 1,
+  "required_migration_version": 56,
+  "mcp_tools_version": 1,
+  "tests": {
+    "storage_unit_and_real_postgres": {
+      "passed": 5,
+      "failed": 0,
+      "ignored": 0
+    },
+    "api_unit_and_real_router_postgres": {
+      "passed": 2,
+      "failed": 0,
+      "ignored": 0
+    },
+    "mcp_unit_and_real_rmcp_protocol_mock_upstream": {
+      "passed": 23,
+      "failed": 0,
+      "ignored": 0
+    }
+  },
+  "limitations": [
+    "MCP forwarding integration fixture mocks upstream; API/storage integration uses real PostgreSQL and Router separately.",
+    "Trusted CI importer must check actual test/commit/artifact before attest_learning_evidence; no production CI artifact fetcher is claimed.",
+    "Credential rotation links and curator grants require trusted admin integration; no agent can write trust roots.",
+    "No semantic search or semantic version range evaluation; explicit exact applicability filters.",
+    "No production rollout, merge, push, or production schema migration performed.",
+    "cargo test --workspace ignores fixture-dependent cases by design; all required PostgreSQL cases are explicitly run in scripts/test-postgres.sh. Optional external labs/provider smoke cases are not claimed executed.",
+    "Compatible rollback is schema56 candidate with feature disabled; restoring old schema55 binary is explicitly unsupported."
+  ],
+  "remaining_gates": [
+    "Full root integration decision",
+    "Checked production CI evidence importer and trusted actor onboarding/rotation wiring",
+    "Full candidate endpoint-to-Hermes integration and checked release digest before deployment"
+  ],
+  "source_sha256": {
+    "Cargo.lock": "3460770c91d0308bdb059634e7dfcfda9c345e531cd29d482461957df5053474",
+    "api/src/learning.rs": "48531fd6863950770245ede21288fc624cd523f4597a5fc90a8293a9e92efd83",
+    "api/src/main.rs": "1c874652b536d5cd8bdb7adf88beaa23a16d1bd2bd42e2c028b935496e32675a",
+    "docs/structured-learning-rollback.json": "034393cbb189aa73a55c4e15f1285dfebf4ca5547d49d5895b1a1982401ef0ae",
+    "docs/structured-learning.md": "f1f6eee19e3f8e5eeda345f5b227ad419c6862926ef1c21fe370e57f3e2ca666",
+    "mcp/src/main.rs": "16f8e63bf9b8946caecf4f91b924cf481b43b5b42804dc9f05287006996df69e",
+    "migrations/0056_structured_learning.sql": "6bc5a345db182d22e2a707a3259e85a5fa12ca5b567b154a9e03f5b611e0cb2c",
+    "scripts/provision-db-roles.sh": "212afc36b8d2d0337889887fcc07791a150799d8c197aa7bc8d7fe801f8a7fc2",
+    "scripts/test-postgres.sh": "efeb3b36fb20fc1971cd6a895c0f1db75c61e91b336690c09edbf4c721173351",
+    "storage/Cargo.toml": "093f7296d8dbaa1dffc917e259de4f541cc3e1ce92f1556d8fc48589f6d1ac69",
+    "storage/src/learning.rs": "286c0d63ceede91c65e42f254b066c85f53289a9afad6533a6ee733970d242c5",
+    "storage/src/lib.rs": "37778ca5f9128b6e015e6986064267dc48dbc8ef8e5242a872ca6da35ff91e51",
+    "storage/tests/learning.rs": "6fed765b035e78b335a8181e611de48bb154681d6e05a647769a5514939901d9",
+    "storage/tests/migration_lineages.rs": "bbbf983293438be845ef6a5cff085c6287795a8c53c6e18c9820ffb9e499a2d9"
+  },
+  "build_checks": {
+    "clippy_workspace_all_targets_D_warnings": "passed",
+    "cargo_fmt_all_check": "passed",
+    "git_diff_check": "passed",
+    "shell_test_postgres_syntax": "passed"
+  },
+  "total_targeted_tests_passed": 30,
+  "required_ci": {
+    "cargo_test_workspace": {
+      "exit_code": 0,
+      "passed": 329,
+      "failed": 0,
+      "ignored": 93,
+      "completed_suites": 53,
+      "log_sha256": "54a08fdb90e017b2fa1c3b55027444afcb704629d14a6d40637e8ad69fc04067"
+    },
+    "full_postgres_gate": {
+      "exit_code": 0,
+      "passed": 60,
+      "failed": 0,
+      "ignored": 0,
+      "completed_suites": 15,
+      "log_sha256": "28d4749a75dcf77c30f941b998d5b54c9743ee173c94ddb20dce1a7b13502752"
+    }
+  }
+}

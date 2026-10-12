@@ -77,6 +77,12 @@ GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO clawforge_api;
 REVOKE INSERT, UPDATE, DELETE ON TABLE _sqlx_migrations FROM clawforge_api;
 REVOKE UPDATE, DELETE ON TABLE audit_events FROM clawforge_api;
 REVOKE DELETE ON TABLE audit_outbox FROM clawforge_api;
+-- Learning content and review records are immutable; only reviewed status changes update revisions.
+REVOKE UPDATE, DELETE ON TABLE learning_lessons, learning_records FROM clawforge_api;
+REVOKE UPDATE, DELETE ON TABLE learning_revisions FROM clawforge_api;
+GRANT UPDATE(status,last_verified) ON TABLE learning_revisions TO clawforge_api;
+-- Trust roots are provisioned only by the database owner/CI importer.
+REVOKE INSERT, UPDATE, DELETE ON TABLE learning_actor_tokens, learning_curator_grants, learning_verified_evidence FROM clawforge_api;
 -- API can inspect journal generations, but only the executor owns transitions.
 REVOKE INSERT, UPDATE, DELETE ON TABLE firewall_action_intents FROM clawforge_api;
 REVOKE UPDATE, DELETE ON TABLE firewall_action_receipts FROM clawforge_api;

@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "compatible_database_migration": 56,
+  "required_build": "reviewed schema-0056-compatible candidate (release digest must be recorded before rollout)",
+  "old_schema_55_binary_compatible": false,
+  "feature_switch": "CLAWFORGE_LEARNING_ENABLED=false",
+  "api_behavior": "learning handlers return 503; existing routes remain unchanged",
+  "mcp_behavior": "optional learning tools absent from discovery",
+  "data_policy": "preserve all tables, revisions and records",
+  "tested_boundary": "actual isolated Router plus runtime-store reconnect; no live production restart claimed",
+  "required_consumers": "all services using strict PostgresStore schema checks, not just API/MCP"
+}

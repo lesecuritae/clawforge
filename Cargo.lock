@@ -587,6 +587,7 @@ dependencies = [
  "clawforge-secret",
  "clawforge-security-events",
  "hmac",
+ "serde",
  "serde_json",
  "sha2",
  "sqlx",

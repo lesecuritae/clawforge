@@ -22,6 +22,7 @@ run_cargo() {
     -e CARGO_TARGET_DIR=/tmp/clawforge-target \
     -e DATABASE_URL \
     -e CLAWFORGE_TEST_DATABASE_URL \
+    -e CLAWFORGE_LEARNING_TEST_DATABASE_URL \
     -e CLAWFORGE_TEST_MIGRATION_URL \
     -e CLAWFORGE_TEST_API_DATABASE_URL \
     -e CLAWFORGE_TEST_WORKER_DATABASE_URL \
@@ -116,7 +117,7 @@ CLAWFORGE_ANALYZER_IP_HMAC_KEY="test-only-ip-hmac-key-0123456789-not-for-product
 
 CLAWFORGE_TEST_DATABASE_URL="$owner_url" \
 CLAWFORGE_ANALYZER_IP_HMAC_KEY="test-only-ip-hmac-key-0123456789-not-for-production" \
-  run_cargo test -p clawforge-api --bin clawforge-api -- --ignored --test-threads=1
+  run_cargo test -p clawforge-api --bin clawforge-api -- --ignored --test-threads=1 --skip learning::
 
 # Both reviewed historical migration lineages and quarantine release invariants.
 export CLAWFORGE_TEST_MIGRATION_URL="$owner_url"
@@ -137,3 +138,12 @@ run_cargo test -p clawforge-storage --test dispatch_recovery -- --ignored --test
 export CLAWFORGE_TEST_FIREWALL_RULE_DATABASE_URL="$owner_url"
 run_cargo test -p clawforge-storage --test firewall_rule_intents -- --ignored --test-threads=1
 run_cargo test -p clawforge-executor firewall_rule_recovery_retains_ownership_without_blind_replay -- --ignored --test-threads=1
+
+# Structured learning is a required real PostgreSQL gate, not an ignored test
+# silently left out of CI. Run its dedicated fixture cases after legacy gates.
+export CLAWFORGE_LEARNING_TEST_DATABASE_URL="$owner_url"
+run_cargo test -p clawforge-storage --test learning -- --include-ignored --test-threads=1
+run_cargo test -p clawforge-api --bin clawforge-api learning:: -- --include-ignored --test-threads=1
+
+# Trusted CI verifier/operator integration uses its own nested disposable DB.
+run_cargo test -p clawforge-storage --bin learning-trust -- --include-ignored --test-threads=1

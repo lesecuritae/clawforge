@@ -1,3 +1,4 @@
+mod learning;
 use std::{
     collections::{HashMap, HashSet},
     env,
@@ -47,6 +48,7 @@ struct AppState {
 
 #[derive(Clone)]
 struct RuntimeConfig {
+    learning_enabled: bool,
     bind: SocketAddr,
     database_configured: bool,
     analyzer_url: Option<String>,
@@ -137,6 +139,9 @@ const AGENT_SCOPE_FIREWALL_READ: &str = "agent:firewall:read";
 const AGENT_SCOPE_ALL_READ: &str = "agent:read";
 
 const AGENT_SCOPES: &[&str] = &[
+    "agent:learning:read",
+    "agent:learning:propose",
+    "agent:learning:curate",
     AGENT_SCOPE_SYSTEM_READ,
     AGENT_SCOPE_EVENTS_READ,
     AGENT_SCOPE_INCIDENT_READ,
@@ -8388,6 +8393,17 @@ fn build_router(app_state: AppState) -> Router {
         .nest(
             "/api/v1",
             Router::new()
+                .route("/learning/capabilities", get(learning::capabilities))
+                .route(
+                    "/learning/lessons",
+                    get(learning::query).post(learning::propose),
+                )
+                .route("/learning/lessons/{id}/revisions", post(learning::revise))
+                .route("/learning/revisions/{id}/review", post(learning::review))
+                .route(
+                    "/learning/revisions/{id}/records",
+                    get(learning::records).post(learning::attach),
+                )
                 .route("/status", get(agent_status))
                 .route("/agents/status", get(agent_health_status))
                 .route("/context", get(agent_context))
@@ -8485,6 +8501,10 @@ async fn main() -> anyhow::Result<()> {
     let app_state = AppState {
         store,
         config: RuntimeConfig {
+            learning_enabled: env::var("CLAWFORGE_LEARNING_ENABLED")
+                .unwrap_or_else(|_| "true".into())
+                .parse()
+                .map_err(|_| anyhow::anyhow!("invalid CLAWFORGE_LEARNING_ENABLED"))?,
             bind: address,
             database_configured: true,
             analyzer_url: env::var("CLAWFORGE_ANALYZER_URL")
@@ -8528,6 +8548,7 @@ mod tests {
     #[test]
     fn internal_tokens_are_bound_to_fixed_service_identities_and_consumers() {
         let config = RuntimeConfig {
+            learning_enabled: true,
             bind: "127.0.0.1:8080".parse().unwrap(),
             database_configured: true,
             analyzer_url: None,
@@ -9354,10 +9375,11 @@ mod tests {
         assert!(result.is_err());
     }
 
-    fn test_app_state(store: PostgresStore) -> AppState {
+    pub(super) fn test_app_state(store: PostgresStore) -> AppState {
         AppState {
             store,
             config: RuntimeConfig {
+                learning_enabled: true,
                 bind: "127.0.0.1:0".parse().unwrap(),
                 database_configured: true,
                 analyzer_url: None,

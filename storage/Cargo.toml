@@ -14,6 +14,7 @@ clawforge-security-events = { path = "../security-events" }
 hmac.workspace = true
 sqlx.workspace = true
 serde_json.workspace = true
+serde.workspace = true
 sha2.workspace = true
 tracing.workspace = true
 uuid.workspace = true
