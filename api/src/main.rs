@@ -2407,12 +2407,16 @@ async fn load_operations_summary(state: &AppState) -> ApiResult<serde_json::Valu
             "operations providers unavailable",
         )
     })?;
-    let incidents = state.store.list_incidents(None, 500).await.map_err(|_| {
-        api_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "operations incidents unavailable",
-        )
-    })?;
+    let incidents = state
+        .store
+        .list_operations_incident_views(500)
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "operations incidents unavailable",
+            )
+        })?;
     let indicators = state.store.list_indicator_views(1000).await.map_err(|_| {
         api_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -8898,6 +8902,53 @@ mod tests {
         assert_eq!(summary["provider_health"]["healthy"], 1);
         assert!(summary.get("payload").is_none());
         assert!(summary.get("action").is_none());
+    }
+
+    #[test]
+    fn operations_summary_is_independent_of_incident_event_history() {
+        let statuses = [
+            "detected",
+            "investigating",
+            "confirmed",
+            "mitigated",
+            "resolved",
+            "closed",
+        ];
+        let detailed: Vec<_> = statuses
+            .iter()
+            .enumerate()
+            .map(|(i, status)| {
+                serde_json::json!({
+                    "id": format!("incident-{i}"), "status": status, "severity": "high",
+                    "risk_score": 82, "confidence": 70 + i, "summary": "review",
+                    "title": "private detail", "source": "history", "event_sources": "many sources",
+                    "event_count": 1_000_000, "created_at": "historic", "updated_at": "now"
+                })
+            })
+            .collect();
+        let projected: Vec<_> = detailed.iter().map(|v| serde_json::json!({
+            "id": v["id"], "status": v["status"], "severity": v["severity"],
+            "risk_score": v["risk_score"], "confidence": v["confidence"], "summary": v["summary"]
+        })).collect();
+        let indicators = [serde_json::json!({"risk_score": 60, "confidence": 90})];
+        let trust = [serde_json::json!({"status": "Revoked"})];
+        let events = [serde_json::json!({"severity": "critical", "event_type": "rpki.invalid"})];
+        let full = operations_summary_data(&detailed, &indicators, &trust, &events, &[]);
+        assert_eq!(
+            full,
+            operations_summary_data(&projected, &indicators, &trust, &events, &[])
+        );
+        assert_eq!(full["active_incidents"], 4);
+        assert_eq!(
+            full["attention_points"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|v| v["type"] == "incident")
+                .count(),
+            4
+        );
+        assert!(full.to_string().find("private detail").is_none());
     }
 
     #[test]

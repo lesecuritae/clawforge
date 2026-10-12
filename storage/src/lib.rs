@@ -1285,6 +1285,24 @@ impl PostgresStore {
             .collect())
     }
 
+    /// Bounded incident projection for operations summaries. The summary only consumes
+    /// these six fields; event counts/sources belong to the detailed incident read.
+    /// Keep the existing latest-500 selection semantics without scanning history.
+    pub async fn list_operations_incident_views(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<serde_json::Value>> {
+        let rows = sqlx::query(
+            "SELECT jsonb_build_object('id',id,'status',status,'severity',severity, \
+             'confidence',confidence,'risk_score',risk_score,'summary',summary) AS incident \
+             FROM incidents ORDER BY updated_at DESC LIMIT $1",
+        )
+        .bind(limit.clamp(1, 500))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|row| row.get("incident")).collect())
+    }
+
     /// Return secret-provider health metadata without exposing references that
     /// could be used to retrieve a value. Secret contents never cross this
     /// storage API.
