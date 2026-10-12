@@ -1,0 +1,39 @@
+{
+  "status": "passed",
+  "source_base": "e7e5895bcfa8b6b73ff46ac2d8beb6c9e87cb38b",
+  "tests": {
+    "unit_tests_passed": 3,
+    "unit_tests_failed": 0,
+    "unit_tests_ignored": 0,
+    "clippy_D_warnings": "passed",
+    "genuine_original_tests": 5,
+    "genuine_independent_holdout": 259,
+    "test_uid": 994,
+    "test_network_namespace_isolated": true,
+    "negative_authenticated_false_success": true,
+    "negative_wrong_database_instance_zero_writes": true,
+    "negative_retarget_zero_writes": true,
+    "actual_authorized_store_import": true,
+    "replay_idempotent": true
+  },
+  "counts": {
+    "bindings": 2,
+    "grants": 1,
+    "evidence": 1,
+    "audit": 4,
+    "outbox": 4
+  },
+  "actual_new_test_artifact_sha256": "0efac4a26407b37fe06e5a136fba31e129bc7c74364d88db587f96e424826fef",
+  "older_native_model_result_provenance_only": true,
+  "cargo_v1_v2_file_unchanged": true,
+  "cargo_v1_v2_sha256": "ae6955357b0a5ea765872b5fb784eb075b40ed83c819ae4994ba8e8e36b4175f",
+  "provider_calls": 0,
+  "production_changed": false,
+  "existing_pending_database_changed": false,
+  "limitations": [
+    "Fixed known Retry-After case only; no arbitrary command or general native proof acceptance.",
+    "Delivery admission requires trusted root inspection; importer does not receive a Docker socket.",
+    "Different pending fixture requires fresh policy/proof and immutable evidence revision; no existing lesson activation is claimed.",
+    "Actual AIAgent lesson reuse/guard and independent curator lifecycle remain untested here."
+  ]
+}
