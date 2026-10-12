@@ -1,7 +1,9 @@
 //! Trusted, offline CI proof producer/importer. No agent endpoint or arbitrary
 //! commands; signing keys, operator policy and owner DB URL remain outside Git.
 use anyhow::{ensure, Context, Result};
-use clawforge_storage::{LearningEvidence, LearningTrustBinding, PostgresStore};
+use clawforge_storage::{
+    LearningEvidence, LearningImportAuthorization, LearningTrustBinding, PostgresStore,
+};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -44,6 +46,24 @@ struct Policy {
     database_host: String,
     database_port: u16,
     database_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    deployment: Option<Deployment>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Deployment {
+    mode: String,
+    network: String,
+    database_host: String,
+    database_port: u16,
+    database_name: String,
+    cluster_system_identifier: String,
+    database_oid: i64,
+    runtime_image_digest: String,
+    importer_sha256: String,
+    bindings: Vec<Binding>,
+    owner_actor: Uuid,
+    curator_actor: Uuid,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -139,7 +159,7 @@ fn load_policy(path: &Path) -> Result<(Policy, String)> {
     let b = fs::read(path)?;
     let p: Policy = serde_json::from_slice(&b)?;
     ensure!(
-        p.version == 1 && now()? <= p.expires_at,
+        matches!(p.version, 1 | 2) && now()? <= p.expires_at,
         "expired/incompatible operator policy"
     );
     ensure!(
@@ -155,8 +175,110 @@ fn load_policy(path: &Path) -> Result<(Policy, String)> {
         !p.source_sha256.is_empty() && p.repository.len() <= 512 && !p.repository.trim().is_empty(),
         "source policy missing"
     );
+    validate_policy_targets(&p)?;
     Ok((p, sha(&b)))
 }
+const V2_DOMAIN: &[u8] = b"clawforge-learning-trust-v2-split-targets\0";
+fn valid_sha(s: &str) -> bool {
+    s.len() == 64
+        && s.bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+fn isolated(host: &str, port: u16, name: &str) -> bool {
+    host == "127.0.0.1" && (55430..=55439).contains(&port) && name.starts_with("learning_")
+}
+fn validate_pair(bindings: &[Binding], owner: Uuid, curator: Uuid) -> Result<()> {
+    ensure!(
+        owner != curator && bindings.len() == 2,
+        "independent identities required"
+    );
+    ensure!(
+        bindings[0].token_id != bindings[1].token_id,
+        "distinct credentials required"
+    );
+    ensure!(
+        bindings.iter().filter(|b| b.actor_id == owner).count() == 1
+            && bindings.iter().filter(|b| b.actor_id == curator).count() == 1,
+        "independent role pair missing"
+    );
+    Ok(())
+}
+fn validate_policy_targets(p: &Policy) -> Result<()> {
+    // The fixture contract is always isolated, even when deployment is production.
+    ensure!(
+        isolated(&p.database_host, p.database_port, &p.database_name),
+        "isolated producer fixture required"
+    );
+    validate_pair(&p.bindings, p.owner_actor, p.curator_actor)?;
+    if p.version == 1 {
+        ensure!(p.deployment.is_none(), "v1 deployment authorization denied");
+        return Ok(());
+    }
+    let d = p
+        .deployment
+        .as_ref()
+        .context("v2 deployment authorization required")?;
+    validate_pair(&d.bindings, d.owner_actor, d.curator_actor)?;
+    ensure!(
+        d.bindings.iter().all(|b| p
+            .bindings
+            .iter()
+            .all(|f| b.token_id != f.token_id && b.actor_id != f.actor_id)),
+        "fixture/deployment identities overlap"
+    );
+    ensure!(
+        (
+            d.database_host.as_str(),
+            d.database_port,
+            d.database_name.as_str()
+        ) != (
+            p.database_host.as_str(),
+            p.database_port,
+            p.database_name.as_str()
+        ),
+        "fixture/deployment database overlap"
+    );
+    ensure!(
+        !d.cluster_system_identifier.is_empty()
+            && d.cluster_system_identifier
+                .bytes()
+                .all(|b| b.is_ascii_digit())
+            && d.database_oid > 0
+            && valid_sha(&d.importer_sha256)
+            && d.runtime_image_digest
+                .strip_prefix("sha256:")
+                .is_some_and(valid_sha),
+        "deployment identity/release binding missing"
+    );
+    match d.mode.as_str() {
+        "isolated" => ensure!(
+            d.network == "loopback"
+                && isolated(&d.database_host, d.database_port, &d.database_name),
+            "isolated deployment required"
+        ),
+        // Exact observed Compose target. No URL-derived fallback or broad production toggle.
+        "production" => ensure!(
+            d.network == "clawforge_backend"
+                && d.database_host == "postgres"
+                && d.database_port == 5432
+                && d.database_name == "clawforge",
+            "unapproved production target"
+        ),
+        _ => anyhow::bail!("unknown deployment mode"),
+    }
+    Ok(())
+}
+fn authenticated_bytes(proof: &Proof) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    match proof.version {
+        1 => {}
+        2 => bytes.extend_from_slice(V2_DOMAIN),
+        _ => anyhow::bail!("unsupported proof version"),
+    }
+    bytes.extend_from_slice(&serde_json::to_vec(proof)?);
+    Ok(bytes)
+}
+
 fn key(path: &Path) -> Result<Vec<u8>> {
     protected(path, true)?;
     let b = fs::read(path)?;
@@ -440,7 +562,7 @@ async fn produce(
     protected(&marker, true)?;
     fs::remove_file(marker)?;
     let mut proof = Proof {
-        version: 1,
+        version: p.version,
         id: Uuid::new_v4(),
         created_at: now()?,
         policy_sha256: digest,
@@ -477,7 +599,7 @@ async fn produce(
     source(&p)?;
     verify_toolchain(&p)?;
     let mut mac = Hmac::<Sha256>::new_from_slice(&signing)?;
-    mac.update(&serde_json::to_vec(&proof)?);
+    mac.update(&authenticated_bytes(&proof)?);
     let sealed = SealedProof {
         proof,
         mac: hex(&mac.finalize().into_bytes()),
@@ -495,13 +617,13 @@ fn verify(policy_path: &Path, key_path: &Path, bundle: &Path) -> Result<(Policy,
     );
     let sealed: SealedProof = serde_json::from_slice(&fs::read(bundle)?)?;
     let mut mac = Hmac::<Sha256>::new_from_slice(&key(key_path)?)?;
-    mac.update(&serde_json::to_vec(&sealed.proof)?);
+    mac.update(&authenticated_bytes(&sealed.proof)?);
     mac.verify_slice(&unhex(&sealed.mac)?)
         .map_err(|_| anyhow::anyhow!("proof authentication failed"))?;
     let proof = sealed.proof;
     let t = now()?;
     ensure!(
-        proof.version == 1
+        proof.version == p.version
             && proof.created_at <= t
             && t - proof.created_at <= 86400
             && proof.created_at <= p.expires_at,
@@ -545,10 +667,35 @@ fn database(path: &Path, p: &Policy) -> Result<String> {
         "database identity mismatch"
     );
     ensure!(
-        p.database_host == "127.0.0.1"
-            && p.database_name.starts_with("learning_")
-            && (55430..=55439).contains(&p.database_port),
+        isolated(&p.database_host, p.database_port, &p.database_name),
         "isolated target required; production import is not enabled"
+    );
+    Ok(url)
+}
+fn deployment_database(path: &Path, p: &Policy) -> Result<String> {
+    let d = p
+        .deployment
+        .as_ref()
+        .context("v2 deployment authorization required")?;
+    if d.mode == "production" {
+        ensure!(
+            uid()? == 10001,
+            "production importer requires operator UID10001"
+        );
+    }
+    protected(path, true)?;
+    let url = fs::read_to_string(path)?.trim().to_string();
+    let opt = PgConnectOptions::from_str(&url)
+        .map_err(|_| anyhow::anyhow!("database configuration invalid"))?;
+    ensure!(
+        opt.get_host() == d.database_host
+            && opt.get_port() == d.database_port
+            && opt.get_database() == Some(d.database_name.as_str()),
+        "deployment database identity mismatch"
+    );
+    ensure!(
+        sha(&fs::read(std::env::current_exe()?)?) == d.importer_sha256,
+        "importer release identity mismatch"
     );
     Ok(url)
 }
@@ -606,13 +753,22 @@ async fn import(
     database_path: &Path,
 ) -> Result<()> {
     let (p, proof) = verify(policy_path, key_path, bundle)?;
-    let store = PostgresStore::connect_runtime(&database(database_path, &p)?).await?;
+    let url = if p.version == 1 {
+        database(database_path, &p)?
+    } else {
+        deployment_database(database_path, &p)?
+    };
+    let store = PostgresStore::connect_runtime(&url).await?;
     ensure!(
         store.readiness().await?.current,
         "database schema not current"
     );
-    let bindings: Vec<_> = p
-        .bindings
+    let (approved, owner, curator) = if let Some(d) = &p.deployment {
+        (&d.bindings, d.owner_actor, d.curator_actor)
+    } else {
+        (&p.bindings, p.owner_actor, p.curator_actor)
+    };
+    let bindings: Vec<_> = approved
         .iter()
         .map(|b| LearningTrustBinding {
             token_id: b.token_id,
@@ -630,13 +786,32 @@ async fn import(
             passed: true,
         })
         .collect();
+    let authorization = p
+        .deployment
+        .as_ref()
+        .map(|d| -> Result<_> {
+            Ok(LearningImportAuthorization {
+                cluster_system_identifier: d.cluster_system_identifier.clone(),
+                database_oid: d.database_oid,
+                expires_at: i64::try_from(
+                    p.expires_at.min(
+                        proof
+                            .created_at
+                            .checked_add(86400)
+                            .context("proof expiry overflow")?,
+                    ),
+                )?,
+            })
+        })
+        .transpose()?;
     store
-        .import_learning_evidence(
+        .import_learning_evidence_authorized(
             &bindings,
-            p.owner_actor,
-            p.curator_actor,
+            owner,
+            curator,
             &p.repository,
             &evidence,
+            authorization.as_ref(),
         )
         .await?;
     println!("{{\"schema_version\":1,\"proof_id\":\"{}\",\"authenticated_checks\":3,\"status\":\"imported\"}}",proof.id);
@@ -741,6 +916,7 @@ mod tests {
                 database_host: "127.0.0.1".into(),
                 database_port: 55436,
                 database_name: "learning_trust_test".into(),
+                deployment: None,
             };
             let path = root.join("policy.json");
             write_new(&path, &serde_json::to_vec(&policy)?)?;
@@ -760,7 +936,7 @@ mod tests {
         fn seal(&self) -> Result<()> {
             let (p, digest) = load_policy(&self.policy)?;
             let mut proof = Proof {
-                version: 1,
+                version: p.version,
                 id: Uuid::new_v4(),
                 created_at: now()?,
                 policy_sha256: digest,
@@ -790,7 +966,7 @@ mod tests {
                 });
             }
             let mut mac = Hmac::<Sha256>::new_from_slice(&key(&self.key)?)?;
-            mac.update(&serde_json::to_vec(&proof)?);
+            mac.update(&authenticated_bytes(&proof)?);
             if self.bundle.exists() {
                 fs::remove_file(&self.bundle)?;
             }
@@ -803,6 +979,147 @@ mod tests {
             )?;
             Ok(())
         }
+    }
+    fn deployment_fixture(p: &Policy) -> Result<Deployment> {
+        let owner = Uuid::new_v4();
+        let curator = Uuid::new_v4();
+        Ok(Deployment {
+            mode: "isolated".into(),
+            network: "loopback".into(),
+            database_host: "127.0.0.1".into(),
+            database_port: p.database_port,
+            database_name: "learning_deployment_fixture".into(),
+            cluster_system_identifier: "123".into(),
+            database_oid: 1,
+            runtime_image_digest: format!("sha256:{}", "a".repeat(64)),
+            importer_sha256: sha(&fs::read(std::env::current_exe()?)?),
+            bindings: vec![
+                Binding {
+                    token_id: owner,
+                    actor_id: owner,
+                    rotation_from: None,
+                },
+                Binding {
+                    token_id: curator,
+                    actor_id: curator,
+                    rotation_from: None,
+                },
+            ],
+            owner_actor: owner,
+            curator_actor: curator,
+        })
+    }
+    fn v2_fixture() -> Result<Fixture> {
+        let f = Fixture::new()?;
+        let mut p = load_policy(&f.policy)?.0;
+        p.version = 2;
+        p.deployment = Some(deployment_fixture(&p)?);
+        fs::write(&f.policy, serde_json::to_vec(&p)?)?;
+        f.seal()?;
+        Ok(f)
+    }
+    #[test]
+    fn v2_separate_targets_and_domains() -> Result<()> {
+        let f = v2_fixture()?;
+        let (p, proof) = verify(&f.policy, &f.key, &f.bundle)?;
+        assert_eq!(proof.version, 2);
+        assert!(authenticated_bytes(&proof)?.starts_with(V2_DOMAIN));
+        let path = f.root.join("fixture-url");
+        write_new(
+            &path,
+            b"postgres://fixture@127.0.0.1:55436/learning_trust_test",
+        )?;
+        assert!(database(&path, &p).is_ok());
+        assert!(deployment_database(&path, &p).is_err());
+        let deployment = f.root.join("deployment-url");
+        write_new(
+            &deployment,
+            b"postgres://fixture@127.0.0.1:55436/learning_deployment_fixture",
+        )?;
+        assert!(deployment_database(&deployment, &p).is_ok());
+        assert!(database(&deployment, &p).is_err());
+        Ok(())
+    }
+    #[test]
+    fn v2_production_url_never_authorizes_producer_tests() -> Result<()> {
+        let f = v2_fixture()?;
+        let mut p = load_policy(&f.policy)?.0;
+        let d = p.deployment.as_mut().unwrap();
+        d.mode = "production".into();
+        d.network = "clawforge_backend".into();
+        d.database_host = "postgres".into();
+        d.database_port = 5432;
+        d.database_name = "clawforge".into();
+        validate_policy_targets(&p)?;
+        let url = f.root.join("production-url");
+        write_new(&url, b"postgres://fixture@postgres:5432/clawforge")?;
+        assert!(database(&url, &p).is_err());
+        p.database_host = "postgres".into();
+        p.database_port = 5432;
+        p.database_name = "clawforge".into();
+        assert!(validate_policy_targets(&p).is_err());
+        Ok(())
+    }
+    #[test]
+    fn v2_policy_target_actor_release_and_mac_tampering_denied() -> Result<()> {
+        for variant in ["target", "actors", "release", "mac", "version"] {
+            let f = v2_fixture()?;
+            let mut p = load_policy(&f.policy)?.0;
+            if variant == "target" {
+                p.deployment.as_mut().unwrap().database_name = "learning_other".into();
+            }
+            if variant == "actors" {
+                let d = p.deployment.as_mut().unwrap();
+                let owner = Uuid::new_v4();
+                d.owner_actor = owner;
+                d.bindings[0].actor_id = owner;
+                d.bindings[0].token_id = owner;
+            }
+            if variant == "release" {
+                p.deployment.as_mut().unwrap().runtime_image_digest =
+                    format!("sha256:{}", "b".repeat(64));
+            }
+            fs::write(&f.policy, serde_json::to_vec(&p)?)?;
+            if variant == "mac" || variant == "version" {
+                let mut sealed: SealedProof = serde_json::from_slice(&fs::read(&f.bundle)?)?;
+                if variant == "mac" {
+                    sealed.mac = "0".repeat(64);
+                } else {
+                    sealed.proof.version = 1;
+                    let mut mac = Hmac::<Sha256>::new_from_slice(&key(&f.key)?)?;
+                    mac.update(&authenticated_bytes(&sealed.proof)?);
+                    sealed.mac = hex(&mac.finalize().into_bytes());
+                }
+                fs::write(&f.bundle, serde_json::to_vec(&sealed)?)?;
+            }
+            assert!(verify(&f.policy, &f.key, &f.bundle).is_err(), "{variant}");
+        }
+        Ok(())
+    }
+    #[test]
+    fn v2_unknown_mode_overlap_v1_deployment_and_binary_substitution_denied() -> Result<()> {
+        let f = v2_fixture()?;
+        let p = load_policy(&f.policy)?.0;
+        let mut bad = p.clone();
+        bad.version = 1;
+        assert!(validate_policy_targets(&bad).is_err());
+        let mut bad = p.clone();
+        bad.deployment.as_mut().unwrap().mode = "arbitrary".into();
+        assert!(validate_policy_targets(&bad).is_err());
+        let mut bad = p.clone();
+        bad.deployment.as_mut().unwrap().bindings = p.bindings.clone();
+        bad.deployment.as_mut().unwrap().owner_actor = p.owner_actor;
+        bad.deployment.as_mut().unwrap().curator_actor = p.curator_actor;
+        assert!(validate_policy_targets(&bad).is_err());
+        let mut bad = p.clone();
+        bad.deployment.as_mut().unwrap().importer_sha256 = "0".repeat(64);
+        let url = f.root.join("deployment-url");
+        write_new(
+            &url,
+            b"postgres://fixture@127.0.0.1:55436/learning_deployment_fixture",
+        )?;
+        assert!(deployment_database(&url, &bad).is_err());
+        Ok(())
     }
     #[test]
     fn authentic_proof_and_tampered_artifact() -> Result<()> {
@@ -961,6 +1278,14 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires isolated owner PostgreSQL fixture; synthetic signed verifier proof, not claimed producer execution"]
     async fn isolated_import_scope_ownership_audit_and_replay() -> Result<()> {
+        isolated_import_contract(1).await
+    }
+    #[tokio::test]
+    #[ignore = "requires separate disposable isolated database; synthetic signed proof, no production"]
+    async fn v2_isolated_deployment_scope_identity_expiry_replay_and_revocation() -> Result<()> {
+        isolated_import_contract(2).await
+    }
+    async fn isolated_import_contract(version: u32) -> Result<()> {
         let base = std::env::var("CLAWFORGE_LEARNING_TEST_DATABASE_URL")?;
         let options = PgConnectOptions::from_str(&base)?;
         ensure!(
@@ -1004,9 +1329,7 @@ mod tests {
                 None,
             )
             .await?;
-        p.owner_actor = owner;
-        p.curator_actor = curator;
-        p.bindings = vec![
+        let bindings = vec![
             Binding {
                 token_id: owner,
                 actor_id: owner,
@@ -1018,12 +1341,85 @@ mod tests {
                 rotation_from: None,
             },
         ];
+        if version == 1 {
+            p.owner_actor = owner;
+            p.curator_actor = curator;
+            p.bindings = bindings;
+        } else {
+            p.version = 2;
+            let mut d = deployment_fixture(&p)?;
+            d.database_port = options.get_port();
+            d.database_name = db.clone();
+            d.bindings = bindings;
+            d.owner_actor = owner;
+            d.curator_actor = curator;
+            d.cluster_system_identifier =
+                sqlx::query_scalar("SELECT system_identifier::text FROM pg_control_system()")
+                    .fetch_one(store.pool())
+                    .await?;
+            d.database_oid = sqlx::query_scalar(
+                "SELECT oid::bigint FROM pg_database WHERE datname=current_database()",
+            )
+            .fetch_one(store.pool())
+            .await?;
+            p.database_name = format!("learning_unused_fixture_{}", Uuid::new_v4().simple());
+            p.deployment = Some(d);
+        }
         fs::write(&f.policy, serde_json::to_vec(&p)?)?;
         f.seal()?;
         let urlfile = f.root.join("database-url");
         write_new(&urlfile, url.as_bytes())?;
-        check_bindings(&store, &p).await?;
+        if version == 1 {
+            check_bindings(&store, &p).await?;
+        }
         assert!(store.learning_actor(owner).await.is_err());
+        if version == 2 {
+            // Exercise Store boundary directly: it must reject the writing connection,
+            // independently of any preliminary CLI verification or pool connection.
+            let d = p.deployment.as_ref().unwrap();
+            let trusted_bindings: Vec<_> = d
+                .bindings
+                .iter()
+                .map(|b| LearningTrustBinding {
+                    token_id: b.token_id,
+                    actor_id: b.actor_id,
+                    rotation_from: b.rotation_from,
+                })
+                .collect();
+            for (cluster, deadline) in [
+                ("wrong-cluster".to_string(), i64::try_from(p.expires_at)?),
+                (d.cluster_system_identifier.clone(), 0),
+            ] {
+                let authorization = LearningImportAuthorization {
+                    cluster_system_identifier: cluster,
+                    database_oid: d.database_oid,
+                    expires_at: deadline,
+                };
+                assert!(store
+                    .import_learning_evidence_authorized(
+                        &trusted_bindings,
+                        owner,
+                        curator,
+                        &p.repository,
+                        &[],
+                        Some(&authorization)
+                    )
+                    .await
+                    .is_err());
+                assert!(store.learning_actor(owner).await.is_err());
+            }
+            let oid = p.deployment.as_ref().unwrap().database_oid;
+            p.deployment.as_mut().unwrap().database_oid = oid + 1;
+            fs::write(&f.policy, serde_json::to_vec(&p)?)?;
+            f.seal()?;
+            assert!(import(&f.policy, &f.key, &f.bundle, &urlfile)
+                .await
+                .is_err());
+            assert!(store.learning_actor(owner).await.is_err());
+            p.deployment.as_mut().unwrap().database_oid = oid;
+            fs::write(&f.policy, serde_json::to_vec(&p)?)?;
+            f.seal()?;
+        }
         sqlx::query(r#"UPDATE agent_tokens SET scopes='["agent:read"]'::jsonb WHERE id=$1"#)
             .bind(curator)
             .execute(store.pool())
@@ -1076,6 +1472,89 @@ mod tests {
             .execute(store.pool()).await?;
         sqlx::query("CREATE TRIGGER learning_import_test_gate BEFORE INSERT ON learning_curator_grants FOR EACH ROW EXECUTE FUNCTION learning_import_test_gate()")
             .execute(store.pool()).await?;
+        if version == 2 {
+            sqlx::query("UPDATE agent_tokens SET expires_at=clock_timestamp()+interval '20 seconds' WHERE id=$1")
+                .bind(curator)
+                .execute(store.pool())
+                .await?;
+            let mut expiry_gate = store.pool().begin().await?;
+            sqlx::query("SELECT pg_advisory_xact_lock($1)")
+                .bind(gate)
+                .execute(&mut *expiry_gate)
+                .await?;
+            let paths = (
+                f.policy.clone(),
+                f.key.clone(),
+                f.bundle.clone(),
+                urlfile.clone(),
+            );
+            let expiry_import =
+                tokio::spawn(async move { import(&paths.0, &paths.1, &paths.2, &paths.3).await });
+            wait_for_locked_query(store.pool(), "INSERT INTO learning_curator_grants%")
+                .await
+                .context("expiry importer must reach grant lock while credential is active")?;
+            // Debug importer binary hashing can consume the original one-second TTL.
+            // Observe the real grant lock before waiting for actual server-side expiry.
+            let remaining: f64 = sqlx::query_scalar(
+                "SELECT GREATEST(EXTRACT(EPOCH FROM expires_at-clock_timestamp()),0)::double precision FROM agent_tokens WHERE id=$1",
+            ).bind(curator).fetch_one(store.pool()).await?;
+            tokio::time::sleep(std::time::Duration::from_secs_f64(remaining + 0.05)).await;
+            expiry_gate.commit().await?;
+            assert!(expiry_import.await?.is_err());
+            let zero:i64=sqlx::query_scalar("SELECT (SELECT count(*) FROM learning_actor_tokens)+(SELECT count(*) FROM learning_curator_grants)+(SELECT count(*) FROM learning_verified_evidence)+(SELECT count(*) FROM audit_events)").fetch_one(store.pool()).await?;
+            assert_eq!(zero, 0);
+            sqlx::query("UPDATE agent_tokens SET expires_at=NOW()+interval '1 hour' WHERE id=$1")
+                .bind(curator)
+                .execute(store.pool())
+                .await?;
+        }
+        if version == 2 {
+            let d = p.deployment.as_ref().unwrap();
+            let authorization = LearningImportAuthorization {
+                cluster_system_identifier: d.cluster_system_identifier.clone(),
+                database_oid: d.database_oid,
+                expires_at: i64::try_from(now()? + 5)?,
+            };
+            let deadline = authorization.expires_at;
+            let approved: Vec<_> = d
+                .bindings
+                .iter()
+                .map(|b| LearningTrustBinding {
+                    token_id: b.token_id,
+                    actor_id: b.actor_id,
+                    rotation_from: b.rotation_from,
+                })
+                .collect();
+            let mut expiry_gate = store.pool().begin().await?;
+            sqlx::query("SELECT pg_advisory_xact_lock($1)")
+                .bind(gate)
+                .execute(&mut *expiry_gate)
+                .await?;
+            let importing_store = store.clone();
+            let repository = p.repository.clone();
+            let expiry_import = tokio::spawn(async move {
+                importing_store
+                    .import_learning_evidence_authorized(
+                        &approved,
+                        owner,
+                        curator,
+                        &repository,
+                        &[],
+                        Some(&authorization),
+                    )
+                    .await
+            });
+            wait_for_locked_query(store.pool(), "INSERT INTO learning_curator_grants%")
+                .await
+                .context("authorization expiry must occur after grant lock")?;
+            let remaining: f64 = sqlx::query_scalar("SELECT GREATEST($1::bigint-EXTRACT(EPOCH FROM clock_timestamp()),0)::double precision")
+                .bind(deadline).fetch_one(store.pool()).await?;
+            tokio::time::sleep(std::time::Duration::from_secs_f64(remaining + 0.05)).await;
+            expiry_gate.commit().await?;
+            assert!(expiry_import.await?.is_err());
+            let zero:i64=sqlx::query_scalar("SELECT (SELECT count(*) FROM learning_actor_tokens)+(SELECT count(*) FROM learning_curator_grants)+(SELECT count(*) FROM learning_verified_evidence)+(SELECT count(*) FROM audit_events)").fetch_one(store.pool()).await?;
+            assert_eq!(zero, 0);
+        }
         let mut barrier = store.pool().begin().await?;
         sqlx::query("SELECT pg_advisory_xact_lock($1)")
             .bind(gate)

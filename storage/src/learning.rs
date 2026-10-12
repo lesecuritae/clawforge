@@ -16,6 +16,14 @@ pub struct LearningTrustBinding {
     pub rotation_from: Option<Uuid>,
 }
 
+/// Trusted offline deployment constraint, checked on the writing transaction.
+#[derive(Clone)]
+pub struct LearningImportAuthorization {
+    pub cluster_system_identifier: String,
+    pub database_oid: i64,
+    pub expires_at: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct LearningEvidence {
@@ -404,6 +412,21 @@ impl PostgresStore {
         repository: &str,
         evidence: &[LearningEvidence],
     ) -> Result<()> {
+        self.import_learning_evidence_authorized(
+            bindings, owner, curator, repository, evidence, None,
+        )
+        .await
+    }
+    /// Deployment authorization is enforced on the same connection as every write.
+    pub async fn import_learning_evidence_authorized(
+        &self,
+        bindings: &[LearningTrustBinding],
+        owner: Uuid,
+        curator: Uuid,
+        repository: &str,
+        evidence: &[LearningEvidence],
+        authorization: Option<&LearningImportAuthorization>,
+    ) -> Result<()> {
         ensure!(
             owner != curator && bindings.len() == 2,
             "independent identities required"
@@ -420,6 +443,16 @@ impl PostgresStore {
             "distinct credentials required"
         );
         let mut tx = self.pool.begin().await?;
+        if let Some(expected) = authorization {
+            let row = sqlx::query("SELECT (SELECT system_identifier::text FROM pg_control_system()) AS cluster, (SELECT oid::bigint FROM pg_database WHERE datname=current_database()) AS database_oid, EXTRACT(EPOCH FROM clock_timestamp()) < $1::bigint AS authorized")
+                .bind(expected.expires_at).fetch_one(&mut *tx).await?;
+            ensure!(
+                row.get::<String, _>("cluster") == expected.cluster_system_identifier
+                    && row.get::<i64, _>("database_oid") == expected.database_oid
+                    && row.get::<bool, _>("authorized"),
+                "deployment transaction identity or authorization mismatch"
+            );
+        }
         // Match the rotation/onboarding lock order, before taking credential row locks.
         for b in &ordered {
             sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))")
@@ -489,6 +522,17 @@ impl PostgresStore {
             let active: bool = sqlx::query_scalar("SELECT revoked_at IS NULL AND expires_at > clock_timestamp() FROM agent_tokens WHERE id=$1")
                 .bind(b.token_id).fetch_one(&mut *tx).await?;
             ensure!(active, "credential inactive before import commit");
+        }
+        if let Some(expected) = authorization {
+            let valid: bool =
+                sqlx::query_scalar("SELECT EXTRACT(EPOCH FROM clock_timestamp()) < $1::bigint")
+                    .bind(expected.expires_at)
+                    .fetch_one(&mut *tx)
+                    .await?;
+            ensure!(
+                valid,
+                "deployment authorization expired before import commit"
+            );
         }
         tx.commit().await?;
         Ok(())

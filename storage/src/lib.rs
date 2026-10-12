@@ -19,8 +19,8 @@ use uuid::Uuid;
 
 mod learning;
 pub use learning::{
-    LearningContext, LearningEvidence, LearningLessonInput, LearningQuery, LearningReview,
-    LearningTrustBinding,
+    LearningContext, LearningEvidence, LearningImportAuthorization, LearningLessonInput,
+    LearningQuery, LearningReview, LearningTrustBinding,
 };
 mod migration_compat;
 mod quarantine_intents;
