@@ -544,3 +544,154 @@ async fn generic_applicability_specificity_and_record_pagination() -> anyhow::Re
     }
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL with provisioned clawforge_api role"]
+async fn immutable_api_role_serializes_lesson_transitions_without_update_grants(
+) -> anyhow::Result<()> {
+    let owner_store =
+        PostgresStore::connect_runtime(&std::env::var("CLAWFORGE_LEARNING_TEST_DATABASE_URL")?)
+            .await?;
+    let api =
+        PostgresStore::connect_runtime(&std::env::var("CLAWFORGE_TEST_API_DATABASE_URL")?).await?;
+    let role: String = sqlx::query_scalar("SELECT current_user")
+        .fetch_one(api.pool())
+        .await?;
+    assert_eq!(role, "clawforge_api");
+    let owner = Uuid::new_v4();
+    let curator = Uuid::new_v4();
+    let input = lesson(&format!("immutable-role-{owner}"));
+    let created = api.propose_learning(owner, &input).await?;
+    let lid: Uuid = serde_json::from_value(created["id"].clone())?;
+    let rid: Uuid = serde_json::from_value(created["revision_id"].clone())?;
+
+    // Reproduce the old bug using the actual production role permissions.
+    let old_lock = sqlx::query("SELECT owner_id FROM learning_lessons WHERE id=$1 FOR UPDATE")
+        .bind(lid)
+        .fetch_one(api.pool())
+        .await
+        .unwrap_err();
+    assert_eq!(
+        old_lock
+            .as_database_error()
+            .and_then(|e| e.code())
+            .as_deref(),
+        Some("42501")
+    );
+    let forbidden_update =
+        sqlx::query("UPDATE learning_lessons SET component='tampered' WHERE id=$1")
+            .bind(lid)
+            .execute(api.pool())
+            .await
+            .unwrap_err();
+    assert_eq!(
+        forbidden_update
+            .as_database_error()
+            .and_then(|e| e.code())
+            .as_deref(),
+        Some("42501")
+    );
+    let content_update: bool = sqlx::query_scalar(
+        "SELECT has_column_privilege(current_user,'learning_lessons','component','UPDATE')",
+    )
+    .fetch_one(api.pool())
+    .await?;
+    assert!(!content_update);
+
+    owner_store.grant_learning_curator(owner, curator).await?;
+    owner_store
+        .attest_learning_evidence(owner, &input.repository, curator, &input.evidence)
+        .await?;
+    let review = LearningReview {
+        idempotency_key: format!("review-{rid}"),
+        status: "active".into(),
+        reason: "Isolated actual API role regression".into(),
+        evidence: input.evidence.clone(),
+    };
+    api.review_learning(curator, rid, &review).await?;
+
+    // A competing transition must wait for the shared lesson transaction lock.
+    let mut held = owner_store.pool().begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))")
+        .bind(format!("learning-lesson:{lid}"))
+        .execute(&mut *held)
+        .await?;
+    let mut revision = input.clone();
+    revision.idempotency_key = format!("revision-after-lock-{owner}");
+    let api_task = api.clone();
+    let mut task =
+        tokio::spawn(async move { api_task.revise_learning(owner, lid, &revision).await });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(150), &mut task)
+            .await
+            .is_err()
+    );
+    held.rollback().await?;
+    tokio::time::timeout(std::time::Duration::from_secs(5), task).await???;
+
+    // Concurrent revisions cannot allocate the same revision number.
+    let mut a = input.clone();
+    a.idempotency_key = format!("revision-a-{owner}");
+    let mut b = input.clone();
+    b.idempotency_key = format!("revision-b-{owner}");
+    let (a, b) = tokio::join!(
+        api.revise_learning(owner, lid, &a),
+        api.revise_learning(owner, lid, &b)
+    );
+    let a: Uuid = serde_json::from_value(a?["revision_id"].clone())?;
+    let b: Uuid = serde_json::from_value(b?["revision_id"].clone())?;
+    let revisions: Vec<(Uuid, i32)> = sqlx::query_as(
+        "SELECT id,revision FROM learning_revisions WHERE id IN ($1,$2) ORDER BY revision",
+    )
+    .bind(a)
+    .bind(b)
+    .fetch_all(api.pool())
+    .await?;
+    assert_eq!(revisions.len(), 2);
+    assert_eq!(revisions[1].1, revisions[0].1 + 1);
+    let older = revisions[0].0;
+    let newer = revisions[1].0;
+    let old_review = LearningReview {
+        idempotency_key: format!("review-{older}"),
+        ..review.clone()
+    };
+    let new_review = LearningReview {
+        idempotency_key: format!("review-{newer}"),
+        ..review.clone()
+    };
+    let (_, new_result) = tokio::join!(
+        api.review_learning(curator, older, &old_review),
+        api.review_learning(curator, newer, &new_review)
+    );
+    new_result?;
+    let active: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM learning_revisions WHERE lesson_id=$1 AND status='active'",
+    )
+    .bind(lid)
+    .fetch_all(api.pool())
+    .await?;
+    assert_eq!(active, vec![newer]);
+
+    // Append-only record retry remains atomic under that same lesson lock.
+    let payload = json!({"decision":"bounded isolated regression"});
+    let (left, right) = tokio::join!(
+        api.attach_learning_record(owner, newer, "decision", "same-record", &payload),
+        api.attach_learning_record(owner, newer, "decision", "same-record", &payload),
+    );
+    assert_eq!(left?, right?);
+    let rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM learning_records WHERE revision_id=$1 AND kind='decision'",
+    )
+    .bind(newer)
+    .fetch_one(api.pool())
+    .await?;
+    assert_eq!(rows, 1);
+    assert!(
+        !sqlx::query_scalar::<_, bool>(
+            "SELECT has_column_privilege(current_user,'learning_lessons','component','UPDATE')"
+        )
+        .fetch_one(api.pool())
+        .await?
+    );
+    Ok(())
+}

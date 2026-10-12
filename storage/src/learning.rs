@@ -216,6 +216,21 @@ impl LearningLessonInput {
     }
 }
 impl PostgresStore {
+    // Lesson content is immutable and the API role has no UPDATE privilege on
+    // learning_lessons. SELECT FOR UPDATE therefore cannot lock that table.
+    // Use one transaction-scoped lesson lock for all revision/record changes,
+    // acquired before revision row locks, without granting content mutation.
+    async fn lock_learning_lesson(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        lesson: Uuid,
+    ) -> Result<()> {
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))")
+            .bind(format!("learning-lesson:{lesson}"))
+            .execute(&mut **tx)
+            .await?;
+        Ok(())
+    }
+
     /// Resolve a stable learning actor while retaining legacy token identity for
     /// unrelated API contracts. Missing links initially use the token UUID.
     pub async fn learning_actor(&self, token: Uuid) -> Result<Uuid> {
@@ -576,12 +591,12 @@ impl PostgresStore {
     ) -> Result<Value> {
         input.validate()?;
         let mut tx = self.pool.begin().await?;
-        let row = sqlx::query(
-            "SELECT owner_id,repository,component FROM learning_lessons WHERE id=$1 FOR UPDATE",
-        )
-        .bind(id)
-        .fetch_one(&mut *tx)
-        .await?;
+        Self::lock_learning_lesson(&mut tx, id).await?;
+        let row =
+            sqlx::query("SELECT owner_id,repository,component FROM learning_lessons WHERE id=$1")
+                .bind(id)
+                .fetch_one(&mut *tx)
+                .await?;
         ensure!(
             row.get::<Uuid, _>("owner_id") == owner,
             "learning owner mismatch"
@@ -694,11 +709,11 @@ impl PostgresStore {
             .bind(rid)
             .fetch_one(&mut *tx)
             .await?;
-        let owner: Uuid =
-            sqlx::query_scalar("SELECT owner_id FROM learning_lessons WHERE id=$1 FOR UPDATE")
-                .bind(lid)
-                .fetch_one(&mut *tx)
-                .await?;
+        Self::lock_learning_lesson(&mut tx, lid).await?;
+        let owner: Uuid = sqlx::query_scalar("SELECT owner_id FROM learning_lessons WHERE id=$1")
+            .bind(lid)
+            .fetch_one(&mut *tx)
+            .await?;
         ensure!(owner != reviewer, "self validation is prohibited");
         let authorized: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM learning_curator_grants WHERE owner_id=$1 AND reviewer_id=$2)").bind(owner).bind(reviewer).fetch_one(&mut *tx).await?;
         ensure!(authorized, "curator is not assigned to this owner");
@@ -771,7 +786,15 @@ impl PostgresStore {
             "invalid learning record"
         );
         let mut tx = self.pool.begin().await?;
-        let actual:Uuid=sqlx::query_scalar("SELECT l.owner_id FROM learning_lessons l JOIN learning_revisions r ON r.lesson_id=l.id WHERE r.id=$1 FOR UPDATE OF l").bind(rid).fetch_one(&mut *tx).await?;
+        let lid: Uuid = sqlx::query_scalar("SELECT lesson_id FROM learning_revisions WHERE id=$1")
+            .bind(rid)
+            .fetch_one(&mut *tx)
+            .await?;
+        Self::lock_learning_lesson(&mut tx, lid).await?;
+        let actual: Uuid = sqlx::query_scalar("SELECT owner_id FROM learning_lessons WHERE id=$1")
+            .bind(lid)
+            .fetch_one(&mut *tx)
+            .await?;
         ensure!(actual == owner, "learning owner mismatch");
         if let Some(existing)=sqlx::query("SELECT id,kind,payload FROM learning_records WHERE revision_id=$1 AND actor_id=$2 AND idempotency_key=$3").bind(rid).bind(owner).bind(idempotency_key).fetch_optional(&mut *tx).await? {
             ensure!(existing.get::<String,_>("kind")==kind && existing.get::<Value,_>("payload")==*payload,"record idempotency mismatch");
