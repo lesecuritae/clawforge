@@ -1303,6 +1303,30 @@ impl PostgresStore {
         Ok(rows.into_iter().map(|row| row.get("incident")).collect())
     }
 
+    /// Decision inputs retain exact legacy plus distinct direct-event counts, but
+    /// omit historical sources and relationship-only events unused by the engine.
+    pub async fn list_decision_incident_views(&self, limit: i64) -> Result<Vec<serde_json::Value>> {
+        let rows = sqlx::query(
+            "WITH selected AS ( \
+                SELECT id,status,severity,confidence,risk_score,summary,updated_at \
+                FROM incidents ORDER BY updated_at DESC LIMIT $1 \
+             ) SELECT jsonb_build_object('id',i.id,'status',i.status,'severity',i.severity, \
+                'confidence',i.confidence,'risk_score',i.risk_score,'summary',i.summary, \
+                'event_count',legacy.event_count + direct.event_count) AS incident \
+             FROM selected i \
+             LEFT JOIN LATERAL (SELECT COUNT(DISTINCT event_id) AS event_count \
+                FROM incident_events WHERE incident_id=i.id) legacy ON TRUE \
+             LEFT JOIN LATERAL (SELECT COUNT(DISTINCT event_id) AS event_count \
+                FROM incident_relations WHERE incident_id=i.id \
+                AND relation_type='event' AND event_id IS NOT NULL) direct ON TRUE \
+             ORDER BY i.updated_at DESC",
+        )
+        .bind(limit.clamp(1, 500))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|row| row.get("incident")).collect())
+    }
+
     /// Return secret-provider health metadata without exposing references that
     /// could be used to retrieve a value. Secret contents never cross this
     /// storage API.

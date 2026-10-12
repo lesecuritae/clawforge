@@ -79,7 +79,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn evaluate_decisions(store: &PostgresStore) -> anyhow::Result<()> {
-    let incidents = store.list_incidents(None, 500).await?;
+    let incidents = store.list_decision_incident_views(500).await?;
     let providers = store.list_provider_views().await?;
     let alerts = store.list_alerts(None, None, 500).await?;
     let knowledge = store.list_knowledge_entries(500).await?;
@@ -201,4 +201,41 @@ async fn prepare_workflow_runs(store: &PostgresStore) -> anyhow::Result<()> {
             .await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn decision_projection_preserves_entire_drafts_and_exact_event_count() {
+        let statuses = [
+            "detected",
+            "investigating",
+            "confirmed",
+            "mitigated",
+            "resolved",
+            "closed",
+        ];
+        let full: Vec<_> = statuses
+            .iter()
+            .enumerate()
+            .map(|(i, status)| {
+                serde_json::json!({
+                    "id": uuid::Uuid::from_u128(i as u128 + 1), "status":status,"severity":"high",
+                    "confidence":70+i,"risk_score":10+i,"summary":"review","event_count":3+i,
+                    "event_sources":"unused history","title":"unused title","source":"unused source"
+                })
+            })
+            .collect();
+        let projected: Vec<_> = full.iter().map(|v| serde_json::json!({
+            "id":v["id"],"status":v["status"],"severity":v["severity"],"confidence":v["confidence"],
+            "risk_score":v["risk_score"],"summary":v["summary"],"event_count":v["event_count"]
+        })).collect();
+        let expected = DecisionEngine.evaluate(&full, &[], &[], &[]);
+        let actual = DecisionEngine.evaluate(&projected, &[], &[], &[]);
+        assert_eq!(expected, actual);
+        assert_eq!(actual.len(), 4);
+        assert_eq!(actual[0].metadata["event_count"], 3);
+        assert_eq!(actual[3].metadata["risk_score"], 13);
+    }
 }
