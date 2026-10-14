@@ -743,7 +743,7 @@ impl McpServer {
                 .map(|(key, value)| (key.as_str(), value.as_str())),
         );
         MCP_UPSTREAM_REQUESTS.fetch_add(1, Ordering::Relaxed);
-        let response = self
+        let mut response = self
             .client
             .get(url)
             .bearer_auth(&self.config.agent_api_token)
@@ -755,17 +755,22 @@ impl McpServer {
                 ErrorData::internal_error("Agent API request failed", None)
             })?;
         let status = response.status();
-        let bytes = response.bytes().await.map_err(|_| {
+
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|_| {
             MCP_UPSTREAM_ERRORS.fetch_add(1, Ordering::Relaxed);
             ErrorData::internal_error("Agent API response invalid", None)
-        })?;
-        if bytes.len() > MAX_RESPONSE_BYTES {
-            MCP_UPSTREAM_ERRORS.fetch_add(1, Ordering::Relaxed);
-            return Err(ErrorData::internal_error(
-                "Agent API response exceeds the MCP size limit",
-                Some(json!({"max_bytes": MAX_RESPONSE_BYTES})),
-            ));
+        })? {
+            if bytes.len() + chunk.len() > MAX_RESPONSE_BYTES {
+                MCP_UPSTREAM_ERRORS.fetch_add(1, Ordering::Relaxed);
+                return Err(ErrorData::internal_error(
+                    "Agent API response exceeds the MCP size limit",
+                    Some(json!({"max_bytes": MAX_RESPONSE_BYTES})),
+                ));
+            }
+            bytes.extend_from_slice(&chunk);
         }
+
         let body = serde_json::from_slice::<ApiEnvelope>(&bytes).map_err(|_| {
             MCP_UPSTREAM_ERRORS.fetch_add(1, Ordering::Relaxed);
             ErrorData::internal_error("Agent API response invalid", None)
