@@ -393,7 +393,13 @@ Agent-API-Credential zu ändern.
 ### Response- und Fehlervertrag
 
 Der Upstream-Body und die redigierte MCP-Antwort sind jeweils auf 1 MiB
-begrenzt. Größere Antworten werden als temporärer MCP-Fehler abgewiesen.
+begrenzt. Der MCP-Dienst prüft die empfangene Größe nach jedem Antwort-Body-Chunk
+und weist Antworten über 1.048.576 Bytes bereits während des Einlesens ab.
+Er wartet dafür weder auf die vollständige Antwort noch auf deren Ende (EOF).
+Dies gilt auch ohne Content-Length, bei Chunked Transfer Encoding und wenn der
+Upstream den Antwortstream offen hält. Antwort-Body-Chunks entsprechen dabei
+nicht zwingend TCP-Paketgrenzen. Die Fehlermeldung enthält die erlaubte Obergrenze,
+aber keine Inhalte des verworfenen Bodys.
 Listen müssen deshalb über die vorgesehenen `page`-/`page_size`-Parameter
 abgefragt werden; `page_size` wird auf 100 begrenzt. Ein Upstream-Timeout,
 ungültiges JSON, `401`, `403`, `404`, `429` oder `5xx` wird in eine
