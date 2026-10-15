@@ -176,6 +176,62 @@ impl Default for ProxmoxAdapter {
     }
 }
 
+/// Result of querying a prepared quarantine's recorded Proxmox config-task UPID once.
+/// The audited operator reconciliation path (Q2b) uses this to prove whether the remote
+/// `net0` config task that may have run actually completed, before deciding on a verified
+/// restore. It never drives an automatic replay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProxmoxTaskCompletion {
+    /// Task finished successfully (status "stopped", exitstatus "OK").
+    SucceededOk,
+    /// Task finished with a non-OK exit status.
+    Failed,
+    /// Task is still running; completion is not yet decided.
+    Running,
+}
+
+/// Validate that `upid` is a well-formed qmconfig task ID for exactly `node`/`vmid`, so a
+/// status query (or wait) can never be pointed at an unrelated task. Same contract as the
+/// task waiter; shared by both so the security-sensitive check cannot drift.
+pub fn validate_qmconfig_upid(node: &str, vmid: u32, upid: &str) -> Result<(), AdapterError> {
+    let parts: Vec<_> = upid.split(':').collect();
+    if upid.len() > 1024
+        || parts.len() != 9
+        || parts[0] != "UPID"
+        || parts[1] != node
+        || parts[5] != "qmconfig"
+        || parts[6] != vmid.to_string()
+        || parts[7].is_empty()
+        || !parts[8].is_empty()
+        || parts[2..5]
+            .iter()
+            .any(|part| part.is_empty() || !part.bytes().all(|b| b.is_ascii_hexdigit()))
+        || upid
+            .bytes()
+            .any(|b| !b.is_ascii_alphanumeric() && !b"_:@.!+-".contains(&b))
+    {
+        return Err(AdapterError::Apply("invalid Proxmox config task ID".into()));
+    }
+    Ok(())
+}
+
+/// Interpret one `/tasks/{upid}/status` response body. Pure; performs no IO. An unknown or
+/// malformed status is an error ("completion unknown"), never silently treated as done.
+pub fn interpret_task_status(
+    body: &serde_json::Value,
+) -> Result<ProxmoxTaskCompletion, AdapterError> {
+    match body["data"]["status"].as_str() {
+        Some("stopped") if body["data"]["exitstatus"].as_str() == Some("OK") => {
+            Ok(ProxmoxTaskCompletion::SucceededOk)
+        }
+        Some("stopped") => Ok(ProxmoxTaskCompletion::Failed),
+        Some("running") => Ok(ProxmoxTaskCompletion::Running),
+        _ => Err(AdapterError::Apply(
+            "invalid Proxmox task status; completion unknown".into(),
+        )),
+    }
+}
+
 impl ProxmoxAdapter {
     pub fn new() -> Self {
         let credentials = Self::load_credentials();
@@ -380,24 +436,7 @@ impl ProxmoxAdapter {
         upid: &str,
         ticket: &str,
     ) -> Result<(), AdapterError> {
-        let parts: Vec<_> = upid.split(':').collect();
-        if upid.len() > 1024
-            || parts.len() != 9
-            || parts[0] != "UPID"
-            || parts[1] != node
-            || parts[5] != "qmconfig"
-            || parts[6] != vmid.to_string()
-            || parts[7].is_empty()
-            || !parts[8].is_empty()
-            || parts[2..5]
-                .iter()
-                .any(|part| part.is_empty() || !part.bytes().all(|b| b.is_ascii_hexdigit()))
-            || upid
-                .bytes()
-                .any(|b| !b.is_ascii_alphanumeric() && !b"_:@.!+-".contains(&b))
-        {
-            return Err(AdapterError::Apply("invalid Proxmox config task ID".into()));
-        }
+        validate_qmconfig_upid(node, vmid, upid)?;
         let credentials = self.credentials()?;
         let mut url = reqwest::Url::parse(&format!("https://{}", credentials.host))
             .map_err(|_| AdapterError::Apply("invalid Proxmox host".into()))?;
@@ -448,6 +487,44 @@ impl ProxmoxAdapter {
                     "Proxmox config task timed out; completion unknown, review required".into(),
                 )
             })?
+    }
+
+    /// Read-only: query a recorded config-task UPID exactly once (no wait loop). The audited
+    /// operator reconciliation path uses this to prove whether a prepared generation's Proxmox
+    /// task completed before deciding on a verified restore. Validates the UPID binds to the
+    /// generation's own node/vmid first, so it can never read an unrelated task.
+    pub async fn task_status(
+        &self,
+        node: &str,
+        vmid: u32,
+        upid: &str,
+    ) -> Result<ProxmoxTaskCompletion, AdapterError> {
+        validate_qmconfig_upid(node, vmid, upid)?;
+        let credentials = self.credentials()?;
+        let (ticket, _csrf) = self.ticket().await?;
+        let mut url = reqwest::Url::parse(&format!("https://{}", credentials.host))
+            .map_err(|_| AdapterError::Apply("invalid Proxmox host".into()))?;
+        url.path_segments_mut()
+            .map_err(|_| AdapterError::Apply("invalid Proxmox task endpoint".into()))?
+            .extend(["api2", "json", "nodes", node, "tasks", upid, "status"]);
+        let response = self
+            .http()?
+            .get(url)
+            .header("Cookie", format!("PVEAuthCookie={ticket}"))
+            .send()
+            .await
+            .map_err(|_| {
+                AdapterError::Apply("Proxmox task status unavailable; completion unknown".into())
+            })?;
+        if !response.status().is_success() {
+            return Err(AdapterError::Apply(
+                "Proxmox task status rejected; completion unknown".into(),
+            ));
+        }
+        let body: serde_json::Value = response.json().await.map_err(|_| {
+            AdapterError::Apply("invalid Proxmox task status; completion unknown".into())
+        })?;
+        interpret_task_status(&body)
     }
 
     /// Read-only: inspects the VM's current NIC state without changing anything.
@@ -590,6 +667,48 @@ mod tests {
     use super::*;
 
     const NIC: &str = "virtio=BC:24:11:6D:2B:EF,bridge=vmbr0";
+
+    const UPID: &str = "UPID:lab:0000ABCD:00001234:60000000:qmconfig:100:root@pam:";
+
+    #[test]
+    fn qmconfig_upid_must_bind_to_the_exact_node_and_vmid() {
+        validate_qmconfig_upid("lab", 100, UPID).unwrap();
+        for (node, vmid, upid) in [
+            ("lab", 101, UPID),                                // wrong vmid
+            ("other", 100, UPID),                              // wrong node
+            ("lab", 100, &UPID.replace("qmconfig", "vzdump")), // wrong task type
+            ("lab", 100, &UPID.replace("0000ABCD", "00zz")),   // non-hex time field
+            ("lab", 100, &UPID[..UPID.len() - 1]),             // missing trailing colon
+            ("lab", 100, "not-a-upid"),
+            ("lab", 100, ""),
+        ] {
+            assert!(
+                validate_qmconfig_upid(node, vmid, upid).is_err(),
+                "must reject node={node} vmid={vmid} upid={upid}"
+            );
+        }
+    }
+
+    #[test]
+    fn task_status_is_only_complete_on_stopped_ok_and_unknown_is_an_error() {
+        use ProxmoxTaskCompletion::*;
+        let stopped_ok = serde_json::json!({"data":{"status":"stopped","exitstatus":"OK"}});
+        let stopped_fail = serde_json::json!({"data":{"status":"stopped","exitstatus":"err"}});
+        let running = serde_json::json!({"data":{"status":"running"}});
+        assert_eq!(interpret_task_status(&stopped_ok).unwrap(), SucceededOk);
+        assert_eq!(interpret_task_status(&stopped_fail).unwrap(), Failed);
+        assert_eq!(interpret_task_status(&running).unwrap(), Running);
+        // "stopped" with any non-OK (or missing) exitstatus is a Failed task, not complete.
+        let stopped_no_exit = serde_json::json!({"data":{"status":"stopped"}});
+        assert_eq!(interpret_task_status(&stopped_no_exit).unwrap(), Failed);
+        for unknown in [
+            serde_json::json!({}),
+            serde_json::json!({"data":{}}),
+            serde_json::json!({"data":{"status":"paused"}}),
+        ] {
+            assert!(interpret_task_status(&unknown).is_err());
+        }
+    }
 
     #[test]
     fn config_parser_requires_one_nic_and_atomic_digest() {
