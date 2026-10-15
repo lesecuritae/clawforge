@@ -710,6 +710,32 @@ mod tests {
         }
     }
 
+    // Live Proxmox proof for Q2b step 1: query a real recorded qmconfig UPID once against
+    // the configured PVE and assert the outcome is decided. Reads the adapter credentials
+    // from the usual CLAWFORGE_PROXMOX_* env plus the live task coordinates.
+    #[tokio::test]
+    #[ignore = "live PVE: needs CLAWFORGE_PROXMOX_* creds + CLAWFORGE_PROXMOX_LIVE_{NODE,VMID,UPID}"]
+    async fn proxmox_task_status_live_returns_a_decided_outcome() {
+        let node = std::env::var("CLAWFORGE_PROXMOX_LIVE_NODE").expect("live node");
+        let vmid: u32 = std::env::var("CLAWFORGE_PROXMOX_LIVE_VMID")
+            .expect("live vmid")
+            .parse()
+            .expect("numeric vmid");
+        let upid = std::env::var("CLAWFORGE_PROXMOX_LIVE_UPID").expect("live upid");
+        let outcome = ProxmoxAdapter::new()
+            .task_status(&node, vmid, &upid)
+            .await
+            .expect("live task_status query");
+        eprintln!("live proxmox task_status({node}/{vmid}) = {outcome:?}");
+        assert!(
+            matches!(
+                outcome,
+                ProxmoxTaskCompletion::SucceededOk | ProxmoxTaskCompletion::Failed
+            ),
+            "a completed historical qmconfig task must report a decided outcome, got {outcome:?}"
+        );
+    }
+
     #[test]
     fn config_parser_requires_one_nic_and_atomic_digest() {
         let valid = serde_json::json!({"data":{"net0": NIC, "digest":"test-digest"}});
