@@ -18,7 +18,7 @@ use axum::{
     routing::get,
     Router,
 };
-use clawforge_secret::load_required_token;
+use clawforge_secret::{load_optional, load_required_token, validate_token};
 use reqwest::{Client, Url};
 use rmcp::{
     handler::server::wrapper::{Json, Parameters},
@@ -89,6 +89,7 @@ struct AppState {
 struct Config {
     agent_api_url: Url,
     agent_api_token: String,
+    learning_api_token: Option<String>,
     mcp_auth_token: String,
     mcp_scopes: HashSet<String>,
     timeout: Duration,
@@ -390,9 +391,27 @@ impl Config {
             "CLAWFORGE_MCP_AGENT_TOKEN_FILE",
             "CLAWFORGE_MCP_AGENT_TOKEN",
         )?;
+        let learning_api_token =
+            if std::env::var("CLAWFORGE_LEARNING_ENABLED").as_deref() == Ok("false") {
+                None
+            } else {
+                load_optional(
+                    "CLAWFORGE_MCP_LEARNING_TOKEN_FILE",
+                    "CLAWFORGE_MCP_LEARNING_TOKEN",
+                )?
+            };
+        if let Some(token) = &learning_api_token {
+            validate_token("learning token", token)?;
+            if token == &agent_api_token {
+                return Err(anyhow!(
+                    "Learning and read-only API credentials must differ"
+                ));
+            }
+        }
         let mcp_auth_token =
             load_required_token("CLAWFORGE_MCP_AUTH_TOKEN_FILE", "CLAWFORGE_MCP_AUTH_TOKEN")?;
-        if agent_api_token == mcp_auth_token {
+        if agent_api_token == mcp_auth_token || learning_api_token.as_ref() == Some(&mcp_auth_token)
+        {
             return Err(anyhow!("MCP and Agent API credentials must be different"));
         }
         let scope_text =
@@ -412,6 +431,7 @@ impl Config {
         Ok(Self {
             agent_api_url,
             agent_api_token,
+            learning_api_token,
             mcp_auth_token,
             mcp_scopes,
             timeout,
@@ -496,6 +516,8 @@ fn parse_scopes(value: &str) -> Result<HashSet<String>> {
         SCOPE_POLICY_DECISION,
         SCOPE_FIREWALL,
         SCOPE_ALL,
+        "agent:learning:read",
+        "agent:learning:propose",
     ];
     if scopes.is_empty()
         || scopes
@@ -656,10 +678,26 @@ async fn metrics() -> impl IntoResponse {
 
 impl McpServer {
     fn new(config: Arc<Config>) -> Self {
+        let mut tool_router = Self::tool_router();
+        for (name, scope) in [
+            ("query_learning_lessons_v1", "agent:learning:read"),
+            ("get_learning_records_v1", "agent:learning:read"),
+            ("propose_learning_lesson_v1", "agent:learning:propose"),
+            ("revise_learning_lesson_v1", "agent:learning:propose"),
+            ("attach_learning_record_v1", "agent:learning:propose"),
+        ] {
+            if config.learning_api_token.is_none() || !config.mcp_scopes.contains(scope) {
+                tool_router.remove_route(name);
+            }
+        }
+        if config.learning_api_token.is_none() || !config.mcp_scopes.contains("agent:learning:read")
+        {
+            tool_router.remove_route("get_learning_capabilities_v1");
+        }
         Self {
             config,
             client: Client::new(),
-            tool_router: Self::tool_router(),
+            tool_router,
         }
     }
 
@@ -866,8 +904,334 @@ impl McpServer {
     }
 }
 
+fn redact_learning(value: Value) -> Value {
+    match value {
+        Value::Object(object) => Value::Object(
+            object
+                .into_iter()
+                .filter(|(key, _)| {
+                    ![
+                        "token",
+                        "secret",
+                        "password",
+                        "api_key",
+                        "apikey",
+                        "authorization",
+                        "request_body",
+                        "raw_payload",
+                        "body",
+                    ]
+                    .contains(&key.to_ascii_lowercase().as_str())
+                })
+                .map(|(key, value)| (key, redact_learning(value)))
+                .collect(),
+        ),
+        Value::Array(values) => Value::Array(values.into_iter().map(redact_learning).collect()),
+        Value::String(value)
+            if [
+                "nvapi-",
+                "ghp_",
+                "sk-or-v1-",
+                "bearer ",
+                "-----begin private key",
+            ]
+            .iter()
+            .any(|prefix| value.to_ascii_lowercase().contains(prefix)) =>
+        {
+            json!("[redacted]")
+        }
+        value => value,
+    }
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct LearningQueryArgs {
+    project: Option<String>,
+    agent: Option<String>,
+    model: Option<String>,
+    provider: Option<String>,
+    language: Option<String>,
+    framework: Option<String>,
+    platform: Option<String>,
+    error_class: Option<String>,
+    file_path: Option<String>,
+    tag: Option<String>,
+    version_key: Option<String>,
+    version: Option<String>,
+    repository: Option<String>,
+    component: Option<String>,
+    status: Option<String>,
+    limit: Option<i64>,
+}
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct LearningPayloadArgs {
+    #[schemars(schema_with = "any_json_value_schema")]
+    payload: Value,
+}
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct LearningRevisionArgs {
+    #[schemars(with = "String")]
+    id: Uuid,
+    #[schemars(schema_with = "any_json_value_schema")]
+    payload: Value,
+}
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct LearningIdArgs {
+    #[schemars(with = "String")]
+    id: Uuid,
+    limit: Option<i64>,
+    #[schemars(with = "Option<String>")]
+    before: Option<Uuid>,
+}
+
+impl McpServer {
+    async fn learning_request(
+        &self,
+        scope: &str,
+        method: reqwest::Method,
+        path: &str,
+        query: &[(String, String)],
+        body: Option<Value>,
+    ) -> Result<ToolResponse, ErrorData> {
+        if !self.config.mcp_scopes.contains(scope) {
+            return Err(ErrorData::invalid_request(
+                "Exact learning scope required",
+                None,
+            ));
+        }
+        let token = self
+            .config
+            .learning_api_token
+            .as_ref()
+            .ok_or_else(|| ErrorData::invalid_request("Learning is disabled", None))?;
+        let mut url = self.config.agent_api_url.clone();
+        let base = url.path().trim_end_matches('/').to_string();
+        url.set_path(&format!("{base}{path}"));
+        url.query_pairs_mut()
+            .clear()
+            .extend_pairs(query.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        let client = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|_| ErrorData::internal_error("Learning client unavailable", None))?;
+        let mut request = client
+            .request(method, url)
+            .bearer_auth(token)
+            .timeout(self.config.timeout);
+        if let Some(body) = body {
+            if serde_json::to_vec(&body).map_or(true, |v| v.len() > MAX_REQUEST_BYTES) {
+                return Err(ErrorData::invalid_params(
+                    "Learning request exceeds size limit",
+                    None,
+                ));
+            }
+            request = request.json(&body);
+        }
+        let mut response = request
+            .send()
+            .await
+            .map_err(|_| ErrorData::internal_error("Learning API unavailable", None))?;
+        if !response.status().is_success() {
+            return Err(ErrorData::invalid_request(
+                "Learning API rejected operation",
+                Some(json!({"upstream_status":response.status().as_u16()})),
+            ));
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|_| ErrorData::internal_error("Learning API response unavailable", None))?
+        {
+            if bytes.len() + chunk.len() > MAX_RESPONSE_BYTES {
+                return Err(ErrorData::internal_error(
+                    "Learning response exceeds size limit",
+                    None,
+                ));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let envelope: ApiEnvelope = serde_json::from_slice(&bytes)
+            .map_err(|_| ErrorData::internal_error("Learning response invalid", None))?;
+        if envelope.status != "ok" || envelope.data["schema_version"] != 1 {
+            return Err(ErrorData::internal_error(
+                "Learning schema incompatible",
+                None,
+            ));
+        }
+        ensure_response_size(ToolResponse {
+            status: envelope.status,
+            data: redact_learning(envelope.data),
+            timestamp: envelope.timestamp,
+            pagination: envelope.pagination.map(redact_learning),
+            errors: envelope.errors,
+        })
+    }
+}
+
 #[tool_router]
 impl McpServer {
+    #[tool(
+        name = "get_learning_capabilities_v1",
+        description = "Discover structured learning API/schema v1 and permitted tools; no curation, attestation or trust-root writes are exposed"
+    )]
+    async fn get_learning_capabilities_v1(
+        &self,
+        Parameters(_): Parameters<EmptyArgs>,
+    ) -> Result<Json<ToolResponse>, ErrorData> {
+        let mut response = self
+            .learning_request(
+                "agent:learning:read",
+                reqwest::Method::GET,
+                "/api/v1/learning/capabilities",
+                &[],
+                None,
+            )
+            .await?;
+        if response.data["api_version"] != 1
+            || response.data["required_migration_version"] != 56
+            || response.data["migration_version"]
+                .as_i64()
+                .is_none_or(|version| version < 56)
+        {
+            return Err(ErrorData::internal_error(
+                "Learning capabilities incompatible",
+                None,
+            ));
+        }
+        response.data["mcp_tools_version"] = json!(1);
+        response.data["curation_exposed"] = json!(false);
+        response.data["tools"] = json!(self
+            .tool_router
+            .list_all()
+            .iter()
+            .filter(|t| t.name.contains("learning"))
+            .map(|t| t.name.to_string())
+            .collect::<Vec<_>>());
+        Ok(Json(response))
+    }
+
+    #[tool(
+        name = "query_learning_lessons_v1",
+        description = "Retrieve only this learning actor's lessons; active is the default. Exact agent:learning:read required"
+    )]
+    async fn query_learning_lessons_v1(
+        &self,
+        Parameters(a): Parameters<LearningQueryArgs>,
+    ) -> Result<Json<ToolResponse>, ErrorData> {
+        let q = pairs([
+            ("project".into(), a.project),
+            ("agent".into(), a.agent),
+            ("model".into(), a.model),
+            ("provider".into(), a.provider),
+            ("language".into(), a.language),
+            ("framework".into(), a.framework),
+            ("platform".into(), a.platform),
+            ("error_class".into(), a.error_class),
+            ("file_path".into(), a.file_path),
+            ("tag".into(), a.tag),
+            ("version_key".into(), a.version_key),
+            ("version".into(), a.version),
+            ("repository".into(), a.repository),
+            ("component".into(), a.component),
+            ("status".into(), a.status),
+            ("limit".into(), a.limit.map(|x| x.clamp(1, 100).to_string())),
+        ]);
+        Ok(Json(
+            self.learning_request(
+                "agent:learning:read",
+                reqwest::Method::GET,
+                "/api/v1/learning/lessons",
+                &q,
+                None,
+            )
+            .await?,
+        ))
+    }
+    #[tool(
+        name = "propose_learning_lesson_v1",
+        description = "Submit an untrusted pending lesson with structured evidence. Never activates it. Exact agent:learning:propose required"
+    )]
+    async fn propose_learning_lesson_v1(
+        &self,
+        Parameters(a): Parameters<LearningPayloadArgs>,
+    ) -> Result<Json<ToolResponse>, ErrorData> {
+        Ok(Json(
+            self.learning_request(
+                "agent:learning:propose",
+                reqwest::Method::POST,
+                "/api/v1/learning/lessons",
+                &[],
+                Some(a.payload),
+            )
+            .await?,
+        ))
+    }
+    #[tool(
+        name = "revise_learning_lesson_v1",
+        description = "Submit a pending immutable revision of an owned lesson. Exact agent:learning:propose required"
+    )]
+    async fn revise_learning_lesson_v1(
+        &self,
+        Parameters(a): Parameters<LearningRevisionArgs>,
+    ) -> Result<Json<ToolResponse>, ErrorData> {
+        Ok(Json(
+            self.learning_request(
+                "agent:learning:propose",
+                reqwest::Method::POST,
+                &format!("/api/v1/learning/lessons/{}/revisions", a.id),
+                &[],
+                Some(a.payload),
+            )
+            .await?,
+        ))
+    }
+    #[tool(
+        name = "attach_learning_record_v1",
+        description = "Attach decision, routing or escalation context to an owned revision; payload requires idempotency_key, kind and payload. Identical retry returns the first record. Cannot attach a review or activate a lesson"
+    )]
+    async fn attach_learning_record_v1(
+        &self,
+        Parameters(a): Parameters<LearningRevisionArgs>,
+    ) -> Result<Json<ToolResponse>, ErrorData> {
+        Ok(Json(
+            self.learning_request(
+                "agent:learning:propose",
+                reqwest::Method::POST,
+                &format!("/api/v1/learning/revisions/{}/records", a.id),
+                &[],
+                Some(a.payload),
+            )
+            .await?,
+        ))
+    }
+    #[tool(
+        name = "get_learning_records_v1",
+        description = "Retrieve newest-first records for an owned revision with limit and before UUID cursor; next_cursor continues older records. Exact agent:learning:read required"
+    )]
+    async fn get_learning_records_v1(
+        &self,
+        Parameters(a): Parameters<LearningIdArgs>,
+    ) -> Result<Json<ToolResponse>, ErrorData> {
+        Ok(Json(
+            self.learning_request(
+                "agent:learning:read",
+                reqwest::Method::GET,
+                &format!("/api/v1/learning/revisions/{}/records", a.id),
+                &pairs([
+                    ("limit".into(), a.limit.map(|v| v.clamp(1, 100).to_string())),
+                    ("before".into(), a.before.map(|v| v.to_string())),
+                ]),
+                None,
+            )
+            .await?,
+        ))
+    }
+
     #[tool(
         name = "get_status",
         description = "Read-only system, migration, runtime, provider, and incident status; requires agent:system:read and agent:incident:read"
@@ -1547,7 +1911,7 @@ impl McpServer {
 impl ServerHandler for McpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_instructions("Read-only Clawforge Agent API v1 tools")
+            .with_instructions(if self.config.learning_api_token.is_some() { "Clawforge Agent API v1: existing security tools remain read-only; optional versioned learning tools may submit untrusted pending proposals/context only. No curation or trust-root writes." } else { "Read-only Clawforge Agent API v1 tools" })
     }
 }
 
@@ -1800,6 +2164,7 @@ mod tests {
         Arc::new(Config {
             agent_api_url: Url::parse("http://127.0.0.1:1").unwrap(),
             agent_api_token: "agent-secret".into(),
+            learning_api_token: None,
             mcp_auth_token: "mcp-secret".into(),
             mcp_scopes: scopes.iter().map(|scope| (*scope).to_string()).collect(),
             timeout: Duration::from_millis(50),
@@ -1807,6 +2172,125 @@ mod tests {
         })
     }
 
+    #[test]
+    fn learning_discovery_requires_separate_token_and_exact_scopes() {
+        let server = McpServer::new(test_config(&[SCOPE_ALL]));
+        assert!(!server
+            .tool_router
+            .list_all()
+            .iter()
+            .any(|t| t.name.contains("learning")));
+        let mut c = (*test_config(&[SCOPE_ALL])).clone();
+        c.learning_api_token = Some("separate-learning-fixture".into());
+        let server = McpServer::new(Arc::new(c.clone()));
+        assert!(!server
+            .tool_router
+            .list_all()
+            .iter()
+            .any(|t| t.name.contains("learning")));
+        c.mcp_scopes.insert("agent:learning:read".into());
+        c.mcp_scopes.insert("agent:learning:propose".into());
+        let server = McpServer::new(Arc::new(c));
+        assert_eq!(
+            server
+                .tool_router
+                .list_all()
+                .iter()
+                .filter(|t| t.name.contains("learning"))
+                .count(),
+            6
+        );
+        assert!(!server
+            .tool_router
+            .list_all()
+            .iter()
+            .any(|t| t.name.contains("curate") || t.name.contains("attest")));
+    }
+    #[tokio::test]
+    async fn learning_upstream_uses_separate_token_and_checks_schema() {
+        async fn upstream(headers: HeaderMap, request: axum::Json<Value>) -> axum::Json<Value> {
+            assert_eq!(
+                headers[header::AUTHORIZATION],
+                "Bearer separate-learning-fixture"
+            );
+            assert_eq!(request.0["title"], "pending-only");
+            axum::Json(
+                json!({"status":"ok","data":{"schema_version":1,"revision_id":"fixture","payload":{"rule":"keep useful learning","Token":"hidden"}},"timestamp":"2026-10-11T00:00:00Z","pagination":null,"errors":[]}),
+            )
+        }
+        let app = Router::new().route("/api/v1/learning/lessons", axum::routing::post(upstream));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut c = (*test_config(&["agent:learning:propose"])).clone();
+        c.agent_api_url = Url::parse(&format!("http://{addr}")).unwrap();
+        c.learning_api_token = Some("separate-learning-fixture".into());
+        c.timeout = Duration::from_secs(2);
+        let config = Arc::new(c);
+        let server = McpServer::new(config.clone());
+        let result = server
+            .propose_learning_lesson_v1(Parameters(LearningPayloadArgs {
+                payload: json!({"title":"pending-only"}),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result.0.data["schema_version"], 1);
+        assert_eq!(result.0.data["payload"]["rule"], "keep useful learning");
+        assert!(result.0.data["payload"].get("Token").is_none());
+        assert!(server
+            .query_learning_lessons_v1(Parameters(LearningQueryArgs {
+                repository: None,
+                component: None,
+                status: None,
+                limit: None,
+                ..Default::default()
+            }))
+            .await
+            .is_err());
+        use rmcp::transport::{
+            streamable_http_client::StreamableHttpClientTransportConfig,
+            StreamableHttpClientTransport,
+        };
+        use rmcp::{
+            model::{CallToolRequestParams, ClientInfo},
+            ServiceExt,
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mcp_addr = listener.local_addr().unwrap();
+        let app = build_app(config);
+        let mcp_handle = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let transport = StreamableHttpClientTransport::from_config(
+            StreamableHttpClientTransportConfig::with_uri(format!("http://{mcp_addr}/mcp"))
+                .auth_header("mcp-secret"),
+        );
+        let client = ClientInfo::default().serve(transport).await.unwrap();
+        let tools = client.list_tools(None).await.unwrap();
+        assert!(tools
+            .tools
+            .iter()
+            .any(|t| t.name == "propose_learning_lesson_v1"));
+        assert!(!tools
+            .tools
+            .iter()
+            .any(|t| t.name == "query_learning_lessons_v1"));
+        let args = json!({"payload":{"title":"pending-only"}})
+            .as_object()
+            .unwrap()
+            .clone();
+        let result = client
+            .call_tool(
+                CallToolRequestParams::new("propose_learning_lesson_v1").with_arguments(args),
+            )
+            .await
+            .unwrap();
+        assert_ne!(result.is_error, Some(true));
+        let serialized = serde_json::to_string(&result).unwrap();
+        assert!(serialized.contains("keep useful learning"));
+        assert!(!serialized.contains("hidden"));
+        client.cancel().await.unwrap();
+        mcp_handle.abort();
+        handle.abort();
+    }
     #[test]
     fn scope_policy_denies_missing_permissions() {
         let server = McpServer::new(test_config(&[SCOPE_EVENTS]));
@@ -1995,6 +2479,7 @@ mod tests {
         let config = Arc::new(Config {
             agent_api_url: Url::parse(&format!("http://{address}")).unwrap(),
             agent_api_token: "agent-secret".into(),
+            learning_api_token: None,
             mcp_auth_token: "mcp-secret".into(),
             mcp_scopes: [SCOPE_CONTEXT, SCOPE_DECISION]
                 .into_iter()
@@ -2407,6 +2892,7 @@ mod tests {
         let config = Arc::new(Config {
             agent_api_url: Url::parse(&format!("http://{agent_address}")).unwrap(),
             agent_api_token: "agent-secret".into(),
+            learning_api_token: None,
             mcp_auth_token: "mcp-secret".into(),
             mcp_scopes: [SCOPE_ALL.to_string()].into_iter().collect(),
             timeout: Duration::from_secs(2),

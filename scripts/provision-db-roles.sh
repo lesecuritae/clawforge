@@ -25,6 +25,8 @@ security_engine_password="$(read_secret database_security_engine_password "${CLA
 policy_engine_password="$(read_secret database_policy_engine_password "${CLAWFORGE_DATABASE_POLICY_ENGINE_PASSWORD_SECRET_FILE:-/run/secrets/database_policy_engine_password}")"
 incidents_password="$(read_secret database_incidents_password "${CLAWFORGE_DATABASE_INCIDENTS_PASSWORD_SECRET_FILE:-/run/secrets/database_incidents_password}")"
 executor_password="$(read_secret database_executor_password "${CLAWFORGE_DATABASE_EXECUTOR_PASSWORD_SECRET_FILE:-/run/secrets/database_executor_password}")"
+operations_password="$(read_secret database_operations_password "${CLAWFORGE_DATABASE_OPERATIONS_PASSWORD_SECRET_FILE:-/run/secrets/database_operations_password}")"
+decision_password="$(read_secret database_decision_password "${CLAWFORGE_DATABASE_DECISION_PASSWORD_SECRET_FILE:-/run/secrets/database_decision_password}")"
 backup_password="$(read_secret database_backup_password "${CLAWFORGE_DATABASE_BACKUP_PASSWORD_SECRET_FILE:-/run/secrets/database_backup_password}")"
 
 psql \
@@ -41,6 +43,8 @@ psql \
   --set policy_engine_password="$policy_engine_password" \
   --set incidents_password="$incidents_password" \
   --set executor_password="$executor_password" \
+  --set operations_password="$operations_password" \
+  --set decision_password="$decision_password" \
   --set backup_password="$backup_password" <<'SQL'
 BEGIN;
 
@@ -53,6 +57,8 @@ SELECT 'CREATE ROLE clawforge_security_engine' WHERE NOT EXISTS (SELECT FROM pg_
 SELECT 'CREATE ROLE clawforge_policy_engine' WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname='clawforge_policy_engine') \gexec
 SELECT 'CREATE ROLE clawforge_incidents' WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname='clawforge_incidents') \gexec
 SELECT 'CREATE ROLE clawforge_executor' WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname='clawforge_executor') \gexec
+SELECT 'CREATE ROLE clawforge_operations' WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname='clawforge_operations') \gexec
+SELECT 'CREATE ROLE clawforge_decision' WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname='clawforge_decision') \gexec
 SELECT 'CREATE ROLE clawforge_backup' WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname='clawforge_backup') \gexec
 
 ALTER ROLE clawforge_api LOGIN PASSWORD :'api_password' NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 64;
@@ -62,12 +68,14 @@ ALTER ROLE clawforge_security_engine LOGIN PASSWORD :'security_engine_password' 
 ALTER ROLE clawforge_policy_engine LOGIN PASSWORD :'policy_engine_password' NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 16;
 ALTER ROLE clawforge_incidents LOGIN PASSWORD :'incidents_password' NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 16;
 ALTER ROLE clawforge_executor LOGIN PASSWORD :'executor_password' NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 16;
+ALTER ROLE clawforge_operations LOGIN PASSWORD :'operations_password' NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 16;
+ALTER ROLE clawforge_decision LOGIN PASSWORD :'decision_password' NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 16;
 ALTER ROLE clawforge_backup LOGIN PASSWORD :'backup_password' NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 4;
 
-GRANT CONNECT ON DATABASE :"database_name" TO clawforge_api, clawforge_worker, clawforge_correlation, clawforge_security_engine, clawforge_policy_engine, clawforge_incidents, clawforge_executor, clawforge_backup;
-GRANT USAGE ON SCHEMA public TO clawforge_api, clawforge_worker, clawforge_correlation, clawforge_security_engine, clawforge_policy_engine, clawforge_incidents, clawforge_executor, clawforge_backup;
-REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM clawforge_api, clawforge_worker, clawforge_correlation, clawforge_security_engine, clawforge_policy_engine, clawforge_incidents, clawforge_executor, clawforge_backup;
-REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public FROM clawforge_api, clawforge_worker, clawforge_correlation, clawforge_security_engine, clawforge_policy_engine, clawforge_incidents, clawforge_executor, clawforge_backup;
+GRANT CONNECT ON DATABASE :"database_name" TO clawforge_api, clawforge_worker, clawforge_correlation, clawforge_security_engine, clawforge_policy_engine, clawforge_incidents, clawforge_executor, clawforge_backup, clawforge_operations, clawforge_decision;
+GRANT USAGE ON SCHEMA public TO clawforge_api, clawforge_worker, clawforge_correlation, clawforge_security_engine, clawforge_policy_engine, clawforge_incidents, clawforge_executor, clawforge_backup, clawforge_operations, clawforge_decision;
+REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM clawforge_api, clawforge_worker, clawforge_correlation, clawforge_security_engine, clawforge_policy_engine, clawforge_incidents, clawforge_executor, clawforge_backup, clawforge_operations, clawforge_decision;
+REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public FROM clawforge_api, clawforge_worker, clawforge_correlation, clawforge_security_engine, clawforge_policy_engine, clawforge_incidents, clawforge_executor, clawforge_backup, clawforge_operations, clawforge_decision;
 
 -- The API is the authenticated administrative boundary. It may mutate the
 -- application schema, but migration metadata and append-only audit rows remain
@@ -77,6 +85,12 @@ GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO clawforge_api;
 REVOKE INSERT, UPDATE, DELETE ON TABLE _sqlx_migrations FROM clawforge_api;
 REVOKE UPDATE, DELETE ON TABLE audit_events FROM clawforge_api;
 REVOKE DELETE ON TABLE audit_outbox FROM clawforge_api;
+-- Learning content and review records are immutable; only reviewed status changes update revisions.
+REVOKE UPDATE, DELETE ON TABLE learning_lessons, learning_records FROM clawforge_api;
+REVOKE UPDATE, DELETE ON TABLE learning_revisions FROM clawforge_api;
+GRANT UPDATE(status,last_verified) ON TABLE learning_revisions TO clawforge_api;
+-- Trust roots are provisioned only by the database owner/CI importer.
+REVOKE INSERT, UPDATE, DELETE ON TABLE learning_actor_tokens, learning_curator_grants, learning_verified_evidence FROM clawforge_api;
 -- API can inspect journal generations, but only the executor owns transitions.
 REVOKE INSERT, UPDATE, DELETE ON TABLE firewall_action_intents FROM clawforge_api;
 REVOKE UPDATE, DELETE ON TABLE firewall_action_receipts FROM clawforge_api;
@@ -201,6 +215,12 @@ REVOKE UPDATE ON TABLE audit_events FROM clawforge_executor;
 GRANT SELECT ON ALL TABLES IN SCHEMA public TO clawforge_backup;
 GRANT SELECT ON ALL SEQUENCES IN SCHEMA public TO clawforge_backup;
 
+
+-- Bounded incident projection readers (operations summary / worker decisions).
+-- operations: incidents + migration ledger only; no incident history, no mutation.
+GRANT SELECT ON TABLE _sqlx_migrations, incidents TO clawforge_operations;
+-- decision: incidents + direct relation/event counts; events table denied, no mutation.
+GRANT SELECT ON TABLE _sqlx_migrations, incidents, incident_relations, incident_events TO clawforge_decision;
 COMMIT;
 SQL
 

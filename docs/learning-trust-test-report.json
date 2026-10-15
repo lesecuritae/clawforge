@@ -1,0 +1,76 @@
+{
+  "checked_at": "2026-10-12T02:34:18.735791+00:00",
+  "phase": "trusted_ci_importer_candidate",
+  "previous_frozen_report_sha256": "40df0216f12f7675ff80de9717603fa023506e2397a2f0ee9aa5c2773fe50203",
+  "previous_report_unchanged": true,
+  "current_aggregate_ci_claim_valid": true,
+  "new_targeted_tests": {
+    "passed": 8,
+    "failed": 0,
+    "ignored": 0,
+    "synthetic_signed_verifier_fixture_tests": 4,
+    "real_isolated_postgres_import_scope_audit_replay_tests": 1,
+    "git_build_input_negative_tests": 2,
+    "absolute_toolchain_negative_tests": 1
+  },
+  "producer_real_candidate_execution": "blocked until root-reviewed clean commit",
+  "production_import_enabled": false,
+  "production_changed": false,
+  "git_commit_created": false,
+  "merged": false,
+  "pushed": false,
+  "build": "passed",
+  "targeted_clippy_D_warnings": "passed",
+  "source_sha256": {
+    "storage/src/bin/learning-trust.rs": "903c5c6d158aa1d39a49926ba21914ba44ccadaa1b20d08e898cc0b7c46767e2",
+    "scripts/test-postgres.sh": "fb0d60f4cc585c3d6df1cfb83925c14f204a49344cbde48aa7b4359f63f23a92",
+    "docs/learning-trust-HANDOFF.md": "180238f9171733f7777f6a91c846b680b09b5c740da8b92cacce5893237f208d",
+    "storage/src/learning.rs": "b049be55dcca85261d23b08ccb2de24f9026983ce2e02921755b7410fce30bcb",
+    "storage/src/lib.rs": "07a63c778a24ec226e17bc602fd3a62e93407477efa75b6ae34ba60ebd4c77e0"
+  },
+  "remaining_gates": [
+    "Root code/policy review and branch cleancommit",
+    "Actual fixed-command producer against protected clean committed source",
+    "Actual proof import/replay/tamper readback on disposable DB",
+    "Review complete live47 known-lineage rollout/all Store consumer release builds before any production"
+  ],
+  "atomic_import_concurrent_revocation": {
+    "focused_tests": {
+      "passed": 8,
+      "failed": 0,
+      "ignored": 0,
+      "real_postgres_cases": 1,
+      "concurrent_orderings": 2
+    },
+    "validation": [
+      "offline cargo check storage --bin learning-trust --tests passed",
+      "offline targeted Clippy -D warnings passed"
+    ],
+    "external_report": "/home/production/learning-trust-release-review-20261012/atomic-import-test-report.json"
+  },
+  "current_aggregate_ci_claim_scope": "Frozen local Rust gates: fmt, workspace unit, all16 complete PostgreSQL commands, workspace all-target Clippy; frontend/security/compose/release not certified",
+  "current_rust_aggregate": {
+    "workspace": {
+      "passed": 336,
+      "failed": 0,
+      "ignored": 94
+    },
+    "postgres": {
+      "passed": 68,
+      "failed": 0,
+      "ignored": 0,
+      "commands": 16,
+      "executed_previously_ignored_pg_or_lab_cases": 59,
+      "included_ordinary_unit_cases": 9
+    },
+    "fmt": "passed",
+    "clippy_workspace_all_targets_D_warnings": "passed",
+    "source_unchanged_during_gate": true,
+    "external_report": "/home/production/learning-trust-release-review-20261012/aggregate-181bb693f0a948bfaa39dda0303af4da/report.json",
+    "external_report_sha256": "521a4b9ea4fc101dcbd6b5d62650dc2b35c18c745030a0f5bb748d485d92a788",
+    "subsequent_documentation_only_updates": [
+      "docs/learning-trust-HANDOFF.md",
+      "docs/learning-trust-test-report.json"
+    ]
+  }
+}

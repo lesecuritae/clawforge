@@ -2852,3 +2852,166 @@ async fn execution_approval_detail_assembles_target_evidence_and_approvals() -> 
 
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL and incidents-only operations read role"]
+async fn operations_incident_projection_preserves_bounds_and_read_permissions() -> anyhow::Result<()>
+{
+    let owner = PostgresStore::connect(&std::env::var("CLAWFORGE_TEST_DATABASE_URL")?).await?;
+    let reader =
+        PostgresStore::connect_runtime(&std::env::var("CLAWFORGE_TEST_OPERATIONS_DATABASE_URL")?)
+            .await?;
+    let mut ids = Vec::new();
+    for (index, status) in ["resolved", "detected", "confirmed"].iter().enumerate() {
+        let id = uuid::Uuid::new_v4();
+        ids.push(id);
+        sqlx::query("INSERT INTO incidents (id,title,status,severity,confidence,risk_score,summary,correlation_key,updated_at) VALUES ($1,'projection fixture',$2,'high',$3,82,'review',$4,$5)")
+            .bind(id).bind(status).bind(70_i16 + index as i16)
+            .bind(format!("projection-{id}"))
+            .bind(Utc::now() + Duration::days(36500) + Duration::seconds(index as i64))
+            .execute(owner.pool()).await?;
+    }
+    let result = reader.list_operations_incident_views(2).await?;
+    assert_eq!(result.len(), 2);
+    assert_eq!(result[0]["id"], ids[2].to_string());
+    assert_eq!(result[1]["id"], ids[1].to_string());
+    assert_eq!(result[0]["confidence"], 72);
+    assert_eq!(result[0]["summary"], "review");
+    assert_eq!(result[0].as_object().unwrap().len(), 6);
+    assert_eq!(reader.list_operations_incident_views(0).await?.len(), 1);
+    let detailed = owner.list_incidents(None, 2).await?;
+    for (view, full) in result.iter().zip(detailed.iter()) {
+        for key in [
+            "id",
+            "status",
+            "severity",
+            "confidence",
+            "risk_score",
+            "summary",
+        ] {
+            assert_eq!(
+                view[key], full[key],
+                "summary input semantics differ for {key}"
+            );
+        }
+    }
+    let cap_key = format!("projection-cap-{}", uuid::Uuid::new_v4());
+    sqlx::query("INSERT INTO incidents (id,title,status,severity,confidence,risk_score,summary,correlation_key,updated_at) SELECT gen_random_uuid(),'cap fixture','detected','high',80,82,'review',$1,$2 + n * INTERVAL '1 second' FROM generate_series(1,501) n")
+        .bind(&cap_key).bind(Utc::now() + Duration::days(36501)).execute(owner.pool()).await?;
+    assert_eq!(
+        reader.list_operations_incident_views(1000).await?.len(),
+        500
+    );
+    sqlx::query("DELETE FROM incidents WHERE correlation_key=$1")
+        .bind(cap_key)
+        .execute(owner.pool())
+        .await?;
+    assert!(sqlx::query("SELECT id FROM incident_relations LIMIT 1")
+        .fetch_optional(reader.pool())
+        .await
+        .is_err());
+    assert!(
+        sqlx::query("UPDATE incidents SET summary=summary WHERE FALSE")
+            .execute(reader.pool())
+            .await
+            .is_err()
+    );
+    for id in ids {
+        sqlx::query("DELETE FROM incidents WHERE id=$1")
+            .bind(id)
+            .execute(owner.pool())
+            .await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL and decision incident read role"]
+async fn decision_incident_projection_preserves_direct_event_counts_and_permissions(
+) -> anyhow::Result<()> {
+    let owner = PostgresStore::connect(&std::env::var("CLAWFORGE_TEST_DATABASE_URL")?).await?;
+    let reader =
+        PostgresStore::connect_runtime(&std::env::var("CLAWFORGE_TEST_DECISION_DATABASE_URL")?)
+            .await?;
+    let id = uuid::Uuid::new_v4();
+    let other = uuid::Uuid::new_v4();
+    for (index, incident) in [other, id].iter().enumerate() {
+        sqlx::query("INSERT INTO incidents (id,title,status,severity,confidence,risk_score,summary,correlation_key,updated_at) VALUES ($1,'decision fixture',$2,'high',81,$3,'review',$4,$5)")
+            .bind(incident).bind(if index==0 {"closed"} else {"confirmed"}).bind(12_i16+index as i16)
+            .bind(format!("decision-projection-{incident}"))
+            .bind(Utc::now()+Duration::days(36502)+Duration::seconds(index as i64))
+            .execute(owner.pool()).await?;
+    }
+    let events = [
+        uuid::Uuid::new_v4(),
+        uuid::Uuid::new_v4(),
+        uuid::Uuid::new_v4(),
+    ];
+    for event in events {
+        sqlx::query("INSERT INTO events(event_id,event_type,source,severity,occurred_at,dedupe_key) VALUES ($1,'fixture','test','info',NOW(),$2)")
+            .bind(event).bind(format!("decision-event-{event}")).execute(owner.pool()).await?;
+    }
+    // Duplicate direct UUIDs with distinct related IDs count once; relationship-only
+    // UUIDs and NULL event IDs count zero. Existing history rows are not rewritten.
+    for (kind, event, related) in [
+        ("event", Some(events[0]), Some(events[1])),
+        ("event", Some(events[0]), Some(events[2])),
+        ("event", Some(events[1]), None),
+        ("event_relationship", Some(events[2]), Some(events[1])),
+        ("event", None, None),
+    ] {
+        sqlx::query("INSERT INTO incident_relations(id,incident_id,relation_type,event_id,related_event_id,related_incident_id) VALUES ($1,$2,$3,$4,$5,$6)")
+            .bind(uuid::Uuid::new_v4()).bind(id).bind(kind).bind(event).bind(related).bind(if event.is_none() {Some(other)} else {None})
+            .execute(owner.pool()).await?;
+    }
+    let legacy: (i64,) = sqlx::query_as("INSERT INTO audit_events(actor,action,resource) VALUES ('test','fixture','decision-count') RETURNING id")
+        .fetch_one(owner.pool()).await?;
+    sqlx::query("INSERT INTO incident_events(incident_id,event_id) VALUES ($1,$2)")
+        .bind(id)
+        .bind(legacy.0)
+        .execute(owner.pool())
+        .await?;
+    let projected = reader.list_decision_incident_views(2).await?;
+    let full = owner.list_incidents(None, 2).await?;
+    assert_eq!(projected.len(), 2);
+    assert_eq!(projected[0]["id"], id.to_string());
+    assert_eq!(projected[0]["event_count"], 3);
+    assert_eq!(projected[1]["event_count"], 0);
+    for (view, detailed) in projected.iter().zip(full.iter()) {
+        for key in [
+            "id",
+            "status",
+            "severity",
+            "confidence",
+            "risk_score",
+            "summary",
+            "event_count",
+        ] {
+            assert_eq!(view[key], detailed[key], "decision field changed: {key}");
+        }
+    }
+    assert_eq!(reader.list_decision_incident_views(0).await?.len(), 1);
+    assert!(sqlx::query("SELECT event_id FROM events LIMIT 1")
+        .fetch_optional(reader.pool())
+        .await
+        .is_err());
+    assert!(
+        sqlx::query("UPDATE incident_relations SET reason=reason WHERE FALSE")
+            .execute(reader.pool())
+            .await
+            .is_err()
+    );
+    for incident in [id, other] {
+        sqlx::query("DELETE FROM incidents WHERE id=$1")
+            .bind(incident)
+            .execute(owner.pool())
+            .await?;
+    }
+    for event in events {
+        sqlx::query("DELETE FROM events WHERE event_id=$1")
+            .bind(event)
+            .execute(owner.pool())
+            .await?;
+    }
+    Ok(())
+}
