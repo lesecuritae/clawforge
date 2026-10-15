@@ -632,3 +632,77 @@ async fn proxmox_upid_persists_on_prepared_intent_even_when_receipt_fails() -> R
 
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "requires an isolated explicit quarantine PostgreSQL fixture with schema 0057"]
+async fn operator_reconcile_requires_a_bound_dual_approved_reconcile_request() -> Result<()> {
+    let store = store().await?;
+    let state = json!({"networks":[{"network_id":"original-net0","aliases":[],"ipv4":"10.0.0.9"}]});
+    let plan = json!({"networks":state["networks"]});
+
+    // A recovery_required proxmox generation at `vmid` (the only state the automatic sweep
+    // will not resolve), returning the intent id and its canonical target.
+    async fn recovery_required(
+        store: &PostgresStore,
+        vmid: u64,
+        state: &Value,
+        plan: &Value,
+    ) -> Result<(Uuid, Value)> {
+        let fp = format!("pve-test/{vmid}");
+        let target = json!({"kind":"proxmox","node":"pve-test","vmid":vmid,"ttl_seconds":60});
+        let (exec, _) = execution_for_action(store, &target, "proxmox.quarantine_vm").await?;
+        let id = store
+            .prepare_quarantine_intent(exec, "proxmox", &fp, &target, state, plan, 60)
+            .await?;
+        store.mark_quarantine_recovery_required(id).await?;
+        Ok((id, target))
+    }
+
+    // Positive: a SEPARATE, dual-approved reconcile request bound to the same target authorizes.
+    let (id, target) = recovery_required(&store, 301, &state, &plan).await?;
+    let (reconcile_exec, _) =
+        execution_for_action(&store, &target, "proxmox.reconcile_quarantine").await?;
+    let mut guard = store.acquire_quarantine_guard(id).await?.unwrap();
+    guard
+        .validate_reconcile_approval(reconcile_exec, "proxmox.reconcile_quarantine", &target)
+        .await?;
+    drop(guard);
+
+    // The ORIGINAL quarantine request's approval must NOT authorize a reconcile (action mismatch).
+    let (id2, target2) = recovery_required(&store, 302, &state, &plan).await?;
+    let (q_exec, _) = execution_for_action(&store, &target2, "proxmox.quarantine_vm").await?;
+    let mut guard2 = store.acquire_quarantine_guard(id2).await?.unwrap();
+    assert!(guard2
+        .validate_reconcile_approval(q_exec, "proxmox.reconcile_quarantine", &target2)
+        .await
+        .is_err());
+    drop(guard2);
+
+    // A reconcile request approved for a DIFFERENT target cannot authorize this generation.
+    let (id3, target3) = recovery_required(&store, 303, &state, &plan).await?;
+    let (rec3, _) = execution_for_action(&store, &target3, "proxmox.reconcile_quarantine").await?;
+    let other = json!({"kind":"proxmox","node":"pve-test","vmid":999,"ttl_seconds":60});
+    let mut guard3 = store.acquire_quarantine_guard(id3).await?.unwrap();
+    assert!(guard3
+        .validate_reconcile_approval(rec3, "proxmox.reconcile_quarantine", &other)
+        .await
+        .is_err());
+    drop(guard3);
+
+    // A generation that is NOT recovery_required (still prepared) cannot be reconciled.
+    let fp4 = "pve-test/304".to_string();
+    let target4 = json!({"kind":"proxmox","node":"pve-test","vmid":304,"ttl_seconds":60});
+    let (exec4, _) = execution_for_action(&store, &target4, "proxmox.quarantine_vm").await?;
+    let id4 = store
+        .prepare_quarantine_intent(exec4, "proxmox", &fp4, &target4, &state, &plan, 60)
+        .await?;
+    let (rec4, _) = execution_for_action(&store, &target4, "proxmox.reconcile_quarantine").await?;
+    let mut guard4 = store.acquire_quarantine_guard(id4).await?.unwrap();
+    assert!(guard4
+        .validate_reconcile_approval(rec4, "proxmox.reconcile_quarantine", &target4)
+        .await
+        .is_err());
+    drop(guard4);
+
+    Ok(())
+}

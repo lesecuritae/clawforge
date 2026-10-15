@@ -19,6 +19,7 @@ pub struct QuarantineIntent {
     pub ttl_seconds: i32,
     pub expires_at: DateTime<Utc>,
     pub status: String,
+    pub proxmox_upid: Option<String>,
 }
 
 fn decode(row: sqlx::postgres::PgRow) -> QuarantineIntent {
@@ -34,6 +35,7 @@ fn decode(row: sqlx::postgres::PgRow) -> QuarantineIntent {
         ttl_seconds: row.get("ttl_seconds"),
         expires_at: row.get("expires_at"),
         status: row.get("status"),
+        proxmox_upid: row.get("proxmox_upid"),
     }
 }
 
@@ -258,6 +260,18 @@ impl PostgresStore {
         .await?
         .map(decode))
     }
+    /// The single active generation for a canonical target - the unique active-generation
+    /// index guarantees at most one in prepared/completed/recovery_required. The operator
+    /// reconcile path resolves by canonical identity (what the reconcile approval is bound to),
+    /// not by a separately-supplied intent id.
+    pub async fn active_quarantine_intent_for(
+        &self,
+        adapter: &str,
+        fingerprint: &str,
+    ) -> Result<Option<QuarantineIntent>> {
+        Ok(sqlx::query("SELECT * FROM firewall_action_intents WHERE adapter=$1 AND target_fingerprint=$2 AND target_fingerprint IS NOT NULL AND status IN ('prepared','completed','recovery_required')")
+            .bind(adapter).bind(fingerprint).fetch_optional(&self.pool).await?.map(decode))
+    }
     /// Prepared generations are inspected/recovered, NEVER automatically reapplied.
     pub async fn unresolved_quarantine_intents(&self) -> Result<Vec<QuarantineIntent>> {
         Ok(sqlx::query("SELECT * FROM firewall_action_intents WHERE target_fingerprint IS NOT NULL AND (status IN ('prepared','recovery_required') OR (status='completed' AND expires_at<=NOW())) ORDER BY created_at,id LIMIT 100")
@@ -293,6 +307,44 @@ impl QuarantineGuard {
             .fetch_one(&mut *self.tx).await?;
         if self.intent.status != "prepared" || !current {
             bail!("quarantine approval no longer valid before mutation");
+        }
+        Ok(())
+    }
+
+    /// Persist the observed external task UPID on THIS generation within the guard's own
+    /// transaction. The guard already holds the row FOR UPDATE, so a separate-transaction
+    /// write to the same row would self-deadlock; this commits atomically with the guard's
+    /// terminal transition (finish or recovery_required), so a generation left
+    /// recovery_required after a verify failure still carries the UPID for reconciliation.
+    pub async fn set_upid(&mut self, upid: &str) -> Result<()> {
+        sqlx::query("UPDATE firewall_action_intents SET proxmox_upid=$2 WHERE id=$1")
+            .bind(self.intent.id)
+            .bind(upid)
+            .execute(&mut *self.tx)
+            .await?;
+        Ok(())
+    }
+
+    /// Authorize an operator reconciliation of THIS generation with a SEPARATE,
+    /// context-bound dual-approved reconcile request - never the original quarantine
+    /// request's approval. Holds the approval lock through the reconcile mutation, exactly
+    /// like validate_approval. The generation must be `recovery_required`: the only state
+    /// the automatic sweep deliberately will not resolve, so it needs an audited operator.
+    pub async fn validate_reconcile_approval(
+        &mut self,
+        reconcile_execution_id: Uuid,
+        reconcile_action_name: &str,
+        target: &Value,
+    ) -> Result<()> {
+        sqlx::query("SELECT clawforge_lock_quarantine_approval($1)")
+            .bind(reconcile_execution_id)
+            .execute(&mut *self.tx)
+            .await?;
+        let authorized: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM execution_requests e JOIN actions a ON a.id=e.action_id JOIN approval_policies p ON p.risk_level=a.risk_level WHERE e.id=$1 AND e.status IN ('starting','running') AND a.name=$2 AND a.enabled AND a.requires_approval AND a.risk_level='critical' AND p.required_approvals>=2 AND e.required_approvals>=2 AND e.requested_by_id IS NOT NULL AND e.approval_expires_at>clock_timestamp() AND e.approval_context->'target'=$3 AND (SELECT COUNT(DISTINCT ea.approver_id) FROM execution_approvals ea WHERE ea.execution_id=e.id AND ea.context_hash=e.approval_context_hash AND ea.approver_id<>e.requested_by_id)>=GREATEST(e.required_approvals,p.required_approvals))")
+            .bind(reconcile_execution_id).bind(reconcile_action_name).bind(target)
+            .fetch_one(&mut *self.tx).await?;
+        if self.intent.status != "recovery_required" || !authorized {
+            bail!("reconcile approval invalid or generation not awaiting reconciliation");
         }
         Ok(())
     }
