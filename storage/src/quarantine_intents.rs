@@ -19,6 +19,7 @@ pub struct QuarantineIntent {
     pub ttl_seconds: i32,
     pub expires_at: DateTime<Utc>,
     pub status: String,
+    pub proxmox_upid: Option<String>,
 }
 
 fn decode(row: sqlx::postgres::PgRow) -> QuarantineIntent {
@@ -34,6 +35,7 @@ fn decode(row: sqlx::postgres::PgRow) -> QuarantineIntent {
         ttl_seconds: row.get("ttl_seconds"),
         expires_at: row.get("expires_at"),
         status: row.get("status"),
+        proxmox_upid: row.get("proxmox_upid"),
     }
 }
 
@@ -257,6 +259,18 @@ impl PostgresStore {
         .fetch_optional(&self.pool)
         .await?
         .map(decode))
+    }
+    /// The single active generation for a canonical target - the unique active-generation
+    /// index guarantees at most one in prepared/completed/recovery_required. The operator
+    /// reconcile path resolves by canonical identity (what the reconcile approval is bound to),
+    /// not by a separately-supplied intent id.
+    pub async fn active_quarantine_intent_for(
+        &self,
+        adapter: &str,
+        fingerprint: &str,
+    ) -> Result<Option<QuarantineIntent>> {
+        Ok(sqlx::query("SELECT * FROM firewall_action_intents WHERE adapter=$1 AND target_fingerprint=$2 AND target_fingerprint IS NOT NULL AND status IN ('prepared','completed','recovery_required')")
+            .bind(adapter).bind(fingerprint).fetch_optional(&self.pool).await?.map(decode))
     }
     /// Prepared generations are inspected/recovered, NEVER automatically reapplied.
     pub async fn unresolved_quarantine_intents(&self) -> Result<Vec<QuarantineIntent>> {

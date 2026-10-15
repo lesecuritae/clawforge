@@ -24,6 +24,25 @@ impl QuarantineKind {
             _ => None,
         }
     }
+
+    /// Map an operator reconcile action to the quarantine kind whose generation it
+    /// resolves. Tailscale has no automated reversible reconcile (manual review only).
+    pub(crate) fn from_reconcile_action_name(name: &str) -> Option<Self> {
+        match name {
+            "docker.reconcile_quarantine" => Some(Self::Docker),
+            "proxmox.reconcile_quarantine" => Some(Self::Proxmox),
+            _ => None,
+        }
+    }
+
+    /// The quarantine action whose generations this kind reconciles.
+    pub(crate) fn quarantine_action_name(self) -> &'static str {
+        match self {
+            Self::Docker => "docker.quarantine_container",
+            Self::Proxmox => "proxmox.quarantine_vm",
+            Self::Tailscale => "tailscale.quarantine_device",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

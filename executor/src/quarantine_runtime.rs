@@ -3,7 +3,9 @@
 use crate::quarantine_gate::{self, QuarantineIdentity, QuarantineKind};
 use anyhow::{bail, Context, Result};
 use clawforge_firewall_agent::{
-    docker::DockerAdapter, proxmox::ProxmoxAdapter, quarantine::QuarantineTarget,
+    docker::DockerAdapter,
+    proxmox::{ProxmoxAdapter, ProxmoxTaskCompletion},
+    quarantine::QuarantineTarget,
     VerificationResult,
 };
 use clawforge_storage::{
@@ -142,6 +144,30 @@ pub(crate) async fn dispatch(
     Option<String>,
     Vec<crate::FirewallDispatchReceipt>,
 ) {
+    if QuarantineKind::from_reconcile_action_name(&claimed.action_name).is_some() {
+        if crate::dispatch_dry_run(claimed) {
+            return crate::dispatch(Some(store), claimed).await;
+        }
+        let result = async {
+            quarantine_gate::ensure_live_dispatch_disabled(false)?;
+            reconcile(store, claimed).await
+        }
+        .await;
+        return match result {
+            Ok(()) => (
+                true,
+                Some("verified operator quarantine reconciliation completed".into()),
+                None,
+                vec![],
+            ),
+            Err(_) => (
+                false,
+                None,
+                Some("operator quarantine reconciliation refused or incomplete".into()),
+                vec![],
+            ),
+        };
+    }
     if QuarantineKind::from_action_name(&claimed.action_name).is_none()
         || crate::dispatch_dry_run(claimed)
     {
@@ -165,6 +191,96 @@ pub(crate) async fn dispatch(
             Some("live quarantine refused or requires verified recovery".into()),
             vec![],
         ),
+    }
+}
+
+/// Operator-authorized reconciliation of a specific `recovery_required` generation - the
+/// state automatic recovery deliberately will not resolve. Gated upstream by the live
+/// dispatch check; requires a context-bound dual-approved reconcile request and PROOF the
+/// remote mutation's outcome is decided before any restore. It resolves the EXISTING
+/// generation and never creates or replays an intent.
+async fn reconcile(store: &PostgresStore, claimed: &ClaimedExecutionRequest) -> Result<()> {
+    let target = claimed
+        .target
+        .as_ref()
+        .context("reconcile target missing")?;
+    let kind = QuarantineKind::from_reconcile_action_name(&claimed.action_name)
+        .context("unrecognized reconcile action")?;
+    let context = quarantine_gate::validate_context(kind.quarantine_action_name(), target, false)?;
+    let (adapter_name, fingerprint) = match context.target {
+        QuarantineIdentity::Docker { container_id } => ("docker", container_id),
+        QuarantineIdentity::Proxmox { node, vmid } => ("proxmox", format!("{node}/{vmid}")),
+        QuarantineIdentity::Tailscale { .. } => {
+            bail!("Tailscale reconciliation requires manual review")
+        }
+    };
+    let intent = store
+        .active_quarantine_intent_for(adapter_name, &fingerprint)
+        .await?
+        .context("no active quarantine generation for reconcile target")?;
+    let mut guard = store
+        .acquire_quarantine_guard(intent.id)
+        .await?
+        .context("quarantine generation busy")?;
+    // Approval bound to THIS reconcile request + target; requires recovery_required.
+    guard
+        .validate_reconcile_approval(claimed.id, &claimed.action_name, target)
+        .await?;
+    // The remote mutation's outcome must be decided before a verified restore.
+    prove_remote_completion(guard.intent()).await?;
+    let restore = restore_target(guard.intent())?;
+    let Some(inflight_id) = crate::try_begin_inflight(store, adapter_name)
+        .await
+        .map_err(|_| anyhow::anyhow!("reconcile concurrency lease unavailable"))?
+    else {
+        bail!("reconcile concurrency lease busy");
+    };
+    let result = crate::rollback_target(
+        adapter_name,
+        &restore,
+        format!("operator reconcile of quarantine generation {}", intent.id),
+    )
+    .await;
+    if store
+        .end_firewall_inflight_operation(inflight_id)
+        .await
+        .is_err()
+    {
+        tracing::warn!(intent_id=%intent.id, "reconcile concurrency lease could not be released");
+    }
+    result?;
+    guard.resolve_rollback().await?;
+    Ok(())
+}
+
+/// Prove a generation's remote mutation outcome is decided before reconciliation restores.
+/// Proxmox: the recorded config-task UPID must report a decided status (never running/unknown).
+/// Docker: an authoritative preflight readback (the effect is directly observable, no task).
+async fn prove_remote_completion(intent: &QuarantineIntent) -> Result<()> {
+    let context =
+        quarantine_gate::validate_context(&intent.action_name, &intent.target_json, true)?;
+    match context.target {
+        QuarantineIdentity::Proxmox { node, vmid } => {
+            let upid = intent
+                .proxmox_upid
+                .as_deref()
+                .context("no recorded Proxmox task UPID; remote completion cannot be proven")?;
+            match ProxmoxAdapter::new().task_status(&node, vmid, upid).await? {
+                ProxmoxTaskCompletion::SucceededOk | ProxmoxTaskCompletion::Failed => Ok(()),
+                ProxmoxTaskCompletion::Running => {
+                    bail!("Proxmox config task still running; completion not yet decided")
+                }
+            }
+        }
+        QuarantineIdentity::Docker { container_id } => {
+            DockerAdapter::new()
+                .preflight(&QuarantineTarget::Docker { container_id })
+                .await?;
+            Ok(())
+        }
+        QuarantineIdentity::Tailscale { .. } => {
+            bail!("Tailscale reconciliation requires manual review")
+        }
     }
 }
 
@@ -335,6 +451,7 @@ mod tests {
             ttl_seconds: 60,
             expires_at: serde_json::from_value(json!("2026-01-01T00:00:00Z")).unwrap(),
             status: "completed".into(),
+            proxmox_upid: None,
         }
     }
     #[test]
