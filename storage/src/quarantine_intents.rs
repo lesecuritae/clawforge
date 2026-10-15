@@ -311,6 +311,20 @@ impl QuarantineGuard {
         Ok(())
     }
 
+    /// Persist the observed external task UPID on THIS generation within the guard's own
+    /// transaction. The guard already holds the row FOR UPDATE, so a separate-transaction
+    /// write to the same row would self-deadlock; this commits atomically with the guard's
+    /// terminal transition (finish or recovery_required), so a generation left
+    /// recovery_required after a verify failure still carries the UPID for reconciliation.
+    pub async fn set_upid(&mut self, upid: &str) -> Result<()> {
+        sqlx::query("UPDATE firewall_action_intents SET proxmox_upid=$2 WHERE id=$1")
+            .bind(self.intent.id)
+            .bind(upid)
+            .execute(&mut *self.tx)
+            .await?;
+        Ok(())
+    }
+
     /// Authorize an operator reconciliation of THIS generation with a SEPARATE,
     /// context-bound dual-approved reconcile request - never the original quarantine
     /// request's approval. Holds the approval lock through the reconcile mutation, exactly

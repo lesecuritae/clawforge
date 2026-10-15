@@ -390,8 +390,11 @@ where
                         .context("NIC snapshot missing")?,
                 )
                 .await?;
+            // Persist on the guard tx (same row lock) - a separate transaction would
+            // self-deadlock against the guard FOR UPDATE. Before verify, so the UPID
+            // survives into recovery_required if verification is uncertain.
             if !upid.is_empty() {
-                store.set_quarantine_intent_upid(id, &upid).await?;
+                guard.set_upid(&upid).await?;
             }
             if adapter.verify(&qtarget).await? != VerificationResult::Verified {
                 bail!("Proxmox verification failed");
@@ -602,6 +605,140 @@ mod tests {
             action_name: "docker.reconcile_quarantine".into(),
             target: Some(target.clone()),
         })
+    }
+    async fn approved_action(
+        store: &PostgresStore,
+        target: &Value,
+        action_name: &str,
+    ) -> Result<ClaimedExecutionRequest> {
+        let action: Uuid = sqlx::query_scalar(
+            "UPDATE actions SET enabled=TRUE,risk_level='critical',requires_approval=TRUE WHERE name=$1 RETURNING id",
+        )
+        .bind(action_name)
+        .fetch_one(store.pool())
+        .await?;
+        let suffix = Uuid::new_v4();
+        let name = format!("lab-req-{suffix}");
+        let requester = store
+            .create_admin_user(&name, "Administrator", "fixture-hash")
+            .await?;
+        let id = store
+            .create_execution_request(&clawforge_storage::ExecutionRequestInput {
+                action_id: action,
+                workflow_run_id: None,
+                decision_id: None,
+                requested_by: name,
+                requested_by_id: Some(requester),
+                idempotency_key: None,
+                target: Some(target.clone()),
+            })
+            .await?;
+        for index in [1, 2] {
+            let name = format!("lab-apr-{suffix}-{index}");
+            let user = store
+                .create_admin_user(&name, "Approver", "fixture-hash")
+                .await?;
+            store.approve_execution_request(id, user, &name).await?;
+        }
+        sqlx::query("UPDATE execution_requests SET status='starting' WHERE id=$1")
+            .bind(id)
+            .execute(store.pool())
+            .await?;
+        Ok(ClaimedExecutionRequest {
+            id,
+            action_name: action_name.to_string(),
+            target: Some(target.clone()),
+        })
+    }
+    #[tokio::test]
+    #[ignore = "LIVE Proxmox + disposable VM (CLAWFORGE_PROXMOX_* + CLAWFORGE_PROXMOX_LAB_{NODE,VMID}) and schema-0057 PG; run alone"]
+    async fn operator_reconcile_restores_a_recovery_required_proxmox_generation_live() -> Result<()>
+    {
+        let url = std::env::var("CLAWFORGE_TEST_QUARANTINE_DATABASE_URL")?;
+        let authority = url
+            .rsplit_once('@')
+            .map(|(_, tail)| tail)
+            .context("explicit fixture URL must have credentials")?;
+        let (dbhost, database) = authority
+            .split_once('/')
+            .context("explicit fixture database missing")?;
+        let database = database.split('?').next().unwrap_or_default();
+        if !matches!(
+            dbhost,
+            "127.0.0.1:55432" | "127.0.0.1:55436" | "127.0.0.1:55437"
+        ) || !database.starts_with("clawforge_test")
+        {
+            bail!("proxmox reconcile lab requires dedicated loopback test port and clawforge_test database");
+        }
+        let node = std::env::var("CLAWFORGE_PROXMOX_LAB_NODE").expect("lab node");
+        let vmid: u32 = std::env::var("CLAWFORGE_PROXMOX_LAB_VMID")
+            .expect("lab vmid")
+            .parse()
+            .expect("numeric vmid");
+        // Protect a different VM so the list is non-empty but the disposable VM is not protected.
+        std::env::set_var(
+            "CLAWFORGE_PROXMOX_NEVER_QUARANTINE",
+            format!("proxmox:{node}/1"),
+        );
+        let store = PostgresStore::connect_runtime(&url)
+            .await
+            .map_err(|_| anyhow::anyhow!("fixture DB unavailable"))?;
+        let qtarget = QuarantineTarget::Proxmox {
+            node: node.clone(),
+            vmid,
+        };
+        let original_net0 = ProxmoxAdapter::new().preflight(&qtarget).await?.net0;
+        let target = json!({
+            "kind":"proxmox","node":node,"vmid":vmid,"ttl_seconds":60,
+            "data_owner":"disposable lab VM",
+            "snapshot_restore_reference":"own net0 config snapshot",
+            "management_network_plan":"lab VM only; management VMs protected via never-quarantine"
+        });
+        // Real quarantine: writes net0 link_down and records the live qmconfig UPID (Q2a).
+        let request = approved_action(&store, &target, "proxmox.quarantine_vm").await?;
+        apply_prepared_observed(&store, &request, |_| async { Ok(()) }).await?;
+        let intent_id: Uuid =
+            sqlx::query_scalar("SELECT id FROM firewall_action_intents WHERE execution_id=$1")
+                .bind(request.id)
+                .fetch_one(store.pool())
+                .await?;
+        assert_eq!(
+            store.quarantine_intent(intent_id).await?.unwrap().status,
+            "completed"
+        );
+        let upid = store
+            .quarantine_intent(intent_id)
+            .await?
+            .unwrap()
+            .proxmox_upid
+            .expect("live quarantine recorded a Proxmox UPID");
+        eprintln!("live proxmox quarantine UPID recorded: {upid}");
+        assert!(
+            ProxmoxAdapter::new()
+                .preflight(&qtarget)
+                .await?
+                .currently_quarantined
+        );
+        // Ambiguous state the automatic sweep will not resolve.
+        store.mark_quarantine_recovery_required(intent_id).await?;
+        // Operator reconcile: proves completion via the recorded UPID, then restores net0.
+        let reconcile_req =
+            approved_action(&store, &target, "proxmox.reconcile_quarantine").await?;
+        reconcile(&store, &reconcile_req).await?;
+        let restored = ProxmoxAdapter::new().preflight(&qtarget).await?;
+        assert!(
+            !restored.currently_quarantined,
+            "reconcile lifted the isolation"
+        );
+        assert_eq!(
+            restored.net0, original_net0,
+            "net0 restored to the exact original"
+        );
+        assert_eq!(
+            store.quarantine_intent(intent_id).await?.unwrap().status,
+            "rolled_back"
+        );
+        Ok(())
     }
     #[tokio::test]
     #[ignore = "own Docker container/networks and explicit disposable schema-0057 PostgreSQL; run alone"]
