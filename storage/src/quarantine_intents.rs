@@ -297,6 +297,30 @@ impl QuarantineGuard {
         Ok(())
     }
 
+    /// Authorize an operator reconciliation of THIS generation with a SEPARATE,
+    /// context-bound dual-approved reconcile request - never the original quarantine
+    /// request's approval. Holds the approval lock through the reconcile mutation, exactly
+    /// like validate_approval. The generation must be `recovery_required`: the only state
+    /// the automatic sweep deliberately will not resolve, so it needs an audited operator.
+    pub async fn validate_reconcile_approval(
+        &mut self,
+        reconcile_execution_id: Uuid,
+        reconcile_action_name: &str,
+        target: &Value,
+    ) -> Result<()> {
+        sqlx::query("SELECT clawforge_lock_quarantine_approval($1)")
+            .bind(reconcile_execution_id)
+            .execute(&mut *self.tx)
+            .await?;
+        let authorized: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM execution_requests e JOIN actions a ON a.id=e.action_id JOIN approval_policies p ON p.risk_level=a.risk_level WHERE e.id=$1 AND e.status IN ('starting','running') AND a.name=$2 AND a.enabled AND a.requires_approval AND a.risk_level='critical' AND p.required_approvals>=2 AND e.required_approvals>=2 AND e.requested_by_id IS NOT NULL AND e.approval_expires_at>clock_timestamp() AND e.approval_context->'target'=$3 AND (SELECT COUNT(DISTINCT ea.approver_id) FROM execution_approvals ea WHERE ea.execution_id=e.id AND ea.context_hash=e.approval_context_hash AND ea.approver_id<>e.requested_by_id)>=GREATEST(e.required_approvals,p.required_approvals))")
+            .bind(reconcile_execution_id).bind(reconcile_action_name).bind(target)
+            .fetch_one(&mut *self.tx).await?;
+        if self.intent.status != "recovery_required" || !authorized {
+            bail!("reconcile approval invalid or generation not awaiting reconciliation");
+        }
+        Ok(())
+    }
+
     /// Release the held generation row lock synchronously. The guard's
     /// transaction holds a FOR UPDATE lock; letting it drop rolls back only on a
     /// deferred, best-effort basis, which can briefly leave the row locked and
