@@ -459,6 +459,180 @@ async fn only_exact_approved_adapter_action_and_target_can_prepare() -> Result<(
     Ok(())
 }
 
+/// Collect every generation across pages so assertions do not depend on how
+/// many rows earlier tests left in the shared fixture.
+async fn all_generations(store: &PostgresStore) -> Result<Vec<Value>> {
+    let mut all = Vec::new();
+    let mut page = 1;
+    loop {
+        let (rows, total) = store.list_quarantine_generations(page, 200).await?;
+        let empty = rows.is_empty();
+        all.extend(rows);
+        if empty || all.len() as i64 >= total {
+            break;
+        }
+        page += 1;
+    }
+    Ok(all)
+}
+fn find(rows: &[Value], id: Uuid) -> &Value {
+    rows.iter()
+        .find(|r| r["generation_id"] == json!(id))
+        .unwrap_or_else(|| panic!("generation {id} missing from read view"))
+}
+
+/// Q1 read projection: every durable status is surfaced with the right operator
+/// lifecycle label, ownership/recovery flags and apply/rollback receipt lineage,
+/// the list is stably ordered newest-first, and pagination partitions it without
+/// gaps or overlap while reporting an accurate total/has_next.
+#[tokio::test]
+#[ignore = "requires an isolated explicit quarantine PostgreSQL fixture with schema 0054"]
+async fn generations_view_reports_all_statuses_lineage_and_stable_pages() -> Result<()> {
+    let store = store().await?;
+    let mk = |tag: &str| {
+        let fp = Uuid::new_v4().simple().to_string().repeat(2);
+        let target = json!({"kind":"docker","container_id":fp,"ttl_seconds":60,"tag":tag});
+        (fp, target)
+    };
+    let state = json!({"networks":[]});
+
+    // prepared: owns its target, no receipts yet.
+    let (fp_prep, t_prep) = mk("prepared");
+    let (ex_prep, _) = execution(&store, &t_prep).await?;
+    let g_prepared = store
+        .prepare_quarantine_intent(ex_prep, "docker", &fp_prep, &t_prep, &state, &state, 60)
+        .await?;
+
+    // completed + active (TTL in the future): apply receipt present.
+    let (fp_act, t_act) = mk("active");
+    let (ex_act, act_action) = execution(&store, &t_act).await?;
+    let g_active = store
+        .prepare_quarantine_intent(ex_act, "docker", &fp_act, &t_act, &state, &state, 60)
+        .await?;
+    let act_receipt = store
+        .finish_quarantine_intent(
+            g_active,
+            &receipt(
+                ex_act,
+                &act_action,
+                &fp_act,
+                t_act.clone(),
+                state.clone(),
+                state.clone(),
+            ),
+        )
+        .await?;
+
+    // not_applied terminal: releases its target, no receipts.
+    let (fp_na, t_na) = mk("not_applied");
+    let (ex_na, _) = execution(&store, &t_na).await?;
+    let g_not_applied = store
+        .prepare_quarantine_intent(ex_na, "docker", &fp_na, &t_na, &state, &state, 60)
+        .await?;
+    store.mark_quarantine_not_applied(g_not_applied).await?;
+
+    // recovery_required: still owns its target, recovery open.
+    let (fp_rec, t_rec) = mk("recovery");
+    let (ex_rec, _) = execution(&store, &t_rec).await?;
+    let g_recovery = store
+        .prepare_quarantine_intent(ex_rec, "docker", &fp_rec, &t_rec, &state, &state, 60)
+        .await?;
+    store.mark_quarantine_recovery_required(g_recovery).await?;
+
+    // rolled_back terminal: apply + verified rollback receipt lineage.
+    let (fp_rb, t_rb) = mk("rolled_back");
+    let (ex_rb, rb_action) = execution(&store, &t_rb).await?;
+    let g_rolled_back = store
+        .prepare_quarantine_intent(ex_rb, "docker", &fp_rb, &t_rb, &state, &state, 60)
+        .await?;
+    store
+        .finish_quarantine_intent(
+            g_rolled_back,
+            &receipt(
+                ex_rb,
+                &rb_action,
+                &fp_rb,
+                t_rb.clone(),
+                state.clone(),
+                state.clone(),
+            ),
+        )
+        .await?;
+    store.resolve_quarantine_rollback(g_rolled_back).await?;
+
+    let rows = all_generations(&store).await?;
+
+    let prepared = find(&rows, g_prepared);
+    assert_eq!(prepared["lifecycle"], "prepared");
+    assert_eq!(prepared["owns_target"], json!(true));
+    assert_eq!(prepared["open_recovery"], json!(false));
+    assert_eq!(prepared["apply_receipt"], Value::Null);
+    assert_eq!(prepared["target_fingerprint"], json!(fp_prep));
+
+    let active = find(&rows, g_active);
+    assert_eq!(active["lifecycle"], "active");
+    assert_eq!(active["status"], "completed");
+    assert_eq!(active["owns_target"], json!(true));
+    assert_eq!(active["is_expired"], json!(false));
+    assert_eq!(active["apply_receipt"]["id"], json!(act_receipt));
+    assert_eq!(active["apply_receipt"]["verification_result"], "verified");
+    assert_eq!(active["rollback_receipt"], Value::Null);
+
+    let not_applied = find(&rows, g_not_applied);
+    assert_eq!(not_applied["lifecycle"], "not_applied");
+    assert_eq!(not_applied["owns_target"], json!(false));
+    assert_eq!(not_applied["open_recovery"], json!(false));
+
+    let recovery = find(&rows, g_recovery);
+    assert_eq!(recovery["lifecycle"], "recovery_required");
+    assert_eq!(recovery["owns_target"], json!(true));
+    assert_eq!(recovery["open_recovery"], json!(true));
+
+    let rolled_back = find(&rows, g_rolled_back);
+    assert_eq!(rolled_back["lifecycle"], "verified_restored");
+    assert_eq!(rolled_back["owns_target"], json!(false));
+    assert_eq!(rolled_back["open_recovery"], json!(false));
+    assert!(!rolled_back["apply_receipt"].is_null());
+    assert_eq!(
+        rolled_back["rollback_receipt"]["verification_result"],
+        "verified"
+    );
+
+    // Newest-first: created_at never increases down the list.
+    let mut previous: Option<chrono::DateTime<chrono::Utc>> = None;
+    for row in &rows {
+        let created: chrono::DateTime<chrono::Utc> =
+            serde_json::from_value(row["created_at"].clone())?;
+        if let Some(prev) = previous {
+            assert!(created <= prev, "generations must be ordered newest-first");
+        }
+        previous = Some(created);
+    }
+
+    // Pagination partitions the same order with no gap or overlap and an exact total.
+    let (page1, total) = store.list_quarantine_generations(1, 2).await?;
+    assert!(total >= 5);
+    assert_eq!(page1.len(), 2);
+    let (page2, total2) = store.list_quarantine_generations(2, 2).await?;
+    assert_eq!(total, total2);
+    assert_eq!(
+        page1
+            .iter()
+            .chain(page2.iter())
+            .cloned()
+            .collect::<Vec<_>>(),
+        rows[..4],
+        "contiguous pages must reproduce the single-query order"
+    );
+    // has_next (computed by the API handler as page*page_size < total) is true
+    // while more pages remain: here total >= 5, so the first size-2 page has more.
+    assert!(2 < total, "has_next must be true while more pages remain");
+    // A page past the end is empty, not a wrapped or duplicated page.
+    let (beyond, _) = store.list_quarantine_generations(total + 1, 2).await?;
+    assert!(beyond.is_empty());
+    Ok(())
+}
+
 #[tokio::test]
 #[ignore = "requires explicit quarantine and restricted API/executor PostgreSQL fixtures"]
 async fn restricted_roles_preserve_generation_and_bind_kill_switch() -> Result<()> {

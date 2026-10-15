@@ -15,6 +15,8 @@ export type OperationsSummary = { overall_status: string; risk_level: string; ac
 export type FirewallReceipt = { id: string; execution_id?: string | null; adapter: string; action_name: string; receipt_kind: "apply" | "rollback"; target_fingerprint?: string | null; is_dry_run: boolean; verification_result?: string | null; ttl_seconds: number; expires_at: string; created_at: string; rendered_commands: unknown; rollback_plan: unknown; observed_state?: unknown };
 export type FirewallExpiredTarget = { receipt_id: string; adapter: string; target_fingerprint: string; target_json: unknown };
 export type FirewallKillSwitchRequest = { id: string; adapter: string; target_fingerprint: string; target_json: unknown; reason?: string | null; requested_by: string; created_at: string; processed_at?: string | null };
+export type QuarantineReceiptRef = { id: string; verification_result?: string | null; created_at?: string | null };
+export type QuarantineGeneration = { generation_id: string; execution_id: string; adapter: string; action_name: string; status: string; lifecycle: string; owns_target: boolean; open_recovery: boolean; is_expired: boolean; target_fingerprint: string; target_json: unknown; ttl_seconds: number; expires_at: string; created_at: string; completed_at?: string | null; error_summary?: string | null; apply_receipt?: QuarantineReceiptRef | null; rollback_receipt?: QuarantineReceiptRef | null };
 
 // Roadmap phase 9 "Dashboard" - "Live Security mit Angriffen, Assessments
 // und Incidents". `resource` on both types below is already the

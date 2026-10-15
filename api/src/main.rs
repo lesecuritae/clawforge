@@ -4298,6 +4298,65 @@ async fn admin_firewall_kill_switch_list(
     Ok(envelope(values, None))
 }
 
+#[derive(Deserialize, Default)]
+struct QuarantineGenerationsQuery {
+    page: Option<i64>,
+    page_size: Option<i64>,
+}
+
+/// Phase 11 Q1: read-only operator visibility into durable quarantine
+/// generations (the `firewall_action_intents` rows that own an external
+/// Docker/Proxmox/Tailscale target). Paginated with a stable
+/// `created_at DESC, id DESC` key and an accurate `total`, so an operator can
+/// see every generation's status, TTL/deadline, apply/rollback receipt lineage
+/// and whether verified recovery is still open. "Expired-pending-recovery",
+/// "recovery_required" and "verified_restored" are distinguished via the
+/// storage `lifecycle` label.
+///
+/// This is the operator surface (session auth + role), so it may show internal
+/// `target_json`; it is strictly read-only and exposes no adapter/rollback
+/// command - there is deliberately no "force resolve" here, and the agent/MCP
+/// projection is untouched and stays sanitized. Operator read roles only, like
+/// the other `admin_firewall_*` read endpoints.
+async fn admin_firewall_quarantine_generations(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<QuarantineGenerationsQuery>,
+) -> ApiResult<Json<ApiEnvelope<Vec<serde_json::Value>>>> {
+    let principal = authenticate(&state, &headers).await?;
+    require_role(&principal, &["Administrator", "Operator", "Viewer"])?;
+    let page = query.page.unwrap_or(1).max(1);
+    let page_size = query.page_size.unwrap_or(50).clamp(1, 200);
+    let (values, total) = state
+        .store
+        .list_quarantine_generations(page, page_size)
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "quarantine generations unavailable",
+            )
+        })?;
+    audit(
+        &state,
+        &principal,
+        "firewall_quarantine_generations_read",
+        "firewall_action_intents",
+        serde_json::json!({"page": page, "page_size": page_size}),
+    )
+    .await;
+    let has_next = page.saturating_mul(page_size) < total;
+    Ok(envelope(
+        values,
+        Some(Pagination {
+            page,
+            page_size,
+            total,
+            has_next,
+        }),
+    ))
+}
+
 async fn agent_actions(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -8303,6 +8362,10 @@ fn build_router(app_state: AppState) -> Router {
         .route(
             "/firewall/kill-switch",
             get(admin_firewall_kill_switch_list).post(admin_firewall_kill_switch_create),
+        )
+        .route(
+            "/firewall/quarantine/generations",
+            get(admin_firewall_quarantine_generations),
         )
         .route(
             "/admin/executions/{id}/approve",
