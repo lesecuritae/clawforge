@@ -550,3 +550,85 @@ async fn restricted_roles_preserve_generation_and_bind_kill_switch() -> Result<(
         .is_err());
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "requires an isolated explicit quarantine PostgreSQL fixture with schema 0056"]
+async fn proxmox_upid_persists_on_prepared_intent_even_when_receipt_fails() -> Result<()> {
+    let store = store().await?;
+    // Canonical Proxmox fingerprint is "{node}/{vmid}" (see prepare_quarantine_intent).
+    let fp = "pve-test/101".to_string();
+    let target = json!({"kind":"proxmox","node":"pve-test","vmid":101,"ttl_seconds":60});
+    let (execution, action) =
+        execution_for_action(&store, &target, "proxmox.quarantine_vm").await?;
+    let state = json!({"networks":[{"network_id":"original-net0","aliases":[],"ipv4":"10.0.0.1"}]});
+    let plan = json!({"networks":state["networks"]});
+
+    // Prepare the quarantine intent.
+    let id = store
+        .prepare_quarantine_intent(execution, "proxmox", &fp, &target, &state, &plan, 60)
+        .await?;
+    let prepared = store.quarantine_intent(id).await?.unwrap();
+    assert_eq!(prepared.status, "prepared");
+    assert_eq!(prepared.target_json, target);
+    assert_eq!(prepared.rollback_plan, plan);
+
+    // Persist the observed Proxmox UPID in its own committed transaction, exactly as the
+    // proxmox adapter does before awaiting the config task.
+    let test_upid = "UPID:pve-test:qmstart:101:user@pve:root@pam:ABCD1234:";
+    store.set_quarantine_intent_upid(id, test_upid).await?;
+    let retrieved_upid: Option<String> =
+        sqlx::query_scalar("SELECT proxmox_upid FROM firewall_action_intents WHERE id = $1")
+            .bind(id)
+            .fetch_one(store.pool())
+            .await?;
+    assert_eq!(retrieved_upid.as_deref(), Some(test_upid));
+
+    // Build a receipt that matches the prepared proxmox generation. The shared receipt()
+    // helper defaults adapter to "docker", so set it to proxmox to exercise real validation.
+    let mut input = receipt(
+        execution,
+        &action,
+        &fp,
+        target.clone(),
+        state.clone(),
+        plan.clone(),
+    );
+    input.adapter = "proxmox";
+
+    // A rejected receipt (verification mismatch) is refused at validation, which releases
+    // the generation lock cleanly. The UPID lives in its own committed transaction, so it
+    // must survive the rejected receipt with the intent still prepared.
+    input.verification_result = Some("mismatch");
+    assert!(store.finish_quarantine_intent(id, &input).await.is_err());
+
+    let intent_after_failed_receipt = store.quarantine_intent(id).await?.unwrap();
+    assert_eq!(intent_after_failed_receipt.status, "prepared");
+    let upid_after_failure: Option<String> =
+        sqlx::query_scalar("SELECT proxmox_upid FROM firewall_action_intents WHERE id = $1")
+            .bind(id)
+            .fetch_one(store.pool())
+            .await?;
+    assert_eq!(upid_after_failure.as_deref(), Some(test_upid));
+
+    // When the receipt verifies, the intent completes and the UPID remains attached.
+    input.verification_result = Some("verified");
+    let receipt_id = store.finish_quarantine_intent(id, &input).await?;
+    let completed = store.quarantine_intent(id).await?.unwrap();
+    assert_eq!(completed.status, "completed");
+    let upid_after_success: Option<String> =
+        sqlx::query_scalar("SELECT proxmox_upid FROM firewall_action_intents WHERE id = $1")
+            .bind(id)
+            .fetch_one(store.pool())
+            .await?;
+    assert_eq!(upid_after_success.as_deref(), Some(test_upid));
+
+    // The apply receipt is linked back to the intent.
+    let linked: Uuid =
+        sqlx::query_scalar("SELECT intent_id FROM firewall_action_receipts WHERE id = $1")
+            .bind(receipt_id)
+            .fetch_one(store.pool())
+            .await?;
+    assert_eq!(linked, id);
+
+    Ok(())
+}

@@ -266,7 +266,7 @@ where
             Ok(json!({"disconnected_networks":applied}))
         } else {
             let adapter = ProxmoxAdapter::new();
-            adapter
+            let (_applied, upid) = adapter
                 .apply_prepared(
                     &qtarget,
                     plan["original_net0"]
@@ -274,6 +274,9 @@ where
                         .context("NIC snapshot missing")?,
                 )
                 .await?;
+            if !upid.is_empty() {
+                store.set_quarantine_intent_upid(id, &upid).await?;
+            }
             if adapter.verify(&qtarget).await? != VerificationResult::Verified {
                 bail!("Proxmox verification failed");
             }
