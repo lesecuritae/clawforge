@@ -338,7 +338,7 @@ impl ProxmoxAdapter {
         digest: &str,
         ticket: &str,
         csrf: &str,
-    ) -> Result<(), AdapterError> {
+    ) -> Result<String, AdapterError> {
         let credentials = self.credentials()?;
         let response = self
             .http()?
@@ -369,7 +369,8 @@ impl ProxmoxAdapter {
         let upid = body["data"].as_str().ok_or_else(|| {
             AdapterError::Apply("proxmox config write returned no asynchronous task ID".into())
         })?;
-        self.wait_for_config_task(node, vmid, upid, ticket).await
+        self.wait_for_config_task(node, vmid, upid, ticket).await?;
+        Ok(upid.to_string())
     }
 
     async fn wait_for_config_task(
@@ -475,7 +476,9 @@ impl ProxmoxAdapter {
         target: &QuarantineTarget,
         dry_run: bool,
     ) -> Result<ProxmoxApplied, AdapterError> {
-        self.apply_checked(target, dry_run, None).await
+        self.apply_checked(target, dry_run, None)
+            .await
+            .map(|(applied, _upid)| applied)
     }
 
     /// Refuse NIC drift between durable preparation and the digest-fenced write.
@@ -483,7 +486,7 @@ impl ProxmoxAdapter {
         &self,
         target: &QuarantineTarget,
         original_net0: &str,
-    ) -> Result<ProxmoxApplied, AdapterError> {
+    ) -> Result<(ProxmoxApplied, String), AdapterError> {
         self.apply_checked(target, false, Some(original_net0)).await
     }
 
@@ -492,7 +495,7 @@ impl ProxmoxAdapter {
         target: &QuarantineTarget,
         dry_run: bool,
         expected_net0: Option<&str>,
-    ) -> Result<ProxmoxApplied, AdapterError> {
+    ) -> Result<(ProxmoxApplied, String), AdapterError> {
         let (node, vmid) = Self::node_vmid(target)?;
         if !dry_run && self.protection_list()?.is_empty() {
             return Err(AdapterError::InvalidTarget(format!(
@@ -518,14 +521,19 @@ impl ProxmoxAdapter {
             ));
         }
         let quarantined = quarantine_net0(&current.net0);
-        if !dry_run {
+        let upid = if !dry_run {
             self.write_net0(node, vmid, &quarantined, &current.digest, &ticket, &csrf)
-                .await?;
-        }
-        Ok(ProxmoxApplied {
-            summary: format!("proxmox quarantine {node}/{vmid} dry_run={dry_run}"),
-            original_net0: current.net0,
-        })
+                .await?
+        } else {
+            String::new()
+        };
+        Ok((
+            ProxmoxApplied {
+                summary: format!("proxmox quarantine {node}/{vmid} dry_run={dry_run}"),
+                original_net0: current.net0,
+            },
+            upid,
+        ))
     }
 
     /// Confirms the NIC is isolated.
@@ -788,7 +796,7 @@ mod tests {
             adapter.preflight(&target(9001)).await.unwrap().net0,
             original.net0
         );
-        let applied = adapter
+        let (applied, _upid) = adapter
             .apply_prepared(&target(9001), &original.net0)
             .await
             .unwrap();

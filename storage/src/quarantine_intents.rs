@@ -38,6 +38,19 @@ fn decode(row: sqlx::postgres::PgRow) -> QuarantineIntent {
 }
 
 impl PostgresStore {
+    /// Store the Proxmox UPID on a prepared quarantine intent.
+    /// This survives a later-failing receipt transaction and takes no FOR UPDATE lock.
+    pub async fn set_quarantine_intent_upid(&self, id: Uuid, upid: &str) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("UPDATE firewall_action_intents SET proxmox_upid = $2 WHERE id = $1")
+            .bind(id)
+            .bind(upid)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Commit the immutable rollback snapshot before calling the external adapter.
     /// Active ownership survives both expiry and executor lease loss.
     #[allow(clippy::too_many_arguments)]

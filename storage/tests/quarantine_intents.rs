@@ -550,3 +550,104 @@ async fn restricted_roles_preserve_generation_and_bind_kill_switch() -> Result<(
         .is_err());
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "requires an isolated explicit quarantine PostgreSQL fixture with schema 0056"]
+async fn proxmox_upid_persists_on_prepared_intent_even_when_receipt_fails() -> Result<()> {
+    let store = store().await?;
+    let fp = Uuid::new_v4().simple().to_string().repeat(2);
+    let target = json!({"kind":"proxmox","node":"pve-test","vmid":101,"ttl_seconds":60});
+    let (execution, action) =
+        execution_for_action(&store, &target, "proxmox.quarantine_vm").await?;
+    let state = json!({"networks":[{"network_id":"original-net0","aliases":[],"ipv4":"10.0.0.1"}]});
+    let plan = json!({"networks":state["networks"]});
+
+    // Prepare the quarantine intent
+    let id = store
+        .prepare_quarantine_intent(execution, "proxmox", &fp, &target, &state, &plan, 60)
+        .await?;
+
+    // Verify the intent is prepared
+    let prepared = store.quarantine_intent(id).await?.unwrap();
+    assert_eq!(prepared.status, "prepared");
+    assert_eq!(prepared.target_json, target);
+    assert_eq!(prepared.rollback_plan, plan);
+
+    // Set a test UPID (simulating what the proxmox adapter would do)
+    let test_upid = "UPID:pve-test:qmstart:101:user@pve:root@pam:ABCD1234:";
+    store.set_quarantine_intent_upid(id, test_upid).await?;
+
+    // Verify the UPID is persisted
+    let _intent_with_upid = store.quarantine_intent(id).await?.unwrap();
+    // Note: We'd need to add a method to read the UPID, but for now we can check via direct SQL
+    let retrieved_upid: Option<String> =
+        sqlx::query_scalar("SELECT proxmox_upid FROM firewall_action_intents WHERE id = $1")
+            .bind(id)
+            .fetch_one(store.pool())
+            .await?;
+    assert_eq!(retrieved_upid.as_deref(), Some(test_upid));
+
+    // Now simulate a failing receipt transaction
+    let mut input = receipt(
+        execution,
+        &action,
+        &fp,
+        target.clone(),
+        state.clone(),
+        plan.clone(),
+    );
+    input.verification_result = Some("mismatch"); // This will cause verification to fail
+
+    // Force a real database failure at receipt INSERT, after the generation row is locked.
+    sqlx::query(
+        "ALTER TABLE firewall_action_receipts ADD CONSTRAINT quarantine_fixture_receipt_rejection CHECK (rendered_commands <> '{\\\"reject_fixture\\\":true}'::jsonb)"
+    )
+    .execute(store.pool())
+    .await?;
+
+    input.rendered_commands = json!({"reject_fixture":true});
+    assert!(store.finish_quarantine_intent(id, &input).await.is_err());
+
+    // Even though the receipt failed, the UPID should still be persisted on the intent
+    let intent_after_failed_receipt = store.quarantine_intent(id).await?.unwrap();
+    assert_eq!(intent_after_failed_receipt.status, "prepared"); // Should still be prepared
+
+    let upid_after_failure: Option<String> =
+        sqlx::query_scalar("SELECT proxmox_upid FROM firewall_action_intents WHERE id = $1")
+            .bind(id)
+            .fetch_one(store.pool())
+            .await?;
+    assert_eq!(upid_after_failure.as_deref(), Some(test_upid));
+
+    // Clean up the test constraint
+    sqlx::query(
+        "ALTER TABLE firewall_action_receipts DROP CONSTRAINT quarantine_fixture_receipt_rejection",
+    )
+    .execute(store.pool())
+    .await?;
+
+    // Now verify that when receipt succeeds, the intent is completed and UPID is still there
+    input.verification_result = Some("verified");
+    input.rendered_commands = json!([]);
+    let receipt_id = store.finish_quarantine_intent(id, &input).await?;
+
+    let completed = store.quarantine_intent(id).await?.unwrap();
+    assert_eq!(completed.status, "completed");
+
+    let upid_after_success: Option<String> =
+        sqlx::query_scalar("SELECT proxmox_upid FROM firewall_action_intents WHERE id = $1")
+            .bind(id)
+            .fetch_one(store.pool())
+            .await?;
+    assert_eq!(upid_after_success.as_deref(), Some(test_upid));
+
+    // Verify the receipt is linked
+    let linked: Uuid =
+        sqlx::query_scalar("SELECT intent_id FROM firewall_action_receipts WHERE id = $1")
+            .bind(receipt_id)
+            .fetch_one(store.pool())
+            .await?;
+    assert_eq!(linked, id);
+
+    Ok(())
+}
