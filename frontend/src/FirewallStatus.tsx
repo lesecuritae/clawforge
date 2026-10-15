@@ -1,7 +1,7 @@
 import React, { useState } from "react";
 import { api, type Envelope } from "./api";
-import { useApi, Card, Table, Empty, Loading, PageTitle, Badge, ErrorNotice, formatDate } from "./ui";
-import type { FirewallReceipt, FirewallExpiredTarget, FirewallKillSwitchRequest } from "./types";
+import { useApi, Card, Table, Empty, Loading, PageTitle, Badge, ErrorNotice, Pager, formatDate } from "./ui";
+import type { FirewallReceipt, FirewallExpiredTarget, FirewallKillSwitchRequest, QuarantineGeneration } from "./types";
 
 /// Roadmap phase 9 "Dashboard": "Firewall Status mit Desired/Actual State,
 /// Sperren, TTL und Drift". Assembles the three read-only admin endpoints
@@ -15,7 +15,13 @@ export function FirewallStatus({ token }: { token: string }) {
   const receipts = useApi<FirewallReceipt[]>("/firewall/receipts?limit=100", token, []);
   const expired = useApi<FirewallExpiredTarget[]>("/firewall/expired", token, []);
   const killSwitch = useApi<FirewallKillSwitchRequest[]>("/firewall/kill-switch?limit=100", token, []);
-  const error = receipts.error || expired.error || killSwitch.error;
+  const [generationsPage, setGenerationsPage] = useState(1);
+  const generations = useApi<QuarantineGeneration[]>(
+    `/firewall/quarantine/generations?page=${generationsPage}&page_size=25`,
+    token,
+    [],
+  );
+  const error = receipts.error || expired.error || killSwitch.error || generations.error;
 
   const [adapter, setAdapter] = useState("nftables");
   const [targetFingerprint, setTargetFingerprint] = useState("");
@@ -58,6 +64,8 @@ export function FirewallStatus({ token }: { token: string }) {
   const applyReceipts = receipts.data.filter((item) => item.receipt_kind === "apply");
   const realApplies = applyReceipts.filter((item) => !item.is_dry_run).length;
   const pendingKillSwitch = killSwitch.data.filter((item) => !item.processed_at).length;
+  const quarantineTotal = generations.pagination?.total ?? generations.data.length;
+  const openRecovery = generations.data.filter((item) => item.open_recovery).length;
 
   return (
     <>
@@ -72,6 +80,8 @@ export function FirewallStatus({ token }: { token: string }) {
         <Card title="Real (non-dry-run)" value={realApplies} tone={realApplies ? "alert" : "good"} />
         <Card title="Drifted targets" value={expired.data.length} tone={expired.data.length ? "alert" : "good"} hint="Past TTL, not yet rolled back" />
         <Card title="Pending kill-switch" value={pendingKillSwitch} tone={pendingKillSwitch ? "alert" : "good"} />
+        <Card title="Quarantine generations" value={quarantineTotal} hint="Owning + resolved" />
+        <Card title="Open recovery" value={openRecovery} tone={openRecovery ? "alert" : "good"} hint="On this page" />
       </div>
 
       <section className="card">
@@ -104,6 +114,56 @@ export function FirewallStatus({ token }: { token: string }) {
           </Table>
         ) : (
           <Empty text="No expired, unrolled-back targets - every real block is within its TTL or already rolled back." />
+        )}
+      </section>
+
+      <section className="card">
+        <div className="section-title">
+          <h3>Quarantine generations</h3>
+          <span>Durable ownership of Docker/Proxmox/Tailscale isolation — read-only</span>
+        </div>
+        {generations.loading ? (
+          <Loading />
+        ) : generations.data.length ? (
+          <>
+            <Table>
+              <thead>
+                <tr>
+                  <th>Generation</th>
+                  <th>Adapter</th>
+                  <th>Target</th>
+                  <th>Lifecycle</th>
+                  <th>Recovery</th>
+                  <th>TTL</th>
+                  <th>Expires</th>
+                  <th>Apply</th>
+                  <th>Rollback</th>
+                </tr>
+              </thead>
+              <tbody>
+                {generations.data.map((item) => (
+                  <tr key={item.generation_id}>
+                    <td className="mono">{item.generation_id}</td>
+                    <td>
+                      <Badge value={item.adapter} />
+                    </td>
+                    <td className="mono">{item.target_fingerprint}</td>
+                    <td>
+                      <Badge value={item.lifecycle} />
+                    </td>
+                    <td>{item.open_recovery ? <Badge value="open" /> : "—"}</td>
+                    <td>{item.ttl_seconds}s</td>
+                    <td>{formatDate(item.expires_at)}</td>
+                    <td>{item.apply_receipt ? item.apply_receipt.verification_result ?? "—" : "—"}</td>
+                    <td>{item.rollback_receipt ? item.rollback_receipt.verification_result ?? "—" : "—"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </Table>
+            <Pager page={generationsPage} pagination={generations.pagination} onPage={setGenerationsPage} />
+          </>
+        ) : (
+          <Empty text="No quarantine generations recorded - no VM/container isolation has been prepared." />
         )}
       </section>
 

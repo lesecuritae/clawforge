@@ -459,6 +459,180 @@ async fn only_exact_approved_adapter_action_and_target_can_prepare() -> Result<(
     Ok(())
 }
 
+/// Collect every generation across pages so assertions do not depend on how
+/// many rows earlier tests left in the shared fixture.
+async fn all_generations(store: &PostgresStore) -> Result<Vec<Value>> {
+    let mut all = Vec::new();
+    let mut page = 1;
+    loop {
+        let (rows, total) = store.list_quarantine_generations(page, 200).await?;
+        let empty = rows.is_empty();
+        all.extend(rows);
+        if empty || all.len() as i64 >= total {
+            break;
+        }
+        page += 1;
+    }
+    Ok(all)
+}
+fn find(rows: &[Value], id: Uuid) -> &Value {
+    rows.iter()
+        .find(|r| r["generation_id"] == json!(id))
+        .unwrap_or_else(|| panic!("generation {id} missing from read view"))
+}
+
+/// Q1 read projection: every durable status is surfaced with the right operator
+/// lifecycle label, ownership/recovery flags and apply/rollback receipt lineage,
+/// the list is stably ordered newest-first, and pagination partitions it without
+/// gaps or overlap while reporting an accurate total/has_next.
+#[tokio::test]
+#[ignore = "requires an isolated explicit quarantine PostgreSQL fixture with schema 0054"]
+async fn generations_view_reports_all_statuses_lineage_and_stable_pages() -> Result<()> {
+    let store = store().await?;
+    let mk = |tag: &str| {
+        let fp = Uuid::new_v4().simple().to_string().repeat(2);
+        let target = json!({"kind":"docker","container_id":fp,"ttl_seconds":60,"tag":tag});
+        (fp, target)
+    };
+    let state = json!({"networks":[]});
+
+    // prepared: owns its target, no receipts yet.
+    let (fp_prep, t_prep) = mk("prepared");
+    let (ex_prep, _) = execution(&store, &t_prep).await?;
+    let g_prepared = store
+        .prepare_quarantine_intent(ex_prep, "docker", &fp_prep, &t_prep, &state, &state, 60)
+        .await?;
+
+    // completed + active (TTL in the future): apply receipt present.
+    let (fp_act, t_act) = mk("active");
+    let (ex_act, act_action) = execution(&store, &t_act).await?;
+    let g_active = store
+        .prepare_quarantine_intent(ex_act, "docker", &fp_act, &t_act, &state, &state, 60)
+        .await?;
+    let act_receipt = store
+        .finish_quarantine_intent(
+            g_active,
+            &receipt(
+                ex_act,
+                &act_action,
+                &fp_act,
+                t_act.clone(),
+                state.clone(),
+                state.clone(),
+            ),
+        )
+        .await?;
+
+    // not_applied terminal: releases its target, no receipts.
+    let (fp_na, t_na) = mk("not_applied");
+    let (ex_na, _) = execution(&store, &t_na).await?;
+    let g_not_applied = store
+        .prepare_quarantine_intent(ex_na, "docker", &fp_na, &t_na, &state, &state, 60)
+        .await?;
+    store.mark_quarantine_not_applied(g_not_applied).await?;
+
+    // recovery_required: still owns its target, recovery open.
+    let (fp_rec, t_rec) = mk("recovery");
+    let (ex_rec, _) = execution(&store, &t_rec).await?;
+    let g_recovery = store
+        .prepare_quarantine_intent(ex_rec, "docker", &fp_rec, &t_rec, &state, &state, 60)
+        .await?;
+    store.mark_quarantine_recovery_required(g_recovery).await?;
+
+    // rolled_back terminal: apply + verified rollback receipt lineage.
+    let (fp_rb, t_rb) = mk("rolled_back");
+    let (ex_rb, rb_action) = execution(&store, &t_rb).await?;
+    let g_rolled_back = store
+        .prepare_quarantine_intent(ex_rb, "docker", &fp_rb, &t_rb, &state, &state, 60)
+        .await?;
+    store
+        .finish_quarantine_intent(
+            g_rolled_back,
+            &receipt(
+                ex_rb,
+                &rb_action,
+                &fp_rb,
+                t_rb.clone(),
+                state.clone(),
+                state.clone(),
+            ),
+        )
+        .await?;
+    store.resolve_quarantine_rollback(g_rolled_back).await?;
+
+    let rows = all_generations(&store).await?;
+
+    let prepared = find(&rows, g_prepared);
+    assert_eq!(prepared["lifecycle"], "prepared");
+    assert_eq!(prepared["owns_target"], json!(true));
+    assert_eq!(prepared["open_recovery"], json!(false));
+    assert_eq!(prepared["apply_receipt"], Value::Null);
+    assert_eq!(prepared["target_fingerprint"], json!(fp_prep));
+
+    let active = find(&rows, g_active);
+    assert_eq!(active["lifecycle"], "active");
+    assert_eq!(active["status"], "completed");
+    assert_eq!(active["owns_target"], json!(true));
+    assert_eq!(active["is_expired"], json!(false));
+    assert_eq!(active["apply_receipt"]["id"], json!(act_receipt));
+    assert_eq!(active["apply_receipt"]["verification_result"], "verified");
+    assert_eq!(active["rollback_receipt"], Value::Null);
+
+    let not_applied = find(&rows, g_not_applied);
+    assert_eq!(not_applied["lifecycle"], "not_applied");
+    assert_eq!(not_applied["owns_target"], json!(false));
+    assert_eq!(not_applied["open_recovery"], json!(false));
+
+    let recovery = find(&rows, g_recovery);
+    assert_eq!(recovery["lifecycle"], "recovery_required");
+    assert_eq!(recovery["owns_target"], json!(true));
+    assert_eq!(recovery["open_recovery"], json!(true));
+
+    let rolled_back = find(&rows, g_rolled_back);
+    assert_eq!(rolled_back["lifecycle"], "verified_restored");
+    assert_eq!(rolled_back["owns_target"], json!(false));
+    assert_eq!(rolled_back["open_recovery"], json!(false));
+    assert!(!rolled_back["apply_receipt"].is_null());
+    assert_eq!(
+        rolled_back["rollback_receipt"]["verification_result"],
+        "verified"
+    );
+
+    // Newest-first: created_at never increases down the list.
+    let mut previous: Option<chrono::DateTime<chrono::Utc>> = None;
+    for row in &rows {
+        let created: chrono::DateTime<chrono::Utc> =
+            serde_json::from_value(row["created_at"].clone())?;
+        if let Some(prev) = previous {
+            assert!(created <= prev, "generations must be ordered newest-first");
+        }
+        previous = Some(created);
+    }
+
+    // Pagination partitions the same order with no gap or overlap and an exact total.
+    let (page1, total) = store.list_quarantine_generations(1, 2).await?;
+    assert!(total >= 5);
+    assert_eq!(page1.len(), 2);
+    let (page2, total2) = store.list_quarantine_generations(2, 2).await?;
+    assert_eq!(total, total2);
+    assert_eq!(
+        page1
+            .iter()
+            .chain(page2.iter())
+            .cloned()
+            .collect::<Vec<_>>(),
+        rows[..4],
+        "contiguous pages must reproduce the single-query order"
+    );
+    // has_next (computed by the API handler as page*page_size < total) is true
+    // while more pages remain: here total >= 5, so the first size-2 page has more.
+    assert!(2 < total, "has_next must be true while more pages remain");
+    // A page past the end is empty, not a wrapped or duplicated page.
+    let (beyond, _) = store.list_quarantine_generations(total + 1, 2).await?;
+    assert!(beyond.is_empty());
+    Ok(())
+}
+
 #[tokio::test]
 #[ignore = "requires explicit quarantine and restricted API/executor PostgreSQL fixtures"]
 async fn restricted_roles_preserve_generation_and_bind_kill_switch() -> Result<()> {
@@ -548,5 +722,161 @@ async fn restricted_roles_preserve_generation_and_bind_kill_switch() -> Result<(
         .create_firewall_kill_switch_request("docker", &fp, &target, None, "operator", None)
         .await
         .is_err());
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated explicit quarantine PostgreSQL fixture with schema 0056"]
+async fn proxmox_upid_persists_on_prepared_intent_even_when_receipt_fails() -> Result<()> {
+    let store = store().await?;
+    // Canonical Proxmox fingerprint is "{node}/{vmid}" (see prepare_quarantine_intent).
+    let fp = "pve-test/101".to_string();
+    let target = json!({"kind":"proxmox","node":"pve-test","vmid":101,"ttl_seconds":60});
+    let (execution, action) =
+        execution_for_action(&store, &target, "proxmox.quarantine_vm").await?;
+    let state = json!({"networks":[{"network_id":"original-net0","aliases":[],"ipv4":"10.0.0.1"}]});
+    let plan = json!({"networks":state["networks"]});
+
+    // Prepare the quarantine intent.
+    let id = store
+        .prepare_quarantine_intent(execution, "proxmox", &fp, &target, &state, &plan, 60)
+        .await?;
+    let prepared = store.quarantine_intent(id).await?.unwrap();
+    assert_eq!(prepared.status, "prepared");
+    assert_eq!(prepared.target_json, target);
+    assert_eq!(prepared.rollback_plan, plan);
+
+    // Persist the observed Proxmox UPID in its own committed transaction, exactly as the
+    // proxmox adapter does before awaiting the config task.
+    let test_upid = "UPID:pve-test:qmstart:101:user@pve:root@pam:ABCD1234:";
+    store.set_quarantine_intent_upid(id, test_upid).await?;
+    let retrieved_upid: Option<String> =
+        sqlx::query_scalar("SELECT proxmox_upid FROM firewall_action_intents WHERE id = $1")
+            .bind(id)
+            .fetch_one(store.pool())
+            .await?;
+    assert_eq!(retrieved_upid.as_deref(), Some(test_upid));
+
+    // Build a receipt that matches the prepared proxmox generation. The shared receipt()
+    // helper defaults adapter to "docker", so set it to proxmox to exercise real validation.
+    let mut input = receipt(
+        execution,
+        &action,
+        &fp,
+        target.clone(),
+        state.clone(),
+        plan.clone(),
+    );
+    input.adapter = "proxmox";
+
+    // A rejected receipt (verification mismatch) is refused at validation, which releases
+    // the generation lock cleanly. The UPID lives in its own committed transaction, so it
+    // must survive the rejected receipt with the intent still prepared.
+    input.verification_result = Some("mismatch");
+    assert!(store.finish_quarantine_intent(id, &input).await.is_err());
+
+    let intent_after_failed_receipt = store.quarantine_intent(id).await?.unwrap();
+    assert_eq!(intent_after_failed_receipt.status, "prepared");
+    let upid_after_failure: Option<String> =
+        sqlx::query_scalar("SELECT proxmox_upid FROM firewall_action_intents WHERE id = $1")
+            .bind(id)
+            .fetch_one(store.pool())
+            .await?;
+    assert_eq!(upid_after_failure.as_deref(), Some(test_upid));
+
+    // When the receipt verifies, the intent completes and the UPID remains attached.
+    input.verification_result = Some("verified");
+    let receipt_id = store.finish_quarantine_intent(id, &input).await?;
+    let completed = store.quarantine_intent(id).await?.unwrap();
+    assert_eq!(completed.status, "completed");
+    let upid_after_success: Option<String> =
+        sqlx::query_scalar("SELECT proxmox_upid FROM firewall_action_intents WHERE id = $1")
+            .bind(id)
+            .fetch_one(store.pool())
+            .await?;
+    assert_eq!(upid_after_success.as_deref(), Some(test_upid));
+
+    // The apply receipt is linked back to the intent.
+    let linked: Uuid =
+        sqlx::query_scalar("SELECT intent_id FROM firewall_action_receipts WHERE id = $1")
+            .bind(receipt_id)
+            .fetch_one(store.pool())
+            .await?;
+    assert_eq!(linked, id);
+
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated explicit quarantine PostgreSQL fixture with schema 0057"]
+async fn operator_reconcile_requires_a_bound_dual_approved_reconcile_request() -> Result<()> {
+    let store = store().await?;
+    let state = json!({"networks":[{"network_id":"original-net0","aliases":[],"ipv4":"10.0.0.9"}]});
+    let plan = json!({"networks":state["networks"]});
+
+    // A recovery_required proxmox generation at `vmid` (the only state the automatic sweep
+    // will not resolve), returning the intent id and its canonical target.
+    async fn recovery_required(
+        store: &PostgresStore,
+        vmid: u64,
+        state: &Value,
+        plan: &Value,
+    ) -> Result<(Uuid, Value)> {
+        let fp = format!("pve-test/{vmid}");
+        let target = json!({"kind":"proxmox","node":"pve-test","vmid":vmid,"ttl_seconds":60});
+        let (exec, _) = execution_for_action(store, &target, "proxmox.quarantine_vm").await?;
+        let id = store
+            .prepare_quarantine_intent(exec, "proxmox", &fp, &target, state, plan, 60)
+            .await?;
+        store.mark_quarantine_recovery_required(id).await?;
+        Ok((id, target))
+    }
+
+    // Positive: a SEPARATE, dual-approved reconcile request bound to the same target authorizes.
+    let (id, target) = recovery_required(&store, 301, &state, &plan).await?;
+    let (reconcile_exec, _) =
+        execution_for_action(&store, &target, "proxmox.reconcile_quarantine").await?;
+    let mut guard = store.acquire_quarantine_guard(id).await?.unwrap();
+    guard
+        .validate_reconcile_approval(reconcile_exec, "proxmox.reconcile_quarantine", &target)
+        .await?;
+    drop(guard);
+
+    // The ORIGINAL quarantine request's approval must NOT authorize a reconcile (action mismatch).
+    let (id2, target2) = recovery_required(&store, 302, &state, &plan).await?;
+    let (q_exec, _) = execution_for_action(&store, &target2, "proxmox.quarantine_vm").await?;
+    let mut guard2 = store.acquire_quarantine_guard(id2).await?.unwrap();
+    assert!(guard2
+        .validate_reconcile_approval(q_exec, "proxmox.reconcile_quarantine", &target2)
+        .await
+        .is_err());
+    drop(guard2);
+
+    // A reconcile request approved for a DIFFERENT target cannot authorize this generation.
+    let (id3, target3) = recovery_required(&store, 303, &state, &plan).await?;
+    let (rec3, _) = execution_for_action(&store, &target3, "proxmox.reconcile_quarantine").await?;
+    let other = json!({"kind":"proxmox","node":"pve-test","vmid":999,"ttl_seconds":60});
+    let mut guard3 = store.acquire_quarantine_guard(id3).await?.unwrap();
+    assert!(guard3
+        .validate_reconcile_approval(rec3, "proxmox.reconcile_quarantine", &other)
+        .await
+        .is_err());
+    drop(guard3);
+
+    // A generation that is NOT recovery_required (still prepared) cannot be reconciled.
+    let fp4 = "pve-test/304".to_string();
+    let target4 = json!({"kind":"proxmox","node":"pve-test","vmid":304,"ttl_seconds":60});
+    let (exec4, _) = execution_for_action(&store, &target4, "proxmox.quarantine_vm").await?;
+    let id4 = store
+        .prepare_quarantine_intent(exec4, "proxmox", &fp4, &target4, &state, &plan, 60)
+        .await?;
+    let (rec4, _) = execution_for_action(&store, &target4, "proxmox.reconcile_quarantine").await?;
+    let mut guard4 = store.acquire_quarantine_guard(id4).await?.unwrap();
+    assert!(guard4
+        .validate_reconcile_approval(rec4, "proxmox.reconcile_quarantine", &target4)
+        .await
+        .is_err());
+    drop(guard4);
+
     Ok(())
 }

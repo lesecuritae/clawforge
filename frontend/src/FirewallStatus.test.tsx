@@ -3,7 +3,7 @@ import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { FirewallStatus } from "./FirewallStatus";
 import * as apiModule from "./api";
-import type { FirewallExpiredTarget, FirewallKillSwitchRequest, FirewallReceipt } from "./types";
+import type { FirewallExpiredTarget, FirewallKillSwitchRequest, FirewallReceipt, QuarantineGeneration } from "./types";
 
 // Roadmap phase 9 "Dashboard" exit gate: "TypeScript-Kompilierung allein
 // reicht nicht als Frontend-Test" - these exercise the rendered DOM
@@ -43,6 +43,27 @@ const killSwitchRequest: FirewallKillSwitchRequest = {
   processed_at: null,
 };
 
+const generation: QuarantineGeneration = {
+  generation_id: "gen-1",
+  execution_id: "exec-9",
+  adapter: "docker",
+  action_name: "docker.quarantine_container",
+  status: "recovery_required",
+  lifecycle: "recovery_required",
+  owns_target: true,
+  open_recovery: true,
+  is_expired: false,
+  target_fingerprint: "a".repeat(64),
+  target_json: { kind: "docker", container_id: "a".repeat(64) },
+  ttl_seconds: 7200,
+  expires_at: "2026-10-06T12:00:00Z",
+  created_at: "2026-10-06T11:00:00Z",
+  completed_at: null,
+  error_summary: "external quarantine state requires verified recovery",
+  apply_receipt: { id: "apply-1", verification_result: "verified", created_at: "2026-10-06T11:05:00Z" },
+  rollback_receipt: null,
+};
+
 function mockApiFor(routes: Record<string, unknown>) {
   return vi.spyOn(apiModule, "api").mockImplementation(async (path: string) => {
     for (const [prefix, data] of Object.entries(routes)) {
@@ -64,6 +85,7 @@ describe("FirewallStatus", () => {
       "/firewall/receipts": [receipt],
       "/firewall/expired": [expiredTarget],
       "/firewall/kill-switch": [killSwitchRequest],
+      "/firewall/quarantine/generations": [generation],
     });
 
     render(<FirewallStatus token="test-token" />);
@@ -78,8 +100,11 @@ describe("FirewallStatus", () => {
     expect(screen.getByText("pending")).toBeInTheDocument();
 
     // Receipts section.
-    expect(screen.getByText("verified")).toBeInTheDocument();
     expect(screen.getByText("3600s")).toBeInTheDocument();
+
+    // Quarantine generations section - lifecycle label and the generation id.
+    expect(screen.getByText("gen-1")).toBeInTheDocument();
+    expect(screen.getByText("recovery_required")).toBeInTheDocument();
   });
 
   it("shows empty states when the API returns no data", async () => {
@@ -87,6 +112,7 @@ describe("FirewallStatus", () => {
       "/firewall/receipts": [],
       "/firewall/expired": [],
       "/firewall/kill-switch": [],
+      "/firewall/quarantine/generations": [],
     });
 
     render(<FirewallStatus token="test-token" />);
@@ -100,6 +126,9 @@ describe("FirewallStatus", () => {
     );
     expect(screen.getByText("No kill-switch requests recorded.")).toBeInTheDocument();
     expect(screen.getByText("No firewall action receipts recorded yet.")).toBeInTheDocument();
+    expect(
+      screen.getByText("No quarantine generations recorded - no VM/container isolation has been prepared.")
+    ).toBeInTheDocument();
   });
 
   it("submits a kill-switch request with the form fields and reloads the list", async () => {
@@ -107,6 +136,7 @@ describe("FirewallStatus", () => {
       "/firewall/receipts": [],
       "/firewall/expired": [],
       "/firewall/kill-switch": [],
+      "/firewall/quarantine/generations": [],
     });
     apiSpy.mockImplementation(async (path: string, _token?: string, init?: RequestInit) => {
       if (path.startsWith("/firewall/kill-switch") && init?.method === "POST") {
@@ -151,6 +181,7 @@ describe("FirewallStatus", () => {
       "/firewall/receipts": [],
       "/firewall/expired": [],
       "/firewall/kill-switch": [],
+      "/firewall/quarantine/generations": [],
     });
 
     const user = userEvent.setup();

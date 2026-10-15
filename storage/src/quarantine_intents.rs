@@ -19,6 +19,7 @@ pub struct QuarantineIntent {
     pub ttl_seconds: i32,
     pub expires_at: DateTime<Utc>,
     pub status: String,
+    pub proxmox_upid: Option<String>,
 }
 
 fn decode(row: sqlx::postgres::PgRow) -> QuarantineIntent {
@@ -34,10 +35,24 @@ fn decode(row: sqlx::postgres::PgRow) -> QuarantineIntent {
         ttl_seconds: row.get("ttl_seconds"),
         expires_at: row.get("expires_at"),
         status: row.get("status"),
+        proxmox_upid: row.get("proxmox_upid"),
     }
 }
 
 impl PostgresStore {
+    /// Store the Proxmox UPID on a prepared quarantine intent.
+    /// This survives a later-failing receipt transaction and takes no FOR UPDATE lock.
+    pub async fn set_quarantine_intent_upid(&self, id: Uuid, upid: &str) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("UPDATE firewall_action_intents SET proxmox_upid = $2 WHERE id = $1")
+            .bind(id)
+            .bind(upid)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Commit the immutable rollback snapshot before calling the external adapter.
     /// Active ownership survives both expiry and executor lease loss.
     #[allow(clippy::too_many_arguments)]
@@ -245,6 +260,18 @@ impl PostgresStore {
         .await?
         .map(decode))
     }
+    /// The single active generation for a canonical target - the unique active-generation
+    /// index guarantees at most one in prepared/completed/recovery_required. The operator
+    /// reconcile path resolves by canonical identity (what the reconcile approval is bound to),
+    /// not by a separately-supplied intent id.
+    pub async fn active_quarantine_intent_for(
+        &self,
+        adapter: &str,
+        fingerprint: &str,
+    ) -> Result<Option<QuarantineIntent>> {
+        Ok(sqlx::query("SELECT * FROM firewall_action_intents WHERE adapter=$1 AND target_fingerprint=$2 AND target_fingerprint IS NOT NULL AND status IN ('prepared','completed','recovery_required')")
+            .bind(adapter).bind(fingerprint).fetch_optional(&self.pool).await?.map(decode))
+    }
     /// Prepared generations are inspected/recovered, NEVER automatically reapplied.
     pub async fn unresolved_quarantine_intents(&self) -> Result<Vec<QuarantineIntent>> {
         Ok(sqlx::query("SELECT * FROM firewall_action_intents WHERE target_fingerprint IS NOT NULL AND (status IN ('prepared','recovery_required') OR (status='completed' AND expires_at<=NOW())) ORDER BY created_at,id LIMIT 100")
@@ -255,6 +282,125 @@ impl PostgresStore {
         Ok(sqlx::query("SELECT * FROM firewall_action_intents WHERE target_fingerprint IS NOT NULL AND (status='prepared' OR (status='completed' AND expires_at<=NOW())) ORDER BY created_at,id LIMIT 100")
             .fetch_all(&self.pool).await?.into_iter().map(decode).collect())
     }
+
+    /// Read-only, paginated operator view of quarantine generations (Q1).
+    ///
+    /// Stable sort `created_at DESC, id DESC`, SQL-level pagination and an
+    /// accurate `total` so pages beyond the first are not silently empty. Each
+    /// row carries the durable status, an operator lifecycle label, the apply
+    /// and rollback receipt lineage and whether verified recovery is still open.
+    ///
+    /// This is deliberately the *operator* surface (session auth + role), so it
+    /// may show internal `target_json`. It performs no mutation and exposes no
+    /// adapter/rollback command; the agent/MCP projection stays separate and
+    /// sanitized. Returns the page rows and the total generation count.
+    pub async fn list_quarantine_generations(
+        &self,
+        page: i64,
+        page_size: i64,
+    ) -> Result<(Vec<Value>, i64)> {
+        let page = page.max(1);
+        let page_size = page_size.clamp(1, 200);
+        let offset = (page - 1) * page_size;
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM firewall_action_intents WHERE target_fingerprint IS NOT NULL",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        // The unique (intent_id, receipt_kind) index guarantees at most one
+        // apply and one rollback receipt per generation, so these joins never
+        // fan the generation row out.
+        let rows = sqlx::query(
+            "SELECT i.id,i.execution_id,i.adapter,i.action_name,i.status,i.target_fingerprint, \
+                    i.target_json,i.ttl_seconds,i.expires_at,i.created_at,i.completed_at,i.error_summary, \
+                    (i.expires_at<=NOW()) AS is_expired, \
+                    ar.id AS apply_receipt_id,ar.verification_result AS apply_verification,ar.created_at AS apply_created_at, \
+                    rr.id AS rollback_receipt_id,rr.verification_result AS rollback_verification,rr.created_at AS rollback_created_at \
+             FROM firewall_action_intents i \
+             LEFT JOIN firewall_action_receipts ar ON ar.intent_id=i.id AND ar.receipt_kind='apply' \
+             LEFT JOIN firewall_action_receipts rr ON rr.intent_id=i.id AND rr.receipt_kind='rollback' \
+             WHERE i.target_fingerprint IS NOT NULL \
+             ORDER BY i.created_at DESC,i.id DESC LIMIT $1 OFFSET $2",
+        )
+        .bind(page_size)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+        let values = rows
+            .into_iter()
+            .map(|r| {
+                let status: String = r.get("status");
+                let is_expired: bool = r.get("is_expired");
+                let apply_receipt = r.get::<Option<Uuid>, _>("apply_receipt_id").map(|id| {
+                    json!({
+                        "id": id,
+                        "verification_result": r.get::<Option<String>, _>("apply_verification"),
+                        "created_at": r.get::<Option<DateTime<Utc>>, _>("apply_created_at"),
+                    })
+                });
+                let rollback_receipt = r.get::<Option<Uuid>, _>("rollback_receipt_id").map(|id| {
+                    json!({
+                        "id": id,
+                        "verification_result": r.get::<Option<String>, _>("rollback_verification"),
+                        "created_at": r.get::<Option<DateTime<Utc>>, _>("rollback_created_at"),
+                    })
+                });
+                json!({
+                    "generation_id": r.get::<Uuid, _>("id"),
+                    "execution_id": r.get::<Uuid, _>("execution_id"),
+                    "adapter": r.get::<String, _>("adapter"),
+                    "action_name": r.get::<String, _>("action_name"),
+                    "status": status,
+                    "lifecycle": quarantine_lifecycle(&status, is_expired),
+                    "owns_target": owns_quarantine_target(&status),
+                    "open_recovery": quarantine_recovery_open(&status, is_expired),
+                    "is_expired": is_expired,
+                    "target_fingerprint": r.get::<String, _>("target_fingerprint"),
+                    "target_json": r.get::<Value, _>("target_json"),
+                    "ttl_seconds": r.get::<i32, _>("ttl_seconds"),
+                    "expires_at": r.get::<DateTime<Utc>, _>("expires_at"),
+                    "created_at": r.get::<DateTime<Utc>, _>("created_at"),
+                    "completed_at": r.get::<Option<DateTime<Utc>>, _>("completed_at"),
+                    "error_summary": r.get::<Option<String>, _>("error_summary"),
+                    "apply_receipt": apply_receipt,
+                    "rollback_receipt": rollback_receipt,
+                })
+            })
+            .collect();
+        Ok((values, total))
+    }
+}
+
+/// Operator-facing lifecycle label derived from the durable status and TTL.
+///
+/// This never widens ownership or terminal semantics (those are enforced by the
+/// DB transition trigger); it only groups statuses so an operator view can tell
+/// an expired block still awaiting verified recovery apart from a verified
+/// restore. `completed` means a verified apply, NOT the end of quarantine.
+pub fn quarantine_lifecycle(status: &str, is_expired: bool) -> &'static str {
+    match status {
+        "prepared" => "prepared",
+        "completed" if is_expired => "expired_pending_recovery",
+        "completed" => "active",
+        "recovery_required" => "recovery_required",
+        "not_applied" => "not_applied",
+        "rolled_back" => "verified_restored",
+        _ => "unknown",
+    }
+}
+
+/// A generation still exclusively owns its `(adapter, fingerprint)` target while
+/// prepared, completed or recovery_required; only `not_applied` and
+/// `rolled_back` release it. Mirrors the active-generation unique index.
+pub fn owns_quarantine_target(status: &str) -> bool {
+    matches!(status, "prepared" | "completed" | "recovery_required")
+}
+
+/// Whether this generation still needs verified recovery: an explicit
+/// `recovery_required`, or a `completed` block whose TTL has passed and which
+/// the sweep has not yet restored. Terminal states never report open recovery.
+pub fn quarantine_recovery_open(status: &str, is_expired: bool) -> bool {
+    status == "recovery_required" || (status == "completed" && is_expired)
 }
 
 /// Generation fence. Keep this guard alive from before mutation through authoritative readback.
@@ -280,6 +426,44 @@ impl QuarantineGuard {
             .fetch_one(&mut *self.tx).await?;
         if self.intent.status != "prepared" || !current {
             bail!("quarantine approval no longer valid before mutation");
+        }
+        Ok(())
+    }
+
+    /// Persist the observed external task UPID on THIS generation within the guard's own
+    /// transaction. The guard already holds the row FOR UPDATE, so a separate-transaction
+    /// write to the same row would self-deadlock; this commits atomically with the guard's
+    /// terminal transition (finish or recovery_required), so a generation left
+    /// recovery_required after a verify failure still carries the UPID for reconciliation.
+    pub async fn set_upid(&mut self, upid: &str) -> Result<()> {
+        sqlx::query("UPDATE firewall_action_intents SET proxmox_upid=$2 WHERE id=$1")
+            .bind(self.intent.id)
+            .bind(upid)
+            .execute(&mut *self.tx)
+            .await?;
+        Ok(())
+    }
+
+    /// Authorize an operator reconciliation of THIS generation with a SEPARATE,
+    /// context-bound dual-approved reconcile request - never the original quarantine
+    /// request's approval. Holds the approval lock through the reconcile mutation, exactly
+    /// like validate_approval. The generation must be `recovery_required`: the only state
+    /// the automatic sweep deliberately will not resolve, so it needs an audited operator.
+    pub async fn validate_reconcile_approval(
+        &mut self,
+        reconcile_execution_id: Uuid,
+        reconcile_action_name: &str,
+        target: &Value,
+    ) -> Result<()> {
+        sqlx::query("SELECT clawforge_lock_quarantine_approval($1)")
+            .bind(reconcile_execution_id)
+            .execute(&mut *self.tx)
+            .await?;
+        let authorized: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM execution_requests e JOIN actions a ON a.id=e.action_id JOIN approval_policies p ON p.risk_level=a.risk_level WHERE e.id=$1 AND e.status IN ('starting','running') AND a.name=$2 AND a.enabled AND a.requires_approval AND a.risk_level='critical' AND p.required_approvals>=2 AND e.required_approvals>=2 AND e.requested_by_id IS NOT NULL AND e.approval_expires_at>clock_timestamp() AND e.approval_context->'target'=$3 AND (SELECT COUNT(DISTINCT ea.approver_id) FROM execution_approvals ea WHERE ea.execution_id=e.id AND ea.context_hash=e.approval_context_hash AND ea.approver_id<>e.requested_by_id)>=GREATEST(e.required_approvals,p.required_approvals))")
+            .bind(reconcile_execution_id).bind(reconcile_action_name).bind(target)
+            .fetch_one(&mut *self.tx).await?;
+        if self.intent.status != "recovery_required" || !authorized {
+            bail!("reconcile approval invalid or generation not awaiting reconciliation");
         }
         Ok(())
     }
@@ -374,5 +558,49 @@ impl QuarantineGuard {
         }
         self.transition("not_applied", Some("verified no external mutation"))
             .await
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn lifecycle_distinguishes_expired_from_restored() {
+        assert_eq!(quarantine_lifecycle("prepared", false), "prepared");
+        assert_eq!(quarantine_lifecycle("completed", false), "active");
+        assert_eq!(
+            quarantine_lifecycle("completed", true),
+            "expired_pending_recovery"
+        );
+        assert_eq!(
+            quarantine_lifecycle("recovery_required", false),
+            "recovery_required"
+        );
+        assert_eq!(quarantine_lifecycle("not_applied", false), "not_applied");
+        assert_eq!(
+            quarantine_lifecycle("rolled_back", false),
+            "verified_restored"
+        );
+        // An expired terminal state is still terminal, not pending recovery.
+        assert_eq!(
+            quarantine_lifecycle("rolled_back", true),
+            "verified_restored"
+        );
+    }
+
+    #[test]
+    fn ownership_and_recovery_match_generation_fence() {
+        for s in ["prepared", "completed", "recovery_required"] {
+            assert!(owns_quarantine_target(s), "{s} must own its target");
+        }
+        for s in ["not_applied", "rolled_back"] {
+            assert!(!owns_quarantine_target(s), "{s} must release its target");
+        }
+        assert!(quarantine_recovery_open("recovery_required", false));
+        assert!(quarantine_recovery_open("completed", true));
+        assert!(!quarantine_recovery_open("completed", false));
+        assert!(!quarantine_recovery_open("rolled_back", true));
+        assert!(!quarantine_recovery_open("prepared", true));
     }
 }
