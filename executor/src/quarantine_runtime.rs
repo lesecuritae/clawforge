@@ -565,6 +565,165 @@ mod tests {
             target: Some(target.clone()),
         })
     }
+    async fn approved_reconcile(
+        store: &PostgresStore,
+        target: &Value,
+    ) -> Result<ClaimedExecutionRequest> {
+        let action:Uuid=sqlx::query_scalar("UPDATE actions SET enabled=TRUE,risk_level='critical',requires_approval=TRUE WHERE name='docker.reconcile_quarantine' RETURNING id").fetch_one(store.pool()).await?;
+        let suffix = Uuid::new_v4();
+        let name = format!("native-reconcile-requester-{suffix}");
+        let requester = store
+            .create_admin_user(&name, "Administrator", "fixture-hash")
+            .await?;
+        let id = store
+            .create_execution_request(&clawforge_storage::ExecutionRequestInput {
+                action_id: action,
+                workflow_run_id: None,
+                decision_id: None,
+                requested_by: name,
+                requested_by_id: Some(requester),
+                idempotency_key: None,
+                target: Some(target.clone()),
+            })
+            .await?;
+        for index in [1, 2] {
+            let name = format!("native-reconcile-approver-{suffix}-{index}");
+            let user = store
+                .create_admin_user(&name, "Approver", "fixture-hash")
+                .await?;
+            store.approve_execution_request(id, user, &name).await?;
+        }
+        sqlx::query("UPDATE execution_requests SET status='starting' WHERE id=$1")
+            .bind(id)
+            .execute(store.pool())
+            .await?;
+        Ok(ClaimedExecutionRequest {
+            id,
+            action_name: "docker.reconcile_quarantine".into(),
+            target: Some(target.clone()),
+        })
+    }
+    #[tokio::test]
+    #[ignore = "own Docker container/networks and explicit disposable schema-0057 PostgreSQL; run alone"]
+    async fn operator_reconcile_restores_a_recovery_required_docker_generation_lab() -> Result<()> {
+        let url = std::env::var("CLAWFORGE_TEST_QUARANTINE_DATABASE_URL")?;
+        let authority = url
+            .rsplit_once('@')
+            .map(|(_, tail)| tail)
+            .context("explicit fixture URL must have credentials")?;
+        let (host, database) = authority
+            .split_once('/')
+            .context("explicit fixture database missing")?;
+        let database = database.split('?').next().unwrap_or_default();
+        if !matches!(
+            host,
+            "127.0.0.1:55432" | "127.0.0.1:55436" | "127.0.0.1:55437"
+        ) || !database.starts_with("clawforge_test")
+        {
+            bail!(
+                "reconcile lab requires dedicated loopback test port and clawforge_test database"
+            );
+        }
+        let store = PostgresStore::connect_runtime(&url)
+            .await
+            .map_err(|_| anyhow::anyhow!("fixture DB unavailable"))?;
+        let suffix = Uuid::new_v4().simple().to_string();
+        let mut lab = DockerLab {
+            container: format!("clawforge-reconcile-{}", &suffix[..12]),
+            networks: vec![],
+            previous_guard: std::env::var("CLAWFORGE_DOCKER_NEVER_QUARANTINE").ok(),
+        };
+        let octet = u8::from_str_radix(&suffix[..2], 16)?.max(1);
+        for index in [0, 1] {
+            let name = format!("clawforge-reconcile-{}-{index}", &suffix[..12]);
+            let subnet = format!("10.{}.{}.0/24", 230 + index, octet);
+            docker(&[
+                "network",
+                "create",
+                "--label",
+                "clawforge.disposable=reconcile",
+                "--subnet",
+                &subnet,
+                &name,
+            ])?;
+            lab.networks.push(name);
+        }
+        let first_ip = format!("10.230.{octet}.23");
+        let second_ip = format!("10.231.{octet}.23");
+        let cid = docker(&[
+            "run",
+            "-d",
+            "--label",
+            "clawforge.disposable=reconcile",
+            "--name",
+            &lab.container,
+            "--network",
+            &lab.networks[0],
+            "--network-alias",
+            "reconcile-first",
+            "--ip",
+            &first_ip,
+            "alpine:latest",
+            "sleep",
+            "600",
+        ])?;
+        docker(&[
+            "network",
+            "connect",
+            "--alias",
+            "reconcile-second",
+            "--ip",
+            &second_ip,
+            &lab.networks[1],
+            &cid,
+        ])?;
+        std::env::set_var(
+            "CLAWFORGE_DOCKER_NEVER_QUARANTINE",
+            format!("docker:{}", "f".repeat(64)),
+        );
+        let qtarget = QuarantineTarget::Docker {
+            container_id: cid.clone(),
+        };
+        let original = DockerAdapter::new().preflight(&qtarget).await?.networks;
+        assert_eq!(original.len(), 2);
+        let target = json!({"kind":"docker","container_id":cid,"ttl_seconds":60,"data_owner":"disposable test fixture","snapshot_restore_reference":"own immutable Docker networks","management_network_plan":"host and production containers protected; fixture only"});
+        // Apply the quarantine (disconnects the networks), leaving a completed generation.
+        let request = approved(&store, &target).await?;
+        apply_prepared_observed(&store, &request, |_| async { Ok(()) }).await?;
+        let intent_id: Uuid =
+            sqlx::query_scalar("SELECT id FROM firewall_action_intents WHERE execution_id=$1")
+                .bind(request.id)
+                .fetch_one(store.pool())
+                .await?;
+        assert_eq!(
+            store.quarantine_intent(intent_id).await?.unwrap().status,
+            "completed"
+        );
+        assert!(DockerAdapter::new()
+            .preflight(&qtarget)
+            .await?
+            .networks
+            .is_empty());
+        // Force the ambiguous state the automatic sweep will not resolve.
+        store.mark_quarantine_recovery_required(intent_id).await?;
+        // Operator reconcile: a separate dual-approved reconcile request resolves it.
+        let reconcile_req = approved_reconcile(&store, &target).await?;
+        reconcile(&store, &reconcile_req).await?;
+        // The container is restored to its original two networks, generation rolled_back.
+        let restored = DockerAdapter::new().preflight(&qtarget).await?.networks;
+        assert_eq!(
+            restored, original,
+            "reconcile restored the exact original networks"
+        );
+        assert_eq!(
+            store.quarantine_intent(intent_id).await?.unwrap().status,
+            "rolled_back"
+        );
+        // A second reconcile has no active generation left and must refuse.
+        let again = approved_reconcile(&store, &target).await?;
+        assert!(reconcile(&store, &again).await.is_err());
+        Ok(())
+    }
     #[tokio::test]
     #[ignore = "own Docker container/networks and explicit disposable schema-54 PostgreSQL; run alone"]
     async fn native_controller_writeahead_recovery_and_stale_generation_lab() -> Result<()> {
