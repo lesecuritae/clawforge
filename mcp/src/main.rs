@@ -743,7 +743,7 @@ impl McpServer {
                 .map(|(key, value)| (key.as_str(), value.as_str())),
         );
         MCP_UPSTREAM_REQUESTS.fetch_add(1, Ordering::Relaxed);
-        let response = self
+        let mut response = self
             .client
             .get(url)
             .bearer_auth(&self.config.agent_api_token)
@@ -755,17 +755,22 @@ impl McpServer {
                 ErrorData::internal_error("Agent API request failed", None)
             })?;
         let status = response.status();
-        let bytes = response.bytes().await.map_err(|_| {
+
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|_| {
             MCP_UPSTREAM_ERRORS.fetch_add(1, Ordering::Relaxed);
             ErrorData::internal_error("Agent API response invalid", None)
-        })?;
-        if bytes.len() > MAX_RESPONSE_BYTES {
-            MCP_UPSTREAM_ERRORS.fetch_add(1, Ordering::Relaxed);
-            return Err(ErrorData::internal_error(
-                "Agent API response exceeds the MCP size limit",
-                Some(json!({"max_bytes": MAX_RESPONSE_BYTES})),
-            ));
+        })? {
+            if bytes.len() + chunk.len() > MAX_RESPONSE_BYTES {
+                MCP_UPSTREAM_ERRORS.fetch_add(1, Ordering::Relaxed);
+                return Err(ErrorData::internal_error(
+                    "Agent API response exceeds the MCP size limit",
+                    Some(json!({"max_bytes": MAX_RESPONSE_BYTES})),
+                ));
+            }
+            bytes.extend_from_slice(&chunk);
         }
+
         let body = serde_json::from_slice::<ApiEnvelope>(&bytes).map_err(|_| {
             MCP_UPSTREAM_ERRORS.fetch_add(1, Ordering::Relaxed);
             ErrorData::internal_error("Agent API response invalid", None)
@@ -2518,5 +2523,134 @@ mod tests {
         client.cancel().await.unwrap();
         server.abort();
         agent_server.abort();
+    }
+
+    // Codex-assisted repair of the model-authored regression-test draft.
+    // Raw TCP lets the fixture intentionally omit Content-Length and withhold EOF.
+    async fn response_stream_fixture(
+        body: Vec<u8>,
+        chunked: bool,
+        hold_open: bool,
+    ) -> (McpServer, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).await.unwrap();
+                request.push(byte[0]);
+                assert!(request.len() <= 8192);
+            }
+            let framing = if chunked {
+                "Transfer-Encoding: chunked\r\n"
+            } else {
+                ""
+            };
+            stream
+                .write_all(
+                    format!("HTTP/1.1 200 OK\r\n{framing}Connection: close\r\n\r\n").as_bytes(),
+                )
+                .await
+                .unwrap();
+            for chunk in body.chunks(4096) {
+                // Early client cancellation is expected once the cap is exceeded.
+                if chunked
+                    && stream
+                        .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
+                        .await
+                        .is_err()
+                {
+                    return;
+                }
+                if stream.write_all(chunk).await.is_err() {
+                    return;
+                }
+                if chunked && stream.write_all(b"\r\n").await.is_err() {
+                    return;
+                }
+            }
+            if hold_open {
+                std::future::pending::<()>().await;
+            }
+            if chunked {
+                let _ = stream.write_all(b"0\r\n\r\n").await;
+            }
+        });
+        let mut config = (*test_config(&[SCOPE_CONTEXT])).clone();
+        config.agent_api_url = Url::parse(&format!("http://{address}")).unwrap();
+        config.timeout = Duration::from_secs(30);
+        (McpServer::new(Arc::new(config)), task)
+    }
+
+    async fn assert_stream_rejected_before_eof(chunked: bool) {
+        let (server, task) =
+            response_stream_fixture(vec![b'x'; MAX_RESPONSE_BYTES + 8192], chunked, true).await;
+        // The upstream never finishes. A buffering implementation reaches the
+        // outer deadline instead of producing the required size error.
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            server.get_agent_context(Parameters(EmptyArgs::default())),
+        )
+        .await;
+        task.abort();
+        let error = match result.expect("must reject without waiting for EOF or upstream timeout") {
+            Err(error) => error,
+            Ok(_) => panic!("oversized stream must be rejected"),
+        };
+        assert_eq!(
+            error.message,
+            "Agent API response exceeds the MCP size limit"
+        );
+        assert_eq!(
+            error.data.as_ref().and_then(|data| data.get("max_bytes")),
+            Some(&json!(MAX_RESPONSE_BYTES))
+        );
+    }
+
+    #[tokio::test]
+    async fn chunked_oversized_body_is_rejected_early() {
+        assert_stream_rejected_before_eof(true).await;
+    }
+
+    #[tokio::test]
+    async fn lengthless_oversized_body_is_rejected_early() {
+        assert_stream_rejected_before_eof(false).await;
+    }
+
+    #[tokio::test]
+    async fn exactly_at_limit_and_smaller_responses_succeed() {
+        for chunked in [true, false] {
+            for at_limit in [true, false] {
+                let mut body = serde_json::to_vec(&json!({
+                    "status":"ok", "data":{"value":1},
+                    "timestamp":"2026-01-01T00:00:00Z", "pagination":null, "errors":[]
+                }))
+                .unwrap();
+                if at_limit {
+                    // Trailing JSON whitespace is valid and counts towards the
+                    // receive cap; do not subtract quotes already serialized.
+                    body.resize(MAX_RESPONSE_BYTES, b' ');
+                    assert_eq!(body.len(), MAX_RESPONSE_BYTES);
+                } else {
+                    assert!(body.len() < MAX_RESPONSE_BYTES);
+                }
+                let (server, task) = response_stream_fixture(body, chunked, false).await;
+                let result = tokio::time::timeout(
+                    Duration::from_secs(3),
+                    server.get_agent_context(Parameters(EmptyArgs::default())),
+                )
+                .await;
+                task.abort();
+                assert!(
+                    result.expect("valid response must finish").is_ok(),
+                    "valid response rejected (chunked={chunked}, at_limit={at_limit})"
+                );
+            }
+        }
     }
 }
