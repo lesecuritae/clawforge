@@ -119,7 +119,7 @@ async fn both_historical_lineages_converge_without_rewriting_history() -> anyhow
             "immutable approvals are preserved"
         );
         assert!(store.readiness().await?.current);
-        assert_eq!(store.readiness().await?.latest, 56);
+        assert_eq!(store.readiness().await?.latest, 57);
         let after: Vec<(i64, Vec<u8>, bool)> = sqlx::query_as("SELECT version,checksum,success FROM _sqlx_migrations WHERE version <= $1 ORDER BY version")
             .bind(if production { 47_i64 } else { 46 }).fetch_all(&pool).await?;
         assert_eq!(
@@ -139,6 +139,8 @@ async fn both_historical_lineages_converge_without_rewriting_history() -> anyhow
         assert_eq!(goaway, 2);
         let quarantines: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM actions WHERE name IN ('docker.quarantine_container','proxmox.quarantine_vm','tailscale.quarantine_device') AND risk_level='critical' AND requires_approval AND NOT enabled").fetch_one(&pool).await?;
         assert_eq!(quarantines, 3);
+        let reconciles: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM actions WHERE name IN ('docker.reconcile_quarantine','proxmox.reconcile_quarantine') AND risk_level='critical' AND requires_approval AND NOT enabled").fetch_one(&pool).await?;
+        assert_eq!(reconciles, 2);
         assert!(
             PostgresStore::connect_runtime(&url)
                 .await?
