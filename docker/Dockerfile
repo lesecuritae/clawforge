@@ -17,6 +17,7 @@ LABEL org.opencontainers.image.source="https://github.com/lesecuritae/clawforge"
 # but every service shares this one runtime image, so it lands here rather
 # than in a second Dockerfile stage.
 RUN apt-get update \
+    && apt-get upgrade -y \
     && apt-get install --no-install-recommends -y ca-certificates curl systemd \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /src/target/release/clawforge-api /usr/local/bin/clawforge-api
