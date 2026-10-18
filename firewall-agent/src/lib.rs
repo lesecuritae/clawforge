@@ -586,7 +586,10 @@ fn set_contains_target(raw_set_json: &str, addr: IpAddr, prefix: Option<u8>) -> 
     else {
         return false;
     };
-    let addr_str = addr.to_string();
+    // nft normalizes /32 and /128 elements to bare addresses. Compare exact
+    // host identities rather than their spelling; never treat a wider subnet
+    // as the same rule, since verification also establishes delete ownership.
+    let target_prefix = prefix.unwrap_or_else(|| full_prefix(addr));
     elements.iter().any(|element| {
         // P7-4: an element that carries a native `timeout` is wrapped by nft
         // as `{"elem": {"val": <X>, "timeout": n, "expires": m}}`, where <X> is
@@ -598,15 +601,19 @@ fn set_contains_target(raw_set_json: &str, addr: IpAddr, prefix: Option<u8>) -> 
             .and_then(|elem| elem.get("val"))
             .unwrap_or(element);
         match value {
-            serde_json::Value::String(s) => prefix.is_none() && *s == addr_str,
+            serde_json::Value::String(s) => {
+                target_prefix == full_prefix(addr) && s.parse::<IpAddr>().ok() == Some(addr)
+            }
             serde_json::Value::Object(_) => {
                 let Some(prefix_obj) = value.get("prefix") else {
                     return false;
                 };
                 let element_addr = prefix_obj.get("addr").and_then(|a| a.as_str());
                 let element_len = prefix_obj.get("len").and_then(|l| l.as_u64());
-                match (element_addr, element_len, prefix) {
-                    (Some(a), Some(l), Some(p)) => a == addr_str && l == u64::from(p),
+                match (element_addr, element_len) {
+                    (Some(a), Some(l)) => {
+                        a.parse::<IpAddr>().ok() == Some(addr) && l == u64::from(target_prefix)
+                    }
                     _ => false,
                 }
             }
@@ -3470,9 +3477,40 @@ mod tests {
     fn set_contains_target_matches_a_plain_ip_element() {
         let addr = "203.0.113.7".parse().unwrap();
         assert!(set_contains_target(REAL_MIXED_SET_JSON, addr, None));
-        // A bare-IP element does not have a prefix - querying with one
-        // must not match.
-        assert!(!set_contains_target(REAL_MIXED_SET_JSON, addr, Some(32)));
+        // nft serializes a /32 as the same bare host address.
+        assert!(set_contains_target(REAL_MIXED_SET_JSON, addr, Some(32)));
+        assert!(!set_contains_target(REAL_MIXED_SET_JSON, addr, Some(31)));
+    }
+
+    #[test]
+    fn set_contains_target_matches_normalized_timed_host_prefixes() {
+        // Captured from nft 1.1.3 after adding 203.0.113.18/32 timeout 60s
+        // inside an isolated container network namespace.
+        let ipv4 = r#"{"nftables":[{"set":{"elem":[{"elem":{"val":"203.0.113.18","timeout":60,"expires":59}}]}}]}"#;
+        let addr = "203.0.113.18".parse().unwrap();
+        assert!(set_contains_target(ipv4, addr, Some(32)));
+        assert!(set_contains_target(ipv4, addr, None));
+        assert!(!set_contains_target(ipv4, addr, Some(24)));
+        assert!(!set_contains_target(
+            ipv4,
+            "203.0.113.19".parse().unwrap(),
+            Some(32)
+        ));
+
+        let ipv6 = r#"{"nftables":[{"set":{"elem":[{"elem":{"val":"2001:db8::18","timeout":60,"expires":59}}]}}]}"#;
+        let addr = "2001:db8::18".parse().unwrap();
+        assert!(set_contains_target(ipv6, addr, Some(128)));
+        assert!(set_contains_target(ipv6, addr, None));
+        assert!(!set_contains_target(ipv6, addr, Some(64)));
+    }
+
+    #[test]
+    fn set_contains_target_matches_explicit_host_prefix_objects() {
+        let json = r#"{"nftables":[{"set":{"elem":[{"prefix":{"addr":"2001:0db8:0:0:0:0:0:18","len":128}}]}}]}"#;
+        let addr = "2001:db8::18".parse().unwrap();
+        assert!(set_contains_target(json, addr, None));
+        assert!(set_contains_target(json, addr, Some(128)));
+        assert!(!set_contains_target(json, addr, Some(64)));
     }
 
     #[test]
@@ -3580,6 +3618,51 @@ mod tests {
             adapter.verify(&action.target).await.unwrap(),
             VerificationResult::NotPresent
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires nftables (NET_ADMIN) - run via scripts/test-firewall-lab.sh"]
+    async fn single_host_cidrs_verify_rollback_and_expire_in_real_nftables() {
+        let adapter = lab_adapter().await;
+        for cidr in ["203.0.113.219/32", "2001:db8::219/128"] {
+            let action = FirewallAction {
+                target: indicator(cidr),
+                ttl_seconds: 2,
+                reason: "isolated host-prefix regression".into(),
+            };
+            assert_eq!(
+                adapter.verify(&action.target).await.unwrap(),
+                VerificationResult::NotPresent
+            );
+            adapter.apply(&action, false).await.unwrap();
+            assert_eq!(
+                adapter.verify(&action.target).await.unwrap(),
+                VerificationResult::Verified
+            );
+            assert!(
+                adapter
+                    .preflight(&action.target)
+                    .await
+                    .unwrap()
+                    .already_blocked
+            );
+            adapter.rollback(&action).await.unwrap();
+            assert_eq!(
+                adapter.verify(&action.target).await.unwrap(),
+                VerificationResult::NotPresent
+            );
+            adapter.apply(&action, false).await.unwrap();
+            assert_eq!(
+                adapter.verify(&action.target).await.unwrap(),
+                VerificationResult::Verified
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            assert_eq!(
+                adapter.verify(&action.target).await.unwrap(),
+                VerificationResult::NotPresent
+            );
+            adapter.rollback(&action).await.unwrap();
+        }
     }
 
     #[tokio::test]

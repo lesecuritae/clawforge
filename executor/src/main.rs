@@ -513,6 +513,40 @@ async fn rollback_target(
         .map_err(|error| anyhow::anyhow!(error.to_string()))
 }
 
+// Durable generations store RecoveryTarget, not the public {kind: ...}
+// payload accepted by rollback_target. Keep this internal decoder separate
+// so legacy caller-supplied kill-switch payloads cannot supply resolved IPs.
+fn firewall_rule_recovery_target(
+    adapter_name: &str,
+    target_json: &serde_json::Value,
+) -> anyhow::Result<FirewallTarget> {
+    let recovery = RecoveryTarget::from_json(target_json)
+        .ok_or_else(|| anyhow::anyhow!("invalid versioned firewall rule recovery target"))?;
+    anyhow::ensure!(
+        recovery.scope == adapter_name,
+        "firewall recovery adapter scope mismatch"
+    );
+    Ok(recovery.target)
+}
+
+async fn rollback_firewall_rule_generation_target(
+    adapter_name: &str,
+    target_json: &serde_json::Value,
+    context: String,
+) -> anyhow::Result<()> {
+    let target = firewall_rule_recovery_target(adapter_name, target_json)?;
+    let adapter = adapter_for(adapter_name)
+        .ok_or_else(|| anyhow::anyhow!("unrecognized firewall recovery adapter"))?;
+    adapter
+        .rollback(&FirewallAction {
+            target,
+            ttl_seconds: DEFAULT_FIREWALL_ACTION_TTL_SECONDS,
+            reason: context,
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!(error.to_string()))
+}
+
 /// TTL-driven auto-rollback: rolls back every real (non-dry-run) block
 /// whose TTL has passed and that has no later rollback receipt yet (see
 /// `PostgresStore::expired_unrolled_back_firewall_targets`'s own query).
@@ -667,7 +701,7 @@ async fn recover_firewall_rule_generation(
             return RecoveryOutcome::Busy;
         }
     };
-    let result = rollback_target(
+    let result = rollback_firewall_rule_generation_target(
         &adapter,
         &target_json,
         format!("firewall rule generation {intent_id} ttl rollback"),
@@ -1927,6 +1961,77 @@ mod tests {
     /// holds the guard across several `.await` points, which clippy
     /// (correctly) rejects for a std mutex.
     static FIREWALL_ADAPTERS_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[test]
+    fn rule_recovery_decodes_internal_snapshot_and_rejects_scope_or_schema_drift() {
+        let target = FirewallTarget::ThreatIntelIndicator {
+            cidr: "203.0.113.18/32".into(),
+            source: "isolated regression".into(),
+        };
+        let json = RecoveryTarget::new("nftables", target.clone()).to_json();
+        assert_eq!(
+            firewall_rule_recovery_target("nftables", &json).unwrap(),
+            target
+        );
+        assert!(firewall_rule_recovery_target("haproxy", &json).is_err());
+        let mut malformed = json.clone();
+        malformed["schema_version"] = serde_json::json!(999);
+        malformed["kind"] = serde_json::json!("threat_intel_indicator");
+        assert!(firewall_rule_recovery_target("nftables", &malformed).is_err());
+        assert!(firewall_rule_recovery_target(
+            "nftables",
+            &serde_json::json!({
+                "kind":"threat_intel_indicator", "cidr":"203.0.113.18/32", "source":"legacy"
+            })
+        )
+        .is_err());
+
+        let resolved = FirewallTarget::ResolvedIncidentSource {
+            raw_ip: "203.0.113.19".into(),
+            pseudonym: "ip-pseudonym:recovery-test".into(),
+        };
+        let snapshot = RecoveryTarget::new("nftables", resolved.clone()).to_json();
+        assert_eq!(
+            firewall_rule_recovery_target("nftables", &snapshot).unwrap(),
+            resolved
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated nftables lab with NET_ADMIN"]
+    async fn versioned_rule_recovery_rolls_back_real_host_prefix_and_expired_rule() {
+        let adapter = clawforge_firewall_agent::NftablesAdapter::new();
+        let action = FirewallAction {
+            target: FirewallTarget::ThreatIntelIndicator {
+                cidr: "203.0.113.220/32".into(),
+                source: "isolated recovery regression".into(),
+            },
+            ttl_seconds: 2,
+            reason: "isolated recovery regression".into(),
+        };
+        let snapshot = RecoveryTarget::new("nftables", action.target.clone()).to_json();
+        for expire in [false, true] {
+            adapter.apply(&action, false).await.unwrap();
+            assert_eq!(
+                adapter.verify(&action.target).await.unwrap(),
+                VerificationResult::Verified
+            );
+            if expire {
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            }
+            rollback_firewall_rule_generation_target(
+                "nftables",
+                &snapshot,
+                "isolated recovery".into(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                adapter.verify(&action.target).await.unwrap(),
+                VerificationResult::NotPresent
+            );
+        }
+    }
 
     fn claimed(action_name: &str, target: Option<serde_json::Value>) -> ClaimedExecutionRequest {
         ClaimedExecutionRequest {
