@@ -3620,7 +3620,8 @@ impl PostgresStore {
         }
         let count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM firewall_action_receipts \
-             WHERE is_dry_run = FALSE AND created_at > NOW() - ($1 * INTERVAL '1 second')",
+             WHERE is_dry_run = FALSE AND receipt_kind = 'apply' \
+             AND created_at > NOW() - ($1 * INTERVAL '1 second')",
         )
         .bind(window_seconds)
         .fetch_one(&self.pool)

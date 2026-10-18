@@ -42,3 +42,17 @@ The recovery receipt proves restoration, not successful original apply
 verification. A new complete canary still requires a new native request and
 independent human approval. Production remains unchanged; these runtime
 checks and the patched executor deployment are confined to the pilot.
+
+## Budget regression found by the second canary
+
+The second approved request was refused before an apply. The mass-block query
+counted every real receipt, including the recovery rollback from the first
+attempt, as an apply. The maximum stayed one per 300-second window. Its retries
+were exhausted without a new intent or block. This was another failed canary,
+not an nftables mutation failure.
+
+The apply counter now filters `receipt_kind = 'apply'`. An isolated PostgreSQL
+regression test verifies that real rollback receipts and dry runs do not count,
+while real applies still count within the configured time window. The pilot
+operator preflight also checks this budget before asking for native approval.
+No budget limit or rate window was increased, and no old receipt was deleted.
