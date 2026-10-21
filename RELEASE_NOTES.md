@@ -1,3 +1,34 @@
+# Clawforge v1.2.0 Evidence-based Detection and Safe Execution Bridge
+
+## Production fixes
+
+- IP resolutions are stored again (`inet` bind fix); they are the prerequisite
+  for any incident-source block.
+- Reputation lookups ignore network-context indicators and over-broad
+  prefixes. Historic assessments are not rewritten; new assessments use the
+  current view.
+
+## Detection
+
+- Staggered window grids for the SSH and HTTP rules (no more window-boundary
+  evasion), HTTP 5xx is observation only, and an attacker finding requires
+  independent evidence. Quality is not released: raw anomalies still contain
+  false positives that are indistinguishable from attacks without additional
+  evidence.
+
+## Intelligence and execution
+
+- Current per-source intelligence with provenance, freshness and confidence;
+  routing context (RPKI, multi-origin, BGP) is displayed, never counted.
+- Policy-to-execution bridge and RIPEstat enrichment exist but are **disabled
+  by default**. Every real block still needs two independent approvals and the
+  executor live authorization.
+
+## Upgrade
+
+- Migrations 0059-0064 are additive (ledger 58 to 64).
+- Back up the database before upgrading and keep the previous image tag.
+
 # Clawforge v0.8.0 Connector Framework
 
 ## Read-only infrastructure connectors
