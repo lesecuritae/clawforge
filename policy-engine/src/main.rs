@@ -177,6 +177,10 @@ async fn independent_evidence_for(
     store: &PostgresStore,
     assessment: &clawforge_storage::SecurityAssessment,
 ) -> Result<(i16, &'static str)> {
+    // An operational observation has exactly one source and nothing to corroborate.
+    if OBSERVATION_ONLY_RULES.contains(&assessment.rule_id.as_str()) {
+        return Ok((1, "observation_only"));
+    }
     if let Some(hit) = &assessment.threat_intel {
         if threat_intel_hit_is_corroborating(hit) {
             return Ok((2, "threat_intel"));

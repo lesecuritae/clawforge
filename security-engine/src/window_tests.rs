@@ -421,5 +421,61 @@ async fn server_error_burst_is_an_observation_not_client_abuse() -> Result<()> {
         }
     }
     assert!(h.assessments().await?.is_empty());
+    h.finish().await?;
     f.finish().await
+}
+
+/// Events arrive in a different order than they occurred, each followed at once
+/// by an evaluation (not all published first). The stored result must equal the
+/// in-order run exactly: assessments depend on the event set, never the arrival order.
+#[tokio::test]
+#[ignore = "requires provisioned roles in an isolated PostgreSQL test container"]
+async fn interleaved_out_of_order_arrival_equals_in_order_arrival() -> Result<()> {
+    let boundary = t(18, 40, 0);
+    let seconds = [-4_i64, -3, -2, -1, 0, 1, 2, 3];
+    let mut in_order = Fixture::new().await?;
+    for second in seconds {
+        let event = in_order.ssh(boundary + Duration::seconds(second)).await?;
+        in_order.run_ssh(&event).await?;
+    }
+    let mut shuffled = Fixture::new().await?;
+    for index in [7_usize, 0, 6, 1, 5, 2, 4, 3] {
+        let event = shuffled
+            .ssh(boundary + Duration::seconds(seconds[index]))
+            .await?;
+        shuffled.run_ssh(&event).await?;
+    }
+    let expected = in_order.assessments().await?;
+    assert_eq!(expected.len(), 1, "{expected:?}");
+    assert_eq!(shuffled.assessments().await?, expected);
+    assert_eq!(shuffled.candidates().await?, 1);
+    // A very late event (100 s before the boundary) joins both windows it belongs
+    // to: the shifted window grows to 9, and the primary window before the boundary
+    // now holds 5 events (4 + this one) and fires on its own.
+    let late = shuffled.ssh(boundary + Duration::seconds(-100)).await?;
+    shuffled.run_ssh(&late).await?;
+    shuffled.run_ssh(&late).await?; // redelivery of the same event changes nothing
+    let after = shuffled.assessments().await?;
+    assert_eq!(
+        after,
+        vec![
+            (
+                "ssh_bruteforce".to_string(),
+                boundary - Duration::seconds(300),
+                5
+            ),
+            (
+                "ssh_bruteforce".to_string(),
+                boundary - Duration::seconds(150),
+                9
+            ),
+        ]
+    );
+    assert_eq!(
+        shuffled.candidates().await?,
+        1,
+        "still one incident candidate"
+    );
+    in_order.finish().await?;
+    shuffled.finish().await
 }

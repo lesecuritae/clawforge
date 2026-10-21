@@ -268,6 +268,14 @@ async fn a_server_fault_observation_is_recorded_as_observe_only() -> Result<()> 
     assert_eq!(rows[0].0, "observe");
     assert!(!rows[0].1);
     assert!(rows[0].2.contains("observation_only=true"));
+    assert!(rows[0].2.contains("evidence_basis=observation_only"));
+    let sources: i16 = sqlx::query_scalar(
+        "SELECT evidence_sources FROM security_policy_decisions WHERE assessment_id=$1",
+    )
+    .bind(target.id)
+    .fetch_one(e.owner.pool())
+    .await?;
+    assert_eq!(sources, 1, "an observation never claims a second source");
     let challenges: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM execution_requests WHERE approval_context->'target'->>'pseudonym'=$1",
     )
@@ -275,5 +283,85 @@ async fn a_server_fault_observation_is_recorded_as_observe_only() -> Result<()> 
     .fetch_one(e.owner.pool())
     .await?;
     assert_eq!(challenges, 0);
+    Ok(())
+}
+
+/// An attack that runs for hours is one episode; its early buckets must not be
+/// "earlier history" for its later ones.
+#[tokio::test]
+#[ignore = "requires provisioned roles in an isolated PostgreSQL test container"]
+async fn a_long_sustained_attack_does_not_corroborate_itself() -> Result<()> {
+    let mut e = Env::new().await?;
+    let now = Utc::now();
+    let mut last = None;
+    for step in 0..36 {
+        // A bucket every five minutes for three hours, each with its own events.
+        let at = now - Duration::minutes(5 * (35 - step));
+        let ids = e.events("ssh_login_failure", at, 5).await?;
+        last = Some(e.assessment("ssh_bruteforce", at, at, &ids).await?);
+    }
+    let latest = last.unwrap();
+    assert_eq!(e.basis(&latest).await?, (1, "behavior_only"));
+    Ok(())
+}
+
+/// One past episode counts once, however many rows (window grids, rules) it left.
+#[tokio::test]
+#[ignore = "requires provisioned roles in an isolated PostgreSQL test container"]
+async fn one_old_episode_counts_once_not_once_per_assessment_row() -> Result<()> {
+    let mut e = Env::new().await?;
+    let now = Utc::now();
+    let current = e.events("ssh_login_failure", now, 5).await?;
+    let target = e.assessment("ssh_bruteforce", now, now, &current).await?;
+    // 28 days = two half-lives: a single episode is worth 0.25, below the 0.5 minimum.
+    let old = now - Duration::days(28);
+    for row in 0..4 {
+        let at = old + Duration::seconds(150 * row);
+        let ids = e.events("ssh_login_failure", at, 5).await?;
+        e.assessment("ssh_bruteforce", at, at, &ids).await?;
+    }
+    assert_eq!(e.basis(&target).await?, (1, "behavior_only"));
+    // A second, separate old episode adds its own term, and enough recent ones corroborate.
+    let recent = now - Duration::days(2);
+    let ids = e.events("ssh_login_failure", recent, 5).await?;
+    e.assessment("ssh_bruteforce", recent, recent, &ids).await?;
+    assert_eq!(e.basis(&target).await?, (2, "prior_episode_history"));
+    Ok(())
+}
+
+/// Overlapping windows of one episode produce several decisions but one
+/// simulated challenge per source.
+#[tokio::test]
+#[ignore = "requires provisioned roles in an isolated PostgreSQL test container"]
+async fn overlapping_decisions_share_one_simulated_challenge() -> Result<()> {
+    let mut e = Env::new().await?;
+    let now = Utc::now();
+    let ids = e.events("ssh_login_failure", now, 6).await?;
+    let mut primary = e.assessment("ssh_bruteforce", now, now, &ids[..5]).await?;
+    let mut shifted = e
+        .assessment("ssh_bruteforce", now - Duration::seconds(150), now, &ids)
+        .await?;
+    // Confidence 60 is a challenge decision (40-69).
+    primary.confidence = 60;
+    shifted.confidence = 60;
+    evaluate_assessment(&e.policy, &primary, None).await?;
+    evaluate_assessment(&e.policy, &shifted, None).await?;
+    let decisions: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM security_policy_decisions WHERE assessment_id = ANY($1)",
+    )
+    .bind(vec![primary.id, shifted.id])
+    .fetch_one(e.owner.pool())
+    .await?;
+    assert_eq!(
+        decisions, 2,
+        "each assessment keeps its own decision record"
+    );
+    let simulations: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM execution_requests WHERE approval_context->'target'->>'pseudonym'=$1",
+    )
+    .bind(&e.resource)
+    .fetch_one(e.owner.pool())
+    .await?;
+    assert_eq!(simulations, 1);
     Ok(())
 }

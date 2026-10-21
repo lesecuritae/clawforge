@@ -278,14 +278,15 @@ impl PostgresStore {
             .map(|rule| (*rule).to_string())
             .collect();
         Ok(sqlx::query_scalar(
-            "SELECT EXISTS( \
+            "WITH t AS (SELECT clawforge_assessment_event_types($2) AS types) \
+             SELECT EXISTS( \
                SELECT 1 FROM security_assessments o \
+                 CROSS JOIN t \
+                 CROSS JOIN LATERAL (SELECT clawforge_assessment_event_types(o.id) AS types) ot \
                 WHERE o.resource=$1 AND o.id<>$2 AND o.bucket_start>=$3 \
                   AND NOT (o.rule_id = ANY($4)) \
-                  AND cardinality(clawforge_assessment_event_types(o.id)) > 0 \
-                  AND cardinality(clawforge_assessment_event_types($2)) > 0 \
-                  AND NOT (clawforge_assessment_event_types(o.id) \
-                           && clawforge_assessment_event_types($2)))",
+                  AND cardinality(t.types) > 0 AND cardinality(ot.types) > 0 \
+                  AND NOT (ot.types && t.types))",
         )
         .bind(resource)
         .bind(assessment_id)
@@ -295,12 +296,17 @@ impl PostgresStore {
         .await?)
     }
 
-    /// Decaying history like [`Self::resource_history_score`], but only from
-    /// assessments of an **earlier episode**: their last activity must lie more
-    /// than `episode_gap_seconds` before this assessment's first activity (the
-    /// engine itself treats anything closer as the same incident candidate, so
-    /// an ongoing episode must not corroborate itself), and observation-only
-    /// rules are ignored.
+    /// Decaying history like [`Self::resource_history_score`], but from **earlier
+    /// episodes only, one decayed term per episode**.
+    ///
+    /// An episode is a chain of this resource's assessments in which consecutive
+    /// activity is never more than `episode_gap_seconds` apart (the engine itself
+    /// treats that as one incident candidate). The episode that contains
+    /// `assessment_id` - however long it has been going on - is never history for
+    /// itself. Every earlier episode contributes `0.5 ^ (age / half_life)` once,
+    /// measured from its last activity, no matter how many assessment rows it
+    /// produced (two window grids, several rules). Observation-only rules are
+    /// ignored.
     pub async fn resource_prior_episode_history_score(
         &self,
         resource: &str,
@@ -317,14 +323,30 @@ impl PostgresStore {
             .map(|rule| (*rule).to_string())
             .collect();
         Ok(sqlx::query_scalar(
-            "SELECT COALESCE(SUM( \
-                 POWER(0.5::float8, \
-                       EXTRACT(EPOCH FROM (NOW() - o.bucket_start))::float8 / $3::float8) \
-               ), 0.0)::float8 \
-             FROM security_assessments o, security_assessments t \
-             WHERE t.id=$2 AND o.resource=$1 AND o.id<>$2 \
-               AND NOT (o.rule_id = ANY($5)) \
-               AND o.last_seen < t.first_seen - ($4 * INTERVAL '1 second')",
+            "WITH RECURSIVE gap AS (SELECT ($4 * INTERVAL '1 second') AS g), \
+             chain(start_at) AS ( \
+                 SELECT first_seen FROM security_assessments WHERE id=$2 \
+               UNION \
+                 SELECT m.first_seen FROM chain c CROSS JOIN gap \
+                   JOIN security_assessments m ON m.resource=$1 AND NOT (m.rule_id = ANY($5)) \
+                  WHERE m.first_seen < c.start_at AND m.last_seen >= c.start_at - gap.g), \
+             episode AS (SELECT MIN(start_at) AS start_at FROM chain), \
+             prior AS ( \
+                 SELECT o.first_seen, o.last_seen FROM security_assessments o, episode e, gap \
+                  WHERE o.resource=$1 AND o.id<>$2 AND NOT (o.rule_id = ANY($5)) \
+                    AND o.last_seen < e.start_at - gap.g), \
+             marked AS ( \
+                 SELECT p.*, CASE WHEN MAX(p.last_seen) OVER (ORDER BY p.first_seen, p.last_seen \
+                                     ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) IS NULL \
+                                    OR p.first_seen - MAX(p.last_seen) OVER (ORDER BY p.first_seen, p.last_seen \
+                                     ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) > gap.g \
+                                  THEN 1 ELSE 0 END AS starts \
+                   FROM prior p, gap), \
+             numbered AS (SELECT *, SUM(starts) OVER (ORDER BY first_seen, last_seen) AS episode_no FROM marked), \
+             episodes AS (SELECT episode_no, MAX(last_seen) AS ended FROM numbered GROUP BY episode_no) \
+             SELECT COALESCE(SUM(POWER(0.5::float8, \
+                    EXTRACT(EPOCH FROM (NOW() - ended))::float8 / $3::float8)), 0.0)::float8 \
+               FROM episodes",
         )
         .bind(resource)
         .bind(assessment_id)

@@ -125,13 +125,27 @@ async fn evidence_decision_and_enforcement_stages_for_the_labelled_cases() -> Re
                 if let Some((decision_id, kind)) = decision {
                     if let Some(params) = config.params_for(kind == "rate_limit") {
                         if matches!(kind.as_str(), "block" | "rate_limit") {
-                            let outcome = policy
-                                .enqueue_policy_bridge_request(decision_id, &params)
-                                .await?;
+                            // Read-only: the plan function never writes.
+                            let (reason, existing): (Option<String>, Option<Uuid>) = sqlx::query_as(
+                                "SELECT reason, existing_request_id FROM clawforge_policy_bridge_plan($1,$2,$3,$4,$5,$6,$7,$8)",
+                            )
+                            .bind(decision_id)
+                            .bind(params.mode.as_str())
+                            .bind(&params.action_name)
+                            .bind(params.ttl_seconds)
+                            .bind(params.requester_id)
+                            .bind(params.rule_id.as_deref())
+                            .bind(params.max_evidence_age_seconds)
+                            .bind(params.require_threat_intel)
+                            .fetch_one(policy.pool())
+                            .await?;
                             reasons
                                 .entry(assessment.resource.clone())
                                 .or_default()
-                                .push(format!("{mode}/{rule}/{kind}: {outcome:?}"));
+                                .push(format!(
+                                "{mode}/{rule}/{kind}: plan reason={reason:?} request_exists={}",
+                                existing.is_some()
+                            ));
                         }
                     }
                 }

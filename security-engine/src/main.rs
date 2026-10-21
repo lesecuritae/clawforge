@@ -74,6 +74,9 @@ struct CountThresholdRule {
     event_type: &'static str,
     /// Which events of the type count (HTTP status class); `Any` for SSH.
     status: EventStatusFilter,
+    /// Whether a firing creates/extends an incident candidate. Observation-only
+    /// rules (server faults) leave an assessment but never an attacker-style incident.
+    incident: bool,
     window_seconds: i64,
     threshold: usize,
 }
@@ -83,6 +86,7 @@ const SSH_BRUTEFORCE: CountThresholdRule = CountThresholdRule {
     rule_version: "2",
     event_type: "ssh_login_failure",
     status: EventStatusFilter::Any,
+    incident: true,
     window_seconds: 300,
     threshold: 5,
 };
@@ -93,6 +97,7 @@ const HTTP_ANOMALY_BURST: CountThresholdRule = CountThresholdRule {
     rule_version: "2",
     event_type: "http_anomaly",
     status: EventStatusFilter::ClientAttributable,
+    incident: true,
     window_seconds: 300,
     threshold: 10,
 };
@@ -106,6 +111,7 @@ const HTTP_SERVER_FAULT_BURST: CountThresholdRule = CountThresholdRule {
     rule_version: "1",
     event_type: "http_anomaly",
     status: EventStatusFilter::ServerError,
+    incident: false,
     window_seconds: 300,
     threshold: 10,
 };
@@ -125,6 +131,7 @@ struct DistinctValueThresholdRule {
     rule_version: &'static str,
     event_type: &'static str,
     status: EventStatusFilter,
+    incident: bool,
     /// The evidence JSON field to count distinct values of - e.g. `"path"`
     /// on `HttpAnomalyEvidence`. Already pseudonymized/sanitized like every
     /// other field on the canonical event, so this rule never needs to
@@ -139,6 +146,7 @@ const HTTP_SCAN: DistinctValueThresholdRule = DistinctValueThresholdRule {
     rule_version: "2",
     event_type: "http_anomaly",
     status: EventStatusFilter::ClientAttributable,
+    incident: true,
     field: "path",
     window_seconds: 300,
     threshold: 8,
@@ -209,6 +217,8 @@ async fn persist_assessment_and_incident(
     severity: &'static str,
     confidence: i16,
     summary: &str,
+    candidate_summary: &str,
+    incident: bool,
 ) -> Result<()> {
     let dedupe_key = format!(
         "{rule_id}:v{rule_version}:{correlation_id}:{}",
@@ -245,6 +255,9 @@ async fn persist_assessment_and_incident(
             threat_intel,
         })
         .await?;
+    if !incident {
+        return Ok(());
+    }
     // Reuse the existing, already-idempotent/escalation-aware incident
     // candidate path (clawforge-correlation's persist_correlation) instead
     // of a second incident-creation mechanism. The candidate key is stable
@@ -261,7 +274,7 @@ async fn persist_assessment_and_incident(
             correlation_key: &candidate_key,
             confidence,
             severity,
-            summary,
+            summary: candidate_summary,
             first_seen,
             last_seen,
             window: CANDIDATE_EXTENSION_WINDOW,
@@ -340,10 +353,11 @@ async fn evaluate_rule(
         let count = members.len();
         let severity = severity_for_count(count, rule.threshold);
         let confidence = confidence_for_count(count, rule.threshold);
-        let summary = format!(
-            "{} events of type {} from the same source within {}s (rule {} v{}, grid offset +{}s)",
-            count, rule.event_type, rule.window_seconds, rule.rule_id, rule.rule_version, offset
+        let candidate_summary = format!(
+            "{} events of type {} from the same source within {}s (rule {} v{})",
+            count, rule.event_type, rule.window_seconds, rule.rule_id, rule.rule_version
         );
+        let summary = format!("{candidate_summary}, grid offset +{offset}s");
         persist_assessment_and_incident(
             store,
             rule.rule_id,
@@ -359,6 +373,8 @@ async fn evaluate_rule(
             severity,
             confidence,
             &summary,
+            &candidate_summary,
+            rule.incident,
         )
         .await?;
     }
@@ -414,18 +430,18 @@ async fn evaluate_scan_rule(
         let distinct_count = distinct_values.len();
         let severity = severity_for_count(distinct_count, rule.threshold);
         let confidence = confidence_for_count(distinct_count, rule.threshold);
-        let summary = format!(
+        let candidate_summary = format!(
             "{} distinct {} values across {} events of type {} from the same source within {}s \
-             (rule {} v{}, grid offset +{}s)",
+             (rule {} v{})",
             distinct_count,
             rule.field,
             members.len(),
             rule.event_type,
             rule.window_seconds,
             rule.rule_id,
-            rule.rule_version,
-            offset
+            rule.rule_version
         );
+        let summary = format!("{candidate_summary}, grid offset +{offset}s");
         persist_assessment_and_incident(
             store,
             rule.rule_id,
@@ -441,6 +457,8 @@ async fn evaluate_scan_rule(
             severity,
             confidence,
             &summary,
+            &candidate_summary,
+            rule.incident,
         )
         .await?;
     }
