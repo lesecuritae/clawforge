@@ -402,6 +402,8 @@ impl PostgresStore {
     /// TTL (`CLAWFORGE_IP_RESOLUTION_TTL_SECONDS`, default 24h) regardless
     /// of how many times it is refreshed - an upsert extends the TTL
     /// window but never accumulates history.
+    // `$2::inet`: sqlx binds a Rust `&str` as TEXT, which PostgreSQL refuses for an
+    // INET column (every write failed silently, best-effort, until this cast).
     pub async fn upsert_ip_resolution(
         &self,
         pseudonym: &str,
@@ -415,7 +417,7 @@ impl PostgresStore {
             .unwrap_or(86_400);
         sqlx::query(
             "INSERT INTO security_ip_resolutions (pseudonym,raw_ip,source,expires_at) \
-             VALUES ($1,$2,$3,NOW() + ($4 * INTERVAL '1 second')) \
+             VALUES ($1,$2::inet,$3,NOW() + ($4 * INTERVAL '1 second')) \
              ON CONFLICT (pseudonym) DO UPDATE SET \
                raw_ip=EXCLUDED.raw_ip, source=EXCLUDED.source, expires_at=EXCLUDED.expires_at",
         )
