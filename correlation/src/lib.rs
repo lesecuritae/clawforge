@@ -139,7 +139,16 @@ pub fn correlate(
     let left_values = extract_indicators(&left.payload);
     let right_values = extract_indicators(&right.payload);
     let shared = left_values.intersection(&right_values).next().cloned();
-    if shared.is_none() && left.source == right.source && !left.source.trim().is_empty() {
+    // A provider identity is operational context, not a shared target.
+    // A feed batch can contain thousands of unrelated addresses: linking every
+    // pair makes a quadratic graph without adding evidence. Keep source-only
+    // context for provider errors; normal intelligence requires a common
+    // correlation ID or extracted indicator (the paths above/below).
+    if shared.is_none()
+        && left.source == right.source
+        && !left.source.trim().is_empty()
+        && (left.event_type == "provider_error" || right.event_type == "provider_error")
+    {
         return Some(CorrelationMatch {
             correlation_key: format!("source:{}", left.source),
             relation_type: "shared-source".into(),
@@ -362,6 +371,56 @@ mod tests {
         let matched = correlate(&left, &right, Duration::seconds(60)).unwrap();
         assert_eq!(matched.relation_type, "shared-source");
         assert_eq!(matched.confidence, 68);
+    }
+
+    #[test]
+    fn unrelated_feed_indicators_do_not_form_a_quadratic_graph() {
+        let events: Vec<_> = (0..64)
+            .map(|i| {
+                let mut e = event(
+                    i + 1,
+                    "new_threat_indicator",
+                    "shared-feed",
+                    10,
+                    serde_json::json!({"ip":format!("203.0.113.{}", i + 1)}),
+                );
+                e.correlation_id = Some(format!("ip-pseudonym:distinct-{i}"));
+                e
+            })
+            .collect();
+        let mut edges = 0;
+        for (i, left) in events.iter().enumerate() {
+            for right in &events[i + 1..] {
+                if correlate(left, right, Duration::seconds(60)).is_some() {
+                    edges += 1;
+                }
+            }
+        }
+        assert_eq!(
+            edges, 0,
+            "one provider is not evidence that 64 unrelated targets belong together"
+        );
+    }
+
+    #[test]
+    fn same_provider_still_links_genuinely_shared_indicators() {
+        let a = event(
+            1,
+            "new_threat_indicator",
+            "shared-feed",
+            10,
+            serde_json::json!({"ip":"203.0.113.8"}),
+        );
+        let b = event(
+            2,
+            "bgp_change",
+            "shared-feed",
+            20,
+            serde_json::json!({"ip":"203.0.113.8"}),
+        );
+        let matched = correlate(&a, &b, Duration::seconds(60)).unwrap();
+        assert_eq!(matched.relation_type, "event-chain");
+        assert!(matched.correlation_key.starts_with("indicator:"));
     }
 
     #[test]
