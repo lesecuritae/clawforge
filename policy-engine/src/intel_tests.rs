@@ -2,7 +2,7 @@
 //! view of the source, so feed updates and removals matter; ASN listings count only
 //! as reputation; routing facts are shown, never counted.
 use super::*;
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 use clawforge_storage::{IpReputationHit, NetworkContextOutcome, SecurityAssessment};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -182,7 +182,7 @@ async fn a_late_listing_counts_and_a_delisting_or_expiry_ends_it() -> Result<()>
 #[ignore = "requires provisioned roles in an isolated PostgreSQL test container"]
 async fn the_ingest_snapshot_is_used_only_without_a_current_view_and_only_from_reputation_sources(
 ) -> Result<()> {
-    let mut e = Env::new().await?;
+    let e = Env::new().await?;
     let fresh = snapshot("spamhaus_drop", 90, Utc::now());
     // No resolution: no current view, so a fresh reputation snapshot still counts.
     let target = e.assessment(Some(fresh.clone())).await?;
