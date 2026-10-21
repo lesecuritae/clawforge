@@ -151,6 +151,7 @@ fn history_min_score() -> f64 {
 ///   that keeps tripping detections is its own form of independent
 ///   evidence, separate from *which* rule
 ///   noticed it this time or that time.
+#[cfg(test)]
 async fn evidence_sources_for(
     store: &PostgresStore,
     assessment: &clawforge_storage::SecurityAssessment,
