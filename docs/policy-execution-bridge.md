@@ -32,10 +32,11 @@ policy engine's `runtime_status.last_error`. Shadow decisions are unaffected.
 | `..._TTL_SECONDS` | block TTL carried in the request target, 1-86400 (required) |
 | `..._MAX_PER_WINDOW`, `..._WINDOW_SECONDS` | request budget enforced in SQL, 1-100 per 60-86400 s (required; also clamped in SQL) |
 | `..._MAX_EVIDENCE_AGE_SECONDS` | maximum age of the decision and the assessment, 1-604800 (required) |
+| `..._MIN_INTEL_CONFIDENCE` | minimum confidence (1-100, required) of the reputation listing that counts; judged on the current source view (`threat-intel-evidence.md`) |
 | `..._REQUIRE_THREAT_INTEL` | default `true`; `false` is refused for `automatic` |
 | `..._REQUESTER_ID` | `propose` only: UUID of an enabled **Operator** account (Administrators are refused) |
 | `..._RULE_ID` | restrict to one security-engine rule; required for `automatic` |
-| `..._AUTOMATIC_ACK` | `automatic` only: must equal `unattended:<rule>:<block action>:<ratelimit action>:<ttl>:<max>/<window>:<age>` - changing any parameter invalidates it |
+| `..._AUTOMATIC_ACK` | `automatic` only: must equal `unattended:<rule>:<block action>:<ratelimit action>:<ttl>:<max>/<window>:<age>:<min intel confidence>` - changing any parameter invalidates it |
 
 The compose file passes these through empty; empty counts as unset.
 

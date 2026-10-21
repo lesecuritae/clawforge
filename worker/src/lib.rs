@@ -1,3 +1,5 @@
+pub mod ip_context;
+
 use std::{
     env,
     sync::Arc,

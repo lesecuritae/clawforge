@@ -2270,6 +2270,124 @@ mod tests {
         Ok(())
     }
 
+    /// Real kernel: a request created by the policy bridge needs its reputation
+    /// evidence to hold when the executor picks it up. Listed -> applied and verified
+    /// in nftables; delisted between approval and apply -> refused, nothing in the
+    /// kernel; relisted -> applied. The approval context mirrors what the bridge stores.
+    #[tokio::test]
+    #[ignore = "requires an isolated nftables lab (NET_ADMIN) and a PostgreSQL fixture"]
+    async fn bridge_request_is_revalidated_against_current_reputation_before_a_real_apply_lab(
+    ) -> anyhow::Result<()> {
+        let owner = PostgresStore::connect(&std::env::var("CLAWFORGE_TEST_DATABASE_URL")?).await?;
+        let store =
+            PostgresStore::connect_runtime(&std::env::var("CLAWFORGE_TEST_EXECUTOR_DATABASE_URL")?)
+                .await?;
+        let pool = owner.pool();
+        let action_id: Uuid = sqlx::query_scalar("INSERT INTO actions(id,name,type,risk_level,required_scope,requires_approval,enabled) VALUES($1,'nftables.block_incident_source','connector_action','low','agent:action:read',FALSE,TRUE) ON CONFLICT(name) DO UPDATE SET enabled=TRUE, requires_approval=FALSE RETURNING id")
+            .bind(Uuid::new_v4()).fetch_one(pool).await?;
+        let n = Uuid::new_v4().as_u128();
+        let raw_ip = format!("45.{}.{}.9", n % 200 + 1, (n >> 8) % 250 + 1);
+        let pseudonym = format!("ip-pseudonym:bridge-lab-{}", Uuid::new_v4().simple());
+        sqlx::query("INSERT INTO security_ip_resolutions(pseudonym,raw_ip,source,expires_at) VALUES($1,$2::inet,'lab',NOW()+INTERVAL '1 hour')")
+            .bind(&pseudonym).bind(&raw_ip).execute(pool).await?;
+        let source = format!("lab-feed-{}", Uuid::new_v4().simple());
+        let list = |confidence: i16| {
+            let (ip, source) = (raw_ip.clone(), source.clone());
+            async move {
+                sqlx::query("INSERT INTO indicators (value,indicator_type,categories,confidence,source,first_seen,last_seen,expires_at) VALUES ($1,'Ip','[\"spamhaus_drop\"]',$2,$3,NOW(),NOW(),NOW()+INTERVAL '1 day') ON CONFLICT (value,indicator_type,source) DO UPDATE SET confidence=EXCLUDED.confidence, last_seen=NOW(), expires_at=EXCLUDED.expires_at")
+                    .bind(ip).bind(confidence).bind(source).execute(pool).await
+            }
+        };
+        let delist = || async {
+            sqlx::query("DELETE FROM indicators WHERE source=$1")
+                .bind(&source)
+                .execute(pool)
+                .await
+        };
+        let adapter = clawforge_firewall_agent::NftablesAdapter::new();
+        let resolved = FirewallTarget::ResolvedIncidentSource {
+            raw_ip: raw_ip.clone(),
+            pseudonym: pseudonym.clone(),
+        };
+        let target = serde_json::json!({"kind": "incident_source", "pseudonym": pseudonym, "ttl_seconds": 600});
+        let context = serde_json::json!({"version": 1, "target": target, "policy_bridge": {
+            "version": 1, "mode": "automatic", "intel_required": true,
+            "min_intel_confidence": 50, "max_evidence_age_seconds": 3600}});
+        let start = |label: &'static str| {
+            let (action_id, context) = (action_id, context.clone());
+            async move {
+                let id = Uuid::new_v4();
+                sqlx::query("INSERT INTO execution_requests(id,action_id,requested_by,status,approval_context) VALUES($1,$2,'policy-bridge','pending',$3)")
+                    .bind(id).bind(action_id).bind(context).execute(pool).await?;
+                sqlx::query("UPDATE execution_requests SET status='starting' WHERE id=$1")
+                    .bind(id)
+                    .execute(pool)
+                    .await?;
+                anyhow::Ok((label, id))
+            }
+        };
+        let claimed = |id: Uuid| ClaimedExecutionRequest {
+            id,
+            action_name: "nftables.block_incident_source".into(),
+            target: Some(target.clone()),
+        };
+
+        // Delisted before apply: refused, the kernel is untouched.
+        delist().await?;
+        let (_, refused) = start("delisted").await?;
+        let outcome = try_dispatch_generic_with_mode(Some(&store), &claimed(refused), false)
+            .await
+            .unwrap();
+        assert_eq!(outcome.completion, DispatchCompletion::Failed);
+        assert_eq!(
+            adapter.verify(&resolved).await.unwrap(),
+            VerificationResult::NotPresent
+        );
+
+        // Listed below the recorded confidence floor: refused as well.
+        list(40).await?;
+        let (_, weak) = start("weak").await?;
+        let outcome = try_dispatch_generic_with_mode(Some(&store), &claimed(weak), false)
+            .await
+            .unwrap();
+        assert_eq!(outcome.completion, DispatchCompletion::Failed);
+        assert_eq!(
+            adapter.verify(&resolved).await.unwrap(),
+            VerificationResult::NotPresent
+        );
+
+        // Listed confidently: applied and verified for real, then rolled back.
+        list(80).await?;
+        let (_, ok) = start("listed").await?;
+        let outcome = try_dispatch_generic_with_mode(Some(&store), &claimed(ok), false)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.completion,
+            DispatchCompletion::Success,
+            "{:?}",
+            outcome.error_summary
+        );
+        assert_eq!(
+            adapter.verify(&resolved).await.unwrap(),
+            VerificationResult::Verified
+        );
+        let snapshot: serde_json::Value = sqlx::query_scalar("SELECT fw_target_json FROM firewall_action_intents WHERE execution_id=$1 AND fw_rule_fingerprint IS NOT NULL")
+            .bind(ok).fetch_one(pool).await?;
+        rollback_firewall_rule_generation_target(
+            "nftables",
+            &snapshot,
+            "bridge lab rollback".into(),
+        )
+        .await?;
+        assert_eq!(
+            adapter.verify(&resolved).await.unwrap(),
+            VerificationResult::NotPresent
+        );
+        delist().await?;
+        Ok(())
+    }
+
     #[test]
     fn dry_run_from_env_defaults_to_true_when_unset() {
         // SAFETY: single-threaded test process, no other test in this

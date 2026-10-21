@@ -34,6 +34,25 @@ async fn main() -> anyhow::Result<()> {
     let enabled = env::var("CLAWFORGE_ENABLE_FEEDS")
         .map(|value| value.eq_ignore_ascii_case("true") || value == "1")
         .unwrap_or(false);
+    // Routing context for suspicious sources: off unless explicitly enabled, because it
+    // sends those addresses to a public routing API.
+    match clawforge_worker::ip_context::IpContextConfig::from_env() {
+        Ok(Some(config)) => {
+            tracing::info!(
+                batch = config.batch,
+                spacing_ms = config.spacing.as_millis() as u64,
+                "ip routing-context enrichment enabled"
+            );
+            tokio::spawn(clawforge_worker::ip_context::run_forever(
+                store.clone(),
+                config,
+            ));
+        }
+        Ok(None) => tracing::info!("ip routing-context enrichment off"),
+        Err(reason) => {
+            tracing::warn!(%reason, "ip routing-context enrichment disabled: invalid configuration")
+        }
+    }
     let mut scheduler = Scheduler::phase_one(enabled)?;
     let mut ticks = interval(Duration::from_secs(seconds.max(5)));
     ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
