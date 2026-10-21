@@ -556,6 +556,7 @@ version = "1.0.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "clawforge-security-events",
  "clawforge-storage",
  "serde_json",
  "sqlx",

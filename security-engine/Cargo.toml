@@ -16,3 +16,4 @@ uuid.workspace = true
 
 [dev-dependencies]
 sqlx.workspace = true
+clawforge-security-events = { path = "../security-events" }

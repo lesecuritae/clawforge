@@ -1040,6 +1040,52 @@ async fn migrations_and_restart_persist() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Regression: `upsert_ip_resolution` bound the address as TEXT against an INET
+/// column, so every write failed (only a warning, by design) and no incident-source
+/// block could ever be resolved. Ingest must leave a short-TTL, single-host
+/// resolution that is keyed by the pseudonym and is the address that was sent.
+#[tokio::test]
+#[ignore = "requires an isolated PostgreSQL test container"]
+async fn ingest_persists_a_short_ttl_single_host_resolution() -> anyhow::Result<()> {
+    use clawforge_security_events::fixtures;
+
+    let url =
+        std::env::var("CLAWFORGE_TEST_DATABASE_URL").or_else(|_| std::env::var("DATABASE_URL"))?;
+    let store = PostgresStore::connect(&url).await?;
+    let sensor_id = store
+        .register_security_sensor(
+            &format!("resolution-writer-{}", uuid::Uuid::new_v4()),
+            &format!("credential-hash-{}", uuid::Uuid::new_v4()),
+            "res12345",
+            None,
+            "integration-test",
+        )
+        .await?;
+    let mut envelope = fixtures::firewall_block();
+    envelope.dedupe_key = format!("resolution-writer-{}", uuid::Uuid::new_v4());
+    let event_id = store.record_security_event(sensor_id, &envelope).await?;
+    let stored = store
+        .get_security_event(event_id)
+        .await?
+        .expect("event exists");
+    let pseudonym = stored["resource"].as_str().unwrap().to_string();
+    let (raw, family, mask, ttl_seconds): (String, i32, i32, f64) = sqlx::query_as(
+        "SELECT host(raw_ip), family(raw_ip), masklen(raw_ip), \
+                EXTRACT(EPOCH FROM (expires_at - NOW()))::float8 \
+           FROM security_ip_resolutions WHERE pseudonym=$1",
+    )
+    .bind(&pseudonym)
+    .fetch_one(store.pool())
+    .await?;
+    assert_eq!(raw, envelope.resource);
+    assert_eq!((family, mask), (4, 32));
+    assert!(
+        ttl_seconds > 0.0 && ttl_seconds <= 86_400.0,
+        "short TTL, got {ttl_seconds}"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 #[ignore = "requires an isolated PostgreSQL test container"]
 async fn security_events_register_sensor_and_record_event() -> anyhow::Result<()> {

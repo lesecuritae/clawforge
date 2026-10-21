@@ -62,6 +62,30 @@ pub struct SecurityAssessment {
     pub threat_intel: Option<crate::IpReputationHit>,
 }
 
+/// Which events of a type an assessment bucket may count, by the HTTP status
+/// class in the payload. Events without a numeric status (SSH, ...) always
+/// pass `Any` and `ClientAttributable`; `ServerError` requires a 5xx status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventStatusFilter {
+    Any,
+    ClientAttributable,
+    ServerError,
+}
+
+impl EventStatusFilter {
+    fn predicate(self) -> &'static str {
+        match self {
+            Self::Any => "TRUE",
+            Self::ClientAttributable => {
+                "COALESCE((CASE WHEN payload->>'status_code' ~ '^[0-9]{3}$' THEN (payload->>'status_code')::int END) < 500, TRUE)"
+            }
+            Self::ServerError => {
+                "COALESCE((CASE WHEN payload->>'status_code' ~ '^[0-9]{3}$' THEN (payload->>'status_code')::int END) >= 500, FALSE)"
+            }
+        }
+    }
+}
+
 impl PostgresStore {
     /// Every canonical event of `event_type` sharing `correlation_id`
     /// (already the pseudonymized resource by the time it reached the
@@ -77,11 +101,34 @@ impl PostgresStore {
         from: DateTime<Utc>,
         to: DateTime<Utc>,
     ) -> Result<Vec<(Uuid, DateTime<Utc>)>> {
-        let rows = sqlx::query(
+        self.list_events_for_bucket_filtered(
+            event_type,
+            correlation_id,
+            from,
+            to,
+            EventStatusFilter::Any,
+        )
+        .await
+    }
+
+    /// Same membership as [`Self::list_events_for_bucket`], optionally
+    /// restricted by the HTTP status class carried in the event payload. A
+    /// 5xx answer is the server's own failure; counting it as client
+    /// behaviour would turn every backend outage into an "abusive client".
+    pub async fn list_events_for_bucket_filtered(
+        &self,
+        event_type: &str,
+        correlation_id: &str,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+        status: EventStatusFilter,
+    ) -> Result<Vec<(Uuid, DateTime<Utc>)>> {
+        let rows = sqlx::query(&format!(
             "SELECT event_id, occurred_at FROM events \
              WHERE event_type=$1 AND correlation_id=$2 AND occurred_at >= $3 AND occurred_at < $4 \
-             ORDER BY occurred_at ASC LIMIT 1000",
-        )
+             AND {} ORDER BY occurred_at ASC LIMIT 1000",
+            status.predicate()
+        ))
         .bind(event_type)
         .bind(correlation_id)
         .bind(from)
@@ -210,6 +257,106 @@ impl PostgresStore {
         .await?)
     }
 
+    /// Whether another assessment of this `resource` is genuinely **independent**
+    /// evidence for `assessment_id`: it comes from a different event family
+    /// (`events.event_type`) than every event behind this assessment, within the
+    /// shared episode window, and its rule is not in `ignore_rules`
+    /// (observation-only rules such as a server-fault burst say nothing about the
+    /// source's intent). Two rules that count the same HTTP events, or an
+    /// overlapping bucket of the same rule, share an event family and are one
+    /// observation, not two corroborating ones. An assessment with no recorded
+    /// events cannot be shown to be independent and never corroborates.
+    pub async fn resource_has_independent_family_assessment(
+        &self,
+        resource: &str,
+        assessment_id: Uuid,
+        since: DateTime<Utc>,
+        ignore_rules: &[&str],
+    ) -> Result<bool> {
+        let ignore: Vec<String> = ignore_rules
+            .iter()
+            .map(|rule| (*rule).to_string())
+            .collect();
+        Ok(sqlx::query_scalar(
+            "WITH t AS (SELECT clawforge_assessment_event_types($2) AS types) \
+             SELECT EXISTS( \
+               SELECT 1 FROM security_assessments o \
+                 CROSS JOIN t \
+                 CROSS JOIN LATERAL (SELECT clawforge_assessment_event_types(o.id) AS types) ot \
+                WHERE o.resource=$1 AND o.id<>$2 AND o.bucket_start>=$3 \
+                  AND NOT (o.rule_id = ANY($4)) \
+                  AND cardinality(t.types) > 0 AND cardinality(ot.types) > 0 \
+                  AND NOT (ot.types && t.types))",
+        )
+        .bind(resource)
+        .bind(assessment_id)
+        .bind(since)
+        .bind(&ignore)
+        .fetch_one(self.pool())
+        .await?)
+    }
+
+    /// Decaying history like [`Self::resource_history_score`], but from **earlier
+    /// episodes only, one decayed term per episode**.
+    ///
+    /// An episode is a chain of this resource's assessments in which consecutive
+    /// activity is never more than `episode_gap_seconds` apart (the engine itself
+    /// treats that as one incident candidate). The episode that contains
+    /// `assessment_id` - however long it has been going on - is never history for
+    /// itself. Every earlier episode contributes `0.5 ^ (age / half_life)` once,
+    /// measured from its last activity, no matter how many assessment rows it
+    /// produced (two window grids, several rules). Observation-only rules are
+    /// ignored.
+    pub async fn resource_prior_episode_history_score(
+        &self,
+        resource: &str,
+        assessment_id: Uuid,
+        half_life_seconds: i64,
+        episode_gap_seconds: i64,
+        ignore_rules: &[&str],
+    ) -> Result<f64> {
+        if half_life_seconds <= 0 || episode_gap_seconds < 0 {
+            anyhow::bail!("half_life_seconds must be positive and the episode gap non-negative");
+        }
+        let ignore: Vec<String> = ignore_rules
+            .iter()
+            .map(|rule| (*rule).to_string())
+            .collect();
+        Ok(sqlx::query_scalar(
+            "WITH RECURSIVE gap AS (SELECT ($4 * INTERVAL '1 second') AS g), \
+             chain(start_at) AS ( \
+                 SELECT first_seen FROM security_assessments WHERE id=$2 \
+               UNION \
+                 SELECT m.first_seen FROM chain c CROSS JOIN gap \
+                   JOIN security_assessments m ON m.resource=$1 AND NOT (m.rule_id = ANY($5)) \
+                  WHERE m.first_seen < c.start_at AND m.last_seen >= c.start_at - gap.g), \
+             episode AS (SELECT MIN(start_at) AS start_at FROM chain), \
+             prior AS ( \
+                 SELECT o.first_seen, o.last_seen FROM security_assessments o, episode e, gap \
+                  WHERE o.resource=$1 AND o.id<>$2 AND NOT (o.rule_id = ANY($5)) \
+                    AND o.last_seen < e.start_at - gap.g), \
+             marked AS ( \
+                 SELECT p.*, CASE WHEN MAX(p.last_seen) OVER (ORDER BY p.first_seen, p.last_seen \
+                                     ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) IS NULL \
+                                    OR p.first_seen - MAX(p.last_seen) OVER (ORDER BY p.first_seen, p.last_seen \
+                                     ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) > gap.g \
+                                  THEN 1 ELSE 0 END AS starts \
+                   FROM prior p, gap), \
+             numbered AS (SELECT *, SUM(starts) OVER (ORDER BY first_seen, last_seen) AS episode_no FROM marked), \
+             episodes AS (SELECT episode_no, MAX(last_seen) AS ended FROM numbered GROUP BY episode_no) \
+             SELECT COALESCE(SUM(POWER(0.5::float8, \
+                    EXTRACT(EPOCH FROM (NOW() - ended))::float8 / $3::float8)), 0.0)::float8 \
+               FROM episodes",
+        )
+        .bind(resource)
+        .bind(assessment_id)
+        .bind(half_life_seconds)
+        .bind(episode_gap_seconds)
+        .bind(&ignore)
+        .fetch_one(self.pool())
+        .await?)
+    }
+
     /// Retention for `security_assessments` - roadmap phase 8's
     /// "Datenschutz und Aufbewahrung fuer Identifikatoren festlegen".
     /// `resource` is a pseudonymized identifier, not raw personal data,
@@ -278,11 +425,33 @@ impl PostgresStore {
         from: DateTime<Utc>,
         to: DateTime<Utc>,
     ) -> Result<Vec<(Uuid, DateTime<Utc>, Option<String>)>> {
-        let rows = sqlx::query(
+        self.list_events_for_bucket_with_field_filtered(
+            event_type,
+            correlation_id,
+            field,
+            from,
+            to,
+            EventStatusFilter::Any,
+        )
+        .await
+    }
+
+    /// [`Self::list_events_for_bucket_with_field`] restricted by status class.
+    pub async fn list_events_for_bucket_with_field_filtered(
+        &self,
+        event_type: &str,
+        correlation_id: &str,
+        field: &str,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+        status: EventStatusFilter,
+    ) -> Result<Vec<(Uuid, DateTime<Utc>, Option<String>)>> {
+        let rows = sqlx::query(&format!(
             "SELECT event_id, occurred_at, payload->>$5 AS field_value FROM events \
              WHERE event_type=$1 AND correlation_id=$2 AND occurred_at >= $3 AND occurred_at < $4 \
-             ORDER BY occurred_at ASC LIMIT 1000",
-        )
+             AND {} ORDER BY occurred_at ASC LIMIT 1000",
+            status.predicate()
+        ))
         .bind(event_type)
         .bind(correlation_id)
         .bind(from)
@@ -357,16 +526,16 @@ impl PostgresStore {
         .bind(threat_intel_indicator_last_seen)
         .fetch_one(&mut *tx)
         .await?;
-        for event_id in request.event_ids {
-            sqlx::query(
-                "INSERT INTO security_assessment_events (assessment_id,event_id) \
-                 VALUES ($1,$2) ON CONFLICT DO NOTHING",
-            )
-            .bind(id)
-            .bind(event_id)
-            .execute(&mut *tx)
-            .await?;
-        }
+        // One statement for the whole evidence set (identical result to a
+        // row-by-row insert, without a round trip per event).
+        sqlx::query(
+            "INSERT INTO security_assessment_events (assessment_id,event_id) \
+             SELECT $1, e FROM unnest($2::uuid[]) AS e ON CONFLICT DO NOTHING",
+        )
+        .bind(id)
+        .bind(request.event_ids)
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         Ok(id)
     }

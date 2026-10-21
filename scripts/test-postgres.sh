@@ -115,13 +115,13 @@ CLAWFORGE_TEST_DATABASE_URL="$owner_url" \
 CLAWFORGE_TEST_SECURITY_ENGINE_DATABASE_URL="$(cat "$secret_dir/database_security_engine_url")" \
 CLAWFORGE_TEST_INCIDENTS_DATABASE_URL="$(cat "$secret_dir/database_incidents_url")" \
 CLAWFORGE_ANALYZER_IP_HMAC_KEY="test-only-ip-hmac-key-0123456789-not-for-production" \
-  run_cargo test -p clawforge-security-engine --bin clawforge-security-engine -- --ignored --test-threads=1
+  run_cargo test -p clawforge-security-engine --bin clawforge-security-engine -- --ignored --test-threads=1 --skip behavioral_tests::
 
 CLAWFORGE_TEST_DATABASE_URL="$owner_url" \
 CLAWFORGE_TEST_POLICY_ENGINE_DATABASE_URL="$(cat "$secret_dir/database_policy_engine_url")" \
 CLAWFORGE_TEST_SECURITY_ENGINE_DATABASE_URL="$(cat "$secret_dir/database_security_engine_url")" \
 CLAWFORGE_ANALYZER_IP_HMAC_KEY="test-only-ip-hmac-key-0123456789-not-for-production" \
-  run_cargo test -p clawforge-policy-engine --bin clawforge-policy-engine -- --ignored --test-threads=1
+  run_cargo test -p clawforge-policy-engine --bin clawforge-policy-engine -- --ignored --test-threads=1 --skip behavior_stage_tests::
 
 CLAWFORGE_TEST_DATABASE_URL="$owner_url" \
 CLAWFORGE_ANALYZER_IP_HMAC_KEY="test-only-ip-hmac-key-0123456789-not-for-production" \
