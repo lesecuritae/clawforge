@@ -805,6 +805,7 @@ mod tests {
             (bridge::MAX_PER_WINDOW, "5"),
             (bridge::WINDOW_SECONDS, "300"),
             (bridge::MAX_EVIDENCE_AGE_SECONDS, "900"),
+            (bridge::MIN_INTEL_CONFIDENCE, "50"),
         ];
         let config = BridgeConfig::from_lookup(|name| {
             pairs

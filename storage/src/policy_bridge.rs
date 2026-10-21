@@ -39,6 +39,8 @@ pub struct PolicyBridgeParams {
     pub rule_id: Option<String>,
     pub max_evidence_age_seconds: i32,
     pub require_threat_intel: bool,
+    /// Minimum confidence of the reputation listing that counts (1-100, required).
+    pub min_intel_confidence: i32,
     pub max_per_window: i32,
     pub window_seconds: i32,
 }
@@ -59,7 +61,7 @@ impl PostgresStore {
         params: &PolicyBridgeParams,
     ) -> Result<BridgeOutcome> {
         let plan = sqlx::query(
-            "SELECT reason, context, existing_request_id FROM clawforge_policy_bridge_plan($1,$2,$3,$4,$5,$6,$7,$8)",
+            "SELECT reason, context, existing_request_id FROM clawforge_policy_bridge_plan($1,$2,$3,$4,$5,$6,$7,$8,$9)",
         )
         .bind(decision_id)
         .bind(params.mode.as_str())
@@ -69,6 +71,7 @@ impl PostgresStore {
         .bind(params.rule_id.as_deref())
         .bind(params.max_evidence_age_seconds)
         .bind(params.require_threat_intel)
+        .bind(params.min_intel_confidence)
         .fetch_one(self.pool())
         .await?;
         if let Some(reason) = plan.get::<Option<String>, _>("reason") {
@@ -85,7 +88,7 @@ impl PostgresStore {
         let hash = execution_context_hash(&context)?;
         let row = sqlx::query(
             "SELECT outcome, request_id FROM clawforge_enqueue_policy_bridge_request(\
-             $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)",
+             $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
         )
         .bind(decision_id)
         .bind(params.mode.as_str())
@@ -95,6 +98,7 @@ impl PostgresStore {
         .bind(params.rule_id.as_deref())
         .bind(params.max_evidence_age_seconds)
         .bind(params.require_threat_intel)
+        .bind(params.min_intel_confidence)
         .bind(params.max_per_window)
         .bind(params.window_seconds)
         .bind(&context)

@@ -172,9 +172,9 @@ GRANT EXECUTE ON FUNCTION clawforge_assessment_event_types(UUID) TO clawforge_po
 GRANT EXECUTE ON FUNCTION clawforge_current_source_intel(TEXT) TO clawforge_policy_engine;
 -- Policy -> execution bridge (migration 0060): the only path by which this role
 -- can create an execution request; every call is re-validated in the database.
-GRANT EXECUTE ON FUNCTION clawforge_policy_bridge_plan(UUID, TEXT, TEXT, INTEGER, UUID, TEXT, INTEGER, BOOLEAN)
+GRANT EXECUTE ON FUNCTION clawforge_policy_bridge_plan(UUID, TEXT, TEXT, INTEGER, UUID, TEXT, INTEGER, BOOLEAN, INTEGER)
   TO clawforge_policy_engine;
-GRANT EXECUTE ON FUNCTION clawforge_enqueue_policy_bridge_request(UUID, TEXT, TEXT, INTEGER, UUID, TEXT, INTEGER, BOOLEAN, INTEGER, INTEGER, JSONB, TEXT)
+GRANT EXECUTE ON FUNCTION clawforge_enqueue_policy_bridge_request(UUID, TEXT, TEXT, INTEGER, UUID, TEXT, INTEGER, BOOLEAN, INTEGER, INTEGER, INTEGER, JSONB, TEXT)
   TO clawforge_policy_engine;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO clawforge_policy_engine;
 
