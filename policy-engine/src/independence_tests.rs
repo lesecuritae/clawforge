@@ -363,5 +363,14 @@ async fn overlapping_decisions_share_one_simulated_challenge() -> Result<()> {
     .fetch_one(e.owner.pool())
     .await?;
     assert_eq!(simulations, 1);
+    // Later PostgreSQL gates in the shared fixture assume no claimable request is
+    // left behind; cancel the simulation.
+    sqlx::query(
+        "UPDATE execution_requests SET status='cancelled' \
+         WHERE approval_context->'target'->>'pseudonym'=$1",
+    )
+    .bind(&e.resource)
+    .execute(e.owner.pool())
+    .await?;
     Ok(())
 }

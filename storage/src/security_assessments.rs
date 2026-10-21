@@ -77,10 +77,10 @@ impl EventStatusFilter {
         match self {
             Self::Any => "TRUE",
             Self::ClientAttributable => {
-                concat!("COALESCE((CASE WHEN payload->>'status_code' ~ '^[0-9]{3}$' THEN (payload->>'status_code')::int END) < 500, TRUE)")
+                "COALESCE((CASE WHEN payload->>'status_code' ~ '^[0-9]{3}$' THEN (payload->>'status_code')::int END) < 500, TRUE)"
             }
             Self::ServerError => {
-                concat!("COALESCE((CASE WHEN payload->>'status_code' ~ '^[0-9]{3}$' THEN (payload->>'status_code')::int END) >= 500, FALSE)")
+                "COALESCE((CASE WHEN payload->>'status_code' ~ '^[0-9]{3}$' THEN (payload->>'status_code')::int END) >= 500, FALSE)"
             }
         }
     }
