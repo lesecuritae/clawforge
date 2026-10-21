@@ -82,3 +82,78 @@ Not covered: SSH attacks on a live daemon, authenticated HTTP sensor ingress,
 full distributed/load capacity, real outage duration, production false-positive
 rates, remote management lockout, or broad automatic enforcement. These require
 additional, explicitly bounded scenarios and the existing rollout gates.
+
+## Stages, fixes and results (detection-fix revision, 2026-10-21)
+
+The report is split by stage. They answer different questions and must not be merged
+into one number:
+
+1. **Raw anomaly detection** (`behavior-report.json`, security-engine): did any rule
+   fire for the case? Confusion matrix against the *intent label*.
+2. **Independent evidence / attacker finding** (`policy-stage-report.json`): is there at
+   least one non-observation decision corroborated by a second **independent** evidence
+   source (fresh, confident reputation listing; a different event family; an earlier
+   episode)? An anomaly alone is not an attacker finding.
+3. **Policy decision**: strongest decision per case (observe/challenge/rate_limit/block).
+4. **Enforcement request**: requests created by the policy -> execution bridge with all
+   attacker-rule policies promoted to `automatic` and the bridge in `automatic` and in
+   `propose` mode (the worst case), never consulting scenario ID, address or label.
+
+Packets, TTL expiry and rollback are the separate packet lab; the bridge stops at the request.
+
+### What changed in the product (rule versions)
+
+* `ssh_bruteforce`, `http_anomaly_burst`, `http_scan` are now **v2**: every rule runs on two
+  grids of the same window length and threshold, the second shifted by half a window.
+  Any span of at most half a window that contains a threshold's worth of events lies inside
+  one window of one grid. A burst split four-and-four across a bucket boundary is detected
+  (shifted-grid assessment, one incident candidate); a spread over a *full* window can still
+  fall between both grids (documented limit, tested). No threshold was lowered.
+* HTTP statuses >= 500 no longer count toward `http_anomaly_burst`/`http_scan`; a 5xx burst
+  is the new observation-only rule `http_server_fault_burst` (own policy, recorded as
+  `observe`, never a challenge, rate limit or block, never counted as corroboration).
+* Corroboration needs a *different* kind of evidence: two rules (or two overlapping buckets
+  of one rule) over the same event family are one observation, and an ongoing episode does
+  not corroborate itself; earlier-episode history still counts. The decision rationale names
+  the basis (`threat_intel`, `independent_event_family`, `prior_episode_history`,
+  `behavior_only`).
+
+### Before / after (same labelled cases; intent labels unchanged)
+
+| | TP | FP | TN | FN |
+| --- | --- | --- | --- | --- |
+| Before, 15 cases, stage 1 | 5 | 3 | 5 | 2 |
+| After, the same 15 cases, stage 1 | 7 | 3 | 5 | 0 |
+| After, 18 cases (3 added: listed/unlisted twins), stage 1 | 10 | 3 | 5 | 0 |
+| After, 18 cases, attacker-rule alerts only (server-fault observation excluded) | 10 | 2 | 6 | 0 |
+| After, 18 cases, stage 2 (attacker finding needs independent evidence) | 2 | 0 | 8 | 8 |
+
+`quality_gate_passed` stays **false** (stage-1 FP > 0) and was not renamed. Stage 2 FN = 8
+does not mean eight missed detections: those attacks were detected and decided
+(challenge/rate_limit), but without independent evidence they are *unconfirmed*, which is
+what keeps them from enforcement.
+
+### The three legitimate cases
+
+* `http_legitimate_backend_failure` (503): fixed by a deterministic, observable property -
+  a server error status. It is now an observation, not an attacker-rule alert.
+* `ssh_legitimate_shared_nat` and `http_broken_asset_release`: their events are
+  *observably identical* (`observables.json`, `scripts/behavior-observables.py`) to attack
+  cases (`ssh_bruteforce_threshold`, `http_scanner_threshold`, ...) apart from their count.
+  No deterministic classifier can separate them from these fields, and none was built from
+  the scenario ID, address or pattern name. They remain raw anomaly alerts at stage 1
+  (documented, not suppressed), reach at most a simulated challenge, never an attacker
+  finding and never an enforcement request. What does discriminate in the fixtures is
+  independent evidence: `ssh_sustained_attack_listed_source` and
+  `http_scanner_sustained_listed_source` behave like their unlisted twins but carry a fresh,
+  confident reputation listing, and only they produce a request (exactly one each:
+  `pending` in automatic mode, `waiting_approval` in propose mode). Further observables that
+  could help in production (successful logins from the same source, asset-like paths with a
+  referrer, cross-client error ratios) are not present in the sensor data today.
+
+### Limits of this evidence
+
+Selected fixtures, not a population false-positive rate. The policy stage shifts the
+fixture timestamps forward by a multiple of the window length so that the freshness gates
+are real; relative timing and grid alignment are unchanged. The engine, policy and bridge
+code are the production code; the executor, packets and kernel are not part of this stage.

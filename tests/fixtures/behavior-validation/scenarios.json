@@ -13,7 +13,9 @@
         0
       ],
       "status": 404,
-      "note": ""
+      "note": "",
+      "expected_strongest_decision": "none",
+      "expected_enforcement_requests": 0
     },
     {
       "id": "ssh_four_typos",
@@ -29,7 +31,9 @@
         3
       ],
       "status": 404,
-      "note": ""
+      "note": "",
+      "expected_strongest_decision": "none",
+      "expected_enforcement_requests": 0
     },
     {
       "id": "ssh_bruteforce_threshold",
@@ -48,7 +52,9 @@
         4
       ],
       "status": 404,
-      "note": ""
+      "note": "",
+      "expected_strongest_decision": "challenge",
+      "expected_enforcement_requests": 0
     },
     {
       "id": "ssh_sustained_attack",
@@ -82,7 +88,9 @@
         19
       ],
       "status": 404,
-      "note": ""
+      "note": "",
+      "expected_strongest_decision": "rate_limit",
+      "expected_enforcement_requests": 0
     },
     {
       "id": "ssh_legitimate_shared_nat",
@@ -102,7 +110,9 @@
         5
       ],
       "status": 404,
-      "note": "Legitimate independent users share one NAT address; intentionally measures a detector false positive, not a block."
+      "note": "Legitimate independent users share one NAT address; intentionally measures a detector false positive, not a block.",
+      "expected_strongest_decision": "challenge",
+      "expected_enforcement_requests": 0
     },
     {
       "id": "ssh_boundary_evasion",
@@ -122,7 +132,12 @@
         303
       ],
       "status": 404,
-      "note": "Four events on either side of a tumbling-window boundary; intentionally measures a false negative."
+      "note": "Four events on either side of a tumbling-window boundary; intentionally measures a false negative.",
+      "expected_rules_after_fix": [
+        "ssh_bruteforce"
+      ],
+      "expected_strongest_decision": "rate_limit",
+      "expected_enforcement_requests": 0
     },
     {
       "id": "ssh_two_attack_buckets",
@@ -146,7 +161,9 @@
         304
       ],
       "status": 404,
-      "note": ""
+      "note": "",
+      "expected_strongest_decision": "rate_limit",
+      "expected_enforcement_requests": 0
     },
     {
       "id": "http_single_missing_asset",
@@ -159,7 +176,9 @@
         0
       ],
       "status": 404,
-      "note": ""
+      "note": "",
+      "expected_strongest_decision": "none",
+      "expected_enforcement_requests": 0
     },
     {
       "id": "http_seven_paths",
@@ -178,7 +197,9 @@
         6
       ],
       "status": 404,
-      "note": ""
+      "note": "",
+      "expected_strongest_decision": "none",
+      "expected_enforcement_requests": 0
     },
     {
       "id": "http_scanner_threshold",
@@ -200,7 +221,9 @@
         7
       ],
       "status": 404,
-      "note": ""
+      "note": "",
+      "expected_strongest_decision": "challenge",
+      "expected_enforcement_requests": 0
     },
     {
       "id": "http_abusive_burst",
@@ -226,7 +249,9 @@
         11
       ],
       "status": 404,
-      "note": ""
+      "note": "",
+      "expected_strongest_decision": "challenge",
+      "expected_enforcement_requests": 0
     },
     {
       "id": "http_legitimate_backend_failure",
@@ -252,7 +277,12 @@
         11
       ],
       "status": 503,
-      "note": "Normal callers hitting an unavailable backend; expected detector false positive."
+      "note": "Normal callers hitting an unavailable backend; expected detector false positive.",
+      "expected_rules_after_fix": [
+        "http_server_fault_burst"
+      ],
+      "expected_strongest_decision": "observe",
+      "expected_enforcement_requests": 0
     },
     {
       "id": "http_broken_asset_release",
@@ -274,7 +304,9 @@
         7
       ],
       "status": 404,
-      "note": "Normal browser loads eight missing assets; expected detector false positive."
+      "note": "Normal browser loads eight missing assets; expected detector false positive.",
+      "expected_strongest_decision": "challenge",
+      "expected_enforcement_requests": 0
     },
     {
       "id": "http_boundary_scan_evasion",
@@ -300,7 +332,13 @@
         306
       ],
       "status": 404,
-      "note": "Seven distinct paths in each bucket; below both per-bucket detectors, expected false negative."
+      "note": "Seven distinct paths in each bucket; below both per-bucket detectors, expected false negative.",
+      "expected_rules_after_fix": [
+        "http_anomaly_burst",
+        "http_scan"
+      ],
+      "expected_strongest_decision": "rate_limit",
+      "expected_enforcement_requests": 0
     },
     {
       "id": "http_normal_successful_burst",
@@ -352,7 +390,115 @@
         39
       ],
       "status": 200,
-      "note": ""
+      "note": "",
+      "expected_strongest_decision": "none",
+      "expected_enforcement_requests": 0
+    },
+    {
+      "id": "ssh_sustained_attack_listed_source",
+      "kind": "ssh",
+      "event_count": 20,
+      "label_attack": true,
+      "expected_rules": [
+        "ssh_bruteforce"
+      ],
+      "distinct_paths": 1,
+      "offsets": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19
+      ],
+      "status": 404,
+      "note": "Same observable behaviour as ssh_sustained_attack, but the source is listed by a fresh confident reputation feed: independent evidence.",
+      "listed_source": true,
+      "expected_strongest_decision": "block",
+      "expected_enforcement_requests": 1
+    },
+    {
+      "id": "http_scanner_sustained_listed_source",
+      "kind": "http",
+      "event_count": 16,
+      "label_attack": true,
+      "expected_rules": [
+        "http_anomaly_burst",
+        "http_scan"
+      ],
+      "distinct_paths": 16,
+      "offsets": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15
+      ],
+      "status": 404,
+      "note": "Sixteen distinct paths from a feed-listed source: independent evidence, high confidence.",
+      "listed_source": true,
+      "expected_strongest_decision": "block",
+      "expected_enforcement_requests": 1
+    },
+    {
+      "id": "http_scanner_sustained_unlisted",
+      "kind": "http",
+      "event_count": 16,
+      "label_attack": true,
+      "expected_rules": [
+        "http_anomaly_burst",
+        "http_scan"
+      ],
+      "distinct_paths": 16,
+      "offsets": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15
+      ],
+      "status": 404,
+      "note": "Identical behaviour to the listed twin without independent evidence: rate limit at most, never a block.",
+      "listed_source": false,
+      "expected_strongest_decision": "rate_limit",
+      "expected_enforcement_requests": 0
     }
-  ]
+  ],
+  "revision_note": "Cases 0-14 and their original expected_rules/label_attack are the frozen 2026-10-21 baseline. expected_rules_after_fix records the deterministic behaviour change of detection-fix rule version 2 (staggered windows, 5xx split) for three cases only; intent labels were not changed. Cases 15-17 were added afterwards. expected_strongest_decision / expected_enforcement_requests describe the policy stage with every policy promoted to class automatic and bridge modes automatic and propose configured."
 }

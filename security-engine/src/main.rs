@@ -23,6 +23,23 @@
 //! latency at the boundary; a real attack does not stop after one bucket,
 //! so it is still caught in the very next one.
 //!
+//! ## Staggered windows (rule version 2)
+//!
+//! A single grid has a blind spot: a burst split evenly across a bucket
+//! boundary (four failed logins on each side, threshold five) never reaches
+//! the threshold in either bucket. Every rule is therefore evaluated on two
+//! grids of the same window length and the same threshold, the second one
+//! shifted by half a window. Both are pure functions of an event's own
+//! timestamp, so determinism, replay and out-of-order arrival are unchanged:
+//! any event triggers a recomputation of exactly its two windows from the
+//! stored events, and each window upserts one assessment by
+//! `rule:vN:resource:bucket_start` (the two grids can never share a start). Any
+//! span of at most half a window that holds a threshold's worth of events lies
+//! completely inside one window of one grid, so it is detected. Thresholds and
+//! window length are not lowered. Overlapping assessments of one rule extend one
+//! incident candidate (the candidate key is stable and its event set is a set);
+//! the policy engine does not count them as independent evidence.
+//!
 //! Every event in a qualifying bucket contributes exactly once, regardless
 //! of how many times the bucket is recomputed as later events in it arrive:
 //! `persist_security_assessment` upserts by `dedupe_key`, and
@@ -34,7 +51,8 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use clawforge_storage::{
-    database_url_from_env, CorrelationPersistence, PostgresStore, SecurityAssessmentUpsert,
+    database_url_from_env, CorrelationPersistence, EventStatusFilter, PostgresStore,
+    SecurityAssessmentUpsert,
 };
 use std::env;
 use tracing::{info, warn};
@@ -42,6 +60,8 @@ use uuid::Uuid;
 
 #[cfg(test)]
 mod behavioral_tests;
+#[cfg(test)]
+mod window_tests;
 
 const CONSUMER_NAME: &str = "security-engine";
 const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -52,27 +72,45 @@ struct CountThresholdRule {
     rule_id: &'static str,
     rule_version: &'static str,
     event_type: &'static str,
+    /// Which events of the type count (HTTP status class); `Any` for SSH.
+    status: EventStatusFilter,
     window_seconds: i64,
     threshold: usize,
 }
 
 const SSH_BRUTEFORCE: CountThresholdRule = CountThresholdRule {
     rule_id: "ssh_bruteforce",
-    rule_version: "1",
+    rule_version: "2",
     event_type: "ssh_login_failure",
+    status: EventStatusFilter::Any,
     window_seconds: 300,
     threshold: 5,
 };
 
+/// Client-attributable HTTP anomalies only: a 5xx is the server's own failure.
 const HTTP_ANOMALY_BURST: CountThresholdRule = CountThresholdRule {
     rule_id: "http_anomaly_burst",
-    rule_version: "1",
+    rule_version: "2",
     event_type: "http_anomaly",
+    status: EventStatusFilter::ClientAttributable,
     window_seconds: 300,
     threshold: 10,
 };
 
-const RULES: &[CountThresholdRule] = &[SSH_BRUTEFORCE, HTTP_ANOMALY_BURST];
+/// Many 5xx answers to one source in a window: visible, but an operational
+/// observation (a backend outage looks exactly like this), never an attacker
+/// finding. The policy engine records it as an observe-only decision and never
+/// counts it as corroborating evidence.
+const HTTP_SERVER_FAULT_BURST: CountThresholdRule = CountThresholdRule {
+    rule_id: "http_server_fault_burst",
+    rule_version: "1",
+    event_type: "http_anomaly",
+    status: EventStatusFilter::ServerError,
+    window_seconds: 300,
+    threshold: 10,
+};
+
+const RULES: &[CountThresholdRule] = &[SSH_BRUTEFORCE, HTTP_ANOMALY_BURST, HTTP_SERVER_FAULT_BURST];
 
 /// A scan/reconnaissance rule: not "how many events", but "how many
 /// *distinct* values of one evidence field" - the shape a vulnerability
@@ -86,6 +124,7 @@ struct DistinctValueThresholdRule {
     rule_id: &'static str,
     rule_version: &'static str,
     event_type: &'static str,
+    status: EventStatusFilter,
     /// The evidence JSON field to count distinct values of - e.g. `"path"`
     /// on `HttpAnomalyEvidence`. Already pseudonymized/sanitized like every
     /// other field on the canonical event, so this rule never needs to
@@ -97,8 +136,9 @@ struct DistinctValueThresholdRule {
 
 const HTTP_SCAN: DistinctValueThresholdRule = DistinctValueThresholdRule {
     rule_id: "http_scan",
-    rule_version: "1",
+    rule_version: "2",
     event_type: "http_anomaly",
+    status: EventStatusFilter::ClientAttributable,
     field: "path",
     window_seconds: 300,
     threshold: 8,
@@ -113,11 +153,24 @@ const DISTINCT_VALUE_RULES: &[DistinctValueThresholdRule] = &[HTTP_SCAN];
 /// escalating incident instead of a new one every `window_seconds`.
 const CANDIDATE_EXTENSION_WINDOW: Duration = Duration::hours(1);
 
-fn bucket_start(occurred_at: DateTime<Utc>, window_seconds: i64) -> DateTime<Utc> {
-    let floored = (occurred_at.timestamp().div_euclid(window_seconds)) * window_seconds;
+/// Start of the window of length `window_seconds` that contains `occurred_at`
+/// on the grid shifted by `offset_seconds` (0 = primary grid).
+fn bucket_start(
+    occurred_at: DateTime<Utc>,
+    window_seconds: i64,
+    offset_seconds: i64,
+) -> DateTime<Utc> {
+    let floored = (occurred_at.timestamp() - offset_seconds).div_euclid(window_seconds)
+        * window_seconds
+        + offset_seconds;
     Utc.timestamp_opt(floored, 0)
         .single()
         .unwrap_or(occurred_at)
+}
+
+/// The two grids every rule is evaluated on: aligned and shifted by half a window.
+fn grid_offsets(window_seconds: i64) -> [i64; 2] {
+    [0, window_seconds / 2]
 }
 
 fn severity_for_count(count: usize, threshold: usize) -> &'static str {
@@ -260,47 +313,56 @@ async fn evaluate_rule(
         // future producer publishes under the same event_type without one).
         return Ok(());
     };
-    let bucket = bucket_start(event.occurred_at, rule.window_seconds);
-    let bucket_end = bucket + Duration::seconds(rule.window_seconds);
-    let members = store
-        .list_events_for_bucket(rule.event_type, correlation_id, bucket, bucket_end)
+    for offset in grid_offsets(rule.window_seconds) {
+        let bucket = bucket_start(event.occurred_at, rule.window_seconds, offset);
+        let bucket_end = bucket + Duration::seconds(rule.window_seconds);
+        let members = store
+            .list_events_for_bucket_filtered(
+                rule.event_type,
+                correlation_id,
+                bucket,
+                bucket_end,
+                rule.status,
+            )
+            .await?;
+        if members.len() < rule.threshold {
+            continue;
+        }
+        let event_ids: Vec<Uuid> = members.iter().map(|(id, _)| *id).collect();
+        let first_seen = members
+            .first()
+            .map(|(_, at)| *at)
+            .unwrap_or(event.occurred_at);
+        let last_seen = members
+            .last()
+            .map(|(_, at)| *at)
+            .unwrap_or(event.occurred_at);
+        let count = members.len();
+        let severity = severity_for_count(count, rule.threshold);
+        let confidence = confidence_for_count(count, rule.threshold);
+        let summary = format!(
+            "{} events of type {} from the same source within {}s (rule {} v{}, grid offset +{}s)",
+            count, rule.event_type, rule.window_seconds, rule.rule_id, rule.rule_version, offset
+        );
+        persist_assessment_and_incident(
+            store,
+            rule.rule_id,
+            rule.rule_version,
+            rule.event_type,
+            rule.window_seconds,
+            correlation_id,
+            bucket,
+            bucket_end,
+            &event_ids,
+            first_seen,
+            last_seen,
+            severity,
+            confidence,
+            &summary,
+        )
         .await?;
-    if members.len() < rule.threshold {
-        return Ok(());
     }
-    let event_ids: Vec<Uuid> = members.iter().map(|(id, _)| *id).collect();
-    let first_seen = members
-        .first()
-        .map(|(_, at)| *at)
-        .unwrap_or(event.occurred_at);
-    let last_seen = members
-        .last()
-        .map(|(_, at)| *at)
-        .unwrap_or(event.occurred_at);
-    let count = members.len();
-    let severity = severity_for_count(count, rule.threshold);
-    let confidence = confidence_for_count(count, rule.threshold);
-    let summary = format!(
-        "{} events of type {} from the same source within {}s (rule {} v{})",
-        count, rule.event_type, rule.window_seconds, rule.rule_id, rule.rule_version
-    );
-    persist_assessment_and_incident(
-        store,
-        rule.rule_id,
-        rule.rule_version,
-        rule.event_type,
-        rule.window_seconds,
-        correlation_id,
-        bucket,
-        bucket_end,
-        &event_ids,
-        first_seen,
-        last_seen,
-        severity,
-        confidence,
-        &summary,
-    )
-    .await
+    Ok(())
 }
 
 /// Evaluate one distinct-value rule (a scan) against the event that just
@@ -320,64 +382,69 @@ async fn evaluate_scan_rule(
     else {
         return Ok(());
     };
-    let bucket = bucket_start(event.occurred_at, rule.window_seconds);
-    let bucket_end = bucket + Duration::seconds(rule.window_seconds);
-    let members = store
-        .list_events_for_bucket_with_field(
-            rule.event_type,
-            correlation_id,
+    for offset in grid_offsets(rule.window_seconds) {
+        let bucket = bucket_start(event.occurred_at, rule.window_seconds, offset);
+        let bucket_end = bucket + Duration::seconds(rule.window_seconds);
+        let members = store
+            .list_events_for_bucket_with_field_filtered(
+                rule.event_type,
+                correlation_id,
+                rule.field,
+                bucket,
+                bucket_end,
+                rule.status,
+            )
+            .await?;
+        let distinct_values: std::collections::BTreeSet<&str> = members
+            .iter()
+            .filter_map(|(_, _, value)| value.as_deref())
+            .collect();
+        if distinct_values.len() < rule.threshold {
+            continue;
+        }
+        let event_ids: Vec<Uuid> = members.iter().map(|(id, _, _)| *id).collect();
+        let first_seen = members
+            .first()
+            .map(|(_, at, _)| *at)
+            .unwrap_or(event.occurred_at);
+        let last_seen = members
+            .last()
+            .map(|(_, at, _)| *at)
+            .unwrap_or(event.occurred_at);
+        let distinct_count = distinct_values.len();
+        let severity = severity_for_count(distinct_count, rule.threshold);
+        let confidence = confidence_for_count(distinct_count, rule.threshold);
+        let summary = format!(
+            "{} distinct {} values across {} events of type {} from the same source within {}s \
+             (rule {} v{}, grid offset +{}s)",
+            distinct_count,
             rule.field,
+            members.len(),
+            rule.event_type,
+            rule.window_seconds,
+            rule.rule_id,
+            rule.rule_version,
+            offset
+        );
+        persist_assessment_and_incident(
+            store,
+            rule.rule_id,
+            rule.rule_version,
+            rule.event_type,
+            rule.window_seconds,
+            correlation_id,
             bucket,
             bucket_end,
+            &event_ids,
+            first_seen,
+            last_seen,
+            severity,
+            confidence,
+            &summary,
         )
         .await?;
-    let distinct_values: std::collections::BTreeSet<&str> = members
-        .iter()
-        .filter_map(|(_, _, value)| value.as_deref())
-        .collect();
-    if distinct_values.len() < rule.threshold {
-        return Ok(());
     }
-    let event_ids: Vec<Uuid> = members.iter().map(|(id, _, _)| *id).collect();
-    let first_seen = members
-        .first()
-        .map(|(_, at, _)| *at)
-        .unwrap_or(event.occurred_at);
-    let last_seen = members
-        .last()
-        .map(|(_, at, _)| *at)
-        .unwrap_or(event.occurred_at);
-    let distinct_count = distinct_values.len();
-    let severity = severity_for_count(distinct_count, rule.threshold);
-    let confidence = confidence_for_count(distinct_count, rule.threshold);
-    let summary = format!(
-        "{} distinct {} values across {} events of type {} from the same source within {}s \
-         (rule {} v{})",
-        distinct_count,
-        rule.field,
-        members.len(),
-        rule.event_type,
-        rule.window_seconds,
-        rule.rule_id,
-        rule.rule_version
-    );
-    persist_assessment_and_incident(
-        store,
-        rule.rule_id,
-        rule.rule_version,
-        rule.event_type,
-        rule.window_seconds,
-        correlation_id,
-        bucket,
-        bucket_end,
-        &event_ids,
-        first_seen,
-        last_seen,
-        severity,
-        confidence,
-        &summary,
-    )
-    .await
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -502,7 +569,7 @@ mod tests {
     #[test]
     fn bucket_start_floors_to_the_window_boundary() {
         let at = Utc.with_ymd_and_hms(2026, 1, 1, 12, 7, 42).unwrap();
-        let bucket = bucket_start(at, 300);
+        let bucket = bucket_start(at, 300, 0);
         assert_eq!(bucket, Utc.with_ymd_and_hms(2026, 1, 1, 12, 5, 0).unwrap());
     }
 
@@ -510,7 +577,7 @@ mod tests {
     fn bucket_start_is_stable_for_every_timestamp_in_the_same_window() {
         let a = Utc.with_ymd_and_hms(2026, 1, 1, 12, 5, 0).unwrap();
         let b = Utc.with_ymd_and_hms(2026, 1, 1, 12, 9, 59).unwrap();
-        assert_eq!(bucket_start(a, 300), bucket_start(b, 300));
+        assert_eq!(bucket_start(a, 300, 0), bucket_start(b, 300, 0));
     }
 
     #[test]
@@ -596,7 +663,7 @@ mod tests {
         // tests: a literal resource reused across tests/runs sharing a
         // database would let unrelated events collide.
         let resource = format!("ip-pseudonym:test-{}", Uuid::new_v4());
-        let bucket = bucket_start(Utc::now(), SSH_BRUTEFORCE.window_seconds);
+        let bucket = bucket_start(Utc::now(), SSH_BRUTEFORCE.window_seconds, 0);
 
         // Four events - one short of the threshold of five.
         let mut last_event = None;
@@ -607,7 +674,7 @@ mod tests {
             evaluate_rule(&engine, &SSH_BRUTEFORCE, &event).await?;
             last_event = Some(event);
         }
-        let dedupe_key = format!("ssh_bruteforce:v1:{resource}:{}", bucket.timestamp());
+        let dedupe_key = format!("ssh_bruteforce:v2:{resource}:{}", bucket.timestamp());
         let below_threshold: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM security_assessments WHERE dedupe_key=$1")
                 .bind(&dedupe_key)
@@ -746,7 +813,7 @@ mod tests {
         let incidents = PostgresStore::connect_runtime(&test_url("incidents")?).await?;
 
         let resource = format!("ip-pseudonym:test-{}", Uuid::new_v4());
-        let bucket = bucket_start(Utc::now(), HTTP_SCAN.window_seconds);
+        let bucket = bucket_start(Utc::now(), HTTP_SCAN.window_seconds, 0);
 
         // Eight hits, but all the same path - a burst the scan rule must
         // not mistake for reconnaissance.
@@ -765,7 +832,7 @@ mod tests {
             last_event = Some(event);
         }
         let _ = last_event;
-        let dedupe_key = format!("http_scan:v1:{resource}:{}", bucket.timestamp());
+        let dedupe_key = format!("http_scan:v2:{resource}:{}", bucket.timestamp());
         let same_path_count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM security_assessments WHERE dedupe_key=$1")
                 .bind(&dedupe_key)
@@ -779,7 +846,7 @@ mod tests {
         // A second, distinct resource: eight hits across eight distinct
         // paths - genuine path diversity, must fire.
         let scanning_resource = format!("ip-pseudonym:test-scan-{}", Uuid::new_v4());
-        let scan_dedupe_key = format!("http_scan:v1:{scanning_resource}:{}", bucket.timestamp());
+        let scan_dedupe_key = format!("http_scan:v2:{scanning_resource}:{}", bucket.timestamp());
         for i in 0..8 {
             let occurred_at = bucket + Duration::seconds(i * 10);
             let event = publish_http_anomaly(
@@ -845,7 +912,7 @@ mod tests {
         let incidents = PostgresStore::connect_runtime(&test_url("incidents")?).await?;
 
         let resource = format!("ip-pseudonym:test-{}", Uuid::new_v4());
-        let bucket = bucket_start(Utc::now(), SSH_BRUTEFORCE.window_seconds);
+        let bucket = bucket_start(Utc::now(), SSH_BRUTEFORCE.window_seconds, 0);
 
         for i in 0..4 {
             let occurred_at = bucket + Duration::seconds(i * 10);
@@ -879,7 +946,7 @@ mod tests {
         };
         evaluate_rule(&engine, &SSH_BRUTEFORCE, &fifth_event).await?;
 
-        let dedupe_key = format!("ssh_bruteforce:v1:{resource}:{}", bucket.timestamp());
+        let dedupe_key = format!("ssh_bruteforce:v2:{resource}:{}", bucket.timestamp());
         let row = sqlx::query(
             "SELECT threat_intel_corroborated, threat_intel_source, threat_intel_confidence \
              FROM security_assessments WHERE dedupe_key=$1",

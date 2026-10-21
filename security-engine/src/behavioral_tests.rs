@@ -102,6 +102,7 @@ async fn golden_behavior_and_bounded_load() -> Result<()> {
     ))?;
     let mut results = Vec::new();
     let (mut tp, mut fp, mut tn, mut fn_) = (0, 0, 0, 0);
+    let (mut tp_attacker, mut fp_attacker, mut tn_attacker, mut fn_attacker) = (0, 0, 0, 0);
     let mut golden_accepted = 0;
     let mut template = None;
     for case in plan["cases"].as_array().unwrap() {
@@ -114,6 +115,17 @@ async fn golden_behavior_and_bounded_load() -> Result<()> {
         let started = Instant::now();
         let mut resource = None;
         let mut replay = None;
+        if case["listed_source"].as_bool().unwrap_or(false) {
+            // A fresh, confident reputation listing for exactly this fixture source,
+            // present before ingest like a real feed entry (never the raw address in
+            // any later record). Independent evidence is the only difference to the
+            // unlisted twin case.
+            let ip = events[0]["resource"].as_str().context("fixture source")?;
+            sqlx::query("INSERT INTO indicators (value,indicator_type,categories,confidence,source,first_seen,last_seen,expires_at) VALUES ($1,'Ip','[]',80,'behavior_fixture_feed',NOW(),NOW(),NOW()+INTERVAL '2 days')")
+                .bind(ip)
+                .execute(owner.pool())
+                .await?;
+        }
         for value in events {
             let envelope: SensorEnvelope = serde_json::from_value(value.clone())?;
             envelope.validate()?;
@@ -142,7 +154,17 @@ async fn golden_behavior_and_bounded_load() -> Result<()> {
                 .bind(resource).fetch_all(owner.pool()).await?;
             rules.extend(rows);
         }
-        let expected: BTreeSet<String> = case["expected_rules"]
+        // The frozen baseline expectation stays recorded; a case whose deterministic
+        // behaviour changed on purpose carries an explicit after-fix expectation.
+        let baseline: BTreeSet<String> = case["expected_rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        let expected: BTreeSet<String> = case
+            .get("expected_rules_after_fix")
+            .unwrap_or(&case["expected_rules"])
             .as_array()
             .unwrap()
             .iter()
@@ -164,7 +186,14 @@ async fn golden_behavior_and_bounded_load() -> Result<()> {
             );
         }
         let alert = !rules.is_empty();
+        let attacker_rule_alert = rules.iter().any(|rule| rule != "http_server_fault_burst");
         let attack = case["label_attack"].as_bool().unwrap();
+        match (attack, attacker_rule_alert) {
+            (true, true) => tp_attacker += 1,
+            (false, true) => fp_attacker += 1,
+            (false, false) => tn_attacker += 1,
+            (true, false) => fn_attacker += 1,
+        }
         let classification = match (attack, alert) {
             (true, true) => {
                 tp += 1;
@@ -184,7 +213,9 @@ async fn golden_behavior_and_bounded_load() -> Result<()> {
             }
         };
         results.push(
-            json!({"id":id,"label_attack":attack,"alert":alert,"rules":rules,
+            json!({"id":id,"label_attack":attack,"alert":alert,"rules":rules,"resource":resource,
+            "baseline_expected_rules":baseline,"expected_rules_after_fix":case.get("expected_rules_after_fix"),
+            "attacker_rule_alert":attacker_rule_alert,
             "classification":classification,"raw_journal_lines":case["event_count"],
             "accepted_events":events.len(),"processed_deliveries":processed,
             "elapsed_ms":started.elapsed().as_secs_f64()*1000.0,"note":case["note"]}),
@@ -310,7 +341,11 @@ async fn golden_behavior_and_bounded_load() -> Result<()> {
     latencies.sort_by(f64::total_cmp);
     let p95 = latencies[(latencies.len() * 95).div_ceil(100) - 1];
     let report = json!({"schema_version":1,"scope":"actual journal parsers -> validated sensor storage -> canonical event delivery -> least-privilege security-engine; HTTP auth and physical sensors excluded",
-        "golden_cases":results,"confusion_matrix":{"tp":tp,"fp":fp,"tn":tn,"fn":fn_},
+        "golden_cases":results,
+        "stage":"1_raw_anomaly_detection (any rule, including observation-only rules)",
+        "confusion_matrix":{"tp":tp,"fp":fp,"tn":tn,"fn":fn_},
+        "attacker_rule_matrix":{"tp":tp_attacker,"fp":fp_attacker,"tn":tn_attacker,"fn":fn_attacker,
+            "note":"alerts of observation-only rules (server-fault bursts) excluded; still a detector alert, not an attacker verdict or a block"},
         "quality_gate_passed":fp==0 && fn_==0,"not_a_production_approval":true,
         "load":{"unique_events":192,"retry_submissions":32,"conflicting_submissions_rejected":rejected,
             "input_submissions":232,"accepted_new":192,"accepted_duplicate":32,"explicit_drop":0,

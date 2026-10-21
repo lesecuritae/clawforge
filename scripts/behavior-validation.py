@@ -79,6 +79,9 @@ def main():
             host_port = run(['docker', 'port', name, '5432/tcp']).split(':')[-1]
             environment['DATABASE_URL'] = f'postgres://clawforge:{owner_password}@127.0.0.1:{host_port}/clawforge_test'
             environment['CLAWFORGE_BEHAVIOR_OWNER_URL'] = environment['DATABASE_URL']
+            environment['CLAWFORGE_BEHAVIOR_POLICY_URL'] = (
+                f'postgres://clawforge_policy_engine:{role_passwords["policy_engine"]}'
+                f'@127.0.0.1:{host_port}/clawforge_test')
             environment['CLAWFORGE_BEHAVIOR_ENGINE_URL'] = (
                 f'postgres://clawforge_security_engine:{role_passwords["security_engine"]}'
                 f'@127.0.0.1:{host_port}/clawforge_test')
@@ -95,6 +98,10 @@ def main():
             stage = 'golden_and_load'
             rust('golden-load.log', ['test', '-p', 'clawforge-security-engine',
                  'golden_behavior_and_bounded_load', '--', '--ignored', '--nocapture'], timeout=300)
+            stage = 'policy_and_enforcement_stages'
+            rust('policy-stage.log', ['test', '-p', 'clawforge-policy-engine',
+                 'evidence_decision_and_enforcement_stages_for_the_labelled_cases',
+                 '--', '--ignored', '--nocapture'], timeout=300)
             stage = 'ingest_publish_recovery'
             rust('ingest-recovery.log', ['test', '-p', 'clawforge-security-engine',
                  'ingest_publish_interruption_is_recoverable', '--', '--ignored', '--nocapture'], timeout=120)
@@ -103,6 +110,10 @@ def main():
                  'security_events_register_sensor_and_record_event', '--', '--ignored', '--exact'], timeout=180)
             rust('existing-reputation-regression.log', ['test', '-p', 'clawforge-storage', '--test', 'postgres',
                  'ip_reputation_lookup_flags_a_match_without_ever_storing_the_raw_ip', '--', '--ignored', '--exact'], timeout=180)
+            stage = 'observable_equivalence'
+            (out / 'observables.json').write_text(subprocess.run(
+                [os.sys.executable, '-I', str(repo / 'scripts/behavior-observables.py'), str(out)],
+                check=True, capture_output=True, text=True, timeout=60).stdout)
             stage = 'complete'
         finally:
             # Remove only the freshly named, test-labelled container. No shared ports, volumes or pruning.

@@ -35,7 +35,7 @@ pub use policy_bridge::{BridgeMode, BridgeOutcome, PolicyBridgeParams};
 mod security_assessments;
 mod security_events;
 mod security_policies;
-pub use security_assessments::{SecurityAssessment, SecurityAssessmentUpsert};
+pub use security_assessments::{EventStatusFilter, SecurityAssessment, SecurityAssessmentUpsert};
 pub use security_events::{IpReputationHit, SecuritySensor};
 pub use security_policies::{SecurityPolicy, SecurityPolicyDecisionUpsert};
 
@@ -1032,13 +1032,11 @@ impl PostgresStore {
                 .await?;
             id
         };
-        for event_id in request.event_ids {
-            sqlx::query("INSERT INTO incident_candidate_events (candidate_id,event_id) VALUES ($1,$2) ON CONFLICT DO NOTHING")
-                .bind(candidate_id)
-                .bind(event_id)
-                .execute(&mut *tx)
-                .await?;
-        }
+        sqlx::query("INSERT INTO incident_candidate_events (candidate_id,event_id) SELECT $1, e FROM unnest($2::uuid[]) AS e ON CONFLICT DO NOTHING")
+            .bind(candidate_id)
+            .bind(request.event_ids)
+            .execute(&mut *tx)
+            .await?;
         sqlx::query("UPDATE incident_candidates SET event_count=(SELECT COUNT(*) FROM incident_candidate_events WHERE candidate_id=$1), updated_at=NOW() WHERE id=$1")
             .bind(candidate_id)
             .execute(&mut *tx)

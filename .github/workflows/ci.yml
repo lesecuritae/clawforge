@@ -37,6 +37,7 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo test --workspace
       - run: python3 -I scripts/test-pilot-observation-evaluate.py
+      - run: python3 -I scripts/test-behavior-observables.py
       - run: ./scripts/test-postgres.sh
       - run: cargo clippy --workspace --all-targets -- -D warnings
 

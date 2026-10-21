@@ -68,6 +68,12 @@ actions are not reachable from the bridge.
 
 ## Design notes and residual risks
 
+* **Independence.** `threat_intel_required` is the default precisely because behavioural
+  "corroboration" is weak: two rules over the same event family, or the overlapping windows
+  of one rule, are one observation (see `docs/behavior-validation.md`). The policy engine
+  counts a second source only for fresh reputation, a different event family or an earlier
+  episode; observation-only rules never corroborate and never reach the bridge.
+
 * **Database-side bounds.** Budget <= 100 per window, window >= 60 s, evidence age
   <= 7 days and TTL <= 1 day hold whatever the caller passes. The executor's own apply
   budgets are an independent backstop, as are the action-row state and the executor

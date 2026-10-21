@@ -160,6 +160,8 @@ GRANT INSERT, UPDATE ON TABLE security_policy_decisions, runtime_status
   TO clawforge_policy_engine;
 GRANT EXECUTE ON FUNCTION clawforge_enqueue_goaway_shadow_challenge(UUID)
   TO clawforge_policy_engine;
+-- Independent corroboration (migration 0061): event families only, never payloads.
+GRANT EXECUTE ON FUNCTION clawforge_assessment_event_types(UUID) TO clawforge_policy_engine;
 -- Policy -> execution bridge (migration 0060): the only path by which this role
 -- can create an execution request; every call is re-validated in the database.
 GRANT EXECUTE ON FUNCTION clawforge_policy_bridge_plan(UUID, TEXT, TEXT, INTEGER, UUID, TEXT, INTEGER, BOOLEAN)
