@@ -29,7 +29,7 @@ use clawforge_firewall_agent::docker::{DockerAdapter, NetworkAttachment};
 use clawforge_firewall_agent::proxmox::ProxmoxAdapter;
 use clawforge_firewall_agent::quarantine::QuarantineTarget;
 use clawforge_firewall_agent::{
-    FirewallAction, FirewallAdapter, FirewallTarget, RecoveryTarget, TailscaleAction,
+    ApplyResult, FirewallAction, FirewallAdapter, FirewallTarget, RecoveryTarget, TailscaleAction,
     TailscaleAdapter, TailscaleTarget, VerificationResult,
 };
 use clawforge_storage::{
@@ -1023,6 +1023,18 @@ struct RuleJournal<'a> {
 /// and resolved atomically after; the receipt is then persisted by `finish`, so
 /// the returned `receipts` is empty. Without one (dry-run, or store-free unit
 /// tests), the F1 behavior is unchanged and the in-memory receipt is returned.
+/// The action as it may appear in receipts: a resolved incident source is
+/// replaced by its pseudonym. Every other target is returned unchanged.
+fn receipt_safe_action(action: &FirewallAction) -> FirewallAction {
+    let mut safe = action.clone();
+    if let FirewallTarget::ResolvedIncidentSource { pseudonym, .. } = &action.target {
+        safe.target = FirewallTarget::IncidentSource {
+            pseudonym: pseudonym.clone(),
+        };
+    }
+    safe
+}
+
 async fn apply_single_adapter(
     adapter: &dyn FirewallAdapter,
     action: &FirewallAction,
@@ -1059,7 +1071,11 @@ async fn apply_single_adapter(
                     "rule already present at preflight; refusing to adopt pre-existing (possibly operator-owned) state - no apply, no ownership",
                 );
             }
-            let rendered = match adapter.render(action) {
+            // Adapters refuse to render a resolved address on purpose. The
+            // receipt-safe view (pseudonym placeholder) yields the same
+            // fingerprint the adapter's own apply receipt reports; the exact
+            // resolved target is kept only in the restricted recovery snapshot.
+            let rendered = match adapter.render(&receipt_safe_action(action)) {
                 Ok(rendered) => rendered,
                 Err(_) => {
                     return GenericDispatchOutcome::failed("adapter render failed; apply refused")
@@ -1102,7 +1118,18 @@ async fn apply_single_adapter(
         }
         _ => None,
     };
-    let result = match adapter.apply(action, dry_run).await {
+    // An unresolved pseudonym has no address, so the adapters' own `apply`
+    // (which they keep refusing, dry run included) cannot plan it. A dry run is
+    // previewed through the pure `render`, which handles the placeholder form.
+    let planned = if dry_run && matches!(action.target, FirewallTarget::IncidentSource { .. }) {
+        adapter.render(action).map(|receipt| ApplyResult {
+            receipt,
+            observed_state: None,
+        })
+    } else {
+        adapter.apply(action, dry_run).await
+    };
+    let result = match planned {
         Ok(result) => result,
         Err(_) if dry_run => {
             return GenericDispatchOutcome::failed("adapter dry-run planning failed")
@@ -1314,6 +1341,17 @@ async fn try_dispatch_generic(
     store: Option<&PostgresStore>,
     claimed: &ClaimedExecutionRequest,
 ) -> Option<GenericDispatchOutcome> {
+    try_dispatch_generic_with_mode(store, claimed, dispatch_dry_run(claimed)).await
+}
+
+/// `dry_run` is decided by the live gates in [`dispatch_dry_run`]; it is a
+/// parameter only so isolated tests can exercise a real apply without
+/// mutating process-wide environment variables.
+async fn try_dispatch_generic_with_mode(
+    store: Option<&PostgresStore>,
+    claimed: &ClaimedExecutionRequest,
+    dry_run: bool,
+) -> Option<GenericDispatchOutcome> {
     let multi = claimed
         .action_name
         .starts_with(FIREWALL_MULTI_ADAPTER_PREFIX);
@@ -1330,7 +1368,7 @@ async fn try_dispatch_generic(
             "firewall action has no target",
         ));
     };
-    let action = match parse_firewall_action(claimed.id, target) {
+    let mut action = match parse_firewall_action(claimed.id, target) {
         Ok(action) => action,
         Err(_) => {
             return Some(GenericDispatchOutcome::failed(
@@ -1338,7 +1376,6 @@ async fn try_dispatch_generic(
             ))
         }
     };
-    let dry_run = dispatch_dry_run(claimed);
     // P7-2: refuse a real apply whose TTL exceeds the live ceiling before
     // anything is journaled or applied - a bounded self-expiry is the core
     // guard against a block that outlives its intent and locks someone out.
@@ -1346,6 +1383,37 @@ async fn try_dispatch_generic(
     // are covered by one gate; dry-runs are never affected.
     if let Some(reason) = firewall_ttl_over_live_ceiling(action.ttl_seconds, dry_run) {
         return Some(GenericDispatchOutcome::failed(&reason));
+    }
+    // A real apply needs a concrete address. Resolve a pseudonymized incident
+    // source only now, just before the adapter call; a dry run never resolves.
+    // Anything but an exact resolution of this request's own pseudonym refuses
+    // the apply without touching the host.
+    if !dry_run {
+        if let FirewallTarget::IncidentSource { pseudonym } = &action.target {
+            let Some(store) = store else {
+                return Some(GenericDispatchOutcome::failed(
+                    "incident source cannot be resolved without a store; apply refused",
+                ));
+            };
+            match store.resolve_incident_source_for_apply(claimed.id).await {
+                Ok(Some(resolved)) if resolved.pseudonym == *pseudonym => {
+                    action.target = FirewallTarget::ResolvedIncidentSource {
+                        raw_ip: resolved.raw_ip,
+                        pseudonym: resolved.pseudonym,
+                    };
+                }
+                Ok(_) => {
+                    return Some(GenericDispatchOutcome::failed(
+                        "incident source resolution missing or expired; apply refused",
+                    ))
+                }
+                Err(_) => {
+                    return Some(GenericDispatchOutcome::failed(
+                        "incident source resolution failed; apply refused",
+                    ))
+                }
+            }
+        }
     }
     // Durable write-ahead ownership for real applies (F2). Dry-run never
     // journals; store-free callers (unit tests) pass None and get F1 behavior.
@@ -2039,6 +2107,162 @@ mod tests {
             action_name: action_name.to_string(),
             target,
         }
+    }
+
+    #[test]
+    fn receipt_safe_action_replaces_only_a_resolved_address_with_its_pseudonym() {
+        let resolved = FirewallAction {
+            target: FirewallTarget::ResolvedIncidentSource {
+                raw_ip: "203.0.113.77".into(),
+                pseudonym: "ip-pseudonym:abc".into(),
+            },
+            ttl_seconds: 60,
+            reason: "r".into(),
+        };
+        let safe = receipt_safe_action(&resolved);
+        assert_eq!(
+            safe.target,
+            FirewallTarget::IncidentSource {
+                pseudonym: "ip-pseudonym:abc".into()
+            }
+        );
+        assert!(!format!("{safe:?}").contains("203.0.113.77"));
+        let indicator = FirewallAction {
+            target: FirewallTarget::ThreatIntelIndicator {
+                cidr: "203.0.113.9/32".into(),
+                source: "s".into(),
+            },
+            ttl_seconds: 60,
+            reason: "r".into(),
+        };
+        assert_eq!(receipt_safe_action(&indicator).target, indicator.target);
+    }
+
+    #[tokio::test]
+    async fn a_real_incident_source_apply_without_a_store_is_refused_before_any_adapter_call() {
+        let request = claimed(
+            "nftables.block_incident_source",
+            Some(serde_json::json!({
+                "kind": "incident_source",
+                "pseudonym": "ip-pseudonym:abc",
+                "ttl_seconds": 60
+            })),
+        );
+        let outcome = try_dispatch_generic_with_mode(None, &request, false)
+            .await
+            .expect("firewall action");
+        assert_eq!(outcome.completion, DispatchCompletion::Failed);
+        assert!(outcome.receipts.is_empty());
+        assert!(outcome
+            .error_summary
+            .unwrap_or_default()
+            .contains("cannot be resolved without a store"));
+        // A dry run never resolves and still plans the redacted receipt.
+        let dry = try_dispatch_generic_with_mode(None, &request, true)
+            .await
+            .expect("firewall action");
+        assert_eq!(dry.completion, DispatchCompletion::Success);
+        assert!(dry.receipts.iter().all(|receipt| receipt.is_dry_run));
+    }
+
+    /// Real kernel + real PostgreSQL, both isolated: an unresolved incident
+    /// source is resolved just in time, journaled with a receipt-safe view,
+    /// applied and verified in nftables, then rolled back from the restricted
+    /// recovery snapshot. An expired resolution applies nothing.
+    #[tokio::test]
+    #[ignore = "requires an isolated nftables lab (NET_ADMIN) and a PostgreSQL fixture"]
+    async fn incident_source_real_apply_resolves_journals_and_rolls_back_lab() -> anyhow::Result<()>
+    {
+        let owner = PostgresStore::connect(&std::env::var("CLAWFORGE_TEST_DATABASE_URL")?).await?;
+        let store =
+            PostgresStore::connect_runtime(&std::env::var("CLAWFORGE_TEST_EXECUTOR_DATABASE_URL")?)
+                .await?;
+        let pool = owner.pool();
+        let action_id: Uuid = sqlx::query_scalar("INSERT INTO actions(id,name,type,risk_level,required_scope,requires_approval,enabled) VALUES($1,'nftables.block_incident_source','connector_action','low','agent:action:read',FALSE,TRUE) ON CONFLICT(name) DO UPDATE SET enabled=TRUE RETURNING id")
+            .bind(Uuid::new_v4()).fetch_one(pool).await?;
+        let host = 200 + (Uuid::new_v4().as_u128() % 50) as u8;
+        let raw_ip = format!("203.0.113.{host}");
+        let adapter = clawforge_firewall_agent::NftablesAdapter::new();
+        let mut requests = Vec::new();
+        for (label, ttl_seconds) in [("live", 600_i64), ("expired", -5)] {
+            let pseudonym = format!("ip-pseudonym:lab-{label}-{}", Uuid::new_v4().simple());
+            sqlx::query("INSERT INTO security_ip_resolutions(pseudonym,raw_ip,source,expires_at) VALUES($1,$2::inet,'lab',NOW()+($3*INTERVAL '1 second'))")
+                .bind(&pseudonym).bind(&raw_ip).bind(ttl_seconds).execute(pool).await?;
+            let target = serde_json::json!({"kind": "incident_source", "pseudonym": pseudonym, "ttl_seconds": 600});
+            let id = Uuid::new_v4();
+            sqlx::query("INSERT INTO execution_requests(id,action_id,requested_by,status,approval_context) VALUES($1,$2,'lab','pending',$3)")
+                .bind(id).bind(action_id).bind(serde_json::json!({"version": 1, "target": target})).execute(pool).await?;
+            sqlx::query("UPDATE execution_requests SET status='starting' WHERE id=$1")
+                .bind(id)
+                .execute(pool)
+                .await?;
+            requests.push((id, pseudonym, target));
+        }
+        let resolved_target = FirewallTarget::ResolvedIncidentSource {
+            raw_ip: raw_ip.clone(),
+            pseudonym: requests[0].1.clone(),
+        };
+
+        // Expired resolution: refused, nothing in the kernel.
+        let (id, _, target) = &requests[1];
+        let expired = ClaimedExecutionRequest {
+            id: *id,
+            action_name: "nftables.block_incident_source".into(),
+            target: Some(target.clone()),
+        };
+        let outcome = try_dispatch_generic_with_mode(Some(&store), &expired, false)
+            .await
+            .unwrap();
+        assert_eq!(outcome.completion, DispatchCompletion::Failed);
+        assert_eq!(
+            adapter.verify(&resolved_target).await.unwrap(),
+            VerificationResult::NotPresent
+        );
+
+        // Live resolution: journaled, applied and verified.
+        let (id, pseudonym, target) = &requests[0];
+        let live = ClaimedExecutionRequest {
+            id: *id,
+            action_name: "nftables.block_incident_source".into(),
+            target: Some(target.clone()),
+        };
+        let outcome = try_dispatch_generic_with_mode(Some(&store), &live, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.completion,
+            DispatchCompletion::Success,
+            "{:?}",
+            outcome.error_summary
+        );
+        assert!(matches!(outcome.effect, FirewallEffect::VerifiedOwned(_)));
+        assert_eq!(
+            adapter.verify(&resolved_target).await.unwrap(),
+            VerificationResult::Verified
+        );
+
+        // Receipts and previews carry the pseudonym, never the address.
+        let (intent_id, snapshot): (Uuid, serde_json::Value) = sqlx::query_as("SELECT id, fw_target_json FROM firewall_action_intents WHERE execution_id=$1 AND fw_rule_fingerprint IS NOT NULL")
+            .bind(id).fetch_one(pool).await?;
+        let intent = store.firewall_rule_intent(intent_id).await?.unwrap();
+        assert_eq!(intent.status, "completed");
+        assert!(intent.rule_fingerprint.contains(pseudonym.as_str()));
+        assert!(!intent.rule_fingerprint.contains(&raw_ip));
+        let receipt_text: String = sqlx::query_scalar("SELECT COALESCE(string_agg(rendered_commands::text || rollback_plan::text || COALESCE(target_fingerprint,'') || preflight_state::text, ' '), '') FROM firewall_action_receipts WHERE execution_id=$1")
+            .bind(id).fetch_one(pool).await?;
+        assert!(
+            !receipt_text.is_empty() && !receipt_text.contains(&raw_ip),
+            "{receipt_text}"
+        );
+
+        // The restricted recovery snapshot reconstructs the exact address.
+        rollback_firewall_rule_generation_target("nftables", &snapshot, "lab rollback".into())
+            .await?;
+        assert_eq!(
+            adapter.verify(&resolved_target).await.unwrap(),
+            VerificationResult::NotPresent
+        );
+        Ok(())
     }
 
     #[test]
