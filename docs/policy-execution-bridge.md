@@ -73,6 +73,10 @@ actions are not reachable from the bridge.
   target-active, budget, executor-health and unresolved-generation stops, role
   least privilege, and the chain propose -> two approvals (Rust hash recomputation)
   -> executor claim.
+* `scripts/test-incident-source-lab.sh` (not part of CI; needs Docker and network): a
+  disposable PostgreSQL plus a container that shares its network namespace and holds
+  NET_ADMIN, so a real kernel nftables applies, verifies and rolls back an
+  incident-source block (IPv4 and IPv6) with receipts free of the address.
 * `policy-engine` unit tests for configuration validation and an end-to-end test
   from assessment to simulated request.
 

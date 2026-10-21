@@ -48,7 +48,9 @@ docker run --rm -d --name "$container" \
   -e POSTGRES_PASSWORD=test-password-012345 \
   -p 127.0.0.1:55432:5432 postgres:16-alpine >/dev/null
 
-until docker exec "$container" pg_isready -U clawforge -d clawforge_test >/dev/null 2>&1; do sleep 1; done
+# TCP readiness (-h): the image first serves only a unix socket while it initializes,
+# so a socket-only probe can pass just before the final restart.
+until docker exec "$container" pg_isready -h 127.0.0.1 -U clawforge -d clawforge_test >/dev/null 2>&1; do sleep 1; done
 
 printf '%s\n' 'test-password-012345' >"$secret_dir/postgres_password"
 for role in api worker correlation security_engine policy_engine incidents executor operations decision; do
@@ -130,6 +132,7 @@ export CLAWFORGE_TEST_MIGRATION_URL="$owner_url"
 export CLAWFORGE_TEST_DATABASE_URL="$owner_url"
 export CLAWFORGE_TEST_API_DATABASE_URL="$(cat "$secret_dir/database_api_url")"
 export CLAWFORGE_TEST_EXECUTOR_DATABASE_URL="$(cat "$secret_dir/database_executor_url")"
+export CLAWFORGE_TEST_POLICY_ENGINE_DATABASE_URL="$(cat "$secret_dir/database_policy_engine_url")"
 run_cargo test -p clawforge-storage --test migration_lineages -- --ignored --test-threads=1
 run_cargo test -p clawforge-storage --test quarantine_approval -- --ignored --test-threads=1
 

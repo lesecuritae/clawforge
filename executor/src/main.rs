@@ -2173,6 +2173,12 @@ mod tests {
     #[ignore = "requires an isolated nftables lab (NET_ADMIN) and a PostgreSQL fixture"]
     async fn incident_source_real_apply_resolves_journals_and_rolls_back_lab() -> anyhow::Result<()>
     {
+        let host = 200 + (Uuid::new_v4().as_u128() % 50) as u8;
+        incident_source_lab_case(&format!("203.0.113.{host}")).await?;
+        incident_source_lab_case(&format!("2001:db8::{host:x}")).await
+    }
+
+    async fn incident_source_lab_case(raw_ip: &str) -> anyhow::Result<()> {
         let owner = PostgresStore::connect(&std::env::var("CLAWFORGE_TEST_DATABASE_URL")?).await?;
         let store =
             PostgresStore::connect_runtime(&std::env::var("CLAWFORGE_TEST_EXECUTOR_DATABASE_URL")?)
@@ -2180,8 +2186,7 @@ mod tests {
         let pool = owner.pool();
         let action_id: Uuid = sqlx::query_scalar("INSERT INTO actions(id,name,type,risk_level,required_scope,requires_approval,enabled) VALUES($1,'nftables.block_incident_source','connector_action','low','agent:action:read',FALSE,TRUE) ON CONFLICT(name) DO UPDATE SET enabled=TRUE RETURNING id")
             .bind(Uuid::new_v4()).fetch_one(pool).await?;
-        let host = 200 + (Uuid::new_v4().as_u128() % 50) as u8;
-        let raw_ip = format!("203.0.113.{host}");
+        let raw_ip = raw_ip.to_string();
         let adapter = clawforge_firewall_agent::NftablesAdapter::new();
         let mut requests = Vec::new();
         for (label, ttl_seconds) in [("live", 600_i64), ("expired", -5)] {
