@@ -146,6 +146,7 @@ run_cargo test -p clawforge-executor operator_reconcile_restores_a_recovery_requ
 run_cargo test -p clawforge-storage --test dispatch_recovery -- --ignored --test-threads=1
 run_cargo test -p clawforge-storage --test incident_source_resolution -- --ignored --test-threads=1
 run_cargo test -p clawforge-storage --test policy_bridge -- --ignored --test-threads=1
+run_cargo test -p clawforge-storage --test source_intel -- --ignored --test-threads=1
 
 export CLAWFORGE_TEST_FIREWALL_RULE_DATABASE_URL="$owner_url"
 run_cargo test -p clawforge-storage --test firewall_rule_intents -- --ignored --test-threads=1
