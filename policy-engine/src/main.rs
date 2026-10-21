@@ -92,7 +92,27 @@ fn threat_intel_min_confidence() -> i16 {
 /// (`confidence`, `last_seen`, the two thresholds) is already visible on
 /// the persisted assessment/in this service's own env config - nothing
 /// about the discount is a black box.
+/// Providers whose indicators describe routing context, never reputation. Hits
+/// recorded at ingest time before the reputation lookup excluded them (production
+/// held a RouteViews `0.0.0.0/0` row that "matched" every IPv4 address) must not
+/// count as corroboration when a stored snapshot is the only evidence left.
+const NETWORK_CONTEXT_SOURCES: &[&str] = &[
+    "routeviews",
+    "ripe_ris",
+    "ripestat_asn",
+    "hackertarget_asn",
+    "peeringdb",
+    "caida_as_rank",
+    "team_cymru",
+    "bgpstream",
+    "bgpview_asn",
+    "rpki_validator",
+];
+
 fn threat_intel_hit_is_corroborating(hit: &clawforge_storage::IpReputationHit) -> bool {
+    if NETWORK_CONTEXT_SOURCES.contains(&hit.source.as_str()) {
+        return false;
+    }
     if hit.confidence < threat_intel_min_confidence() {
         return false;
     }
@@ -565,6 +585,24 @@ mod tests {
             "a fresh but low-confidence hit (below the default minimum of 50) must not corroborate"
         );
         Ok(())
+    }
+
+    #[test]
+    fn a_network_context_source_never_corroborates_even_when_fresh_and_confident() {
+        for source in NETWORK_CONTEXT_SOURCES {
+            let hit = clawforge_storage::IpReputationHit {
+                source: source.to_string(),
+                confidence: 99,
+                last_seen: chrono::Utc::now(),
+            };
+            assert!(!threat_intel_hit_is_corroborating(&hit), "{source}");
+        }
+        let listed = clawforge_storage::IpReputationHit {
+            source: "spamhaus_drop".into(),
+            confidence: 80,
+            last_seen: chrono::Utc::now(),
+        };
+        assert!(threat_intel_hit_is_corroborating(&listed));
     }
 
     #[test]

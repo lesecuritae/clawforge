@@ -1040,6 +1040,63 @@ async fn migrations_and_restart_persist() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Regression for a production defect: a RouteViews context row `0.0.0.0/0` matched
+/// every IPv4 address as "listed" (thousands of assessments were marked
+/// threat-intel corroborated by it). Network-context indicators and implausibly wide
+/// prefixes must never count; a specific reputation prefix still does.
+#[tokio::test]
+#[ignore = "requires an isolated PostgreSQL test container"]
+async fn network_context_indicators_and_default_routes_never_count_as_reputation(
+) -> anyhow::Result<()> {
+    let url =
+        std::env::var("CLAWFORGE_TEST_DATABASE_URL").or_else(|_| std::env::var("DATABASE_URL"))?;
+    let store = PostgresStore::connect(&url).await?;
+    let tag = uuid::Uuid::new_v4().simple().to_string();
+    let probe = "198.18.77.9"; // benchmarking range: no real feed lists it
+    let mut ids = Vec::new();
+    for (value, kind, category, source) in [
+        ("0.0.0.0/0", "Prefix", "network-intelligence", "routeviews"),
+        (
+            "198.18.0.0/15",
+            "Prefix",
+            "network-intelligence",
+            "ripe_ris",
+        ),
+        ("128.0.0.0/1", "Prefix", "spamhaus_drop", "wide_feed"),
+        ("198.0.0.0/7", "Prefix", "spamhaus_drop", "wide_feed"),
+        ("::/0", "Prefix", "spamhaus_drop", "wide_feed"),
+    ] {
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO indicators (value,indicator_type,categories,confidence,source,first_seen,last_seen,expires_at) \
+             VALUES ($1,$2,jsonb_build_array($3::text),95,$4,NOW(),NOW(),NOW()+INTERVAL '1 hour') RETURNING id",
+        )
+        .bind(value).bind(kind).bind(category).bind(format!("{source}-{tag}"))
+        .fetch_one(store.pool()).await?;
+        ids.push(id);
+    }
+    let result = async {
+        assert_eq!(store.lookup_ip_reputation(probe).await?, None);
+        assert_eq!(store.lookup_ip_reputation("2001:db8::1").await?, None);
+        // A specific reputation prefix (a /8 is the widest accepted) still matches.
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO indicators (value,indicator_type,categories,confidence,source,first_seen,last_seen,expires_at) \
+             VALUES ('198.0.0.0/8','Prefix','[\"spamhaus_drop\"]',85,$1,NOW(),NOW(),NOW()+INTERVAL '1 hour') RETURNING id",
+        )
+        .bind(format!("listed-{tag}"))
+        .fetch_one(store.pool()).await?;
+        ids.push(id);
+        let hit = store.lookup_ip_reputation(probe).await?.expect("a /8 reputation prefix matches");
+        assert_eq!(hit.source, format!("listed-{tag}"));
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    sqlx::query("DELETE FROM indicators WHERE id = ANY($1)")
+        .bind(&ids)
+        .execute(store.pool())
+        .await?;
+    result
+}
+
 /// Regression: `upsert_ip_resolution` bound the address as TEXT against an INET
 /// column, so every write failed (only a warning, by design) and no incident-source
 /// block could ever be resolved. Ingest must leave a short-TTL, single-host

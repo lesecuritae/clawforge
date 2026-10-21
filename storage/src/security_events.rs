@@ -372,14 +372,10 @@ impl PostgresStore {
         if ip.parse::<std::net::IpAddr>().is_err() {
             return Ok(None);
         }
+        // The single definition of "listed" lives in the database (migration 0062):
+        // network-context indicators and implausibly wide prefixes never match.
         let row = sqlx::query(
-            "SELECT source, confidence, last_seen FROM indicators \
-             WHERE expires_at > NOW() \
-             AND ( \
-               (indicator_type='Ip' AND value=$1) OR \
-               (indicator_type='Prefix' AND $1::inet <<= value::cidr) \
-             ) \
-             ORDER BY confidence DESC, last_seen DESC LIMIT 1",
+            "SELECT source, confidence, last_seen FROM clawforge_ip_reputation($1::inet)",
         )
         .bind(ip)
         .fetch_optional(self.pool())

@@ -14,3 +14,6 @@ serde_json.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
 clawforge-secret = { path = "../secret" }
+
+[dev-dependencies]
+tokio.workspace = true
