@@ -1,13 +1,73 @@
 use clawforge_storage::{ExecutionRequestInput, PostgresStore};
+use sqlx::{postgres::PgConnectOptions, ConnectOptions, PgPool};
+use std::str::FromStr;
 
 #[tokio::test]
 #[ignore = "requires an isolated CLAWFORGE_TEST_DATABASE_URL"]
 async fn quarantine_needs_two_distinct_approvers_and_revalidates_policy_at_claim(
 ) -> anyhow::Result<()> {
-    let store = PostgresStore::connect(&std::env::var("CLAWFORGE_TEST_DATABASE_URL")?).await?;
-    let executor =
-        PostgresStore::connect_runtime(&std::env::var("CLAWFORGE_TEST_EXECUTOR_DATABASE_URL")?)
-            .await?;
+    let base = std::env::var("CLAWFORGE_TEST_DATABASE_URL")?;
+    let executor_base = std::env::var("CLAWFORGE_TEST_EXECUTOR_DATABASE_URL")?;
+    let admin = PgPool::connect(&base).await?;
+    let database = format!("quarantine_approval_{}", uuid::Uuid::new_v4().simple());
+    sqlx::query(&format!("CREATE DATABASE {database}"))
+        .execute(&admin)
+        .await?;
+    let owner_url = PgConnectOptions::from_str(&base)?
+        .database(&database)
+        .to_url_lossy()
+        .to_string();
+    let executor_url = PgConnectOptions::from_str(&executor_base)?
+        .database(&database)
+        .to_url_lossy()
+        .to_string();
+    // Earlier suites intentionally retain immutable request/approval audit rows.
+    // A global claim must see only this test's requests, never claim those rows.
+    // Spawn catches assertion panics so the disposable DB is also removed on RED.
+    let result =
+        tokio::spawn(async move { check_approval_invariants(&owner_url, &executor_url).await })
+            .await;
+    let cleanup = sqlx::query(&format!("DROP DATABASE {database} WITH (FORCE)"))
+        .execute(&admin)
+        .await;
+    admin.close().await;
+    cleanup?;
+    result??;
+    Ok(())
+}
+
+async fn check_approval_invariants(owner_url: &str, executor_url: &str) -> anyhow::Result<()> {
+    let store = PostgresStore::connect(owner_url).await?;
+    let provision = include_str!("../../scripts/provision-db-roles.sh");
+    let grants = provision
+        .split("GRANT SELECT ON TABLE _sqlx_migrations, actions, execution_requests,")
+        .nth(1)
+        .expect("executor grants start")
+        .split("GRANT SELECT ON ALL TABLES IN SCHEMA public TO clawforge_backup;")
+        .next()
+        .expect("executor grants end");
+    sqlx::raw_sql(&format!(
+        "GRANT SELECT ON TABLE _sqlx_migrations, actions, execution_requests,{grants}"
+    ))
+    .execute(store.pool())
+    .await?;
+    let executor = PostgresStore::connect_runtime(executor_url).await?;
+    let request_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM execution_requests")
+        .fetch_one(store.pool())
+        .await?;
+    assert_eq!(
+        request_count, 0,
+        "approval fixture starts with an empty queue"
+    );
+    let elevated: bool = sqlx::query_scalar(
+        "SELECT rolsuper OR rolcreatedb OR rolcreaterole FROM pg_roles WHERE rolname=current_user",
+    )
+    .fetch_one(executor.pool())
+    .await?;
+    assert!(
+        !elevated,
+        "approvals must be checked by the restricted executor"
+    );
     for table in [
         "execution_approvals",
         "approval_policies",
