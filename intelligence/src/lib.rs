@@ -4,6 +4,8 @@
 //! and collectors can be added behind the worker boundary without coupling the
 //! risk model to a transport.
 
+pub mod ip_context;
+
 use std::{env, net::IpAddr, time::Duration};
 
 use async_trait::async_trait;
