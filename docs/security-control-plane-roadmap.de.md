@@ -727,19 +727,20 @@ Belege und Einzelheiten: [Phase-7-Pilotnachweis](phase7-pilot-evidence-20261021.
   Rollback-Receipt zählte im Apply-Budget), behoben in `8b75ee5` und `aad5e12`.
   Das ist **kein** Produktionsnachweis und keine Freigabe für Automatik.
 - **7B (48-h-Beobachtung): Fenster abgelaufen, Gate NICHT bestanden.**
-  2676 von erwarteten 2880 Proben, 168 SSH-Ausfälle (`telemetry_unavailable`).
+  2676 Probenversuche (nominell 2880, realer Zyklus Ø 64,6 s), davon 2508
+  erfolgreich und 168 SSH-Ausfälle (`telemetry_unavailable`).
   Alle erfolgreichen Proben zeigen den Ruhezustand (0 unaufgelöste Generationen,
   leere Sets, kein Executor). False Positives wurden **nicht gemessen** (nur
   Dokumentationsadresse), Rollback-p95 liegt nur als n=1 vor. Laut
   Stoppbedingungen sperren Telemetrieausfälle neue automatische Applies; die
   Auswertung erfordert eine Betreiberentscheidung.
-- **7C: nicht begonnen; gesperrt durch das nicht bestandene 7B.** Eine
-  Policy→Execution-Brücke für Block/RateLimit ist technisch möglich (die
-  Zielauflösung `ip-pseudonym` → Roh-IP erfolgt über `security_ip_resolutions`
-  mit kurzer TTL erst unmittelbar vor dem Apply), setzt aber Betreiberentscheidungen
-  voraus, die nicht aus dem Code abgeleitet werden dürfen: Dienstidentität als
-  Antragsteller (`requested_by_id` verlangt einen `admin_users`-Eintrag),
-  Policyklasse und TTL, Budget. Details im Pilotnachweis, Abschnitt 7C.
+- **7C: Brücke nicht vorhanden; Vorarbeit in Arbeit.** Bis Migration `0059`
+  las nichts `security_ip_resolutions`, und der journalisierte Apply-Pfad lehnte
+  aufgelöste Adressen ab: ein echter Incident-Source-Block war unmöglich. `0059`
+  ergänzt den engen Resolver für die Executor-Rolle samt Executor-Anbindung
+  (siehe Pilotnachweis). Die Policy→Execution-Brücke selbst (Block/RateLimit) gilt
+  erst als vorhanden, wenn sie implementiert und getestet ist; Live-Betrieb bleibt
+  durch 7B und die Executor-Gates gesperrt.
 
 ## Phase 8: Threat Intelligence
 
