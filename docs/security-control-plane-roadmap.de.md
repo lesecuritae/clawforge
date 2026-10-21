@@ -682,7 +682,9 @@ bis der Nutzer dazu separat gefragt wurde und zustimmt.
   kann als den, der tatsaechlich liefe. `blast_radius_hint` markiert
   Einzeladress-Ziele (`/32`/`/128`/keine Praefix) als Canary-groesse.)
 - Gate 7A: manuell freigegebener Produktions-Canary für `/32`/`/128` mit kurzer
-  TTL; noch keine automatische Sperre (**noch offen - ein echter Versuch am
+  TTL; noch keine automatische Sperre (**Stand 2026-10-21: als isolierter
+  VPS-Einzelcanary bestanden, siehe „Prüfstand 2026-10-21“ unten; der folgende
+  Text über den Versuch vom 2026-09-24 ist Historie** - ein echter Versuch am
   2026-09-24 gegen srv19680 wurde bewusst abgebrochen**: Zielhost (srv19680),
   Ziel-IP (echte Spamhaus-DROP-Adresse `103.95.56.1/32`), Adapterwahl
   (HAProxy statt nftables - kleinerer Blast-Radius, nur `korbklar_https`),
@@ -711,6 +713,33 @@ bis der Nutzer dazu separat gefragt wurde und zustimmt.
 
 Veraltete, widersprüchliche oder nicht ausreichend unabhängige Threat-
 Intelligence ergibt höchstens `observe` oder `approval`, niemals `automatic`.
+
+### Prüfstand 2026-10-21
+
+Belege und Einzelheiten: [Phase-7-Pilotnachweis](phase7-pilot-evidence-20261021.md).
+
+- **7A (isolierter VPS-Pilot): bestanden.** Der dritte native Antrag wurde von
+  einem unabhängigen Betreiber freigegeben: echter Kernel-Block von
+  `203.0.113.18/32` (TTL 60 s), gemessene Paketblockade, Wiederherstellung,
+  Execution `success`, Generation `rolled_back`, je ein real verifiziertes
+  Apply- und Rollback-Receipt. Zwei vorherige Versuche scheiterten an echten
+  Defekten (Verifier `/32` vs. nft-Bare-IP, interner `RecoveryTarget`-Decoder,
+  Rollback-Receipt zählte im Apply-Budget), behoben in `8b75ee5` und `aad5e12`.
+  Das ist **kein** Produktionsnachweis und keine Freigabe für Automatik.
+- **7B (48-h-Beobachtung): Fenster abgelaufen, Gate NICHT bestanden.**
+  2676 von erwarteten 2880 Proben, 168 SSH-Ausfälle (`telemetry_unavailable`).
+  Alle erfolgreichen Proben zeigen den Ruhezustand (0 unaufgelöste Generationen,
+  leere Sets, kein Executor). False Positives wurden **nicht gemessen** (nur
+  Dokumentationsadresse), Rollback-p95 liegt nur als n=1 vor. Laut
+  Stoppbedingungen sperren Telemetrieausfälle neue automatische Applies; die
+  Auswertung erfordert eine Betreiberentscheidung.
+- **7C: nicht begonnen; gesperrt durch das nicht bestandene 7B.** Eine
+  Policy→Execution-Brücke für Block/RateLimit ist technisch möglich (die
+  Zielauflösung `ip-pseudonym` → Roh-IP erfolgt über `security_ip_resolutions`
+  mit kurzer TTL erst unmittelbar vor dem Apply), setzt aber Betreiberentscheidungen
+  voraus, die nicht aus dem Code abgeleitet werden dürfen: Dienstidentität als
+  Antragsteller (`requested_by_id` verlangt einen `admin_users`-Eintrag),
+  Policyklasse und TTL, Budget. Details im Pilotnachweis, Abschnitt 7C.
 
 ## Phase 8: Threat Intelligence
 
