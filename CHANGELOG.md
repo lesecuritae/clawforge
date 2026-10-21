@@ -4,6 +4,34 @@
 
 Weitere Änderungen für die nächste Version werden hier gesammelt.
 
+## [1.2.0] - 2026-10-21
+
+- Fixed the persistence of IP resolutions (`security_ip_resolutions`): the
+  text-to-`inet` bind failed in production and left no raw-address resolution.
+- Fixed the reputation lookup (migration 0062): network-context indicators such
+  as a RouteViews `0.0.0.0/0` entry no longer count as a threat listing, and
+  prefixes shorter than /8 (IPv4) or /16 (IPv6) never match a source.
+- Detection: staggered window grids close the window-boundary evasion of the
+  SSH and HTTP rules (rule version 2); HTTP 5xx is no longer client behaviour;
+  an assessment only becomes an attacker finding with independent evidence
+  (migration 0061). Raw anomaly, assessment, policy decision and execution are
+  reported as separate stages.
+- Current source intelligence and routing context (migrations 0063, 0064): a
+  listing counts only while it is current; RPKI, multi-origin and BGP facts are
+  shown and never counted. No ASN or prefix is ever blocked.
+- Optional policy-to-execution bridge (migrations 0059, 0060, 0064), **off by
+  default**: modes simulate/propose/automatic, DB-side bounds, approval context
+  bound to the evidence, and dispatch-time revalidation of the listing.
+- Optional RIPEstat routing-context enrichment in the worker, **off by
+  default** (it sends addresses of suspicious sources to RIPE NCC when enabled).
+- Executor: narrow resolver role for the incident-source block, receipt-safe
+  action view, nftables /32 and /128 verification, rollback receipts do not
+  count against the apply budget.
+- Release pipeline: the image matrix builds `security-engine` and
+  `policy-engine`; images are linux/amd64.
+- Upgrade: additive migrations 0059-0064 (ledger 58 to 64). No live
+  enforcement, bridge, enrichment or quarantine is enabled by the upgrade.
+
 ## [1.0.0] - 2026-09-09
 
 - Marked the first stable Clawforge release as a self-hosted Operations
