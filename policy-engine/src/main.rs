@@ -38,10 +38,15 @@
 //! gate ("Policies können gegen historische Incidents replayed werden")
 //! true by construction rather than an untested claim.
 
+mod bridge;
+
 use anyhow::Result;
+use bridge::BridgeConfig;
 use clawforge_policy::{decide, Decision};
 use clawforge_risk::RiskAssessment;
-use clawforge_storage::{database_url_from_env, PostgresStore, SecurityPolicyDecisionUpsert};
+use clawforge_storage::{
+    database_url_from_env, BridgeOutcome, PostgresStore, SecurityPolicyDecisionUpsert,
+};
 use sha2::{Digest, Sha256};
 use std::env;
 use tracing::{info, warn};
@@ -226,6 +231,7 @@ fn evidence_hash(
 async fn evaluate_assessment(
     store: &PostgresStore,
     assessment: &clawforge_storage::SecurityAssessment,
+    bridge: Option<&BridgeConfig>,
 ) -> Result<()> {
     let policies = store
         .list_active_security_policies_for_rule(&assessment.rule_id, chrono::Utc::now())
@@ -287,6 +293,27 @@ async fn evaluate_assessment(
         if outcome.decision == Decision::Challenge {
             store.enqueue_goaway_shadow_challenge(decision_id).await?;
         }
+        // Optional policy -> execution bridge (default off). The database
+        // re-derives and re-checks every condition; a refusal is routine (the
+        // same decision is re-evaluated each poll) and never fails evaluation.
+        if let (Some(bridge), Decision::Block | Decision::RateLimit) = (bridge, outcome.decision) {
+            if let Some(params) = bridge.params_for(outcome.decision == Decision::RateLimit) {
+                match store
+                    .enqueue_policy_bridge_request(decision_id, &params)
+                    .await
+                {
+                    Ok(BridgeOutcome::Enqueued(request_id)) => info!(
+                        %request_id, %decision_id, mode = params.mode.as_str(),
+                        action = %params.action_name, "policy bridge created an execution request"
+                    ),
+                    Ok(BridgeOutcome::Duplicate(_)) => {}
+                    Ok(BridgeOutcome::Rejected(reason)) => {
+                        tracing::debug!(%decision_id, %reason, "policy bridge declined a decision")
+                    }
+                    Err(error) => warn!(%error, %decision_id, "policy bridge call failed"),
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -314,21 +341,34 @@ async fn main() -> Result<()> {
     let poll = poll_interval();
     let limit = recent_assessments_limit();
     let store = PostgresStore::connect_runtime(&database_url_from_env()?).await?;
+    // An invalid bridge configuration disables the bridge entirely and stays
+    // visible in the runtime status; shadow decisions keep running.
+    let (bridge, bridge_error) = match BridgeConfig::from_env() {
+        Ok(config) => (config, None),
+        Err(reason) => {
+            warn!(%reason, "policy bridge disabled: invalid configuration");
+            (None, Some(format!("policy bridge disabled: {reason}")))
+        }
+    };
     store
-        .set_runtime_status("policy-engine", "running", None)
+        .set_runtime_status("policy-engine", "running", bridge_error.as_deref())
         .await?;
+    match &bridge {
+        Some(config) => info!(mode = config.mode.as_str(), "policy bridge enabled"),
+        None => info!("policy bridge off"),
+    }
     info!(shadow_mode = true, "Clawforge policy engine started");
     let mut interval = tokio::time::interval(poll);
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                if let Err(error) = store.set_runtime_status("policy-engine", "running", None).await {
+                if let Err(error) = store.set_runtime_status("policy-engine", "running", bridge_error.as_deref()).await {
                     warn!(%error, "could not heartbeat policy-engine runtime status");
                 }
                 match store.list_security_assessments(None, limit).await {
                     Ok(assessments) => {
                         for assessment in assessments {
-                            if let Err(error) = evaluate_assessment(&store, &assessment).await {
+                            if let Err(error) = evaluate_assessment(&store, &assessment, bridge.as_ref()).await {
                                 warn!(%error, assessment_id = %assessment.id, "policy evaluation failed");
                             }
                         }
@@ -704,6 +744,131 @@ mod tests {
         assert_eq!(decision_str(Decision::Block), "block");
     }
 
+    /// End to end through the real engine path: a threat-intel-corroborated
+    /// assessment becomes a Block shadow decision, and only a configured bridge
+    /// turns it into exactly one simulation-only request.
+    #[tokio::test]
+    #[ignore = "requires provisioned roles in an isolated PostgreSQL test container"]
+    async fn bridge_turns_a_corroborated_block_into_one_simulated_request_only_when_configured(
+    ) -> Result<()> {
+        let owner =
+            PostgresStore::connect_runtime(&env::var("CLAWFORGE_TEST_DATABASE_URL")?).await?;
+        let engine = PostgresStore::connect_runtime(&env::var(
+            "CLAWFORGE_TEST_SECURITY_ENGINE_DATABASE_URL",
+        )?)
+        .await?;
+        let policy_engine =
+            PostgresStore::connect_runtime(&env::var("CLAWFORGE_TEST_POLICY_ENGINE_DATABASE_URL")?)
+                .await?;
+        // Simulation requires the action to be disabled (its seeded state).
+        sqlx::query("UPDATE actions SET enabled=FALSE WHERE name='nftables.block_incident_source'")
+            .execute(owner.pool())
+            .await?;
+        let resource = format!("ip-pseudonym:bridge-{}", uuid::Uuid::new_v4());
+        let now = chrono::Utc::now();
+        let event_id = owner
+            .publish_event(
+                "ssh_login_failure",
+                "test-sensor",
+                "critical",
+                now,
+                Some(&resource),
+                serde_json::json!({"test": true}),
+                serde_json::json!({}),
+                &format!("test:policy-bridge-fixture:{resource}"),
+            )
+            .await?;
+        let assessment_id = engine
+            .persist_security_assessment(clawforge_storage::SecurityAssessmentUpsert {
+                rule_id: "ssh_bruteforce",
+                rule_version: "1",
+                engine_version: "test",
+                dedupe_key: &format!("ssh_bruteforce:v1:{resource}:{}", now.timestamp()),
+                resource: &resource,
+                severity: "critical",
+                confidence: 99,
+                summary: "bridge fixture",
+                event_count: 20,
+                window_seconds: 300,
+                bucket_start: now,
+                first_seen: now,
+                last_seen: now,
+                event_ids: &[event_id],
+                threat_intel: Some(clawforge_storage::IpReputationHit {
+                    source: "spamhaus_drop".to_string(),
+                    confidence: 90,
+                    last_seen: now,
+                }),
+            })
+            .await?;
+        let assessment = policy_engine
+            .list_security_assessments(None, 500)
+            .await?
+            .into_iter()
+            .find(|value| value.id == assessment_id)
+            .expect("the fixture assessment must be listable");
+        let count = || async {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM execution_requests WHERE requested_by='policy-bridge' \
+                 AND approval_context->'target'->>'pseudonym'=$1",
+            )
+            .bind(&resource)
+            .fetch_one(owner.pool())
+            .await
+        };
+
+        // Bridge off: the Block decision is recorded, nothing is enqueued.
+        evaluate_assessment(&policy_engine, &assessment, None).await?;
+        let decision: String = sqlx::query_scalar(
+            "SELECT decision FROM security_policy_decisions WHERE assessment_id=$1",
+        )
+        .bind(assessment_id)
+        .fetch_one(owner.pool())
+        .await?;
+        assert_eq!(decision, "block");
+        assert_eq!(count().await?, 0);
+
+        // Bridge in simulate mode: exactly one dry-run-only request, replay-safe.
+        let pairs = [
+            (bridge::MODE, "simulate"),
+            (bridge::BLOCK_ACTION, "nftables.block_incident_source"),
+            (bridge::TTL_SECONDS, "60"),
+            (bridge::MAX_PER_WINDOW, "5"),
+            (bridge::WINDOW_SECONDS, "300"),
+            (bridge::MAX_EVIDENCE_AGE_SECONDS, "900"),
+        ];
+        let config = BridgeConfig::from_lookup(|name| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, v)| v.to_string())
+        })
+        .map_err(anyhow::Error::msg)?
+        .expect("bridge configured");
+        evaluate_assessment(&policy_engine, &assessment, Some(&config)).await?;
+        evaluate_assessment(&policy_engine, &assessment, Some(&config)).await?;
+        assert_eq!(count().await?, 1);
+        let (status, simulation): (String, serde_json::Value) = sqlx::query_as(
+            "SELECT status, approval_context->'target'->'simulation_only' FROM execution_requests \
+             WHERE requested_by='policy-bridge' AND approval_context->'target'->>'pseudonym'=$1",
+        )
+        .bind(&resource)
+        .fetch_one(owner.pool())
+        .await?;
+        assert_eq!(status, "pending");
+        assert_eq!(simulation, serde_json::json!(true));
+        // Later PostgreSQL gates in this fixture assume no claimable request
+        // is left behind; cancel the simulated one.
+        sqlx::query(
+            "UPDATE execution_requests SET status='cancelled' \
+             WHERE requested_by='policy-bridge' AND approval_context->'target'->>'pseudonym'=$1",
+        )
+        .bind(&resource)
+        .execute(owner.pool())
+        .await?;
+        Ok(())
+    }
+
     /// Proves the whole shadow-decision path end to end against real
     /// PostgreSQL, running as the least-privilege `policy_engine` role the
     /// deployed binary actually uses: a critical/high-confidence assessment
@@ -768,7 +933,7 @@ mod tests {
             .into_iter()
             .find(|value| value.id == assessment_id)
             .expect("the fixture assessment must be listable");
-        evaluate_assessment(&policy_engine, &assessment).await?;
+        evaluate_assessment(&policy_engine, &assessment, None).await?;
 
         let decisions: Vec<(String, bool, bool)> = sqlx::query_as(
             "SELECT decision, corroborated, is_shadow FROM security_policy_decisions \
@@ -792,7 +957,7 @@ mod tests {
 
         // Replay: evaluating the identical assessment again must upsert the
         // same row, not create a second one.
-        evaluate_assessment(&policy_engine, &assessment).await?;
+        evaluate_assessment(&policy_engine, &assessment, None).await?;
         let decision_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM security_policy_decisions WHERE assessment_id=$1",
         )
@@ -843,8 +1008,8 @@ mod tests {
             .into_iter()
             .find(|value| value.id == assessment_id)
             .expect("fixture assessment must be visible");
-        evaluate_assessment(&policy_engine, &assessment).await?;
-        evaluate_assessment(&policy_engine, &assessment).await?;
+        evaluate_assessment(&policy_engine, &assessment, None).await?;
+        evaluate_assessment(&policy_engine, &assessment, None).await?;
 
         let rows: Vec<(uuid::Uuid, String, bool, serde_json::Value)> = sqlx::query_as(
             "SELECT e.id,a.name,a.enabled,e.approval_context FROM execution_requests e \

@@ -303,7 +303,7 @@ mod postgres_tests {
             .await?;
         assert_eq!(cap.status(), StatusCode::OK);
         let cap_value: Value = serde_json::from_slice(&to_bytes(cap.into_body(), 100000).await?)?;
-        assert_eq!(cap_value["data"]["migration_version"], 59);
+        assert_eq!(cap_value["data"]["migration_version"], 60);
 
         let review = json!({"idempotency_key":"activate-fixture","status":"active","reason":"objective fixture assertion","evidence":body["evidence"]});
         let path = format!("/api/v1/learning/revisions/{rid}/review");

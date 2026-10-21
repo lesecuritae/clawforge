@@ -8,6 +8,12 @@ Layer") does not exist yet, so there is no action layer this service could
 call even if it wanted to. Shadow mode is a property of the current
 architecture.
 
+> Update 2026-10-21: an optional, default-off policy -> execution bridge now exists
+> (migration 0060, `docs/policy-execution-bridge.md`). It is configured explicitly,
+> re-validated in the database and not enabled anywhere; the decision logic below
+> is unchanged. Statements here that nothing can be executed describe the engine
+> when the bridge is off.
+
 ## Why reuse `clawforge_policy::decide`, not a new decision function
 
 `decide()` already existed (for a different, unrelated concern - internal

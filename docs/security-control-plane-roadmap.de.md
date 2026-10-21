@@ -734,13 +734,15 @@ Belege und Einzelheiten: [Phase-7-Pilotnachweis](phase7-pilot-evidence-20261021.
   Dokumentationsadresse), Rollback-p95 liegt nur als n=1 vor. Laut
   Stoppbedingungen sperren Telemetrieausfälle neue automatische Applies; die
   Auswertung erfordert eine Betreiberentscheidung.
-- **7C: Brücke nicht vorhanden; Vorarbeit in Arbeit.** Bis Migration `0059`
-  las nichts `security_ip_resolutions`, und der journalisierte Apply-Pfad lehnte
-  aufgelöste Adressen ab: ein echter Incident-Source-Block war unmöglich. `0059`
-  ergänzt den engen Resolver für die Executor-Rolle samt Executor-Anbindung
-  (siehe Pilotnachweis). Die Policy→Execution-Brücke selbst (Block/RateLimit) gilt
-  erst als vorhanden, wenn sie implementiert und getestet ist; Live-Betrieb bleibt
-  durch 7B und die Executor-Gates gesperrt.
+- **7C: Brücke implementiert und isoliert getestet, nirgends aktiviert.**
+  Bis Migration `0059` las nichts `security_ip_resolutions`, und der
+  journalisierte Apply-Pfad lehnte aufgelöste Adressen ab: ein echter
+  Incident-Source-Block war unmöglich. `0059` ergänzt den engen Resolver samt
+  Executor-Anbindung; `0060` die Policy→Execution-Brücke (Modi `simulate`,
+  `propose`, `automatic`, Standard aus, keine eingebauten Betriebswerte, Prüfungen
+  in der Datenbank). Siehe [Policy-Execution-Bridge](policy-execution-bridge.md).
+  `automatic` bleibt durch 7B, die Executor-Gates (DRY_RUN, Live-Autorisierung)
+  und eine ausdrückliche Betreiberbestätigung gesperrt.
 
 ## Phase 8: Threat Intelligence
 
