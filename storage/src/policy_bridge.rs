@@ -59,7 +59,7 @@ impl PostgresStore {
         params: &PolicyBridgeParams,
     ) -> Result<BridgeOutcome> {
         let plan = sqlx::query(
-            "SELECT reason, context FROM clawforge_policy_bridge_plan($1,$2,$3,$4,$5,$6,$7,$8)",
+            "SELECT reason, context, existing_request_id FROM clawforge_policy_bridge_plan($1,$2,$3,$4,$5,$6,$7,$8)",
         )
         .bind(decision_id)
         .bind(params.mode.as_str())
@@ -73,6 +73,11 @@ impl PostgresStore {
         .await?;
         if let Some(reason) = plan.get::<Option<String>, _>("reason") {
             return Ok(BridgeOutcome::Rejected(reason));
+        }
+        // Steady state (the engine re-evaluates every poll): a decision that already
+        // produced its request costs this one cheap call.
+        if let Some(existing) = plan.get::<Option<Uuid>, _>("existing_request_id") {
+            return Ok(BridgeOutcome::Duplicate(existing));
         }
         let Some(context) = plan.get::<Option<serde_json::Value>, _>("context") else {
             bail!("policy bridge plan returned neither a reason nor a context");

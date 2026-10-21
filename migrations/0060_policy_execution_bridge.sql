@@ -20,6 +20,12 @@
 --             intel corroboration, a fresh healthy executor and no unresolved
 --             firewall generations.
 --
+-- Hard database-side bounds (budget <= 100 per window, window >= 60 s, evidence age
+-- <= 7 days, TTL <= 1 day) apply whatever the caller passes. The executor's own
+-- apply budgets stay an independent backstop. The decisions table is writable by
+-- the policy-engine role and cannot be re-derived here; the bridge therefore also
+-- checks the assessment against the policy's rule and minimum severity.
+--
 -- Because the approval hash is computed in Rust over the stored JSONB, Rust
 -- obtains the context from clawforge_policy_bridge_plan(), hashes it, and the
 -- enqueue function re-derives the same context and refuses any difference.
@@ -33,7 +39,7 @@ CREATE OR REPLACE FUNCTION clawforge_policy_bridge_plan(
     p_rule_id TEXT,
     p_max_evidence_age_seconds INTEGER,
     p_require_threat_intel BOOLEAN
-) RETURNS TABLE (reason TEXT, context JSONB)
+) RETURNS TABLE (reason TEXT, context JSONB, existing_request_id UUID)
 LANGUAGE plpgsql
 STABLE
 SECURITY DEFINER
@@ -49,68 +55,81 @@ DECLARE
     requester_ok BOOLEAN;
     needs_intel BOOLEAN;
     target JSONB;
+    existing UUID;
+    request_key TEXT;
 BEGIN
     IF p_mode NOT IN ('simulate', 'propose', 'automatic') THEN
-        RETURN QUERY SELECT 'mode_invalid'::TEXT, NULL::JSONB; RETURN;
+        RETURN QUERY SELECT 'mode_invalid'::TEXT, NULL::JSONB, NULL::UUID; RETURN;
     END IF;
     IF p_action_name NOT IN ('nftables.block_incident_source', 'haproxy.block_incident_source',
                              'firewall.block_incident_source',
                              'haproxy_ratelimit.block_incident_source') THEN
-        RETURN QUERY SELECT 'action_not_allowed'::TEXT, NULL::JSONB; RETURN;
+        RETURN QUERY SELECT 'action_not_allowed'::TEXT, NULL::JSONB, NULL::UUID; RETURN;
     END IF;
     IF p_ttl_seconds IS NULL OR p_ttl_seconds < 1 OR p_ttl_seconds > 86400
-       OR p_max_evidence_age_seconds IS NULL OR p_max_evidence_age_seconds < 1 THEN
-        RETURN QUERY SELECT 'parameters_invalid'::TEXT, NULL::JSONB; RETURN;
+       OR p_max_evidence_age_seconds IS NULL OR p_max_evidence_age_seconds < 1
+       OR p_max_evidence_age_seconds > 604800 THEN
+        RETURN QUERY SELECT 'parameters_invalid'::TEXT, NULL::JSONB, NULL::UUID; RETURN;
     END IF;
 
     SELECT * INTO d FROM security_policy_decisions WHERE id = p_decision_id;
     IF NOT FOUND OR d.is_shadow IS NOT TRUE THEN
-        RETURN QUERY SELECT 'decision_not_found'::TEXT, NULL::JSONB; RETURN;
+        RETURN QUERY SELECT 'decision_not_found'::TEXT, NULL::JSONB, NULL::UUID; RETURN;
     END IF;
     IF d.decision IS DISTINCT FROM (CASE WHEN p_action_name = 'haproxy_ratelimit.block_incident_source'
                                          THEN 'rate_limit' ELSE 'block' END) THEN
-        RETURN QUERY SELECT 'decision_does_not_match_action'::TEXT, NULL::JSONB; RETURN;
+        RETURN QUERY SELECT 'decision_does_not_match_action'::TEXT, NULL::JSONB, NULL::UUID; RETURN;
     END IF;
     IF d.corroborated IS NOT TRUE OR d.evidence_sources < 2 THEN
-        RETURN QUERY SELECT 'not_corroborated'::TEXT, NULL::JSONB; RETURN;
+        RETURN QUERY SELECT 'not_corroborated'::TEXT, NULL::JSONB, NULL::UUID; RETURN;
     END IF;
     IF d.updated_at < NOW() - make_interval(secs => p_max_evidence_age_seconds) THEN
-        RETURN QUERY SELECT 'decision_stale'::TEXT, NULL::JSONB; RETURN;
+        RETURN QUERY SELECT 'decision_not_reconfirmed'::TEXT, NULL::JSONB, NULL::UUID; RETURN;
     END IF;
 
     SELECT * INTO p FROM security_policies WHERE id = d.policy_id AND version = d.policy_version;
     IF NOT FOUND OR p.status <> 'active' OR p.valid_from > NOW()
        OR (p.valid_until IS NOT NULL AND p.valid_until <= NOW()) THEN
-        RETURN QUERY SELECT 'policy_inactive'::TEXT, NULL::JSONB; RETURN;
+        RETURN QUERY SELECT 'policy_inactive'::TEXT, NULL::JSONB, NULL::UUID; RETURN;
     END IF;
     IF (p_mode = 'propose' AND p.class NOT IN ('approval', 'automatic'))
        OR (p_mode = 'automatic' AND p.class <> 'automatic') THEN
-        RETURN QUERY SELECT 'policy_class_insufficient'::TEXT, NULL::JSONB; RETURN;
+        RETURN QUERY SELECT 'policy_class_insufficient'::TEXT, NULL::JSONB, NULL::UUID; RETURN;
     END IF;
     IF p_rule_id IS NULL AND p_mode = 'automatic' THEN
-        RETURN QUERY SELECT 'rule_required'::TEXT, NULL::JSONB; RETURN;
+        RETURN QUERY SELECT 'rule_required'::TEXT, NULL::JSONB, NULL::UUID; RETURN;
     END IF;
     IF p_rule_id IS NOT NULL AND p.rule_id <> p_rule_id THEN
-        RETURN QUERY SELECT 'rule_mismatch'::TEXT, NULL::JSONB; RETURN;
+        RETURN QUERY SELECT 'rule_mismatch'::TEXT, NULL::JSONB, NULL::UUID; RETURN;
     END IF;
 
     SELECT * INTO s FROM security_assessments WHERE id = d.assessment_id;
     IF NOT FOUND OR s.resource NOT LIKE 'ip-pseudonym:%'
        OR char_length(s.resource) <= char_length('ip-pseudonym:') THEN
-        RETURN QUERY SELECT 'resource_not_pseudonym'::TEXT, NULL::JSONB; RETURN;
+        RETURN QUERY SELECT 'resource_not_pseudonym'::TEXT, NULL::JSONB, NULL::UUID; RETURN;
+    END IF;
+    -- The decisions table is writable by the policy-engine role, so re-check what
+    -- the database can: the assessment must belong to the policy's rule and meet
+    -- its minimum severity. (A decision cannot be re-run through decide() here.)
+    IF s.rule_id <> p.rule_id THEN
+        RETURN QUERY SELECT 'assessment_rule_mismatch'::TEXT, NULL::JSONB, NULL::UUID; RETURN;
+    END IF;
+    IF (CASE s.severity WHEN 'critical' THEN 3 WHEN 'high' THEN 2 WHEN 'medium' THEN 1 ELSE 0 END)
+       < (CASE p.min_severity WHEN 'critical' THEN 3 WHEN 'high' THEN 2 WHEN 'medium' THEN 1 ELSE 0 END) THEN
+        RETURN QUERY SELECT 'severity_below_policy'::TEXT, NULL::JSONB, NULL::UUID; RETURN;
     END IF;
     IF s.last_seen < NOW() - make_interval(secs => p_max_evidence_age_seconds) THEN
-        RETURN QUERY SELECT 'assessment_stale'::TEXT, NULL::JSONB; RETURN;
+        RETURN QUERY SELECT 'assessment_stale'::TEXT, NULL::JSONB, NULL::UUID; RETURN;
     END IF;
     needs_intel := COALESCE(p_require_threat_intel, TRUE) OR p_mode = 'automatic';
     IF needs_intel AND s.threat_intel_corroborated IS NOT TRUE THEN
-        RETURN QUERY SELECT 'threat_intel_required'::TEXT, NULL::JSONB; RETURN;
+        RETURN QUERY SELECT 'threat_intel_required'::TEXT, NULL::JSONB, NULL::UUID; RETURN;
     END IF;
     IF p_mode <> 'simulate' AND NOT EXISTS (
         SELECT 1 FROM security_ip_resolutions r
          WHERE r.pseudonym = s.resource AND r.expires_at > NOW()
            AND masklen(r.raw_ip) = CASE family(r.raw_ip) WHEN 4 THEN 32 ELSE 128 END) THEN
-        RETURN QUERY SELECT 'resolution_missing'::TEXT, NULL::JSONB; RETURN;
+        RETURN QUERY SELECT 'resolution_missing'::TEXT, NULL::JSONB, NULL::UUID; RETURN;
     END IF;
 
     SELECT * INTO a FROM actions WHERE name = p_action_name;
@@ -118,23 +137,23 @@ BEGIN
        OR (p_mode = 'simulate' AND a.enabled)
        OR (p_mode = 'propose' AND NOT (a.enabled AND a.requires_approval))
        OR (p_mode = 'automatic' AND NOT (a.enabled AND NOT a.requires_approval)) THEN
-        RETURN QUERY SELECT 'action_state_mismatch'::TEXT, NULL::JSONB; RETURN;
+        RETURN QUERY SELECT 'action_state_mismatch'::TEXT, NULL::JSONB, NULL::UUID; RETURN;
     END IF;
 
     IF p_mode = 'propose' THEN
         SELECT TRUE INTO requester_ok FROM admin_users
          WHERE id = p_requester_id AND enabled AND role = 'Operator';
         IF requester_ok IS NOT TRUE THEN
-            RETURN QUERY SELECT 'requester_invalid'::TEXT, NULL::JSONB; RETURN;
+            RETURN QUERY SELECT 'requester_invalid'::TEXT, NULL::JSONB, NULL::UUID; RETURN;
         END IF;
         SELECT GREATEST(1, ap.required_approvals), ap.approval_timeout
           INTO approvals, approval_timeout
           FROM approval_policies ap WHERE ap.risk_level = a.risk_level;
         IF approvals IS NULL OR approval_timeout IS NULL THEN
-            RETURN QUERY SELECT 'approval_policy_missing'::TEXT, NULL::JSONB; RETURN;
+            RETURN QUERY SELECT 'approval_policy_missing'::TEXT, NULL::JSONB, NULL::UUID; RETURN;
         END IF;
     ELSIF p_requester_id IS NOT NULL THEN
-        RETURN QUERY SELECT 'requester_not_allowed'::TEXT, NULL::JSONB; RETURN;
+        RETURN QUERY SELECT 'requester_not_allowed'::TEXT, NULL::JSONB, NULL::UUID; RETURN;
     END IF;
 
     target := jsonb_build_object('kind', 'incident_source', 'pseudonym', s.resource,
@@ -142,6 +161,9 @@ BEGIN
     IF p_mode = 'simulate' THEN
         target := target || jsonb_build_object('simulation_only', TRUE);
     END IF;
+
+    request_key := 'policy-bridge:' || p_mode || ':' || d.id::TEXT;
+    SELECT e.id INTO existing FROM execution_requests e WHERE e.idempotency_key = request_key;
 
     RETURN QUERY SELECT NULL::TEXT, jsonb_build_object(
         'version', 1,
@@ -157,7 +179,7 @@ BEGIN
         'decision_id', NULL,
         'requested_by', 'policy-bridge',
         'requested_by_id', p_requester_id,
-        'idempotency_key', 'policy-bridge:' || p_mode || ':' || d.id::TEXT,
+        'idempotency_key', request_key,
         'target', target,
         'policy_bridge', jsonb_build_object(
             'version', 1,
@@ -167,7 +189,7 @@ BEGIN
             'policy_version', p.version,
             'assessment_id', s.id,
             'rule_id', p.rule_id,
-            'evidence_hash', d.evidence_hash));
+            'evidence_hash', d.evidence_hash)), existing;
 END;
 $$;
 
@@ -198,10 +220,26 @@ DECLARE
     key TEXT;
     audit_id BIGINT;
     details JSONB;
+    simulated BOOLEAN := (p_mode = 'simulate');
 BEGIN
-    IF p_max_per_window IS NULL OR p_max_per_window < 1 OR p_window_seconds IS NULL
-       OR p_window_seconds < 1 OR p_context_hash IS NULL OR p_context_hash !~ '^[0-9a-f]{64}$' THEN
+    -- Hard database-side bounds: the caller's values are inputs, never the limit.
+    -- (The executor's own apply budgets remain an independent backstop.)
+    IF p_max_per_window IS NULL OR p_max_per_window < 1 OR p_max_per_window > 100
+       OR p_window_seconds IS NULL OR p_window_seconds < 60 OR p_window_seconds > 86400
+       OR p_context_hash IS NULL OR p_context_hash !~ '^[0-9a-f]{64}$' THEN
         RETURN QUERY SELECT 'rejected:parameters_invalid'::TEXT, NULL::UUID; RETURN;
+    END IF;
+
+    -- Serialize bridge callers, then lock the rows the plan depends on so an
+    -- operator kill switch (disable the action, retire the policy, disable the
+    -- requester) waits for this transaction instead of racing the insert.
+    PERFORM pg_advisory_xact_lock(hashtext('clawforge_policy_bridge'));
+    PERFORM 1 FROM actions WHERE name = p_action_name FOR SHARE;
+    PERFORM 1 FROM security_policy_decisions d
+              JOIN security_policies pol ON pol.id = d.policy_id AND pol.version = d.policy_version
+             WHERE d.id = p_decision_id FOR SHARE OF pol;
+    IF p_requester_id IS NOT NULL THEN
+        PERFORM 1 FROM admin_users WHERE id = p_requester_id FOR SHARE;
     END IF;
 
     SELECT pl.reason, pl.context INTO plan_reason, plan_context
@@ -215,22 +253,26 @@ BEGIN
     END IF;
     key := plan_context ->> 'idempotency_key';
 
-    -- Serialize budget, duplicate and health checks with the insert.
-    PERFORM pg_advisory_xact_lock(hashtext('clawforge_policy_bridge'));
-
     SELECT id INTO existing FROM execution_requests WHERE idempotency_key = key;
     IF existing IS NOT NULL THEN
         RETURN QUERY SELECT 'duplicate'::TEXT, existing; RETURN;
     END IF;
+    -- A simulation never blocks, and is never counted against, live requests
+    -- (and vice versa); everything else active on the target does, including a
+    -- partially applied one awaiting rollback.
     IF EXISTS (SELECT 1 FROM execution_requests e
                 WHERE e.action_id = (plan_context ->> 'action_id')::UUID
                   AND e.approval_context -> 'target' ->> 'pseudonym' = plan_context -> 'target' ->> 'pseudonym'
-                  AND e.status IN ('waiting_approval', 'approved', 'pending', 'queued', 'starting', 'running')) THEN
+                  AND e.status IN ('waiting_approval', 'approved', 'pending', 'queued', 'starting',
+                                   'running', 'rollback_required')
+                  AND ((e.approval_context -> 'target' -> 'simulation_only') IS NOT DISTINCT FROM 'true'::jsonb) = simulated) THEN
         RETURN QUERY SELECT 'rejected:target_already_active'::TEXT, NULL::UUID; RETURN;
     END IF;
-    IF (SELECT count(*) FROM execution_requests
-         WHERE requested_by = 'policy-bridge'
-           AND created_at > NOW() - make_interval(secs => p_window_seconds)) >= p_max_per_window THEN
+    IF (SELECT count(*) FROM execution_requests e
+         WHERE e.requested_by = 'policy-bridge'
+           AND e.created_at > NOW() - make_interval(secs => p_window_seconds)
+           AND ((e.approval_context -> 'target' -> 'simulation_only') IS NOT DISTINCT FROM 'true'::jsonb) = simulated
+       ) >= p_max_per_window THEN
         RETURN QUERY SELECT 'rejected:budget_exhausted'::TEXT, NULL::UUID; RETURN;
     END IF;
     IF p_mode = 'automatic' THEN

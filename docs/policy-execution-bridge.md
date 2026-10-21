@@ -30,7 +30,7 @@ policy engine's `runtime_status.last_error`. Shadow decisions are unaffected.
 | `CLAWFORGE_POLICY_BRIDGE_BLOCK_ACTION` | action for `Block`: `nftables.`, `haproxy.` or `firewall.block_incident_source` |
 | `CLAWFORGE_POLICY_BRIDGE_RATELIMIT_ACTION` | action for `RateLimit`: `haproxy_ratelimit.block_incident_source` (at least one of the two is required) |
 | `..._TTL_SECONDS` | block TTL carried in the request target, 1-86400 (required) |
-| `..._MAX_PER_WINDOW`, `..._WINDOW_SECONDS` | request budget enforced in SQL, 1-100 per 1-86400 s (required) |
+| `..._MAX_PER_WINDOW`, `..._WINDOW_SECONDS` | request budget enforced in SQL, 1-100 per 60-86400 s (required; also clamped in SQL) |
 | `..._MAX_EVIDENCE_AGE_SECONDS` | maximum age of the decision and the assessment, 1-604800 (required) |
 | `..._REQUIRE_THREAT_INTEL` | default `true`; `false` is refused for `automatic` |
 | `..._REQUESTER_ID` | `propose` only: UUID of an enabled **Operator** account (Administrators are refused) |
@@ -65,6 +65,35 @@ class, the TTL ceiling, the apply and concurrency budgets, the never-block list
 (checked on the resolved address) and the just-in-time address resolution of
 migration `0059`. `simulation_only` requests always stay dry runs. Quarantine
 actions are not reachable from the bridge.
+
+## Design notes and residual risks
+
+* **Database-side bounds.** Budget <= 100 per window, window >= 60 s, evidence age
+  <= 7 days and TTL <= 1 day hold whatever the caller passes. The executor's own apply
+  budgets are an independent backstop, as are the action-row state and the executor
+  gates, none of which the policy-engine role can change.
+* **The decisions table is writable by the policy-engine role** and cannot be
+  re-derived in SQL (`decide()` lives in Rust). The bridge therefore also checks the
+  assessment against the policy: same rule, minimum severity met, recent, and (always
+  for `automatic`) threat-intel corroborated; the assessment table is written by the
+  security-engine role, not the policy engine. A compromised policy-engine role could
+  still forge a decision for a genuinely corroborated assessment; `automatic` therefore
+  stays behind an operator-flipped action row and the executor gates.
+* **Freshness.** `decision_not_reconfirmed` means the engine has not re-evaluated the
+  decision within the evidence age (the engine upserts every poll, so a live engine
+  keeps it fresh); evidence age itself is the assessment's `last_seen`.
+* **One request per decision and mode.** The idempotency key is
+  `policy-bridge:<mode>:<decision>`. A continuing attack produces a new assessment
+  bucket and therefore a new decision; an expired proposal is not re-proposed by
+  itself. This is deliberate (no repeated unattended blocks from one decision).
+* **Simulations are separate.** They neither block nor count against live requests.
+  A partially applied request (`rollback_required`) keeps its target busy.
+* **`automatic` and risk levels.** The seeded incident-source actions are `critical`
+  and require approval. Clearing `requires_approval` on such an action is the
+  deliberate unattended switch; it also removes the approval requirement for manual
+  requests of that action, so it should be done knowingly and reverted when done.
+* Concurrent operator changes (disabling the action, retiring the policy, disabling
+  the requester) are serialized with the insert via row locks.
 
 ## Tests
 

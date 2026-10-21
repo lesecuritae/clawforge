@@ -49,9 +49,13 @@ impl Env {
     }
 
     async fn policy(&self, class: &str, rule: &str) -> Result<Uuid> {
+        self.policy_sev(class, rule, "medium").await
+    }
+
+    async fn policy_sev(&self, class: &str, rule: &str, min_severity: &str) -> Result<Uuid> {
         let id = Uuid::new_v4();
-        sqlx::query("INSERT INTO security_policies(id,name,version,status,class,rule_id,min_severity) VALUES($1,$2,1,'active',$3,$4,'medium')")
-            .bind(id).bind(format!("bridge-{id}")).bind(class).bind(rule)
+        sqlx::query("INSERT INTO security_policies(id,name,version,status,class,rule_id,min_severity) VALUES($1,$2,1,'active',$3,$4,$5)")
+            .bind(id).bind(format!("bridge-{id}")).bind(class).bind(rule).bind(min_severity)
             .execute(self.pool()).await?;
         Ok(id)
     }
@@ -182,6 +186,12 @@ async fn check(owner_url: &str, policy_url: &str, executor_url: &str) -> Result<
         env.run(sim, &params(BridgeMode::Simulate)).await?,
         BridgeOutcome::Duplicate(sim_id)
     );
+    // A simulation of the very target a live request will use later; it must
+    // neither block nor consume the budget of that live request.
+    let p1_sim = env.decision(sim_policy, "ip-pseudonym:p1", true, 0).await?;
+    let BridgeOutcome::Enqueued(_) = env.run(p1_sim, &params(BridgeMode::Simulate)).await? else {
+        panic!("simulate must enqueue for the shared target");
+    };
     // The same request is refused when the action is enabled (simulate needs it off).
     env.action(true, true).await?;
     let other = env
@@ -279,6 +289,43 @@ async fn check(owner_url: &str, policy_url: &str, executor_url: &str) -> Result<
         env.run(expired, &propose).await?,
         rejected("resolution_missing")
     );
+    // Database-side bounds, whatever the caller passes.
+    for mutate in [
+        (|p: &mut PolicyBridgeParams| p.window_seconds = 30) as fn(&mut PolicyBridgeParams),
+        |p| p.window_seconds = 86_401,
+        |p| p.max_per_window = 101,
+        |p| p.max_per_window = 0,
+        |p| p.max_evidence_age_seconds = 604_801,
+        |p| p.ttl_seconds = 86_401,
+    ] {
+        let mut clamped = propose.clone();
+        mutate(&mut clamped);
+        assert_eq!(env.run(p1, &clamped).await?, rejected("parameters_invalid"));
+    }
+    // A forged or inconsistent decision: assessment of another rule, or below the
+    // policy's minimum severity.
+    let other_rule_policy = env.policy("approval", "http_scan").await?;
+    let mismatched = env
+        .decision(other_rule_policy, "ip-pseudonym:mm", true, 0)
+        .await?;
+    env.resolve("ip-pseudonym:mm", 600).await?;
+    let mut any_rule = propose.clone();
+    any_rule.rule_id = None;
+    assert_eq!(
+        env.run(mismatched, &any_rule).await?,
+        rejected("assessment_rule_mismatch")
+    );
+    let strict_policy = env
+        .policy_sev("approval", "ssh_bruteforce", "critical")
+        .await?;
+    let weak_severity = env
+        .decision(strict_policy, "ip-pseudonym:sv", true, 0)
+        .await?;
+    env.resolve("ip-pseudonym:sv", 600).await?;
+    assert_eq!(
+        env.run(weak_severity, &propose).await?,
+        rejected("severity_below_policy")
+    );
     sqlx::query("UPDATE security_policy_decisions SET corroborated=FALSE WHERE id=$1")
         .bind(p1)
         .execute(env.pool())
@@ -353,21 +400,25 @@ async fn check(owner_url: &str, policy_url: &str, executor_url: &str) -> Result<
     env.owner
         .approve_execution_request(request, a2, "bridge-approver-2")
         .await?;
-    // The earlier simulation request is claimable first; it carries the marker
+    // Earlier simulation requests are claimable first; each carries the marker
     // that forces a dry run no matter how the executor is configured.
-    let first = executor
-        .claim_execution_request_for_dispatch(None)
-        .await?
-        .expect("simulation is claimable");
-    assert_eq!(first.id, sim_id);
-    assert_eq!(
-        first.target.as_ref().unwrap()["simulation_only"],
-        json!(true)
-    );
-    let claimed = executor
-        .claim_execution_request_for_dispatch(None)
-        .await?
-        .expect("approved request is claimable");
+    let mut simulations = 0;
+    let claimed = loop {
+        let next = executor
+            .claim_execution_request_for_dispatch(None)
+            .await?
+            .expect("the approved request is eventually claimable");
+        if next.id == request {
+            break next;
+        }
+        assert_eq!(
+            next.target.as_ref().unwrap()["simulation_only"],
+            json!(true),
+            "only simulations may be claimed before the approved request"
+        );
+        simulations += 1;
+    };
+    assert_eq!(simulations, 2);
     assert_eq!(claimed.id, request);
     assert_eq!(claimed.action_name, BLOCK);
     assert_eq!(
@@ -375,6 +426,19 @@ async fn check(owner_url: &str, policy_url: &str, executor_url: &str) -> Result<
         json!("ip-pseudonym:p1")
     );
     assert_eq!(claimed.target.as_ref().unwrap()["ttl_seconds"], json!(60));
+    // A partially applied request awaiting rollback keeps its target busy.
+    sqlx::query("UPDATE execution_requests SET status='rollback_required' WHERE id=$1")
+        .bind(request)
+        .execute(env.pool())
+        .await?;
+    assert_eq!(
+        env.run(again, &propose).await?,
+        rejected("target_already_active")
+    );
+    sqlx::query("UPDATE execution_requests SET status='cancelled' WHERE id=$1")
+        .bind(request)
+        .execute(env.pool())
+        .await?;
     // Tampering: the enqueue function refuses a context that is not its own derivation.
     let tamper = env
         .decision(approval_policy, "ip-pseudonym:t", true, 0)

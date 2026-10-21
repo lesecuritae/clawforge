@@ -34,6 +34,7 @@ const RATELIMIT_ACTIONS: [&str; 1] = ["haproxy_ratelimit.block_incident_source"]
 const MAX_SECONDS: i32 = 86_400;
 const MAX_EVIDENCE_AGE: i32 = 604_800;
 const MAX_REQUESTS_PER_WINDOW: i32 = 100;
+const MIN_WINDOW_SECONDS: i32 = 60;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BridgeConfig {
@@ -65,15 +66,15 @@ impl BridgeConfig {
             Some("automatic") => BridgeMode::Automatic,
             Some(other) => return Err(format!("{MODE}: unknown mode {other:?}")),
         };
-        let number = |name: &str, max: i32| -> Result<i32, String> {
+        let number = |name: &str, min: i32, max: i32| -> Result<i32, String> {
             let raw = text(name).ok_or_else(|| format!("{name} is required"))?;
             let value: i32 = raw
                 .parse()
                 .map_err(|_| format!("{name} is not an integer"))?;
-            if (1..=max).contains(&value) {
+            if (min..=max).contains(&value) {
                 Ok(value)
             } else {
-                Err(format!("{name} must be between 1 and {max}"))
+                Err(format!("{name} must be between {min} and {max}"))
             }
         };
         let action = |name: &str, allowed: &[&str]| -> Result<Option<String>, String> {
@@ -88,10 +89,10 @@ impl BridgeConfig {
         if block_action.is_none() && ratelimit_action.is_none() {
             return Err(format!("{BLOCK_ACTION} or {RATELIMIT_ACTION} is required"));
         }
-        let ttl_seconds = number(TTL_SECONDS, MAX_SECONDS)?;
-        let max_per_window = number(MAX_PER_WINDOW, MAX_REQUESTS_PER_WINDOW)?;
-        let window_seconds = number(WINDOW_SECONDS, MAX_SECONDS)?;
-        let max_evidence_age_seconds = number(MAX_EVIDENCE_AGE_SECONDS, MAX_EVIDENCE_AGE)?;
+        let ttl_seconds = number(TTL_SECONDS, 1, MAX_SECONDS)?;
+        let max_per_window = number(MAX_PER_WINDOW, 1, MAX_REQUESTS_PER_WINDOW)?;
+        let window_seconds = number(WINDOW_SECONDS, MIN_WINDOW_SECONDS, MAX_SECONDS)?;
+        let max_evidence_age_seconds = number(MAX_EVIDENCE_AGE_SECONDS, 1, MAX_EVIDENCE_AGE)?;
         let require_threat_intel = match text(REQUIRE_THREAT_INTEL).as_deref() {
             None | Some("true") => true,
             Some("false") => false,
@@ -278,6 +279,7 @@ mod tests {
             (TTL_SECONDS, "ten"),
             (MAX_PER_WINDOW, "0"),
             (MAX_PER_WINDOW, "101"),
+            (WINDOW_SECONDS, "59"),
             (WINDOW_SECONDS, "0"),
             (MAX_EVIDENCE_AGE_SECONDS, "604801"),
             (REQUIRE_THREAT_INTEL, "maybe"),

@@ -6,7 +6,7 @@
 set -eu
 
 repo_dir="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
-container="clawforge-incident-lab-pg"
+container="clawforge-incident-lab-pg-$$"
 secret_dir="$(mktemp -d)"
 cleanup() {
   docker rm -f "$container" >/dev/null 2>&1 || true
@@ -25,7 +25,9 @@ for role in api worker correlation security_engine policy_engine incidents execu
 done
 chmod 644 "$secret_dir"/*
 
-mkdir -p /tmp/cf-claude-target /tmp/cf-claude-cargo
+# Build caches live in a private per-user directory, not in predictable /tmp paths.
+cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/clawforge-lab"
+mkdir -p -m 700 "$cache_dir/target" "$cache_dir/cargo"
 docker run --rm --cap-add=NET_ADMIN --cap-add=NET_RAW --network "container:$container" \
   -e CARGO_HOME=/cargo \
   -e PGHOST=127.0.0.1 -e PGPORT=5432 -e POSTGRES_DB=clawforge_test -e POSTGRES_USER=clawforge \
@@ -40,7 +42,7 @@ docker run --rm --cap-add=NET_ADMIN --cap-add=NET_RAW --network "container:$cont
   -e CLAWFORGE_DATABASE_OPERATIONS_PASSWORD_SECRET_FILE=/secrets/database_operations_password \
   -e CLAWFORGE_DATABASE_DECISION_PASSWORD_SECRET_FILE=/secrets/database_decision_password \
   -e CLAWFORGE_DATABASE_BACKUP_PASSWORD_SECRET_FILE=/secrets/database_backup_password \
-  -v "$repo_dir:/src" -v /tmp/cf-claude-target:/src/target -v /tmp/cf-claude-cargo:/cargo \
+  -v "$repo_dir:/src" -v "$cache_dir/target:/src/target" -v "$cache_dir/cargo:/cargo" \
   -v "$secret_dir:/secrets:ro" -w /src rust:1.98-bookworm sh -c '
     set -eu
     apt-get update -qq >/dev/null
