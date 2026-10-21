@@ -437,7 +437,7 @@ impl PostgresStore {
         let evidence = pseudonymize_evidence(&envelope.evidence)?;
         let evidence_json = serde_json::to_value(&evidence)?;
         let event_type = envelope.event_type().as_str();
-        let id = Uuid::new_v4();
+        let mut id = Uuid::new_v4();
         let mut tx = self.pool().begin().await?;
         let inserted = sqlx::query(
             "INSERT INTO security_events \
@@ -494,13 +494,26 @@ impl PostgresStore {
                     envelope.dedupe_key
                 );
             }
-            return Ok(existing.0);
+            // The sensor row commits before canonical publication. A failure in
+            // that later stage must be repairable by an identical retry; merely
+            // acknowledging this row would permanently lose its fanout. Normal
+            // duplicates keep their no-side-effects path once publication exists.
+            let published: bool =
+                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM events WHERE dedupe_key=$1)")
+                    .bind(format!("security-event:{}", existing.0))
+                    .fetch_one(self.pool())
+                    .await?;
+            if published {
+                return Ok(existing.0);
+            }
+            id = existing.0;
+        } else {
+            sqlx::query("UPDATE security_sensors SET last_seen_at=NOW() WHERE id=$1")
+                .bind(sensor_id)
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
         }
-        sqlx::query("UPDATE security_sensors SET last_seen_at=NOW() WHERE id=$1")
-            .bind(sensor_id)
-            .execute(&mut *tx)
-            .await?;
-        tx.commit().await?;
         // Reputation lookup against the STILL-RAW envelope.resource -
         // pseudonymization already happened above (into `resource`), but
         // envelope.resource itself is untouched, and this is the last point
@@ -554,11 +567,10 @@ impl PostgresStore {
         {
             warn!(%error, "could not persist short-TTL IP resolution");
         }
-        // Fan this out onto the canonical event bus - exactly once, only for
-        // a genuinely new row (the ON CONFLICT/dedupe-hit path above already
-        // returned early with the existing id, never reaching here) - so a
-        // sensor's own at-least-once retry never republishes the same
-        // security event a second time. clawforge-security-engine (Phase 4)
+        // Fan this out idempotently: either this is a new sensor row, or
+        // an identical retry repairing a previously interrupted publication.
+        // publish_event's stable dedupe key makes concurrent repair attempts
+        // safe and creates each consumer delivery only once. clawforge-security-engine (Phase 4)
         // is the one service that consumes it from there; the resource is
         // already pseudonymized above, so using it as correlation_id lets
         // rules group events (e.g. repeated ssh_login_failure) by the same
