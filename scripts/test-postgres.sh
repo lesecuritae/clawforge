@@ -133,6 +133,7 @@ export CLAWFORGE_TEST_DATABASE_URL="$owner_url"
 export CLAWFORGE_TEST_API_DATABASE_URL="$(cat "$secret_dir/database_api_url")"
 export CLAWFORGE_TEST_EXECUTOR_DATABASE_URL="$(cat "$secret_dir/database_executor_url")"
 export CLAWFORGE_TEST_POLICY_ENGINE_DATABASE_URL="$(cat "$secret_dir/database_policy_engine_url")"
+export CLAWFORGE_TEST_WORKER_DATABASE_URL="$(cat "$secret_dir/database_worker_url")"
 run_cargo test -p clawforge-storage --test migration_lineages -- --ignored --test-threads=1
 run_cargo test -p clawforge-storage --test quarantine_approval -- --ignored --test-threads=1
 
@@ -146,6 +147,8 @@ run_cargo test -p clawforge-executor operator_reconcile_restores_a_recovery_requ
 run_cargo test -p clawforge-storage --test dispatch_recovery -- --ignored --test-threads=1
 run_cargo test -p clawforge-storage --test incident_source_resolution -- --ignored --test-threads=1
 run_cargo test -p clawforge-storage --test policy_bridge -- --ignored --test-threads=1
+run_cargo test -p clawforge-storage --test source_intel -- --ignored --test-threads=1
+run_cargo test -p clawforge-worker --test ip_context -- --ignored --test-threads=1
 
 export CLAWFORGE_TEST_FIREWALL_RULE_DATABASE_URL="$owner_url"
 run_cargo test -p clawforge-storage --test firewall_rule_intents -- --ignored --test-threads=1

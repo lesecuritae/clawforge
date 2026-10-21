@@ -101,7 +101,8 @@ impl Env {
     }
 
     async fn basis(&self, target: &SecurityAssessment) -> Result<(i16, &'static str)> {
-        independent_evidence_for(&self.policy, target).await
+        let evidence = independent_evidence_for(&self.policy, target).await?;
+        Ok((evidence.sources, evidence.basis))
     }
 }
 

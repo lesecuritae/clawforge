@@ -21,6 +21,7 @@ pub const MAX_PER_WINDOW: &str = "CLAWFORGE_POLICY_BRIDGE_MAX_PER_WINDOW";
 pub const WINDOW_SECONDS: &str = "CLAWFORGE_POLICY_BRIDGE_WINDOW_SECONDS";
 pub const MAX_EVIDENCE_AGE_SECONDS: &str = "CLAWFORGE_POLICY_BRIDGE_MAX_EVIDENCE_AGE_SECONDS";
 pub const REQUIRE_THREAT_INTEL: &str = "CLAWFORGE_POLICY_BRIDGE_REQUIRE_THREAT_INTEL";
+pub const MIN_INTEL_CONFIDENCE: &str = "CLAWFORGE_POLICY_BRIDGE_MIN_INTEL_CONFIDENCE";
 pub const REQUESTER_ID: &str = "CLAWFORGE_POLICY_BRIDGE_REQUESTER_ID";
 pub const RULE_ID: &str = "CLAWFORGE_POLICY_BRIDGE_RULE_ID";
 pub const AUTOMATIC_ACK: &str = "CLAWFORGE_POLICY_BRIDGE_AUTOMATIC_ACK";
@@ -45,6 +46,7 @@ pub struct BridgeConfig {
     requester_id: Option<Uuid>,
     rule_id: Option<String>,
     max_evidence_age_seconds: i32,
+    min_intel_confidence: i32,
     require_threat_intel: bool,
     max_per_window: i32,
     window_seconds: i32,
@@ -93,6 +95,7 @@ impl BridgeConfig {
         let max_per_window = number(MAX_PER_WINDOW, 1, MAX_REQUESTS_PER_WINDOW)?;
         let window_seconds = number(WINDOW_SECONDS, MIN_WINDOW_SECONDS, MAX_SECONDS)?;
         let max_evidence_age_seconds = number(MAX_EVIDENCE_AGE_SECONDS, 1, MAX_EVIDENCE_AGE)?;
+        let min_intel_confidence = number(MIN_INTEL_CONFIDENCE, 1, 100)?;
         let require_threat_intel = match text(REQUIRE_THREAT_INTEL).as_deref() {
             None | Some("true") => true,
             Some("false") => false,
@@ -137,6 +140,7 @@ impl BridgeConfig {
             requester_id,
             rule_id,
             max_evidence_age_seconds,
+            min_intel_confidence,
             require_threat_intel,
             max_per_window,
             window_seconds,
@@ -167,7 +171,7 @@ impl BridgeConfig {
     /// parameter, so editing one of them without re-acknowledging fails closed.
     pub fn expected_ack(&self) -> String {
         format!(
-            "unattended:{}:{}:{}:{}:{}/{}:{}",
+            "unattended:{}:{}:{}:{}:{}/{}:{}:{}",
             self.rule_id.as_deref().unwrap_or("-"),
             self.block_action.as_deref().unwrap_or("-"),
             self.ratelimit_action.as_deref().unwrap_or("-"),
@@ -175,6 +179,7 @@ impl BridgeConfig {
             self.max_per_window,
             self.window_seconds,
             self.max_evidence_age_seconds,
+            self.min_intel_confidence,
         )
     }
 
@@ -193,6 +198,7 @@ impl BridgeConfig {
             requester_id: self.requester_id,
             rule_id: self.rule_id.clone(),
             max_evidence_age_seconds: self.max_evidence_age_seconds,
+            min_intel_confidence: self.min_intel_confidence,
             require_threat_intel: self.require_threat_intel,
             max_per_window: self.max_per_window,
             window_seconds: self.window_seconds,
@@ -223,6 +229,7 @@ mod tests {
             (MAX_PER_WINDOW, "1"),
             (WINDOW_SECONDS, "300"),
             (MAX_EVIDENCE_AGE_SECONDS, "900"),
+            (MIN_INTEL_CONFIDENCE, "70"),
         ]
     }
 
@@ -258,6 +265,7 @@ mod tests {
         let ok = with(base("simulate"), &[]);
         assert!(BridgeConfig::from_lookup(lookup(&ok)).unwrap().is_some());
         for missing in [
+            MIN_INTEL_CONFIDENCE,
             BLOCK_ACTION,
             TTL_SECONDS,
             MAX_PER_WINDOW,
@@ -282,6 +290,9 @@ mod tests {
             (WINDOW_SECONDS, "59"),
             (WINDOW_SECONDS, "0"),
             (MAX_EVIDENCE_AGE_SECONDS, "604801"),
+            (MIN_INTEL_CONFIDENCE, "0"),
+            (MIN_INTEL_CONFIDENCE, "101"),
+            (MIN_INTEL_CONFIDENCE, "high"),
             (REQUIRE_THREAT_INTEL, "maybe"),
         ] {
             let pairs = with(ok.clone(), &[(name, bad)]);
@@ -352,7 +363,7 @@ mod tests {
 
     #[test]
     fn automatic_needs_rule_threat_intel_and_an_exact_acknowledgement() {
-        let ack = "unattended:ssh_bruteforce:nftables.block_incident_source:-:60:1/300:900";
+        let ack = "unattended:ssh_bruteforce:nftables.block_incident_source:-:60:1/300:900:70";
         let ok = with(
             base("automatic"),
             &[(RULE_ID, "ssh_bruteforce"), (AUTOMATIC_ACK, ack)],
@@ -371,6 +382,7 @@ mod tests {
             (MAX_PER_WINDOW, "2"),
             (WINDOW_SECONDS, "301"),
             (MAX_EVIDENCE_AGE_SECONDS, "901"),
+            (MIN_INTEL_CONFIDENCE, "71"),
             (BLOCK_ACTION, "haproxy.block_incident_source"),
             (RULE_ID, "http_scan"),
         ] {

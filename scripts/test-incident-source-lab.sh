@@ -1,5 +1,6 @@
 #!/usr/bin/env sh
-# Real-kernel lab for the just-in-time incident-source apply (migration 0059):
+# Real-kernel lab for the just-in-time incident-source apply (migration 0059) and the
+# dispatch-time reputation revalidation of bridge requests (migration 0064):
 # a disposable PostgreSQL container plus a Rust container that SHARES its network
 # namespace and holds NET_ADMIN, so nftables rules land in that private namespace
 # only - never on the host. Needs Docker and network access for apt/crates.
@@ -53,5 +54,5 @@ docker run --rm --cap-add=NET_ADMIN --cap-add=NET_RAW --network "container:$cont
     sh scripts/provision-db-roles.sh
     export CLAWFORGE_TEST_DATABASE_URL=postgres://clawforge:test-password-012345@127.0.0.1:5432/clawforge_test
     export CLAWFORGE_TEST_EXECUTOR_DATABASE_URL=postgres://clawforge_executor:test-executor-password-0123456789@127.0.0.1:5432/clawforge_test
-    cargo test -p clawforge-executor incident_source_real_apply -- --ignored --test-threads=1
+    cargo test -p clawforge-executor -- --ignored --test-threads=1 incident_source_real_apply bridge_request_is_revalidated
   '

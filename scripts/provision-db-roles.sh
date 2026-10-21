@@ -81,6 +81,8 @@ REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public FROM clawforge_api, claw
 -- application schema, but migration metadata and append-only audit rows remain
 -- protected by PostgreSQL itself.
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO clawforge_api;
+-- Routing context is written only through the worker's verified function (0063).
+REVOKE INSERT, UPDATE, DELETE ON TABLE source_network_context FROM clawforge_api;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO clawforge_api;
 REVOKE INSERT, UPDATE, DELETE ON TABLE _sqlx_migrations FROM clawforge_api;
 REVOKE UPDATE, DELETE ON TABLE audit_events FROM clawforge_api;
@@ -118,6 +120,10 @@ GRANT SELECT, INSERT, UPDATE ON TABLE
   audit_events, audit_outbox, notification_events
   TO clawforge_worker;
 GRANT DELETE ON TABLE indicators TO clawforge_worker;
+-- Routing context for suspicious sources (migration 0063): the worker has the egress
+-- and may only list targets and record verified results through these functions.
+GRANT EXECUTE ON FUNCTION clawforge_network_context_targets(INTEGER, INTEGER, INTEGER) TO clawforge_worker;
+GRANT EXECUTE ON FUNCTION clawforge_record_network_context(TEXT, TEXT, CIDR, BIGINT[], TEXT, TEXT, INTEGER, INTEGER, TEXT) TO clawforge_worker;
 GRANT DELETE ON TABLE security_policy_decisions, security_assessments TO clawforge_worker;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO clawforge_worker;
 REVOKE UPDATE ON TABLE audit_events FROM clawforge_worker;
@@ -162,11 +168,13 @@ GRANT EXECUTE ON FUNCTION clawforge_enqueue_goaway_shadow_challenge(UUID)
   TO clawforge_policy_engine;
 -- Independent corroboration (migration 0061): event families only, never payloads.
 GRANT EXECUTE ON FUNCTION clawforge_assessment_event_types(UUID) TO clawforge_policy_engine;
+-- Current reputation/routing view of one pseudonymized source (migration 0063).
+GRANT EXECUTE ON FUNCTION clawforge_current_source_intel(TEXT) TO clawforge_policy_engine;
 -- Policy -> execution bridge (migration 0060): the only path by which this role
 -- can create an execution request; every call is re-validated in the database.
-GRANT EXECUTE ON FUNCTION clawforge_policy_bridge_plan(UUID, TEXT, TEXT, INTEGER, UUID, TEXT, INTEGER, BOOLEAN)
+GRANT EXECUTE ON FUNCTION clawforge_policy_bridge_plan(UUID, TEXT, TEXT, INTEGER, UUID, TEXT, INTEGER, BOOLEAN, INTEGER)
   TO clawforge_policy_engine;
-GRANT EXECUTE ON FUNCTION clawforge_enqueue_policy_bridge_request(UUID, TEXT, TEXT, INTEGER, UUID, TEXT, INTEGER, BOOLEAN, INTEGER, INTEGER, JSONB, TEXT)
+GRANT EXECUTE ON FUNCTION clawforge_enqueue_policy_bridge_request(UUID, TEXT, TEXT, INTEGER, UUID, TEXT, INTEGER, BOOLEAN, INTEGER, INTEGER, INTEGER, JSONB, TEXT)
   TO clawforge_policy_engine;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO clawforge_policy_engine;
 

@@ -29,9 +29,14 @@ pub use quarantine_intents::{QuarantineGuard, QuarantineIntent};
 mod firewall_rule_intents;
 mod incident_source_resolution;
 mod policy_bridge;
+mod source_intel;
 pub use firewall_rule_intents::{FirewallRuleGuard, FirewallRuleIntent};
 pub use incident_source_resolution::ResolvedIncidentSourceAddress;
 pub use policy_bridge::{BridgeMode, BridgeOutcome, PolicyBridgeParams};
+pub use source_intel::{
+    AsnListingHit, ListingHit, NetworkContextOutcome, NetworkContextTarget, RoutingContext,
+    SourceIntel,
+};
 mod security_assessments;
 mod security_events;
 mod security_policies;

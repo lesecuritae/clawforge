@@ -2,7 +2,9 @@
 //! action-state modes, budgets/duplicates/health, the least-privilege role, and
 //! the full chain propose -> two approvals -> executor claim.
 use anyhow::Result;
-use clawforge_storage::{BridgeMode, BridgeOutcome, PolicyBridgeParams, PostgresStore};
+use clawforge_storage::{
+    BridgeMode, BridgeOutcome, NetworkContextOutcome, PolicyBridgeParams, PostgresStore,
+};
 use serde_json::{json, Value};
 use sqlx::{postgres::PgConnectOptions, ConnectOptions, PgPool};
 use std::str::FromStr;
@@ -41,6 +43,10 @@ async fn bridge_is_gated_by_database_facts_not_by_the_caller() -> Result<()> {
 struct Env {
     owner: PostgresStore,
     bridge: PostgresStore,
+    /// pseudonym -> address handed out by `resolve`, and the pseudonyms whose
+    /// address must be listed by a reputation indicator (current-view evidence).
+    ips: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    wanted: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 impl Env {
@@ -68,6 +74,13 @@ impl Env {
         intel: bool,
         age_secs: i64,
     ) -> Result<Uuid> {
+        if intel {
+            self.wanted.lock().unwrap().insert(pseudonym.to_string());
+            let known = self.ips.lock().unwrap().get(pseudonym).cloned();
+            if let Some(ip) = known {
+                self.list(&ip, 80, 0).await?;
+            }
+        }
         let assessment = Uuid::new_v4();
         sqlx::query("INSERT INTO security_assessments(id,rule_id,rule_version,engine_version,dedupe_key,resource,severity,confidence,summary,event_count,window_seconds,bucket_start,first_seen,last_seen,threat_intel_corroborated,threat_intel_source,threat_intel_confidence,threat_intel_indicator_last_seen) \
                       VALUES($1,'ssh_bruteforce','1','1',$2,$3,'high',90,'s',5,300,NOW(),NOW(),NOW()-($4*INTERVAL '1 second'),$5,$6,$7,$8)")
@@ -82,9 +95,44 @@ impl Env {
     }
 
     async fn resolve(&self, pseudonym: &str, ttl: i64) -> Result<()> {
-        sqlx::query("INSERT INTO security_ip_resolutions(pseudonym,raw_ip,source,expires_at) VALUES($1,'203.0.113.99',$2,NOW()+($3*INTERVAL '1 second')) ON CONFLICT(pseudonym) DO UPDATE SET expires_at=EXCLUDED.expires_at")
-            .bind(pseudonym).bind("t").bind(ttl).execute(self.pool()).await?;
+        let ip = {
+            let mut ips = self.ips.lock().unwrap();
+            let next = 20 + ips.len();
+            ips.entry(pseudonym.to_string())
+                .or_insert_with(|| format!("203.0.113.{next}"))
+                .clone()
+        };
+        sqlx::query("INSERT INTO security_ip_resolutions(pseudonym,raw_ip,source,expires_at) VALUES($1,$2::inet,$3,NOW()+($4*INTERVAL '1 second')) ON CONFLICT(pseudonym) DO UPDATE SET expires_at=EXCLUDED.expires_at")
+            .bind(pseudonym).bind(&ip).bind("t").bind(ttl).execute(self.pool()).await?;
+        if self.wanted.lock().unwrap().contains(pseudonym) {
+            self.list(&ip, 80, 0).await?;
+        }
         Ok(())
+    }
+
+    /// A reputation listing for exactly this address (the address is the identity).
+    async fn list(&self, ip: &str, confidence: i16, last_seen_age_secs: i64) -> Result<()> {
+        sqlx::query("INSERT INTO indicators (value,indicator_type,categories,confidence,source,first_seen,last_seen,expires_at) VALUES ($1,'Ip','[\"spamhaus_drop\"]',$2,$3,NOW(),NOW()-($4*INTERVAL '1 second'),NOW()+INTERVAL '1 day') ON CONFLICT (value,indicator_type,source) DO UPDATE SET confidence=EXCLUDED.confidence, last_seen=EXCLUDED.last_seen, expires_at=EXCLUDED.expires_at")
+            .bind(ip).bind(confidence).bind(format!("bridge-test-{ip}")).bind(last_seen_age_secs)
+            .execute(self.pool()).await?;
+        Ok(())
+    }
+
+    async fn delist(&self, ip: &str) -> Result<()> {
+        sqlx::query("DELETE FROM indicators WHERE value=$1 AND indicator_type='Ip'")
+            .bind(ip)
+            .execute(self.pool())
+            .await?;
+        Ok(())
+    }
+
+    fn ip_of(&self, pseudonym: &str) -> String {
+        self.ips
+            .lock()
+            .unwrap()
+            .get(pseudonym)
+            .cloned()
+            .expect("resolved pseudonym")
     }
 
     async fn action(&self, enabled: bool, requires_approval: bool) -> Result<()> {
@@ -113,6 +161,7 @@ fn params(mode: BridgeMode) -> PolicyBridgeParams {
         rule_id: Some("ssh_bruteforce".into()),
         max_evidence_age_seconds: 600,
         require_threat_intel: true,
+        min_intel_confidence: 50,
         max_per_window: 5,
         window_seconds: 300,
     }
@@ -154,6 +203,8 @@ async fn check(owner_url: &str, policy_url: &str, executor_url: &str) -> Result<
     let env = Env {
         bridge: PostgresStore::connect_runtime(policy_url).await?,
         owner,
+        ips: Default::default(),
+        wanted: Default::default(),
     };
     let executor = PostgresStore::connect_runtime(executor_url).await?;
 
@@ -446,7 +497,7 @@ async fn check(owner_url: &str, policy_url: &str, executor_url: &str) -> Result<
     env.resolve("ip-pseudonym:t", 600).await?;
     let forged: Value =
         json!({"target": {"kind": "incident_source", "pseudonym": "ip-pseudonym:other"}});
-    let row: (String,) = sqlx::query_as("SELECT outcome FROM clawforge_enqueue_policy_bridge_request($1,'propose',$2,60,$3,'ssh_bruteforce',600,TRUE,5,300,$4,$5)")
+    let row: (String,) = sqlx::query_as("SELECT outcome FROM clawforge_enqueue_policy_bridge_request($1,'propose',$2,60,$3,'ssh_bruteforce',600,TRUE,50,5,300,$4,$5)")
         .bind(tamper).bind(BLOCK).bind(operator).bind(&forged).bind("0".repeat(64))
         .fetch_one(env.bridge.pool()).await?;
     assert_eq!(row.0, "rejected:context_changed");
@@ -550,5 +601,210 @@ async fn check(owner_url: &str, policy_url: &str, executor_url: &str) -> Result<
     .await?;
     assert!(audited.len() >= 3);
     assert!(audited.iter().all(|row| !row.0.contains("203.0.113")));
+    Ok(())
+}
+
+/// The bridge judges reputation on the current view of the source and re-checks it
+/// when the executor picks the request up.
+#[tokio::test]
+#[ignore = "requires explicit disposable owner, policy-engine and executor database URLs"]
+async fn bridge_judges_the_current_intel_view_and_revalidates_at_dispatch() -> Result<()> {
+    let base = std::env::var("CLAWFORGE_TEST_DATABASE_URL")?;
+    let policy_base = std::env::var("CLAWFORGE_TEST_POLICY_ENGINE_DATABASE_URL")?;
+    let admin = PgPool::connect(&base).await?;
+    let database = format!("policy_bridge_intel_{}", Uuid::new_v4().simple());
+    sqlx::query(&format!("CREATE DATABASE {database}"))
+        .execute(&admin)
+        .await?;
+    let url = |base: &str| -> Result<String> {
+        Ok(PgConnectOptions::from_str(base)?
+            .database(&database)
+            .to_url_lossy()
+            .to_string())
+    };
+    let (owner_url, policy_url) = (url(&base)?, url(&policy_base)?);
+    let result = tokio::spawn(async move { intel_gates(&owner_url, &policy_url).await }).await;
+    let cleanup = sqlx::query(&format!("DROP DATABASE {database} WITH (FORCE)"))
+        .execute(&admin)
+        .await;
+    admin.close().await;
+    cleanup?;
+    result??;
+    Ok(())
+}
+
+async fn intel_gates(owner_url: &str, policy_url: &str) -> Result<()> {
+    let owner = PostgresStore::connect(owner_url).await?;
+    let provision = include_str!("../../scripts/provision-db-roles.sh");
+    sqlx::raw_sql(&restricted(
+        provision,
+        "GRANT SELECT ON TABLE _sqlx_migrations, security_policies, security_assessments,",
+        "GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO clawforge_policy_engine;",
+    ))
+    .execute(owner.pool())
+    .await?;
+    let env = Env {
+        bridge: PostgresStore::connect_runtime(policy_url).await?,
+        owner,
+        ips: Default::default(),
+        wanted: Default::default(),
+    };
+    let pool = env.pool().clone();
+    let operator = env
+        .owner
+        .create_admin_user("intel-operator", "Operator", "!")
+        .await?;
+    let policy = env.policy("automatic", "ssh_bruteforce").await?;
+    let mut propose = params(BridgeMode::Propose);
+    propose.requester_id = Some(operator);
+    propose.max_per_window = 50;
+    propose.window_seconds = 3600;
+    env.action(true, true).await?;
+
+    // Reputation by origin ASN only (no listing of the address itself).
+    let asn = 4_100_000_042_i64;
+    env.resolve("ip-pseudonym:asn-only", 600).await?;
+    let asn_ip = env.ip_of("ip-pseudonym:asn-only");
+    let by_asn = env
+        .decision(policy, "ip-pseudonym:asn-only", false, 0)
+        .await?;
+    assert_eq!(
+        env.run(by_asn, &propose).await?,
+        rejected("threat_intel_required"),
+        "no listing, no context yet"
+    );
+    let prefix = format!("{}.0/24", asn_ip.rsplit_once('.').unwrap().0);
+    assert!(
+        env.owner
+            .record_network_context(
+                "ip-pseudonym:asn-only",
+                &NetworkContextOutcome::Routed {
+                    prefix: prefix.clone(),
+                    origin_asns: vec![asn],
+                    rpki: "invalid".into(),
+                    ttl_seconds: 3600
+                }
+            )
+            .await?
+    );
+    assert_eq!(
+        env.run(by_asn, &propose).await?,
+        rejected("threat_intel_required"),
+        "routing context alone - even RPKI-invalid - is not reputation"
+    );
+    sqlx::query("INSERT INTO indicators (value,indicator_type,categories,confidence,source,first_seen,last_seen,expires_at) VALUES ($1,'Asn','[\"spamhaus_asn\"]',80,'bridge-asn-test',NOW(),NOW(),NOW()+INTERVAL '1 day')")
+        .bind(format!("AS{asn}")).execute(&pool).await?;
+    let BridgeOutcome::Enqueued(request) = env.run(by_asn, &propose).await? else {
+        panic!("an origin-ASN listing is reputation");
+    };
+    let context: Value =
+        sqlx::query_scalar("SELECT approval_context FROM execution_requests WHERE id=$1")
+            .bind(request)
+            .fetch_one(&pool)
+            .await?;
+    let bridge_ctx = &context["policy_bridge"];
+    assert_eq!(bridge_ctx["intel"]["basis"], json!("asn"));
+    assert_eq!(bridge_ctx["intel"]["source"], json!("bridge-asn-test"));
+    assert_eq!(bridge_ctx["routing"]["origin_asns"], json!([asn]));
+    assert_eq!(bridge_ctx["routing"]["rpki"], json!("invalid"));
+    assert_eq!(bridge_ctx["routing"]["prefix"], json!(prefix));
+    assert_eq!(bridge_ctx["intel_required"], json!(true));
+    assert!(
+        !context.to_string().contains(&asn_ip),
+        "the approver sees routing facts, never the address"
+    );
+
+    // Address listing: confidence floor, staleness and delisting all end eligibility.
+    for (confidence, age_secs, expect_ok) in
+        [(40_i16, 0_i64, false), (80, 100_000, false), (80, 0, true)]
+    {
+        let name = format!("ip-pseudonym:ip-{confidence}-{age_secs}");
+        env.resolve(&name, 600).await?;
+        let ip = env.ip_of(&name);
+        env.list(&ip, confidence, age_secs).await?;
+        let d = env.decision(policy, &name, false, 0).await?;
+        let outcome = env.run(d, &propose).await?;
+        assert_eq!(
+            matches!(outcome, BridgeOutcome::Enqueued(_)),
+            expect_ok,
+            "{confidence}/{age_secs}: {outcome:?}"
+        );
+        if !expect_ok {
+            assert_eq!(outcome, rejected("threat_intel_required"));
+        }
+    }
+    // An ingest-time snapshot is overruled by a current view that no longer lists the source.
+    env.resolve("ip-pseudonym:snapshot", 600).await?;
+    let snap = env
+        .decision(policy, "ip-pseudonym:snapshot", true, 0)
+        .await?;
+    let snap_ip = env.ip_of("ip-pseudonym:snapshot");
+    env.delist(&snap_ip).await?;
+    assert_eq!(
+        env.run(snap, &propose).await?,
+        rejected("threat_intel_required"),
+        "delisted since ingest"
+    );
+    env.list(&snap_ip, 80, 0).await?;
+    let BridgeOutcome::Enqueued(_) = env.run(snap, &propose).await? else {
+        panic!("relisted")
+    };
+
+    // ---- dispatch-time revalidation (automatic: the request is claimable at once).
+    env.action(true, false).await?;
+    sqlx::query("INSERT INTO runtime_status (component,state,version,last_heartbeat_at) VALUES ('executor','running','t',NOW()) ON CONFLICT (component) DO UPDATE SET state='running', last_heartbeat_at=NOW()")
+        .execute(&pool).await?;
+    let mut automatic = params(BridgeMode::Automatic);
+    automatic.max_per_window = 50;
+    automatic.window_seconds = 3600;
+    env.resolve("ip-pseudonym:dispatch", 600).await?;
+    let ip = env.ip_of("ip-pseudonym:dispatch");
+    let d = env
+        .decision(policy, "ip-pseudonym:dispatch", true, 0)
+        .await?;
+    let BridgeOutcome::Enqueued(auto) = env.run(d, &automatic).await? else {
+        panic!("automatic enqueue")
+    };
+    sqlx::query("UPDATE execution_requests SET status='starting' WHERE id=$1")
+        .bind(auto)
+        .execute(&pool)
+        .await?;
+    let resolves = || async {
+        sqlx::query_scalar::<_, String>(
+            "SELECT raw_ip FROM clawforge_resolve_incident_source_for_apply($1)",
+        )
+        .bind(auto)
+        .fetch_optional(&pool)
+        .await
+    };
+    assert_eq!(
+        resolves().await?,
+        Some(ip.clone()),
+        "still listed: released to the executor"
+    );
+    env.delist(&ip).await?;
+    assert_eq!(
+        resolves().await?,
+        None,
+        "delisted before apply: nothing is released"
+    );
+    env.list(&ip, 40, 0).await?;
+    assert_eq!(
+        resolves().await?,
+        None,
+        "below the recorded confidence floor"
+    );
+    env.list(&ip, 80, 100_000).await?;
+    assert_eq!(
+        resolves().await?,
+        None,
+        "no longer reconfirmed within the recorded evidence age"
+    );
+    env.list(&ip, 80, 0).await?;
+    assert_eq!(
+        resolves().await?,
+        Some(ip.clone()),
+        "listed again: released"
+    );
     Ok(())
 }

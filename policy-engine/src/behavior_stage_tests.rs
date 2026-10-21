@@ -21,7 +21,7 @@ fn rank(decision: &str) -> usize {
 }
 
 fn bridge_config(mode: &str, rule: &str, requester: Option<Uuid>) -> Result<BridgeConfig> {
-    let ack = format!("unattended:{rule}:nftables.block_incident_source:-:60:100/3600:3600");
+    let ack = format!("unattended:{rule}:nftables.block_incident_source:-:60:100/3600:3600:50");
     let requester = requester.map(|id| id.to_string());
     BridgeConfig::from_lookup(|name| match name {
         bridge::MODE => Some(mode.to_string()),
@@ -30,6 +30,7 @@ fn bridge_config(mode: &str, rule: &str, requester: Option<Uuid>) -> Result<Brid
         bridge::MAX_PER_WINDOW => Some("100".into()),
         bridge::WINDOW_SECONDS => Some("3600".into()),
         bridge::MAX_EVIDENCE_AGE_SECONDS => Some("3600".into()),
+        bridge::MIN_INTEL_CONFIDENCE => Some("50".into()),
         bridge::RULE_ID => Some(rule.to_string()),
         bridge::REQUESTER_ID if mode == "propose" => requester.clone(),
         bridge::AUTOMATIC_ACK if mode == "automatic" => Some(ack.clone()),
@@ -127,7 +128,7 @@ async fn evidence_decision_and_enforcement_stages_for_the_labelled_cases() -> Re
                         if matches!(kind.as_str(), "block" | "rate_limit") {
                             // Read-only: the plan function never writes.
                             let (reason, existing): (Option<String>, Option<Uuid>) = sqlx::query_as(
-                                "SELECT reason, existing_request_id FROM clawforge_policy_bridge_plan($1,$2,$3,$4,$5,$6,$7,$8)",
+                                "SELECT reason, existing_request_id FROM clawforge_policy_bridge_plan($1,$2,$3,$4,$5,$6,$7,$8,$9)",
                             )
                             .bind(decision_id)
                             .bind(params.mode.as_str())
@@ -137,6 +138,7 @@ async fn evidence_decision_and_enforcement_stages_for_the_labelled_cases() -> Re
                             .bind(params.rule_id.as_deref())
                             .bind(params.max_evidence_age_seconds)
                             .bind(params.require_threat_intel)
+                            .bind(params.min_intel_confidence)
                             .fetch_one(policy.pool())
                             .await?;
                             reasons
