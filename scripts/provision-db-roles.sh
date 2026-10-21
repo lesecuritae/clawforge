@@ -16,6 +16,14 @@ read_secret() {
   printf '%s' "$value"
 }
 
+# The projection reader roles are used by tests and by an optional learning
+# integration only. Without their secret they are created without a login so the
+# grants below stay valid and no password has to be invented.
+read_optional_secret() {
+  [ -f "$2" ] || return 0
+  read_secret "$1" "$2"
+}
+
 PGPASSWORD="$(read_secret postgres_password "${CLAWFORGE_POSTGRES_SECRET_FILE:-/run/secrets/postgres_password}")"
 export PGPASSWORD
 api_password="$(read_secret database_api_password "${CLAWFORGE_DATABASE_API_PASSWORD_SECRET_FILE:-/run/secrets/database_api_password}")"
@@ -25,10 +33,16 @@ security_engine_password="$(read_secret database_security_engine_password "${CLA
 policy_engine_password="$(read_secret database_policy_engine_password "${CLAWFORGE_DATABASE_POLICY_ENGINE_PASSWORD_SECRET_FILE:-/run/secrets/database_policy_engine_password}")"
 incidents_password="$(read_secret database_incidents_password "${CLAWFORGE_DATABASE_INCIDENTS_PASSWORD_SECRET_FILE:-/run/secrets/database_incidents_password}")"
 executor_password="$(read_secret database_executor_password "${CLAWFORGE_DATABASE_EXECUTOR_PASSWORD_SECRET_FILE:-/run/secrets/database_executor_password}")"
-operations_password="$(read_secret database_operations_password "${CLAWFORGE_DATABASE_OPERATIONS_PASSWORD_SECRET_FILE:-/run/secrets/database_operations_password}")"
-decision_password="$(read_secret database_decision_password "${CLAWFORGE_DATABASE_DECISION_PASSWORD_SECRET_FILE:-/run/secrets/database_decision_password}")"
+operations_password="$(read_optional_secret database_operations_password "${CLAWFORGE_DATABASE_OPERATIONS_PASSWORD_SECRET_FILE:-/run/secrets/database_operations_password}")"
+decision_password="$(read_optional_secret database_decision_password "${CLAWFORGE_DATABASE_DECISION_PASSWORD_SECRET_FILE:-/run/secrets/database_decision_password}")"
 backup_password="$(read_secret database_backup_password "${CLAWFORGE_DATABASE_BACKUP_PASSWORD_SECRET_FILE:-/run/secrets/database_backup_password}")"
 
+# Only passed when the secret exists; the value is restricted to URL-safe characters.
+optional_password_args=""
+[ -z "$operations_password" ] || optional_password_args="$optional_password_args --set operations_password=$operations_password"
+[ -z "$decision_password" ] || optional_password_args="$optional_password_args --set decision_password=$decision_password"
+
+# shellcheck disable=SC2086
 psql \
   --host "${PGHOST:-postgres}" \
   --port "${PGPORT:-5432}" \
@@ -43,8 +57,7 @@ psql \
   --set policy_engine_password="$policy_engine_password" \
   --set incidents_password="$incidents_password" \
   --set executor_password="$executor_password" \
-  --set operations_password="$operations_password" \
-  --set decision_password="$decision_password" \
+  $optional_password_args \
   --set backup_password="$backup_password" <<'SQL'
 BEGIN;
 
@@ -68,8 +81,16 @@ ALTER ROLE clawforge_security_engine LOGIN PASSWORD :'security_engine_password' 
 ALTER ROLE clawforge_policy_engine LOGIN PASSWORD :'policy_engine_password' NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 16;
 ALTER ROLE clawforge_incidents LOGIN PASSWORD :'incidents_password' NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 16;
 ALTER ROLE clawforge_executor LOGIN PASSWORD :'executor_password' NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 16;
+\if :{?operations_password}
 ALTER ROLE clawforge_operations LOGIN PASSWORD :'operations_password' NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 16;
+\else
+ALTER ROLE clawforge_operations NOLOGIN PASSWORD NULL NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+\endif
+\if :{?decision_password}
 ALTER ROLE clawforge_decision LOGIN PASSWORD :'decision_password' NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 16;
+\else
+ALTER ROLE clawforge_decision NOLOGIN PASSWORD NULL NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+\endif
 ALTER ROLE clawforge_backup LOGIN PASSWORD :'backup_password' NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 4;
 
 GRANT CONNECT ON DATABASE :"database_name" TO clawforge_api, clawforge_worker, clawforge_correlation, clawforge_security_engine, clawforge_policy_engine, clawforge_incidents, clawforge_executor, clawforge_backup, clawforge_operations, clawforge_decision;
