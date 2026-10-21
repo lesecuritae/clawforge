@@ -2054,7 +2054,7 @@ async fn a_worker_that_dies_after_claiming_is_reclaimed_by_a_different_worker() 
 
 /// `recent_real_firewall_apply_count` backs `clawforge-executor`'s
 /// mass-block budget - proves the three ways a receipt must NOT count
-/// (dry run, outside the window) alongside the one way it must.
+/// (dry run, rollback, outside the window) alongside the one way it must.
 #[tokio::test]
 #[ignore = "requires an isolated PostgreSQL test container"]
 async fn recent_real_firewall_apply_count_only_counts_real_applies_in_the_window(
@@ -2080,6 +2080,16 @@ async fn recent_real_firewall_apply_count_only_counts_real_applies_in_the_window
         target_fingerprint: Some("test-mass-block-budget-fingerprint"),
         target_json: None,
     };
+
+    // Recovery removes a block; its real receipt must not consume a new apply.
+    let mut rollback = receipt_input(false);
+    rollback.receipt_kind = "rollback";
+    store.record_firewall_action_receipt(rollback).await?;
+    assert_eq!(
+        store.recent_real_firewall_apply_count(3600).await?,
+        baseline,
+        "a real rollback receipt must not consume the mass-block apply budget"
+    );
 
     // A dry run must never count towards the budget.
     store

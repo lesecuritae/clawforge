@@ -3,7 +3,7 @@ WORKDIR /src
 COPY . .
 RUN cargo build --release --workspace
 
-FROM debian:bookworm-slim AS runtime
+FROM debian:trixie-slim AS runtime
 ARG RELEASE_VERSION=dev
 ARG VCS_REF=unknown
 LABEL org.opencontainers.image.source="https://github.com/lesecuritae/clawforge" \
@@ -15,10 +15,11 @@ LABEL org.opencontainers.image.source="https://github.com/lesecuritae/clawforge"
       org.opencontainers.image.licenses="Apache-2.0"
 # systemd (for journalctl) is only actually used by clawforge-linux-sensor,
 # but every service shares this one runtime image, so it lands here rather
-# than in a second Dockerfile stage.
+# than in a second Dockerfile stage. The executor also needs nftables;
+# Bookworm's nft 1.0.6 crashes reading the pilot host's newer kernel sets.
 RUN apt-get update \
     && apt-get upgrade -y \
-    && apt-get install --no-install-recommends -y ca-certificates curl systemd \
+    && apt-get install --no-install-recommends -y ca-certificates curl systemd nftables \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /src/target/release/clawforge-api /usr/local/bin/clawforge-api
 COPY --from=builder /src/target/release/clawforge-linux-sensor /usr/local/bin/clawforge-linux-sensor
