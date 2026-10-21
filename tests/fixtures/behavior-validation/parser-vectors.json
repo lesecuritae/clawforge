@@ -1,0 +1,86 @@
+{
+  "ssh": [
+    {
+      "id": "valid_ipv4_password_fail",
+      "message": "Failed password for invalid user test from 203.0.113.11 port 22",
+      "expected_ip": "203.0.113.11"
+    },
+    {
+      "id": "valid_ipv6_publickey_fail",
+      "message": "Failed publickey for root from 2001:db8::1 port 22",
+      "expected_ip": "2001:db8::1"
+    },
+    {
+      "id": "valid_none_user_fail",
+      "message": "Failed none for admin from 203.0.113.12 port 22",
+      "expected_ip": "203.0.113.12"
+    },
+    {
+      "id": "valid_invalid_user",
+      "message": "Invalid user nobody from 203.0.113.13 port 2222",
+      "expected_ip": "203.0.113.13"
+    },
+    {
+      "id": "negative_accepted_password",
+      "message": "Accepted password for admin from 203.0.113.14 port 22",
+      "expected_ip": null
+    },
+    {
+      "id": "negative_disconnect",
+      "message": "Disconnecting: Too many authentication failures for invalid user (max 3 attempts) [preauth]",
+      "expected_ip": null
+    },
+    {
+      "id": "negative_pam_sudo",
+      "message": "PAM pam_unix(sshd:auth): authentication failure; logname= uid=0 euid=0 tty=ssh ruser= rhost=203.0.113.15",
+      "expected_ip": null
+    },
+    {
+      "id": "negative_no_ip",
+      "message": "Failed password for root from unknown port 22",
+      "expected_ip": null
+    }
+  ],
+  "http": [
+    {
+      "id": "valid_404",
+      "message": "203.0.113.25:54321 [01/Jan/2026:12:00:00.000] fe be/srv 0/0/0/1/1 404 123 - - ---- 1/1/1/1/0 0/0 \"GET /missing HTTP/1.1\"",
+      "expected_envelope_status": 404
+    },
+    {
+      "id": "valid_429",
+      "message": "198.51.100.10:8080 [02/Jan/2026:15:30:00.000] fe be/api 0/0/0/0/1 429 456 - - ---- 0/0/0/0/0 0/0 \"POST /rate-limited HTTP/1.1\"",
+      "expected_envelope_status": 429
+    },
+    {
+      "id": "valid_503",
+      "message": "192.0.2.42:443 [03/Jan/2026:18:45:00.000] fe be/health 0/0/0/0/1 503 789 - - ---- 0/0/0/0/0 0/0 \"GET /health HTTP/1.1\"",
+      "expected_envelope_status": 503
+    },
+    {
+      "id": "valid_negative_one",
+      "message": "203.0.113.25:54321 [04/Jan/2026:20:10:00.000] fe be/srv 0/0/0/1/1 -1 1024 - - ---- 1/1/1/1/0 0/0 \"GET /error HTTP/1.1\"",
+      "expected_envelope_status": 0
+    },
+    {
+      "id": "negative_200",
+      "message": "198.51.100.10:8080 [05/Jan/2026:10:00:00.000] fe be/api 0/0/0/0/1 200 256 - - ---- 0/0/0/0/0 0/0 \"GET /success HTTP/1.1\"",
+      "expected_envelope_status": null
+    },
+    {
+      "id": "negative_204",
+      "message": "192.0.2.42:443 [06/Jan/2026:11:30:00.000] fe be/health 0/0/0/0/1 204 0 - - ---- 0/0/0/0/0 0/0 \"GET /no-content HTTP/1.1\"",
+      "expected_envelope_status": null
+    },
+    {
+      "id": "negative_301",
+      "message": "203.0.113.25:54321 [07/Jan/2026:14:20:00.000] fe be/srv 0/0/0/0/1 301 300 - - ---- 0/0/0/0/0 0/0 \"GET /redirect HTTP/1.1\"",
+      "expected_envelope_status": null
+    },
+    {
+      "id": "negative_304",
+      "message": "198.51.100.10:8080 [08/Jan/2026:16:45:00.000] fe be/api 0/0/0/0/1 304 0 - - ---- 0/0/0/0/0 0/0 \"GET /cached HTTP/1.1\"",
+      "expected_envelope_status": null
+    }
+  ]
+}

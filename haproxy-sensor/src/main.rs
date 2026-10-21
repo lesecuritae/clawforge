@@ -45,6 +45,9 @@ use tokio::{
 };
 use tracing_subscriber::EnvFilter;
 
+#[cfg(test)]
+mod behavioral_tests;
+
 const SENSOR_NAME: &str = "haproxy";
 const DEFAULT_CHECKPOINT_PATH: &str = "/var/lib/clawforge/haproxy-sensor/cursor";
 const DEFAULT_BATCH_MAX_ITEMS: usize = 50;

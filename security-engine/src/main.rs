@@ -40,6 +40,9 @@ use std::env;
 use tracing::{info, warn};
 use uuid::Uuid;
 
+#[cfg(test)]
+mod behavioral_tests;
+
 const CONSUMER_NAME: &str = "security-engine";
 const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
