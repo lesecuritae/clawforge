@@ -172,11 +172,12 @@ fn history_min_score() -> f64 {
 ///   evidence, separate from *which* rule
 ///   noticed it this time or that time.
 #[cfg(test)]
+#[cfg(test)]
 async fn evidence_sources_for(
     store: &PostgresStore,
     assessment: &clawforge_storage::SecurityAssessment,
 ) -> Result<i16> {
-    Ok(independent_evidence_for(store, assessment).await?.0)
+    Ok(independent_evidence_for(store, assessment).await?.sources)
 }
 
 /// Rules that describe the system rather than the source's intent. They are
@@ -188,23 +189,70 @@ const OBSERVATION_ONLY_RULES: &[&str] = &["http_server_fault_burst"];
 /// anything closer is the same ongoing episode, not independent history.
 const EPISODE_GAP_SECONDS: i64 = 3600;
 
+/// How many evidence sources back an assessment, why, and the routing context
+/// that was visible when it was decided (prefix, origin ASNs, RPKI summary, BGP
+/// anomaly flag - never an address). Routing context is shown, never counted.
+#[derive(Debug, Clone)]
+struct IndependentEvidence {
+    sources: i16,
+    basis: &'static str,
+    routing: serde_json::Value,
+}
+
 /// The evidence-source count together with the basis that produced it, so the
 /// decision rationale shows *why* a second source was (or was not) counted.
 /// Independence means a different evidence kind, never the same observation
 /// seen twice: two rules (or two overlapping buckets of one rule) counting the
 /// same event family are one source, and an ongoing episode does not
 /// corroborate itself.
+///
+/// Reputation is judged on the **current** view of the source whenever one
+/// exists (an unexpired resolution): a listing that appeared after the events
+/// counts, a delisted or expired one does not, and an origin-ASN listing counts as
+/// reputation too. Only when no current view exists is the ingest-time snapshot
+/// used - and then only if it came from a real reputation source.
 async fn independent_evidence_for(
     store: &PostgresStore,
     assessment: &clawforge_storage::SecurityAssessment,
-) -> Result<(i16, &'static str)> {
+) -> Result<IndependentEvidence> {
+    let evidence = |sources, basis| IndependentEvidence {
+        sources,
+        basis,
+        routing: serde_json::Value::Null,
+    };
     // An operational observation has exactly one source and nothing to corroborate.
     if OBSERVATION_ONLY_RULES.contains(&assessment.rule_id.as_str()) {
-        return Ok((1, "observation_only"));
+        return Ok(evidence(1, "observation_only"));
     }
-    if let Some(hit) = &assessment.threat_intel {
+    let intel = store.current_source_intel(&assessment.resource).await?;
+    let routing = if intel.resolved {
+        intel.routing_json()
+    } else {
+        serde_json::Value::Null
+    };
+    let with_routing = |sources, basis| IndependentEvidence {
+        sources,
+        basis,
+        routing: routing.clone(),
+    };
+    if intel.resolved {
+        if let Some((kind, _)) = intel.qualifying_listing(
+            threat_intel_min_confidence(),
+            threat_intel_max_staleness_seconds(),
+            chrono::Utc::now(),
+        ) {
+            return Ok(with_routing(
+                2,
+                if kind == "ip" {
+                    "threat_intel_ip"
+                } else {
+                    "threat_intel_asn"
+                },
+            ));
+        }
+    } else if let Some(hit) = &assessment.threat_intel {
         if threat_intel_hit_is_corroborating(hit) {
-            return Ok((2, "threat_intel"));
+            return Ok(with_routing(2, "threat_intel_snapshot"));
         }
     }
     let since = chrono::Utc::now() - CROSS_RULE_CORROBORATION_WINDOW;
@@ -217,7 +265,7 @@ async fn independent_evidence_for(
         )
         .await?
     {
-        return Ok((2, "independent_event_family"));
+        return Ok(with_routing(2, "independent_event_family"));
     }
     let history_score = store
         .resource_prior_episode_history_score(
@@ -229,9 +277,9 @@ async fn independent_evidence_for(
         )
         .await?;
     if history_score >= history_min_score() {
-        return Ok((2, "prior_episode_history"));
+        return Ok(with_routing(2, "prior_episode_history"));
     }
-    Ok((1, "behavior_only"))
+    Ok(with_routing(1, "behavior_only"))
 }
 
 /// `security_assessments.confidence` (0-99, `security-engine`'s own scale)
@@ -290,7 +338,8 @@ async fn evaluate_assessment(
     let policies = store
         .list_active_security_policies_for_rule(&assessment.rule_id, chrono::Utc::now())
         .await?;
-    let (evidence_sources, evidence_basis) = independent_evidence_for(store, assessment).await?;
+    let independent = independent_evidence_for(store, assessment).await?;
+    let (evidence_sources, evidence_basis) = (independent.sources, independent.basis);
     let observation_only = OBSERVATION_ONLY_RULES.contains(&assessment.rule_id.as_str());
     for policy in policies {
         if !min_severity_met(&assessment.severity, &policy.min_severity) {
@@ -338,6 +387,7 @@ async fn evaluate_assessment(
             "event_count": assessment.event_count,
             "bucket_start": assessment.bucket_start,
             "evidence_basis": evidence_basis,
+            "routing_context": independent.routing,
             "observation_only": observation_only,
         });
         let hash = evidence_hash(policy.id, policy.version, &evidence_snapshot);
@@ -472,6 +522,8 @@ async fn shutdown_signal() {
 mod behavior_stage_tests;
 #[cfg(test)]
 mod independence_tests;
+#[cfg(test)]
+mod intel_tests;
 
 #[cfg(test)]
 mod tests {
