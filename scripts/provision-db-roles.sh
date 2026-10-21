@@ -199,6 +199,7 @@ GRANT SELECT, INSERT, UPDATE ON TABLE firewall_action_intents TO clawforge_execu
 -- Revalidate context-bound distinct approvals at dispatch; never grant approval writes.
 GRANT SELECT ON TABLE execution_approvals, approval_policies TO clawforge_executor;
 GRANT EXECUTE ON FUNCTION clawforge_lock_quarantine_approval(UUID) TO clawforge_executor;
+GRANT EXECUTE ON FUNCTION clawforge_resolve_incident_source_for_apply(UUID) TO clawforge_executor;
 -- Kill-switch intent queue (migration 0042): the executor's sweep reads
 -- pending rows and marks them processed once rolled back - it never
 -- inserts one itself (clawforge-api does that, via its own blanket
