@@ -1031,3 +1031,13 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod network_ids_policy_boundary {
+    #[test]
+    fn raw_ids_alert_has_no_implicit_threshold_rule() {
+        assert!(super::RULES
+            .iter()
+            .all(|r| r.event_type != "network_ids_alert"));
+    }
+}

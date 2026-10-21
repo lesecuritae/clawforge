@@ -9542,6 +9542,62 @@ mod tests {
         }
     }
 
+    /// Real Suricata 8.0.7 PCAP replay -> our Python normalizer -> the
+    /// authenticated production router and PostgreSQL, without attack attribution.
+    #[tokio::test]
+    #[ignore = "requires isolated PostgreSQL"]
+    async fn network_ids_batch_ingress_preserves_passive_observations() -> anyhow::Result<()> {
+        let url = std::env::var("CLAWFORGE_TEST_API_DATABASE_URL")
+            .or_else(|_| std::env::var("CLAWFORGE_TEST_DATABASE_URL"))?;
+        let store = PostgresStore::connect_runtime(&url).await?;
+        let credential = format!("ids-lab-{}", Uuid::new_v4());
+        let sensor_id = store
+            .register_security_sensor(
+                &format!("ids-lab-{}", Uuid::new_v4()),
+                &digest(&credential),
+                &credential[..8],
+                None,
+                "integration-test",
+            )
+            .await?;
+        let app = build_router(test_app_state(store.clone()));
+        let mut events: Vec<serde_json::Value> = serde_json::from_str(include_str!(
+            "../../tests/network-ids/real-suricata-normalized.json"
+        ))?;
+        // Historical replay fixtures must not bypass the normal ingress clock check.
+        for event in &mut events {
+            event["occurred_at"] = serde_json::json!(Utc::now());
+        }
+        let (status, _) = post_security_event_batch(&app, None, serde_json::to_vec(&events)?).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        for _ in 0..2 {
+            let (status, body) =
+                post_security_event_batch(&app, Some(&credential), serde_json::to_vec(&events)?)
+                    .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["data"]["accepted"], 2);
+        }
+        let rows: Vec<(String, serde_json::Value)> =
+            sqlx::query_as("SELECT event_type,evidence FROM security_events WHERE sensor_id=$1")
+                .bind(sensor_id)
+                .fetch_all(store.pool())
+                .await?;
+        assert_eq!(rows.len(), 2, "replay must not duplicate observations");
+        for (kind, evidence) in rows {
+            assert_eq!(kind, "network_ids_alert");
+            for field in ["source_ip", "destination_ip"] {
+                assert!(evidence[field]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("ip-pseudonym:"));
+            }
+            assert_eq!(evidence["signature_id"], 1000001);
+            assert_eq!(evidence["observed_action"], "allowed");
+            assert!(evidence.get("payload").is_none());
+        }
+        Ok(())
+    }
+
     async fn post_security_event_batch(
         app: &Router,
         bearer_token: Option<&str>,

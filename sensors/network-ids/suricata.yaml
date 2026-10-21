@@ -1,0 +1,40 @@
+%YAML 1.1
+---
+# Clawforge passive sensor configuration. No inline queue, routing, or drop rules.
+# Replace HOME_NET with the explicitly protected networks before deployment.
+vars:
+  address-groups:
+    HOME_NET: "any"
+    EXTERNAL_NET: "any"
+default-rule-path: /rules
+rule-files:
+  - suricata.rules
+outputs:
+  - eve-log:
+      enabled: yes
+      filetype: regular
+      filename: eve.json
+      types:
+        - alert:
+            payload: no
+            packet: no
+            metadata: no
+        - stats:
+            totals: yes
+            threads: no
+stats:
+  enabled: yes
+  interval: 30
+af-packet:
+  - interface: default
+    cluster-id: 91
+    cluster-type: cluster_flow
+    defrag: yes
+    use-mmap: yes
+    tpacket-v3: yes
+    promisc: no
+logging:
+  default-log-level: notice
+  outputs:
+    - console:
+        enabled: yes

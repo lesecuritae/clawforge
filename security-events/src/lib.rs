@@ -56,10 +56,11 @@ pub enum SecurityEventType {
     ContainerAnomaly,
     ContainerEscapeAttempt,
     ContainerLifecycleChanged,
+    NetworkIdsAlert,
 }
 
 impl SecurityEventType {
-    pub const ALL: [SecurityEventType; 12] = [
+    pub const ALL: [SecurityEventType; 13] = [
         SecurityEventType::FirewallBlock,
         SecurityEventType::FirewallRuleChanged,
         SecurityEventType::AuthFailure,
@@ -72,10 +73,12 @@ impl SecurityEventType {
         SecurityEventType::ContainerAnomaly,
         SecurityEventType::ContainerEscapeAttempt,
         SecurityEventType::ContainerLifecycleChanged,
+        SecurityEventType::NetworkIdsAlert,
     ];
 
     pub fn as_str(&self) -> &'static str {
         match self {
+            SecurityEventType::NetworkIdsAlert => "network_ids_alert",
             SecurityEventType::FirewallBlock => "firewall_block",
             SecurityEventType::FirewallRuleChanged => "firewall_rule_changed",
             SecurityEventType::AuthFailure => "auth_failure",
@@ -343,6 +346,58 @@ impl DnsAnomalyEvidence {
     }
 }
 
+/// A network IDS observation, not an attacker attribution or permission to block.
+/// Source/destination refer to the observed packet, not attacker/victim roles.
+/// No payload, URL, signature text, headers or DNS names are carried here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetworkIdsAlertEvidence {
+    pub source_ip: String,
+    pub destination_ip: String,
+    pub source_port: Option<u16>,
+    pub destination_port: Option<u16>,
+    pub protocol: String,
+    pub engine: String,
+    pub signature_id: u32,
+    pub generator_id: u32,
+    pub signature_revision: u32,
+    pub native_severity: u8,
+    pub observed_action: String,
+    pub flow_id: Option<u64>,
+}
+
+impl NetworkIdsAlertEvidence {
+    fn validate(&self) -> Result<(), ValidationError> {
+        validate_ip("source_ip", &self.source_ip)?;
+        validate_ip("destination_ip", &self.destination_ip)?;
+        validate_text("engine", &self.engine, SHORT_FIELD_MAX)?;
+        if !matches!(
+            self.protocol.as_str(),
+            "tcp" | "udp" | "icmp" | "icmpv6" | "sctp" | "other"
+        ) {
+            return Err(ValidationError::InvalidField {
+                field: "protocol",
+                max: 6,
+            });
+        }
+        if !matches!(
+            self.observed_action.as_str(),
+            "allowed" | "blocked" | "unknown"
+        ) {
+            return Err(ValidationError::InvalidField {
+                field: "observed_action",
+                max: 7,
+            });
+        }
+        if self.native_severity == 0 || self.native_severity > 4 {
+            return Err(ValidationError::InvalidField {
+                field: "native_severity",
+                max: 4,
+            });
+        }
+        Ok(())
+    }
+}
+
 /// A port or service scan detected against a monitored host.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PortScanDetectedEvidence {
@@ -442,6 +497,7 @@ impl ContainerLifecycleChangedEvidence {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "event_type", rename_all = "snake_case")]
 pub enum SecurityEventEvidence {
+    NetworkIdsAlert(NetworkIdsAlertEvidence),
     FirewallBlock(FirewallBlockEvidence),
     FirewallRuleChanged(FirewallRuleChangedEvidence),
     AuthFailure(AuthFailureEvidence),
@@ -459,6 +515,7 @@ pub enum SecurityEventEvidence {
 impl SecurityEventEvidence {
     pub fn event_type(&self) -> SecurityEventType {
         match self {
+            SecurityEventEvidence::NetworkIdsAlert(_) => SecurityEventType::NetworkIdsAlert,
             SecurityEventEvidence::FirewallBlock(_) => SecurityEventType::FirewallBlock,
             SecurityEventEvidence::FirewallRuleChanged(_) => SecurityEventType::FirewallRuleChanged,
             SecurityEventEvidence::AuthFailure(_) => SecurityEventType::AuthFailure,
@@ -480,6 +537,7 @@ impl SecurityEventEvidence {
 
     fn validate(&self) -> Result<(), ValidationError> {
         match self {
+            SecurityEventEvidence::NetworkIdsAlert(evidence) => evidence.validate(),
             SecurityEventEvidence::FirewallBlock(evidence) => evidence.validate(),
             SecurityEventEvidence::FirewallRuleChanged(evidence) => evidence.validate(),
             SecurityEventEvidence::AuthFailure(evidence) => evidence.validate(),
@@ -773,6 +831,31 @@ pub mod fixtures {
         .expect("container_lifecycle_changed fixture is valid")
     }
 
+    pub fn network_ids_alert() -> SensorEnvelope {
+        SensorEnvelope::new(
+            at(1_700_000_012),
+            "suricata:lab",
+            Severity::Medium,
+            "203.0.113.7",
+            "eve:fixture:1",
+            SecurityEventEvidence::NetworkIdsAlert(NetworkIdsAlertEvidence {
+                source_ip: "203.0.113.7".into(),
+                destination_ip: "198.51.100.10".into(),
+                source_port: Some(40000),
+                destination_port: Some(80),
+                protocol: "tcp".into(),
+                engine: "suricata".into(),
+                signature_id: 1000001,
+                generator_id: 1,
+                signature_revision: 1,
+                native_severity: 2,
+                observed_action: "allowed".into(),
+                flow_id: Some(1234),
+            }),
+        )
+        .expect("network IDS fixture is valid")
+    }
+
     /// One valid envelope per `SecurityEventType::ALL`, in the same order.
     pub fn all() -> Vec<SensorEnvelope> {
         vec![
@@ -788,6 +871,7 @@ pub mod fixtures {
             container_anomaly(),
             container_escape_attempt(),
             container_lifecycle_changed(),
+            network_ids_alert(),
         ]
     }
 }

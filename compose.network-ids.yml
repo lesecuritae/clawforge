@@ -1,0 +1,60 @@
+# Optional adapter only. Does not install/start a capture engine or redirect traffic.
+services:
+  clawforge-network-ids-sensor:
+    profiles: [network-ids]
+    build:
+      context: .
+      dockerfile: sensors/network-ids/Dockerfile
+    command:
+      - --eve=/eve/eve.json
+      - --state=/state/adapter.sqlite
+      - --source=${CLAWFORGE_IDS_SOURCE:-suricata:production}
+      - --ingress=http://clawforge-api:8080
+      - --allow-http
+      - --credential-file=/run/secrets/network_ids_sensor_credential
+    user: "${CLAWFORGE_IDS_UID:-10001}:${CLAWFORGE_IDS_GID:-10001}"
+    volumes:
+      - ${CLAWFORGE_EVE_DIRECTORY:?set existing EVE log directory}:/eve:ro
+      - ${CLAWFORGE_IDS_STATE_DIRECTORY:?set writable adapter state directory}:/state
+    secrets:
+      - network_ids_sensor_credential
+    networks: [backend]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 32
+    mem_limit: 128m
+    cpus: 0.5
+    restart: on-failure:5
+  clawforge-suricata:
+    profiles: [packet-capture]
+    image: local/clawforge-suricata:8.0.7
+    build:
+      context: .
+      dockerfile: sensors/network-ids/Suricata.Dockerfile
+    entrypoint: [/usr/bin/suricata]
+    command:
+      - -c
+      - /etc/clawforge/suricata.yaml
+      - --af-packet=${CLAWFORGE_SURICATA_INTERFACE:?set verified capture interface}
+      - -l
+      - /var/log/suricata
+    # Only packets visible on this Linux host. No forwarding or inline filtering.
+    network_mode: host
+    user: "${CLAWFORGE_IDS_UID:-10001}:${CLAWFORGE_IDS_GID:-10001}"
+    volumes:
+      - ./sensors/network-ids/suricata.yaml:/etc/clawforge/suricata.yaml:ro
+      - ${CLAWFORGE_SURICATA_RULES_DIRECTORY:?set reviewed rules directory}:/rules:ro
+      - ${CLAWFORGE_EVE_DIRECTORY:?set existing EVE log directory}:/var/log/suricata
+    cap_drop: [ALL]
+    cap_add: [NET_RAW]
+    read_only: true
+    security_opt: [no-new-privileges:true]
+    pids_limit: 64
+    mem_limit: 512m
+    cpus: 1.0
+    restart: on-failure:5
+
+secrets:
+  network_ids_sensor_credential:
+    file: ${CLAWFORGE_IDS_CREDENTIAL_FILE:?set registered sensor credential file}
