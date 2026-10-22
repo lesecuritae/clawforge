@@ -4,6 +4,28 @@
 
 Weitere Änderungen für die nächste Version werden hier gesammelt.
 
+## [1.2.2] - 2026-10-22
+
+- Performance: event-delivery claims read the oldest ready deliveries from the new partial
+  index `event_delivery_ready_idx` (migration 0065) instead of sorting the whole backlog on
+  every poll (400k backlog: 816 ms -> 0.5 ms; production polls took ~2.2 s and kept several
+  PostgreSQL backends busy). Stale in-flight rows are reclaimed first, so a deep backlog never
+  starves a stuck delivery. On large installations build the index first with
+  `CREATE INDEX CONCURRENTLY` (see `docs/event-delivery.md`).
+- Detection: `ssh_bruteforce_slow` v1 (migration 0066) finds sources that try about once a
+  minute (>= 15 failed logins per hour) and are invisible to the five-minute rule. Bounded
+  cost per firing, yields to an overlapping `ssh_bruteforce` finding, same event family (never
+  independent evidence for it). Measured limit: a busy shared NAT trips it too - a reported
+  false positive that the independent-evidence requirement keeps from becoming an attacker finding.
+- Telemetry: sensors send an authenticated heartbeat (`POST /internal/security-events/heartbeat`,
+  no event, no audit row) and `/metrics` exports `clawforge_security_sensor_last_seen_age_seconds`,
+  so a quiet sensor can be told from a dead one. `scripts/sensor-census.sh` is the read-only census.
+- Providers: Team Cymru through its WHOIS interface, RPKI validation with a separate origin AS and
+  prefix, BGPStream retired (`scripts/release/disable-retired-providers.sql` for the orphan rows).
+- Release tooling: rollback and rehearsal cover ledger 65/66 and the patch rollback 1.2.2 -> 1.2.1;
+  `scripts/release/rehearse-patch.sh` rehearses a patch against a copy of the current production schema.
+- Upgrade: additive migrations 0065 and 0066 (ledger 64 -> 66). Nothing is enabled by the upgrade.
+
 ## [1.2.1] - 2026-10-22
 
 - Intelligence: the Spamhaus ASN-DROP feed's trailing metadata object is accepted
