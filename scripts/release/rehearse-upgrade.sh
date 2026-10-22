@@ -3,13 +3,14 @@
 # -> 1.2.0 again, on a throw-away PostgreSQL. Production is only READ (pg_dump of schema and of the
 # small tables; the five giant relation/event tables are copied schema-only).
 #
-#   rehearse-upgrade.sh <old-image> <new-image> <old-roles-script> <new-roles-script> <state-dir>
+#   rehearse-upgrade.sh <old-image> <new-image> <old-roles-script> <new-roles-script> <state-dir> [<previous-patch-image>]
+#   (with a previous patch image, e.g. 1.2.1 for a 1.2.2 candidate, the patch-level rollback is rehearsed too)
 #
 # Fails closed: every restore step runs with ON_ERROR_STOP=1, every check is an assertion against an
 # explicit expected value, and the exit code is non-zero if any assertion failed. It does NOT claim a
 # full-size restore: the giant tables carry no rows in the fixture.
 set -uo pipefail
-OLD_IMG="$1"; NEW_IMG="$2"; OLD_ROLES="$3"; NEW_ROLES="$4"; D="$5"
+OLD_IMG="$1"; NEW_IMG="$2"; OLD_ROLES="$3"; NEW_ROLES="$4"; D="$5"; PREV_IMG="${6:-}"
 HERE="$(cd "$(dirname "$0")" && pwd)"; REPO="$(cd "$HERE/../.." && pwd)"
 PROD=clawforge-postgres-1
 C=clawforge-rehearsal-pg; N=clawforge-rehearsal-net
@@ -134,4 +135,19 @@ assert "restore script" "$(P -v arch="$ARCH" -f /tmp/restore.sql >> "$LOG" 2>&1;
 assert "archived row restored" "$(P -c "select count(*) from public.source_network_context where pseudonym='rehearsal-pseudonym' and origin_asns=ARRAY[64500]::bigint[]")" 1
 assert "restore is idempotent" "$(P -v arch="$ARCH" -f /tmp/restore.sql >> "$LOG" 2>&1; P -c "select count(*) from public.source_network_context")" 1
 assert "archive still present (nothing deleted)" "$(P -c "select count(*) from \"$ARCH\".source_network_context")" 1
+
+if [ -n "$PREV_IMG" ] && [ "$NMAX" -ge 66 ]; then
+  say "== phase 4: patch rollback to $PREV_IMG and forward again"
+  MIG_PREV(){ docker run --rm --network "$N" -e DATABASE_URL_FILE=/s/database_url -v "$D/secrets:/s:ro" "$PREV_IMG" /usr/local/bin/clawforge-migrate; }
+  docker cp "$HERE/rollback-1.2.2-to-1.2.1.sql" "$C:/tmp/rb2.sql"
+  assert "patch rollback exit" "$(P -f /tmp/rb2.sql >> "$LOG" 2>&1; echo $?)" 0
+  assert "ledger back at 64" "$(P -c "select max(version)||'/'||count(*) from _sqlx_migrations")" "64/$((NFILES-2))"
+  assert "previous patch image accepts the database" "$(MIG_PREV >> "$LOG" 2>&1; echo $?)" 0
+  assert "ledger untouched by the previous image" "$(P -c "select max(version)||'/'||count(*) from _sqlx_migrations")" "64/$((NFILES-2))"
+  assert "patch rollback refuses to run twice" "$(P -f /tmp/rb2.sql >> "$LOG" 2>&1; [ $? -ne 0 ] && echo refused || echo ran)" refused
+  assert "ready index kept (nothing dropped)" "$(P -c "select count(*) from pg_indexes where indexname='event_delivery_ready_idx'")" 1
+  assert "slow-rule policy row kept" "$(P -c "select count(*) from security_policies where rule_id='ssh_bruteforce_slow'")" 1
+  assert "forward again" "$(MIG_NEW >> "$LOG" 2>&1; echo $?)" 0
+  assert "ledger identical to the first upgrade" "$(LEDGER_SIG)" "$UP1_SIG"
+fi
 finish

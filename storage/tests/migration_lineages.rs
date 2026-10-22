@@ -119,7 +119,9 @@ async fn both_historical_lineages_converge_without_rewriting_history() -> anyhow
             "immutable approvals are preserved"
         );
         assert!(store.readiness().await?.current);
-        assert_eq!(store.readiness().await?.latest, 65);
+        // the newest migration this binary knows, not a literal every new migration must bump
+        let status = store.readiness().await?;
+        assert_eq!(status.latest, status.expected_latest);
         let after: Vec<(i64, Vec<u8>, bool)> = sqlx::query_as("SELECT version,checksum,success FROM _sqlx_migrations WHERE version <= $1 ORDER BY version")
             .bind(if production { 47_i64 } else { 46 }).fetch_all(&pool).await?;
         assert_eq!(

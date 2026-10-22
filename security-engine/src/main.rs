@@ -79,6 +79,12 @@ struct CountThresholdRule {
     incident: bool,
     window_seconds: i64,
     threshold: usize,
+    /// Most members read and recorded per firing; `severity_for_count` saturates at
+    /// `threshold * 4`, so a long window needs no more than that plus one.
+    max_members: i64,
+    /// A rule whose findings make this one redundant: while an assessment of that rule overlaps
+    /// the window, this rule stays quiet (one finding per activity, not one per rule).
+    yields_to: Option<&'static str>,
 }
 
 const SSH_BRUTEFORCE: CountThresholdRule = CountThresholdRule {
@@ -89,6 +95,25 @@ const SSH_BRUTEFORCE: CountThresholdRule = CountThresholdRule {
     incident: true,
     window_seconds: 300,
     threshold: 5,
+    max_members: 1000,
+    yields_to: None,
+};
+
+/// The same behaviour at a pace the five-minute rule cannot see: a source that tries about
+/// once a minute never has five failures in any five minutes, yet makes dozens an hour.
+/// Measured on production (three days, one SSH host): 71 source-hours with at least 15 failures
+/// and no five-minute window at threshold were invisible. Same event family as `ssh_bruteforce`,
+/// so it never counts as independent evidence for it; per-event cost is bounded by `max_members`.
+const SSH_BRUTEFORCE_SLOW: CountThresholdRule = CountThresholdRule {
+    rule_id: "ssh_bruteforce_slow",
+    rule_version: "1",
+    event_type: "ssh_login_failure",
+    status: EventStatusFilter::Any,
+    incident: true,
+    window_seconds: 3600,
+    threshold: 15,
+    max_members: 61,
+    yields_to: Some("ssh_bruteforce"),
 };
 
 /// Client-attributable HTTP anomalies only: a 5xx is the server's own failure.
@@ -100,6 +125,8 @@ const HTTP_ANOMALY_BURST: CountThresholdRule = CountThresholdRule {
     incident: true,
     window_seconds: 300,
     threshold: 10,
+    max_members: 1000,
+    yields_to: None,
 };
 
 /// Many 5xx answers to one source in a window: visible, but an operational
@@ -114,9 +141,16 @@ const HTTP_SERVER_FAULT_BURST: CountThresholdRule = CountThresholdRule {
     incident: false,
     window_seconds: 300,
     threshold: 10,
+    max_members: 1000,
+    yields_to: None,
 };
 
-const RULES: &[CountThresholdRule] = &[SSH_BRUTEFORCE, HTTP_ANOMALY_BURST, HTTP_SERVER_FAULT_BURST];
+const RULES: &[CountThresholdRule] = &[
+    SSH_BRUTEFORCE,
+    SSH_BRUTEFORCE_SLOW,
+    HTTP_ANOMALY_BURST,
+    HTTP_SERVER_FAULT_BURST,
+];
 
 /// A scan/reconnaissance rule: not "how many events", but "how many
 /// *distinct* values of one evidence field" - the shape a vulnerability
@@ -330,16 +364,25 @@ async fn evaluate_rule(
         let bucket = bucket_start(event.occurred_at, rule.window_seconds, offset);
         let bucket_end = bucket + Duration::seconds(rule.window_seconds);
         let members = store
-            .list_events_for_bucket_filtered(
+            .list_events_for_bucket_limited(
                 rule.event_type,
                 correlation_id,
                 bucket,
                 bucket_end,
                 rule.status,
+                rule.max_members,
             )
             .await?;
         if members.len() < rule.threshold {
             continue;
+        }
+        if let Some(other) = rule.yields_to {
+            if store
+                .resource_has_assessment_overlapping(correlation_id, other, bucket, bucket_end)
+                .await?
+            {
+                continue;
+            }
         }
         let event_ids: Vec<Uuid> = members.iter().map(|(id, _)| *id).collect();
         let first_seen = members
