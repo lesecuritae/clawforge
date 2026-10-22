@@ -1,3 +1,25 @@
+# Clawforge v1.2.3 Attack-shape evidence, inventory events no longer incidents
+
+## Detection
+- `attack_shape` evidence (migration 0067, read-only function): account enumeration (>= 8 account
+  names tried) and secret-file probes (>= 3 distinct `/.env`-style paths) corroborate an assessment
+  as a content-based second source. Counts only; usernames and paths never reach the policy role.
+  Enforcement still needs a counting reputation listing. The quality gate stays red.
+
+## Fixes
+- Network inventory (RouteViews/RIPE RIS prefix rows, unchanged ASN records) is no longer published
+  as `bgp_change` / `asn_change` security events. This was the cause of most of the ~210k
+  "incidents". Existing incidents are not touched; cleanup needs an operator-reviewed plan.
+
+## Operations
+- `docs/graph-retention.md` and `scripts/ops/graph-retention.sh`: reviewed swap-and-archive plan for
+  the two large graph tables. Nothing is applied automatically.
+
+## Upgrade
+- Migration 0067 is additive (ledger 66 to 67); the patch rollback is
+  `scripts/release/rollback-last-migration.sql -v top=67` (nothing is dropped).
+- Bridge, RIPEstat enrichment, live enforcement and quarantine stay off.
+
 # Clawforge v1.2.2 Delivery claim index, hourly SSH rule, sensor heartbeat
 
 ## Performance
