@@ -4,6 +4,8 @@
 
 Weitere Änderungen für die nächste Version werden hier gesammelt.
 
+- Detection: `attack_shape` evidence (migration 0067): account enumeration (>= 8 account names tried) and secret-file probes (>= 3 distinct `/.env`-style paths) corroborate an assessment as a content-based second source; counts only, never usernames or paths. Enforcement still needs a reputation listing. Fixtures carry explicit username/path models; attacker findings over the 21 scenarios TP 2 -> 7 at FP 0; quality gate stays false.
+
 ## [1.2.2] - 2026-10-22
 
 - Performance: event-delivery claims read the oldest ready deliveries from the new partial

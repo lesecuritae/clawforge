@@ -15,7 +15,10 @@
       "status": 404,
       "note": "",
       "expected_strongest_decision": "none",
-      "expected_enforcement_requests": 0
+      "expected_enforcement_requests": 0,
+      "usernames": [
+        "alice"
+      ]
     },
     {
       "id": "ssh_four_typos",
@@ -33,7 +36,10 @@
       "status": 404,
       "note": "",
       "expected_strongest_decision": "none",
-      "expected_enforcement_requests": 0
+      "expected_enforcement_requests": 0,
+      "usernames": [
+        "alice"
+      ]
     },
     {
       "id": "ssh_bruteforce_threshold",
@@ -54,7 +60,10 @@
       "status": 404,
       "note": "",
       "expected_strongest_decision": "challenge",
-      "expected_enforcement_requests": 0
+      "expected_enforcement_requests": 0,
+      "usernames": [
+        "root"
+      ]
     },
     {
       "id": "ssh_sustained_attack",
@@ -88,9 +97,41 @@
         19
       ],
       "status": 404,
-      "note": "",
-      "expected_strongest_decision": "rate_limit",
-      "expected_enforcement_requests": 0
+      "note": " Dictionary run (20 different account names): content-based attack_shape evidence corroborates it, so the shadow decision is block; no listing, so no enforcement request.",
+      "expected_strongest_decision": "block",
+      "expected_enforcement_requests": 0,
+      "usernames": [
+        "root",
+        "admin",
+        "ubuntu",
+        "test",
+        "oracle",
+        "postgres",
+        "git",
+        "user",
+        "guest",
+        "pi",
+        "ftp",
+        "www",
+        "deploy",
+        "jenkins",
+        "ansible",
+        "hadoop",
+        "nagios",
+        "mysql",
+        "tomcat",
+        "support",
+        "backup",
+        "demo",
+        "dev",
+        "info",
+        "web",
+        "mail",
+        "operator",
+        "vagrant",
+        "sysadmin",
+        "elastic"
+      ]
     },
     {
       "id": "ssh_legitimate_shared_nat",
@@ -112,7 +153,12 @@
       "status": 404,
       "note": "Legitimate independent users share one NAT address; intentionally measures a detector false positive, not a block.",
       "expected_strongest_decision": "challenge",
-      "expected_enforcement_requests": 0
+      "expected_enforcement_requests": 0,
+      "usernames": [
+        "alice",
+        "bob",
+        "carol"
+      ]
     },
     {
       "id": "ssh_boundary_evasion",
@@ -137,7 +183,10 @@
         "ssh_bruteforce"
       ],
       "expected_strongest_decision": "rate_limit",
-      "expected_enforcement_requests": 0
+      "expected_enforcement_requests": 0,
+      "usernames": [
+        "root"
+      ]
     },
     {
       "id": "ssh_two_attack_buckets",
@@ -163,7 +212,39 @@
       "status": 404,
       "note": "",
       "expected_strongest_decision": "rate_limit",
-      "expected_enforcement_requests": 0
+      "expected_enforcement_requests": 0,
+      "usernames": [
+        "root",
+        "admin",
+        "ubuntu",
+        "test",
+        "oracle",
+        "postgres",
+        "git",
+        "user",
+        "guest",
+        "pi",
+        "ftp",
+        "www",
+        "deploy",
+        "jenkins",
+        "ansible",
+        "hadoop",
+        "nagios",
+        "mysql",
+        "tomcat",
+        "support",
+        "backup",
+        "demo",
+        "dev",
+        "info",
+        "web",
+        "mail",
+        "operator",
+        "vagrant",
+        "sysadmin",
+        "elastic"
+      ]
     },
     {
       "id": "http_single_missing_asset",
@@ -178,7 +259,10 @@
       "status": 404,
       "note": "",
       "expected_strongest_decision": "none",
-      "expected_enforcement_requests": 0
+      "expected_enforcement_requests": 0,
+      "paths": [
+        "/static/old.3d9a.png"
+      ]
     },
     {
       "id": "http_seven_paths",
@@ -199,7 +283,16 @@
       "status": 404,
       "note": "",
       "expected_strongest_decision": "none",
-      "expected_enforcement_requests": 0
+      "expected_enforcement_requests": 0,
+      "paths": [
+        "/static/app.1f3a9c.js",
+        "/static/vendor.7be21d.js",
+        "/static/main.c04e55.css",
+        "/static/logo.3d9a1b.svg",
+        "/static/fonts/inter.8c2f.woff2",
+        "/static/chunk-4812.js",
+        "/static/chunk-7731.js"
+      ]
     },
     {
       "id": "http_scanner_threshold",
@@ -223,7 +316,17 @@
       "status": 404,
       "note": "",
       "expected_strongest_decision": "challenge",
-      "expected_enforcement_requests": 0
+      "expected_enforcement_requests": 0,
+      "paths": [
+        "/.env",
+        "/.git/config",
+        "/wp-login.php",
+        "/phpmyadmin/",
+        "/.aws/credentials",
+        "/admin/",
+        "/config/.env",
+        "/backup.zip"
+      ]
     },
     {
       "id": "http_abusive_burst",
@@ -251,7 +354,10 @@
       "status": 404,
       "note": "",
       "expected_strongest_decision": "challenge",
-      "expected_enforcement_requests": 0
+      "expected_enforcement_requests": 0,
+      "paths": [
+        "/api/login"
+      ]
     },
     {
       "id": "http_legitimate_backend_failure",
@@ -282,7 +388,10 @@
         "http_server_fault_burst"
       ],
       "expected_strongest_decision": "observe",
-      "expected_enforcement_requests": 0
+      "expected_enforcement_requests": 0,
+      "paths": [
+        "/api/items"
+      ]
     },
     {
       "id": "http_broken_asset_release",
@@ -306,7 +415,17 @@
       "status": 404,
       "note": "Normal browser loads eight missing assets; expected detector false positive.",
       "expected_strongest_decision": "challenge",
-      "expected_enforcement_requests": 0
+      "expected_enforcement_requests": 0,
+      "paths": [
+        "/static/app.1f3a9c.js",
+        "/static/vendor.7be21d.js",
+        "/static/main.c04e55.css",
+        "/static/logo.3d9a1b.svg",
+        "/static/fonts/inter.8c2f.woff2",
+        "/static/chunk-4812.js",
+        "/static/chunk-7731.js",
+        "/static/icons.55aa.svg"
+      ]
     },
     {
       "id": "http_boundary_scan_evasion",
@@ -338,7 +457,23 @@
         "http_scan"
       ],
       "expected_strongest_decision": "rate_limit",
-      "expected_enforcement_requests": 0
+      "expected_enforcement_requests": 0,
+      "paths": [
+        "/.env",
+        "/.git/config",
+        "/wp-login.php",
+        "/phpmyadmin/",
+        "/.aws/credentials",
+        "/admin/",
+        "/config/.env",
+        "/backup.zip",
+        "/.docker/config.json",
+        "/xmlrpc.php",
+        "/.env.production",
+        "/api/.env",
+        "/aws/credentials",
+        "/.pypirc"
+      ]
     },
     {
       "id": "http_normal_successful_burst",
@@ -392,7 +527,10 @@
       "status": 200,
       "note": "",
       "expected_strongest_decision": "none",
-      "expected_enforcement_requests": 0
+      "expected_enforcement_requests": 0,
+      "paths": [
+        "/"
+      ]
     },
     {
       "id": "ssh_sustained_attack_listed_source",
@@ -429,7 +567,39 @@
       "note": "Same observable behaviour as ssh_sustained_attack, but the source is listed by a fresh confident reputation feed: independent evidence.",
       "listed_source": true,
       "expected_strongest_decision": "block",
-      "expected_enforcement_requests": 1
+      "expected_enforcement_requests": 1,
+      "usernames": [
+        "root",
+        "admin",
+        "ubuntu",
+        "test",
+        "oracle",
+        "postgres",
+        "git",
+        "user",
+        "guest",
+        "pi",
+        "ftp",
+        "www",
+        "deploy",
+        "jenkins",
+        "ansible",
+        "hadoop",
+        "nagios",
+        "mysql",
+        "tomcat",
+        "support",
+        "backup",
+        "demo",
+        "dev",
+        "info",
+        "web",
+        "mail",
+        "operator",
+        "vagrant",
+        "sysadmin",
+        "elastic"
+      ]
     },
     {
       "id": "http_scanner_sustained_listed_source",
@@ -463,7 +633,25 @@
       "note": "Sixteen distinct paths from a feed-listed source: independent evidence, high confidence.",
       "listed_source": true,
       "expected_strongest_decision": "block",
-      "expected_enforcement_requests": 1
+      "expected_enforcement_requests": 1,
+      "paths": [
+        "/.env",
+        "/.git/config",
+        "/wp-login.php",
+        "/phpmyadmin/",
+        "/.aws/credentials",
+        "/admin/",
+        "/config/.env",
+        "/backup.zip",
+        "/.docker/config.json",
+        "/xmlrpc.php",
+        "/.env.production",
+        "/api/.env",
+        "/aws/credentials",
+        "/.pypirc",
+        "/server-status",
+        "/cgi-bin/luci/"
+      ]
     },
     {
       "id": "http_scanner_sustained_unlisted",
@@ -494,10 +682,28 @@
         15
       ],
       "status": 404,
-      "note": "Identical behaviour to the listed twin without independent evidence: rate limit at most, never a block.",
+      "note": "Same requests as the listed twin but no reputation listing: the sixteen probed paths include secret/config files (attack_shape evidence), so the shadow decision is block, yet no enforcement request exists because the bridge requires a counting reputation listing.",
       "listed_source": false,
-      "expected_strongest_decision": "rate_limit",
-      "expected_enforcement_requests": 0
+      "expected_strongest_decision": "block",
+      "expected_enforcement_requests": 0,
+      "paths": [
+        "/.env",
+        "/.git/config",
+        "/wp-login.php",
+        "/phpmyadmin/",
+        "/.aws/credentials",
+        "/admin/",
+        "/config/.env",
+        "/backup.zip",
+        "/.docker/config.json",
+        "/xmlrpc.php",
+        "/.env.production",
+        "/api/.env",
+        "/aws/credentials",
+        "/.pypirc",
+        "/server-status",
+        "/cgi-bin/luci/"
+      ]
     },
     {
       "id": "ssh_slow_attacker_below_the_five_minute_threshold",
@@ -543,7 +749,10 @@
       "status": 404,
       "note": "One failed login every two minutes for an hour: never five in five minutes, thirty an hour. Production showed 71 such source-hours in three days. Added with rule ssh_bruteforce_slow v1.",
       "expected_strongest_decision": "rate_limit",
-      "expected_enforcement_requests": 0
+      "expected_enforcement_requests": 0,
+      "usernames": [
+        "root"
+      ]
     },
     {
       "id": "ssh_occasional_typos_across_a_day",
@@ -565,7 +774,10 @@
       "status": 404,
       "note": "One mistyped password every half hour for four hours stays below both the five-minute and the hourly threshold.",
       "expected_strongest_decision": "none",
-      "expected_enforcement_requests": 0
+      "expected_enforcement_requests": 0,
+      "usernames": [
+        "alice"
+      ]
     },
     {
       "id": "ssh_busy_shared_nat_over_an_hour",
@@ -601,8 +813,15 @@
       "status": 404,
       "note": "Many independent users behind one NAT address mistype passwords at about twenty an hour; intentionally measures a detector false positive of the new hourly rule, not a block.",
       "expected_strongest_decision": "rate_limit",
-      "expected_enforcement_requests": 0
+      "expected_enforcement_requests": 0,
+      "usernames": [
+        "alice",
+        "bob",
+        "carol",
+        "dave",
+        "erin"
+      ]
     }
   ],
-  "revision_note": "Cases 0-14 and their original expected_rules/label_attack are the frozen 2026-10-21 baseline. expected_rules_after_fix records the deterministic behaviour change of detection-fix rule version 2 (staggered windows, 5xx split) for three cases only; intent labels were not changed. Cases 15-17 were added afterwards. expected_strongest_decision / expected_enforcement_requests describe the policy stage with every policy promoted to class automatic and bridge modes automatic and propose configured. Cases 18-20 (hourly SSH rule) were added with ssh_bruteforce_slow v1; their expected_strongest_decision values are taken from the first real run of the policy stage and reviewed, not chosen to make a gate pass."
+  "revision_note": "Cases 0-14 and their original expected_rules/label_attack are the frozen 2026-10-21 baseline. expected_rules_after_fix records the deterministic behaviour change of detection-fix rule version 2 (staggered windows, 5xx split) for three cases only; intent labels were not changed. Cases 15-17 were added afterwards. expected_strongest_decision / expected_enforcement_requests describe the policy stage with every policy promoted to class automatic and bridge modes automatic and propose configured. Cases 18-20 (hourly SSH rule) were added with ssh_bruteforce_slow v1; their expected_strongest_decision values are taken from the first real run of the policy stage and reviewed, not chosen to make a gate pass. Cases carry an explicit username/path model since 2026-10-22 (fields `usernames`, `paths`; the generator used a new invalid account name per SSH failure and synthetic /fixture-N paths before, which made every SSH case look like a dictionary run). The model follows the scenario description, not its outcome: legitimate cases use a few valid accounts / ordinary application paths; password guessing against root uses one account, dictionary runs many names; scanners ask for secret and config files (production: 112 source-hours with >= 10 distinct usernames and mass /.env*, /.git/config, /.aws/credentials probes in three days). Labels, offsets, counts and expected detector rules are unchanged."
 }

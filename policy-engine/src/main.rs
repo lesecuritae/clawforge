@@ -38,6 +38,7 @@
 //! gate ("Policies können gegen historische Incidents replayed werden")
 //! true by construction rather than an untested claim.
 
+mod attack_shape;
 mod bridge;
 
 use anyhow::Result;
@@ -197,6 +198,14 @@ struct IndependentEvidence {
     sources: i16,
     basis: &'static str,
     routing: serde_json::Value,
+    /// Behaviour counts of the member events (usernames tried, secret-path probes) and the shape
+    /// they were classified as; shown with every decision, counted only as `attack_shape`.
+    shape: serde_json::Value,
+}
+
+fn attack_shape_config() -> &'static attack_shape::ShapeConfig {
+    static CONFIG: std::sync::OnceLock<attack_shape::ShapeConfig> = std::sync::OnceLock::new();
+    CONFIG.get_or_init(attack_shape::ShapeConfig::from_env)
 }
 
 /// The evidence-source count together with the basis that produced it, so the
@@ -219,6 +228,7 @@ async fn independent_evidence_for(
         sources,
         basis,
         routing: serde_json::Value::Null,
+        shape: serde_json::Value::Null,
     };
     // An operational observation has exactly one source and nothing to corroborate.
     if OBSERVATION_ONLY_RULES.contains(&assessment.rule_id.as_str()) {
@@ -230,10 +240,32 @@ async fn independent_evidence_for(
     } else {
         serde_json::Value::Null
     };
+    // Behaviour counts first (numbers only), so every decision shows them.
+    let shape_config = attack_shape_config();
+    let (shape_json, shape_kind) = if shape_config.enabled {
+        let counts = store
+            .assessment_shape(assessment.id, &shape_config.path_patterns)
+            .await?;
+        let kind = shape_config.classify(&counts);
+        (
+            serde_json::json!({
+                "kind": kind.map(attack_shape::ShapeKind::as_str),
+                "events": counts.events,
+                "distinct_usernames": counts.distinct_usernames,
+                "signature_paths": counts.signature_paths,
+                "min_usernames": shape_config.min_usernames,
+                "min_signature_paths": shape_config.min_signature_paths,
+            }),
+            kind,
+        )
+    } else {
+        (serde_json::Value::Null, None)
+    };
     let with_routing = |sources, basis| IndependentEvidence {
         sources,
         basis,
         routing: routing.clone(),
+        shape: shape_json.clone(),
     };
     if intel.resolved {
         if let Some((kind, _)) = intel.qualifying_listing(
@@ -278,6 +310,9 @@ async fn independent_evidence_for(
         .await?;
     if history_score >= history_min_score() {
         return Ok(with_routing(2, "prior_episode_history"));
+    }
+    if shape_kind.is_some() {
+        return Ok(with_routing(2, "attack_shape"));
     }
     Ok(with_routing(1, "behavior_only"))
 }
@@ -388,6 +423,7 @@ async fn evaluate_assessment(
             "bucket_start": assessment.bucket_start,
             "evidence_basis": evidence_basis,
             "routing_context": independent.routing,
+            "attack_shape": independent.shape,
             "observation_only": observation_only,
         });
         let hash = evidence_hash(policy.id, policy.version, &evidence_snapshot);

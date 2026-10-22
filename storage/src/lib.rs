@@ -26,10 +26,12 @@ pub use learning::{
 mod migration_compat;
 mod quarantine_intents;
 pub use quarantine_intents::{QuarantineGuard, QuarantineIntent};
+mod attack_shape;
 mod firewall_rule_intents;
 mod incident_source_resolution;
 mod policy_bridge;
 mod source_intel;
+pub use attack_shape::AssessmentShape;
 pub use firewall_rule_intents::{FirewallRuleGuard, FirewallRuleIntent};
 pub use incident_source_resolution::ResolvedIncidentSourceAddress;
 pub use policy_bridge::{BridgeMode, BridgeOutcome, PolicyBridgeParams};

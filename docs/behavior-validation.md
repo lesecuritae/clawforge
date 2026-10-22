@@ -101,6 +101,43 @@ into one number:
 
 Packets, TTL expiry and rollback are the separate packet lab; the bridge stops at the request.
 
+### Attack shape: content-based corroboration (migration 0067)
+
+A plain event count cannot tell users behind a NAT from a dictionary run, or a broken asset
+release from a scanner. Two properties of the events themselves can, and the policy engine now
+derives them as **counts** (`clawforge_assessment_shape`, numbers only - the engine never sees
+usernames or paths):
+
+* `account_enumeration`: the failed SSH logins of an assessment tried >= 8 different account names
+  (`CLAWFORGE_ATTACK_SHAPE_MIN_USERNAMES`). Users behind one NAT mistype a few valid accounts.
+* `secret_path_probe`: >= 3 distinct requested paths match a secret/config signature (`/.env*`,
+  `/.git/...`, `/.aws/...`, `/.docker/...`, `.pypirc`, SSH keys; built-in, extend with
+  `CLAWFORGE_ATTACK_SHAPE_PATH_PATTERNS`). `/robots.txt`, `/.well-known/...` and application paths do not match.
+
+Either one is evidence basis `attack_shape` (a second, content-based source). It does not
+replace reputation: the policy -> execution bridge still needs a counting threat-intel listing
+(`REQUIRE_THREAT_INTEL`, mandatory for `automatic`), routing/ASN/RPKI context stays context, and
+`CLAWFORGE_ATTACK_SHAPE=off` disables it. Every decision shows the counts (`attack_shape` in the
+evidence snapshot).
+
+Fixtures: every scenario now has an explicit account/path model (`usernames`, `paths`). Before, the
+generator used a new invalid account name per SSH failure and synthetic `/fixture-N` paths, which
+made every SSH case look like a dictionary run. The models follow the scenario description (legitimate:
+a few valid accounts / application paths; password guessing against root: one account; dictionary run:
+many names; scanners: secret files), not the outcome, and production shows both shapes (3 days: 112
+source-hours with >= 10 distinct usernames; mass `/.env*`, `/.git/config`, `/.aws/credentials` probes).
+The improvement below is therefore only as real as that modelling; it is not a general-population estimate.
+
+Result over the 21 scenarios (stage 1 unchanged at TP 11 / FP 4 / TN 6 / FN 0, gate still false):
+attacker finding (stage 2) **TP 7 / FP 0 / TN 10 / FN 4** (was TP 2 / FP 0 / TN 10 / FN 9). The four
+remaining false negatives are single-account guessing against root (`ssh_bruteforce_threshold`,
+`ssh_boundary_evasion`, `ssh_slow_attacker...`) and a flood of one path (`http_abusive_burst`): from
+these fields they are identical to a forgetful user or a retrying client (`observables.json`), so they stay
+unconfirmed until independent evidence exists. Missing signals, concretely: a successful login from the
+same source (separates a user who finally got in), the sshd distinction between `invalid user` and a valid
+account (the Linux sensor currently drops it), and per-source success ratios on HTTP. None of them is
+collected yet.
+
 ### What changed in the product (rule versions)
 
 * `ssh_bruteforce`, `http_anomaly_burst`, `http_scan` are now **v2**: every rule runs on two

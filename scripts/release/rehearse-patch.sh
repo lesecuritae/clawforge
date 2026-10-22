@@ -3,13 +3,15 @@
 # -> forward again, on a throw-away PostgreSQL. Production is only READ (pg_dump of schema and of the
 # small tables; the five giant relation/event tables are copied schema-only).
 #
-#   rehearse-patch.sh <previous-patch-image> <new-image> <roles-script> <state-dir>
+#   rehearse-patch.sh <previous-patch-image> <new-image> <roles-script> <state-dir> [<start-ledger> [<top-migration>]]
+#   default: start 64/60 and the 1.2.2 patch (migrations 65, 66, rollback-1.2.2-to-1.2.1.sql);
+#   later patches: e.g. 66/62 and top 67 (rollback-last-migration.sql, additive migrations only)
 #
 # Fails closed: every restore step runs with ON_ERROR_STOP=1, every check is an assertion against an
 # explicit expected value, and the exit code is non-zero if any assertion failed. It does NOT claim a
 # full-size restore: the giant tables carry no rows in the fixture.
 set -uo pipefail
-PREV_IMG="$1"; NEW_IMG="$2"; NEW_ROLES="$3"; D="$4"
+PREV_IMG="$1"; NEW_IMG="$2"; NEW_ROLES="$3"; D="$4"; START="${5:-64/60}"; TOP="${6:-}"
 HERE="$(cd "$(dirname "$0")" && pwd)"; REPO="$(cd "$HERE/../.." && pwd)"
 PROD=clawforge-postgres-1
 C=clawforge-rehearsal-pg; N=clawforge-rehearsal-net
@@ -53,7 +55,7 @@ for t in "${CRITICAL[@]}"; do
 done
 assert ledger-md5 "$(P -c "select md5(string_agg(version||':'||encode(checksum,'hex'),',' order by version)) from _sqlx_migrations")" \
   "$(PP -c "select md5(string_agg(version||':'||encode(checksum,'hex'),',' order by version)) from _sqlx_migrations")"
-assert ledger-0 "$(P -c "select max(version)||'/'||count(*) from _sqlx_migrations")" "64/60"
+assert ledger-0 "$(P -c "select max(version)||'/'||count(*) from _sqlx_migrations")" "$START"
 ROUTE_ROWS="$(P -c "select count(*) from indicators where value like '0.0.0.0/0%' or categories ? 'network-intelligence'")"
 say "  info indicators of network-context kind in the copy: $ROUTE_ROWS"
 for t in "${GIANTS[@]}"; do assert "giant $t schema present" "$(P -c "select to_regclass('public.$t') is not null")" t; done
@@ -74,24 +76,29 @@ assert "roles script (as deployed) exit" "$(ROLES "$NEW_ROLES" >> "$LOG" 2>&1; e
 START_SIG="$(LEDGER_SIG)"
 assert "previous patch image migrate on the production copy" "$(MIG_PREV >> "$LOG" 2>&1; echo $?)" 0
 assert "ledger unchanged by it" "$(LEDGER_SIG)" "$START_SIG"
-assert "ready index absent before (it is built concurrently on production first)" "$(P -c "select count(*) from pg_indexes where indexname='event_delivery_ready_idx'")" 0
+if [ "$START" = "64/60" ]; then assert "ready index absent before (it is built concurrently on production first)" "$(P -c "select count(*) from pg_indexes where indexname='event_delivery_ready_idx'")" 0; fi
 
 say "== phase 1: patch upgrade"
 assert "new image migrate" "$(MIG_NEW >> "$LOG" 2>&1; echo $?)" 0
 assert "roles script after migrate" "$(ROLES "$NEW_ROLES" >> "$LOG" 2>&1; echo $?)" 0
 assert "ledger" "$(P -c "select max(version)||'/'||count(*) from _sqlx_migrations where success")" "$NMAX/$NFILES"
-assert "ready index built by the migration (empty giant table here)" "$(P -c "select indisvalid from pg_index where indexrelid=to_regclass('event_delivery_ready_idx')")" t
+assert "ready index present and valid" "$(P -c "select indisvalid from pg_index where indexrelid=to_regclass('event_delivery_ready_idx')")" t
 assert "slow-rule policy present" "$(P -c "select count(*) from security_policies where rule_id='ssh_bruteforce_slow' and status='active'")" 1
+if [ -n "$TOP" ]; then assert "assessment-shape function present" "$(P -c "select count(*) from pg_proc where proname='clawforge_assessment_shape'")" 1; fi
 assert "previous patch image REFUSES the newer ledger" "$(MIG_PREV >> "$LOG" 2>&1; [ $? -ne 0 ] && echo refused || echo accepted)" refused
 UP1_SIG="$(LEDGER_SIG)"
 
 say "== phase 2: patch rollback and forward again"
-docker cp "$HERE/rollback-1.2.2-to-1.2.1.sql" "$C:/tmp/rb2.sql"
-assert "patch rollback exit" "$(P -f /tmp/rb2.sql >> "$LOG" 2>&1; echo $?)" 0
+if [ -n "$TOP" ]; then
+  docker cp "$HERE/rollback-last-migration.sql" "$C:/tmp/rb2.sql"; RBV=(-v "top=$TOP")
+else
+  docker cp "$HERE/rollback-1.2.2-to-1.2.1.sql" "$C:/tmp/rb2.sql"; RBV=()
+fi
+assert "patch rollback exit" "$(P "${RBV[@]}" -f /tmp/rb2.sql >> "$LOG" 2>&1; echo $?)" 0
 assert "ledger back at the start state" "$(LEDGER_SIG)" "$START_SIG"
 assert "previous patch image accepts the database again" "$(MIG_PREV >> "$LOG" 2>&1; echo $?)" 0
 assert "ledger untouched by the previous image" "$(LEDGER_SIG)" "$START_SIG"
-assert "patch rollback refuses to run twice" "$(P -f /tmp/rb2.sql >> "$LOG" 2>&1; [ $? -ne 0 ] && echo refused || echo ran)" refused
+assert "patch rollback refuses to run twice" "$(P "${RBV[@]}" -f /tmp/rb2.sql >> "$LOG" 2>&1; [ $? -ne 0 ] && echo refused || echo ran)" refused
 assert "ready index kept (nothing dropped)" "$(P -c "select count(*) from pg_indexes where indexname='event_delivery_ready_idx'")" 1
 assert "slow-rule policy row kept" "$(P -c "select count(*) from security_policies where rule_id='ssh_bruteforce_slow'")" 1
 assert "forward again" "$(MIG_NEW >> "$LOG" 2>&1; echo $?)" 0
