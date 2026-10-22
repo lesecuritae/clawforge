@@ -600,7 +600,7 @@
       ],
       "status": 404,
       "note": "Many independent users behind one NAT address mistype passwords at about twenty an hour; intentionally measures a detector false positive of the new hourly rule, not a block.",
-      "expected_strongest_decision": "challenge",
+      "expected_strongest_decision": "rate_limit",
       "expected_enforcement_requests": 0
     }
   ],
