@@ -19,6 +19,8 @@ without an explicitly documented administrative process.
   one.
 - Events and correlation relationships should be archived to the configured
   backup/archive store before their operational retention window is reached.
+  The reviewed plan for the two large graph tables (and the unclaimed analyzer
+  deliveries) is in [graph-retention.md](graph-retention.md).
 - Incident records and their timeline remain available while an incident is
   open or under investigation. Closed incident retention must be agreed with
   the operator and validated against the backup policy.
