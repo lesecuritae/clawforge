@@ -123,6 +123,19 @@ enum FeedFormat {
     AsnJsonLines,
 }
 
+// ASN-DROP ends with a metadata object, not another ASN. Recognize only that
+// explicit shape; unknown rows and malformed ASN entries must still fail closed.
+fn is_asn_feed_metadata(row: &serde_json::Value) -> bool {
+    row.get("asn").is_none()
+        && row.get("type").and_then(serde_json::Value::as_str) == Some("metadata")
+        && ["timestamp", "size", "records"]
+            .iter()
+            .all(|key| row.get(*key).and_then(serde_json::Value::as_u64).is_some())
+        && ["copyright", "terms"]
+            .iter()
+            .all(|key| row.get(*key).and_then(serde_json::Value::as_str).is_some())
+}
+
 impl HttpFeedProvider {
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -267,6 +280,9 @@ impl HttpFeedProvider {
                 let row: serde_json::Value = serde_json::from_str(line).map_err(|error| {
                     ProviderError::Validation(format!("invalid ASN JSON line: {error}"))
                 })?;
+                if is_asn_feed_metadata(&row) {
+                    continue;
+                }
                 if row.get("asn").and_then(serde_json::Value::as_u64).is_none() {
                     return Err(ProviderError::Validation(
                         "ASN JSON line has no numeric asn".to_string(),
@@ -302,6 +318,9 @@ impl HttpFeedProvider {
             let row: serde_json::Value = serde_json::from_str(line).map_err(|error| {
                 ProviderError::Validation(format!("invalid ASN JSON line: {error}"))
             })?;
+            if is_asn_feed_metadata(&row) {
+                continue;
+            }
             let Some(asn) = row.get("asn").and_then(serde_json::Value::as_u64) else {
                 return Err(ProviderError::Validation(
                     "ASN JSON line has no numeric asn".to_string(),
@@ -828,10 +847,13 @@ fn json_rows(value: serde_json::Value) -> Vec<serde_json::Value> {
                 "new_asn",
             ]
             .iter()
-            .any(|key| object.contains_key(*key))
-                || (object.contains_key("resource")
-                    && !object.contains_key("prefixes")
-                    && !object.contains_key("counts"));
+            .any(|key| {
+                object
+                    .get(*key)
+                    .is_some_and(|field| field.is_string() || field.is_number())
+            }) || (object.contains_key("resource")
+                && !object.contains_key("prefixes")
+                && !object.contains_key("counts"));
             if is_record {
                 output.push(value);
             } else {
@@ -1585,6 +1607,45 @@ mod provider_tests {
                 ..raw
             })
             .is_err());
+    }
+
+    #[test]
+    fn spamhaus_asn_accepts_metadata_but_rejects_unknown_or_invalid_rows() {
+        let provider = SpamhausAsnProvider::new().unwrap();
+        let metadata = r#"{"type":"metadata","timestamp":1792622642,"size":123,"records":1,"copyright":"(c) The Spamhaus Project","terms":"https://www.spamhaus.org/drop/terms/"}"#;
+        let raw = feed(&format!("{{\"asn\":64500}}\n{metadata}\n"));
+        provider.validate(&raw).unwrap();
+        let values = provider.normalize(&raw).unwrap();
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0].value, "AS64500");
+        for invalid in [
+            metadata.to_string(),
+            "{\"asn\":64500}\n{\"unknown\":true}".into(),
+            "{\"asn\":64500}\n{\"type\":\"metadata\"}".into(),
+            format!("{{\"asn\":\"invalid\"}}\n{metadata}"),
+            format!(
+                "{{\"asn\":64500}}\n{}",
+                metadata.replace("\"type\":", "\"asn\":\"invalid\",\"type\":")
+            ),
+        ] {
+            let raw = feed(&invalid);
+            assert!(provider.validate(&raw).is_err(), "accepted {invalid}");
+            assert!(provider.normalize(&raw).is_err(), "normalized {invalid}");
+        }
+    }
+
+    #[test]
+    fn caida_nested_asn_envelope_is_not_mistaken_for_a_record() {
+        let provider = CaidaProvider::with_resource("3333").unwrap();
+        let raw = feed(
+            r#"{"data":{"asn":{"asn":"3333","asnName":"RIPE-NCC-AS","country":{"iso":"NL"}}}}"#,
+        );
+        provider.validate(&raw).unwrap();
+        let batch = provider.normalize(&raw).unwrap();
+        assert_eq!(batch.asn_records.len(), 1);
+        assert_eq!(batch.asn_records[0].asn, "AS3333");
+        assert_eq!(batch.asn_records[0].name, "RIPE-NCC-AS");
+        assert_eq!(batch.asn_records[0].country, "NL");
     }
 
     #[test]
