@@ -42,11 +42,12 @@
 | `CLAWFORGE_HACKERTARGET_RESOURCE` | `3333` | ASN resource for HackerTarget ASlookup (replaced BGPView - `api.bgpview.io` stopped resolving entirely) |
 | `CLAWFORGE_PEERINGDB_RESOURCE` | `3333` | ASN resource for PeeringDB |
 | `CLAWFORGE_CAIDA_RESOURCE` | `3333` | ASN resource for CAIDA AS Rank |
-| `CLAWFORGE_TEAM_CYMRU_RESOURCE` | `8.8.8.8` | IP lookup resource for Team Cymru |
+| `CLAWFORGE_TEAM_CYMRU_RESOURCE` | `8.8.8.8` | One public IP address for the Team Cymru WHOIS lookup (TCP 43, `whois.cymru.com`); private, loopback and documentation addresses are refused |
+| `CLAWFORGE_TEAM_CYMRU_WHOIS` | `whois.cymru.com:43` | WHOIS server override (host:port) |
 | `CLAWFORGE_RIPE_RIS_RESOURCE` | `AS3333` | ASN resource for RIPE RIS |
 | `CLAWFORGE_ROUTEVIEWS_RESOURCE` | `203.0.113.0/24` | Prefix resource for RouteViews |
-| `CLAWFORGE_BGPSTREAM_RESOURCE` | `203.0.113.0/24` | Prefix/query resource for BGPStream |
-| `CLAWFORGE_RPKI_RESOURCE` | `203.0.113.0/24` | Prefix resource for RPKI validation |
+| `CLAWFORGE_RPKI_ORIGIN_ASN` | `AS3333` | Origin AS of the sampled RPKI route-origin validation (RIPEstat `rpki-validation`, `resource`) |
+| `CLAWFORGE_RPKI_PREFIX` | `193.0.0.0/21` | Prefix of the sampled RPKI validation (`prefix`); must be announced by the origin AS |
 | `REDIS_URL` | unset | Optional Redis URL used only for the scheduler lock |
 | `CLAWFORGE_SCHEDULER_LOCK_KEY` | `clawforge:scheduler:lock` | Redis lock key for one active worker run |
 | `CLAWFORGE_BACKUP_INTERVAL_SECONDS` | `86400` | Automated PostgreSQL backup interval |
