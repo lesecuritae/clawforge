@@ -5,8 +5,8 @@
 BEGIN;
 DO $$
 BEGIN
-  IF (SELECT max(version) FROM _sqlx_migrations) <> 64 THEN
-    RAISE EXCEPTION 'restore refused: ledger is not at 64';
+  IF (SELECT max(version) FROM _sqlx_migrations) < 64 THEN
+    RAISE EXCEPTION 'restore refused: ledger is below 64';
   END IF;
 END $$;
 INSERT INTO public.source_network_context SELECT * FROM :"arch".source_network_context ON CONFLICT (pseudonym) DO NOTHING;

@@ -1,4 +1,4 @@
--- Reverse the schema effect of migrations 0059-0064 (release 1.2.0) so that the 1.1.0 migrator
+-- Reverse the schema effect of migrations 0059-0064/0065 (release 1.2.x) so that the 1.1.0 migrator
 -- again sees ledger 58 / 54 rows, WITHOUT deleting data.
 --
 --   psql -v ON_ERROR_STOP=1 -v goaway_def_file=/path/old-goaway-enqueue.sql -f rollback-1.2-to-1.1.sql
@@ -15,10 +15,12 @@ BEGIN;
 LOCK TABLE _sqlx_migrations IN ACCESS EXCLUSIVE MODE;
 DO $$
 BEGIN
-  IF (SELECT max(version) FROM _sqlx_migrations) <> 64
-     OR (SELECT count(*) FROM _sqlx_migrations WHERE version BETWEEN 59 AND 64 AND success) <> 6
-     OR (SELECT count(*) FROM _sqlx_migrations WHERE version > 64 OR NOT success) <> 0 THEN
-    RAISE EXCEPTION 'rollback refused: ledger is not exactly 1.1.0 (58) + migrations 59..64';
+  -- 1.2.0/1.2.1 end at 64; later 1.2.x add 65 (an index only: nothing to archive, it stays)
+  IF (SELECT max(version) FROM _sqlx_migrations) NOT IN (64, 65)
+     OR (SELECT count(*) FROM _sqlx_migrations WHERE version BETWEEN 59 AND (SELECT max(version) FROM _sqlx_migrations) AND success)
+        <> (SELECT max(version) FROM _sqlx_migrations) - 58
+     OR (SELECT count(*) FROM _sqlx_migrations WHERE NOT success) <> 0 THEN
+    RAISE EXCEPTION 'rollback refused: ledger is not exactly 1.1.0 (58) + the contiguous migrations 59..64/65';
   END IF;
   IF to_regclass('public.source_network_context') IS NULL THEN
     RAISE EXCEPTION 'rollback refused: public.source_network_context is missing';
@@ -51,7 +53,7 @@ BEGIN
   END LOOP;
 END $$;
 
-DELETE FROM _sqlx_migrations WHERE version BETWEEN 59 AND 64;
+DELETE FROM _sqlx_migrations WHERE version BETWEEN 59 AND 65;
 DO $$
 BEGIN
   IF (SELECT max(version) FROM _sqlx_migrations) <> 58 OR (SELECT count(*) FROM _sqlx_migrations) <> 54 THEN

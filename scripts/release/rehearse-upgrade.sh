@@ -61,6 +61,7 @@ for t in "${GIANTS[@]}"; do assert "giant $t schema present" "$(P -c "select to_
 assert table-count "$(P -c "select count(*) from pg_tables where schemaname='public'")" "$(PP -c "select count(*) from pg_tables where schemaname='public'")"
 
 NFILES="$(ls "$REPO"/migrations/*.sql | wc -l)"
+NMAX="$(ls "$REPO"/migrations/*.sql | sed -E 's#.*/([0-9]+)_.*#\1#' | sort -n | tail -1 | sed 's/^0*//')"
 MIG_OLD(){ docker run --rm --network "$N" -e DATABASE_URL_FILE=/s/database_url -v "$D/secrets:/s:ro" "$OLD_IMG" /usr/local/bin/clawforge-migrate; }
 MIG_NEW(){ docker run --rm --network "$N" -e DATABASE_URL_FILE=/s/database_url -v "$D/secrets:/s:ro" "$NEW_IMG" /usr/local/bin/clawforge-migrate; }
 ROLES(){ docker run --rm --network "$N" -e PGHOST=postgres -e PGPORT=5432 -e POSTGRES_USER=clawforge -e POSTGRES_DB=clawforge \
@@ -69,7 +70,7 @@ ROLES(){ docker run --rm --network "$N" -e PGHOST=postgres -e PGPORT=5432 -e POS
 LEDGER_SIG(){ P -c "select max(version)||'/'||count(*)||'/'||md5(string_agg(version||':'||encode(checksum,'hex'),',' order by version)) from _sqlx_migrations"; }
 priv(){ P -c "select has_function_privilege('$1','$2','EXECUTE')"; }
 UPGRADE_CHECKS(){ # $1 = label
-  assert "$1 ledger" "$(P -c "select max(version)||'/'||count(*) from _sqlx_migrations where success")" "64/$NFILES"
+  assert "$1 ledger" "$(P -c "select max(version)||'/'||count(*) from _sqlx_migrations where success")" "$NMAX/$NFILES"
   assert "$1 all-ledger-rows-success" "$(P -c "select count(*) from _sqlx_migrations where not success")" 0
   assert "$1 source_network_context in public" "$(P -c "select to_regclass('public.source_network_context') is not null")" t
   assert "$1 resolver exists" "$(P -c "select count(*) from pg_proc where proname='clawforge_resolve_incident_source_for_apply'")" 1

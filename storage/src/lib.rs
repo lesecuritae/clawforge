@@ -203,6 +203,13 @@ const DEFAULT_EXECUTION_TIMEOUT_SECONDS: i32 = 60;
 /// feed that has genuinely stopped updating.
 const STALE_INTERVAL_MULTIPLIER: f64 = 3.0;
 
+/// Event-delivery claim statements. Public (hidden) so the database tests can ask
+/// PostgreSQL for the plan of exactly what the consumers run.
+#[doc(hidden)]
+pub const CLAIM_STALE_DELIVERIES_SQL: &str = "SELECT d.id FROM event_delivery d WHERE d.consumer_id=$1 AND d.status='processing' AND d.available_at <= NOW() AND d.attempts < 5 AND d.processing_started_at < NOW()-INTERVAL '10 minutes' ORDER BY d.created_at FOR UPDATE OF d SKIP LOCKED LIMIT $2";
+#[doc(hidden)]
+pub const CLAIM_READY_DELIVERIES_SQL: &str = "SELECT d.id FROM event_delivery d WHERE d.consumer_id=$1 AND d.status IN ('pending','failed') AND d.available_at <= NOW() AND d.attempts < 5 ORDER BY d.created_at FOR UPDATE OF d SKIP LOCKED LIMIT $2";
+
 impl PostgresStore {
     pub async fn connect(database_url: &str) -> Result<Self> {
         let store = Self::open(database_url).await?;
@@ -934,26 +941,42 @@ impl PostgresStore {
         limit: i64,
     ) -> Result<Vec<serde_json::Value>> {
         let consumer_id = self.ensure_event_consumer(consumer).await?;
+        let limit = limit.clamp(1, 100);
         let mut tx = self.pool.begin().await?;
-        // `FOR UPDATE OF d`, not a bare `FOR UPDATE`: an unqualified
-        // row-locking clause on a join locks every table it touches, which
-        // requires UPDATE privilege on `events` too - a real, previously
-        // undiscovered bug found live (clawforge_correlation only ever had
-        // SELECT on `events`, by design: a consumer must never be able to
-        // modify the canonical event bus, only its own delivery bookkeeping
-        // in `event_delivery`). Every prior real-Postgres test of this path
-        // called process_event directly rather than through this method, so
-        // it never actually exercised claim_event_deliveries under a
-        // least-privilege role and never caught this - clawforge-correlation
-        // has likely never successfully claimed a delivery in production
-        // through its normal poll loop until this fix.
-        let rows = sqlx::query("SELECT d.id,e.event_id,e.event_type,e.source,e.severity,e.occurred_at,e.correlation_id,e.payload,e.metadata,d.attempts FROM event_delivery d JOIN events e ON e.event_id=d.event_id WHERE d.consumer_id=$1 AND d.available_at <= NOW() AND d.attempts < 5 AND (d.status IN ('pending','failed') OR (d.status='processing' AND d.processing_started_at < NOW()-INTERVAL '10 minutes')) ORDER BY d.created_at FOR UPDATE OF d SKIP LOCKED LIMIT $2")
-            .bind(consumer_id).bind(limit.clamp(1, 100)).fetch_all(&mut *tx).await?;
+        // Step 1 locks delivery rows only (`FOR UPDATE` on `event_delivery` alone, never on
+        // `events`): a consumer role has SELECT on the canonical event bus and must never
+        // need UPDATE there (a bare FOR UPDATE on a join once failed live under the
+        // least-privilege correlation role). The `events` join happens after the claim.
+        //
+        // Stale `processing` rows (a consumer died mid-flight) come first: they are rare and
+        // use the (consumer_id, status, ...) index. Ready rows then fill the remaining slots
+        // oldest-first from the partial index `event_delivery_ready_idx` (migration 0065), so
+        // a claim reads `limit` rows however deep the backlog is. Reclaim before backlog also
+        // means a deep backlog can never starve a stuck delivery.
+        let mut ids: Vec<Uuid> = sqlx::query_scalar(CLAIM_STALE_DELIVERIES_SQL)
+            .bind(consumer_id)
+            .bind(limit)
+            .fetch_all(&mut *tx)
+            .await?;
+        let remaining = limit - ids.len() as i64;
+        if remaining > 0 {
+            let ready: Vec<Uuid> = sqlx::query_scalar(CLAIM_READY_DELIVERIES_SQL)
+                .bind(consumer_id)
+                .bind(remaining)
+                .fetch_all(&mut *tx)
+                .await?;
+            ids.extend(ready);
+        }
+        let rows = if ids.is_empty() {
+            Vec::new()
+        } else {
+            sqlx::query("WITH claimed AS (UPDATE event_delivery SET status='processing',attempts=attempts+1,processing_started_at=NOW() WHERE id = ANY($1) RETURNING id,event_id,attempts,created_at) SELECT c.id,e.event_id,e.event_type,e.source,e.severity,e.occurred_at,e.correlation_id,e.payload,e.metadata,c.attempts FROM claimed c JOIN events e ON e.event_id=c.event_id ORDER BY c.created_at,c.id")
+                .bind(&ids).fetch_all(&mut *tx).await?
+        };
         let mut result = Vec::with_capacity(rows.len());
         for row in rows {
             let id = row.get::<Uuid, _>("id");
-            sqlx::query("UPDATE event_delivery SET status='processing',attempts=attempts+1,processing_started_at=NOW() WHERE id=$1").bind(id).execute(&mut *tx).await?;
-            result.push(serde_json::json!({"delivery_id":id,"event_id":row.get::<Uuid,_>("event_id"),"event_type":row.get::<String,_>("event_type"),"source":row.get::<String,_>("source"),"severity":row.get::<String,_>("severity"),"timestamp":row.get::<chrono::DateTime<chrono::Utc>,_>("occurred_at"),"correlation_id":row.get::<Option<String>,_>("correlation_id"),"payload":row.get::<serde_json::Value,_>("payload"),"metadata":row.get::<serde_json::Value,_>("metadata"),"attempts":row.get::<i32,_>("attempts")+1}));
+            result.push(serde_json::json!({"delivery_id":id,"event_id":row.get::<Uuid,_>("event_id"),"event_type":row.get::<String,_>("event_type"),"source":row.get::<String,_>("source"),"severity":row.get::<String,_>("severity"),"timestamp":row.get::<chrono::DateTime<chrono::Utc>,_>("occurred_at"),"correlation_id":row.get::<Option<String>,_>("correlation_id"),"payload":row.get::<serde_json::Value,_>("payload"),"metadata":row.get::<serde_json::Value,_>("metadata"),"attempts":row.get::<i32,_>("attempts")}));
         }
         tx.commit().await?;
         self.heartbeat_event_consumer(consumer).await?;
