@@ -3,7 +3,10 @@
 # -> forward again, on a throw-away PostgreSQL. Production is only READ (pg_dump of schema and of the
 # small tables; the five giant relation/event tables are copied schema-only).
 #
-#   rehearse-patch.sh <previous-patch-image> <new-image> <roles-script> <state-dir> [<start-ledger> [<top-migration>]]
+#   rehearse-patch.sh <previous-patch-image> <new-image> <roles-script> <state-dir> [<start-ledger> [<top-migration> [<previous-roles-script>]]]
+#   <previous-roles-script> is the roles script of the release running in production (phase 0 "as deployed");
+#   required when the new roles script grants on objects the new migration creates (e.g. 1.2.3 / 0067), because
+#   those grants cannot run before the migration. Defaults to <roles-script>.
 #   default: start 64/60 and the 1.2.2 patch (migrations 65, 66, rollback-1.2.2-to-1.2.1.sql);
 #   later patches: e.g. 66/62 and top 67 (rollback-last-migration.sql, additive migrations only)
 #
@@ -11,7 +14,7 @@
 # explicit expected value, and the exit code is non-zero if any assertion failed. It does NOT claim a
 # full-size restore: the giant tables carry no rows in the fixture.
 set -uo pipefail
-PREV_IMG="$1"; NEW_IMG="$2"; NEW_ROLES="$3"; D="$4"; START="${5:-64/60}"; TOP="${6:-}"
+PREV_IMG="$1"; NEW_IMG="$2"; NEW_ROLES="$3"; D="$4"; START="${5:-64/60}"; TOP="${6:-}"; PREV_ROLES="${7:-$NEW_ROLES}"
 HERE="$(cd "$(dirname "$0")" && pwd)"; REPO="$(cd "$HERE/../.." && pwd)"
 PROD=clawforge-postgres-1
 C=clawforge-rehearsal-pg; N=clawforge-rehearsal-net
@@ -72,7 +75,7 @@ ROLES(){ docker run --rm --network "$N" -e PGHOST=postgres -e PGPORT=5432 -e POS
 LEDGER_SIG(){ P -c "select max(version)||'/'||count(*)||'/'||md5(string_agg(version||':'||encode(checksum,'hex'),',' order by version)) from _sqlx_migrations"; }
 
 say "== phase 0: current production state (roles as deployed, previous patch migrate is a no-op)"
-assert "roles script (as deployed) exit" "$(ROLES "$NEW_ROLES" >> "$LOG" 2>&1; echo $?)" 0
+assert "roles script (as deployed) exit" "$(ROLES "$PREV_ROLES" >> "$LOG" 2>&1; echo $?)" 0
 START_SIG="$(LEDGER_SIG)"
 assert "previous patch image migrate on the production copy" "$(MIG_PREV >> "$LOG" 2>&1; echo $?)" 0
 assert "ledger unchanged by it" "$(LEDGER_SIG)" "$START_SIG"
