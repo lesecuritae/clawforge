@@ -4247,6 +4247,23 @@ impl PostgresStore {
         Ok(())
     }
 
+    /// Whether `record` is new or differs from the stored identity of its ASN (provider, name,
+    /// organisation, country, registry, announced prefixes). An unchanged record seen again on the
+    /// next sync is inventory, not a change.
+    pub async fn asn_record_differs(&self, record: &AsnRecord) -> Result<bool> {
+        let same: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM asn_records WHERE asn=$1 AND name=$2 AND organisation=$3 AND provider=$4 AND country=$5 AND registry=$6 AND prefixes=$7)")
+            .bind(&record.asn)
+            .bind(&record.name)
+            .bind(&record.organisation)
+            .bind(&record.provider)
+            .bind(&record.country)
+            .bind(&record.registry)
+            .bind(serde_json::to_value(&record.prefixes)?)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(!same)
+    }
+
     pub async fn upsert_bgp_event(&self, event: &BgpEvent) -> Result<()> {
         let fingerprint = format!(
             "{}|{}|{}|{}",

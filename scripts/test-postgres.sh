@@ -152,6 +152,7 @@ run_cargo test -p clawforge-storage --test incident_source_resolution -- --ignor
 run_cargo test -p clawforge-storage --test policy_bridge -- --ignored --test-threads=1
 run_cargo test -p clawforge-storage --test source_intel -- --ignored --test-threads=1
 run_cargo test -p clawforge-worker --test ip_context -- --ignored --test-threads=1
+run_cargo test -p clawforge-worker --test network_events -- --ignored --test-threads=1
 
 export CLAWFORGE_TEST_FIREWALL_RULE_DATABASE_URL="$owner_url"
 run_cargo test -p clawforge-storage --test firewall_rule_intents -- --ignored --test-threads=1

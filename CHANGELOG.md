@@ -5,6 +5,7 @@
 Weitere Änderungen für die nächste Version werden hier gesammelt.
 
 - Detection: `attack_shape` evidence (migration 0067): account enumeration (>= 8 account names tried) and secret-file probes (>= 3 distinct `/.env`-style paths) corroborate an assessment as a content-based second source; counts only, never usernames or paths. Enforcement still needs a reputation listing. Fixtures carry explicit username/path models; attacker findings over the 21 scenarios TP 2 -> 7 at FP 0; quality gate stays false.
+- Fix: network inventory is no longer published as security events. Every row of a RouteViews/RIPE RIS prefix list (status Unknown, no previous origin) was published as a medium `bgp_change` and correlated with the same prefix's next sync: ~194k of 210k "incidents" on production were such prefixes (and ~5.5k unchanged ASN records). Only a changed or anomalous BGP record and a new or changed ASN record are events now; inventory stays in `bgp_events`/`asn_records`/indicators. Existing incidents are not touched.
 
 ## [1.2.2] - 2026-10-22
 
