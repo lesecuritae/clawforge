@@ -134,8 +134,10 @@ export CLAWFORGE_TEST_API_DATABASE_URL="$(cat "$secret_dir/database_api_url")"
 export CLAWFORGE_TEST_EXECUTOR_DATABASE_URL="$(cat "$secret_dir/database_executor_url")"
 export CLAWFORGE_TEST_POLICY_ENGINE_DATABASE_URL="$(cat "$secret_dir/database_policy_engine_url")"
 export CLAWFORGE_TEST_WORKER_DATABASE_URL="$(cat "$secret_dir/database_worker_url")"
+export CLAWFORGE_TEST_CORRELATION_DATABASE_URL="$(cat "$secret_dir/database_correlation_url")"
 run_cargo test -p clawforge-storage --test migration_lineages -- --ignored --test-threads=1
 run_cargo test -p clawforge-storage --test quarantine_approval -- --ignored --test-threads=1
+run_cargo test -p clawforge-storage --test event_delivery_claim -- --ignored --test-threads=1
 
 export CLAWFORGE_TEST_QUARANTINE_DATABASE_URL="$owner_url"
 run_cargo test -p clawforge-storage --test quarantine_intents -- --ignored --test-threads=1
