@@ -77,6 +77,8 @@ pub enum ProviderError {
     RateLimited { retry_after: String },
     #[error("provider request timed out")]
     Timeout,
+    #[error("provider connection failed: {0}")]
+    Connection(String),
     #[error("provider response was empty")]
     EmptyResponse,
     #[error("provider response validation failed: {0}")]
@@ -662,7 +664,6 @@ enum NetworkFormat {
     AsnJson,
     BgpJson,
     RpkiJson,
-    CymruText,
     HackerTargetAsn,
 }
 
@@ -760,10 +761,7 @@ impl NetworkHttpProvider {
                 "network response exceeds 50 MiB".to_string(),
             ));
         }
-        if matches!(
-            self.format,
-            NetworkFormat::CymruText | NetworkFormat::HackerTargetAsn
-        ) {
+        if matches!(self.format, NetworkFormat::HackerTargetAsn) {
             std::str::from_utf8(&feed.body).map_err(|error| {
                 ProviderError::Validation(format!("invalid text encoding: {error}"))
             })?;
@@ -795,9 +793,6 @@ impl NetworkHttpProvider {
             ),
             NetworkFormat::RpkiJson => {
                 normalize_rpki_json(&feed.body, &self.provider, feed.fetched_at)
-            }
-            NetworkFormat::CymruText => {
-                normalize_cymru_text(&feed.body, &self.provider, feed.fetched_at)
             }
             NetworkFormat::HackerTargetAsn => {
                 normalize_hackertarget_asn(&feed.body, &self.provider, feed.fetched_at)
@@ -1113,44 +1108,68 @@ fn normalize_rpki_json(
     })
 }
 
-fn normalize_cymru_text(
+/// Team Cymru IP-to-ASN mapping, verbose WHOIS answer:
+/// ```text
+/// AS      | IP               | BGP Prefix          | CC | Registry | Allocated  | AS Name
+/// 15169   | 8.8.8.8          | 8.8.8.0/24          | US | arin     | 2023-12-28 | GOOGLE - Google LLC, US
+/// ```
+/// An unannounced address answers `NA` in the AS column and error text has no
+/// header at all; both are rejected rather than turned into an empty record.
+fn normalize_cymru_whois(
     body: &[u8],
     provider: &Provider,
     fetched_at: DateTime<Utc>,
 ) -> Result<NetworkBatch, ProviderError> {
     let text = std::str::from_utf8(body)
         .map_err(|error| ProviderError::Validation(format!("invalid Team Cymru text: {error}")))?;
+    let mut lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
+    let header_ok = lines.next().is_some_and(|line| {
+        let cells: Vec<&str> = line.split('|').map(str::trim).collect();
+        cells.len() >= 7 && cells[0] == "AS" && cells[1] == "IP" && cells[2] == "BGP Prefix"
+    });
+    if !header_ok {
+        return Err(ProviderError::Validation(
+            "Team Cymru answer has no WHOIS header".to_string(),
+        ));
+    }
     let mut records = Vec::new();
-    for line in text
-        .lines()
-        .filter(|line| !line.trim().is_empty() && !line.starts_with('#'))
-    {
+    for line in lines {
         let fields: Vec<&str> = line.split('|').map(str::trim).collect();
-        if fields.len() < 2 {
-            continue;
+        if fields.len() < 7 {
+            return Err(ProviderError::Validation(
+                "Team Cymru row has fewer than 7 columns".to_string(),
+            ));
         }
         let Some(asn) = normalize_asn(fields[0]) else {
-            continue;
+            return Err(ProviderError::Validation(format!(
+                "Team Cymru has no ASN for this address ({})",
+                fields[0]
+            )));
         };
+        if fields[2].parse::<ipnet::IpNet>().is_err() {
+            return Err(ProviderError::Validation(
+                "Team Cymru BGP prefix is not a prefix".to_string(),
+            ));
+        }
         records.push(AsnRecord {
             asn,
-            name: fields
-                .get(4)
-                .copied()
-                .unwrap_or(provider.name.as_str())
-                .to_string(),
-            organisation: fields.get(4).copied().unwrap_or_default().to_string(),
+            name: fields[6].to_string(),
+            organisation: fields[6].to_string(),
             provider: provider.id.clone(),
-            country: fields.get(1).copied().unwrap_or_default().to_string(),
-            registry: fields.get(2).copied().unwrap_or_default().to_string(),
-            prefixes: Vec::new(),
+            country: fields[3].to_string(),
+            registry: fields[4].to_string(),
+            prefixes: vec![fields[2].to_string()],
             network_type: "unknown".to_string(),
             reputation: 0,
             first_seen: fetched_at,
             last_seen: fetched_at,
         });
     }
-    records.dedup_by(|left, right| left.asn == right.asn);
+    if records.is_empty() {
+        return Err(ProviderError::Validation(
+            "Team Cymru answer has no rows".to_string(),
+        ));
+    }
     Ok(NetworkBatch {
         asn_records: records,
         ..NetworkBatch::default()
@@ -1341,18 +1360,6 @@ define_network_provider!(
     NetworkFormat::AsnJson
 );
 define_network_provider!(
-    TeamCymruProvider,
-    "team_cymru",
-    "Team Cymru",
-    "Team Cymru",
-    "https://asn.cymru.com/cgi-bin/asnlookup.pl?ip={resource}",
-    "CLAWFORGE_TEAM_CYMRU_RESOURCE",
-    "8.8.8.8",
-    86400,
-    65,
-    NetworkFormat::CymruText
-);
-define_network_provider!(
     RipeRisProvider,
     "ripe_ris",
     "RIPE RIS",
@@ -1376,30 +1383,209 @@ define_network_provider!(
     70,
     NetworkFormat::BgpJson
 );
-define_network_provider!(
-    BgpStreamProvider,
-    "bgpstream",
-    "BGPStream",
-    "BGPStream",
-    "https://bgpstream.com/api/v2/events?resource={resource}",
-    "CLAWFORGE_BGPSTREAM_RESOURCE",
-    "203.0.113.0%2F24",
-    900,
-    70,
-    NetworkFormat::BgpJson
-);
-define_network_provider!(
-    RpkiProvider,
-    "rpki_validator",
-    "RPKI Validator",
-    "RPKI",
-    "https://stat.ripe.net/data/rpki-validation/data.json?resource={resource}&prefix={resource}",
-    "CLAWFORGE_RPKI_RESOURCE",
-    "203.0.113.0%2F24",
-    3600,
-    90,
-    NetworkFormat::RpkiJson
-);
+/// RPKI route-origin validation for ONE explicit (origin AS, prefix) pair through
+/// the RIPEstat data call `rpki-validation`, which needs both: `resource` is the
+/// origin ASN, `prefix` the announced prefix. (The former default sent the prefix
+/// as the resource and got HTTP 400.) The pair is a sample; the per-source
+/// validation of real traffic lives in the routing-context worker.
+pub struct RpkiProvider(NetworkHttpProvider);
+
+impl RpkiProvider {
+    pub const DEFAULT_ASN: &'static str = "AS3333";
+    pub const DEFAULT_PREFIX: &'static str = "193.0.0.0/21";
+
+    pub fn new() -> Result<Self, ProviderError> {
+        let asn = env::var("CLAWFORGE_RPKI_ORIGIN_ASN")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| Self::DEFAULT_ASN.to_string());
+        let prefix = env::var("CLAWFORGE_RPKI_PREFIX")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| Self::DEFAULT_PREFIX.to_string());
+        Self::with_origin(&asn, &prefix)
+    }
+
+    pub fn with_origin(asn: &str, prefix: &str) -> Result<Self, ProviderError> {
+        let asn = normalize_asn(asn).ok_or_else(|| {
+            ProviderError::Configuration("CLAWFORGE_RPKI_ORIGIN_ASN is not an ASN".to_string())
+        })?;
+        let net: ipnet::IpNet = prefix.trim().parse().map_err(|_| {
+            ProviderError::Configuration("CLAWFORGE_RPKI_PREFIX is not a prefix".to_string())
+        })?;
+        let endpoint = env::var("CLAWFORGE_RPKI_VALIDATOR_ENDPOINT")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| {
+                format!(
+                    "https://stat.ripe.net/data/rpki-validation/data.json?resource={asn}&prefix={}",
+                    net.to_string().replace('/', "%2F")
+                )
+            });
+        Ok(Self(NetworkHttpProvider::new(
+            "rpki_validator",
+            "RPKI Validator",
+            "RPKI",
+            endpoint,
+            3600,
+            90,
+            NetworkFormat::RpkiJson,
+            Some(asn),
+        )?))
+    }
+}
+
+#[async_trait]
+impl NetworkProvider for RpkiProvider {
+    fn provider(&self) -> Provider {
+        self.0.provider.clone()
+    }
+    async fn fetch(&self) -> Result<RawFeed, ProviderError> {
+        self.0.fetch().await
+    }
+    fn validate(&self, feed: &RawFeed) -> Result<(), ProviderError> {
+        self.0.validate(feed)
+    }
+    fn normalize(&self, feed: &RawFeed) -> Result<NetworkBatch, ProviderError> {
+        self.0.normalize(feed)
+    }
+}
+
+/// Team Cymru IP-to-ASN mapping through the documented WHOIS interface
+/// (`whois.cymru.com:43`, verbose query ` -v <ip>`). The former
+/// `asn.cymru.com/cgi-bin/asnlookup.pl` URL is an HTML form, not a machine
+/// interface (verified live: `text/html`), so the old provider could only ever
+/// fail with "no records". One address per run, once a day by default.
+pub struct TeamCymruProvider {
+    provider: Provider,
+    address: std::net::IpAddr,
+    server: String,
+}
+
+impl TeamCymruProvider {
+    pub const DEFAULT_SERVER: &'static str = "whois.cymru.com:43";
+    const MAX_ANSWER_BYTES: u64 = 16 * 1024;
+
+    pub fn new() -> Result<Self, ProviderError> {
+        let resource = env::var("CLAWFORGE_TEAM_CYMRU_RESOURCE")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "8.8.8.8".to_string());
+        let mut provider = Self::with_resource(&resource)?;
+        if let Some(server) = env::var("CLAWFORGE_TEAM_CYMRU_WHOIS")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+        {
+            provider.server = server;
+        }
+        Ok(provider)
+    }
+
+    pub fn with_resource(resource: &str) -> Result<Self, ProviderError> {
+        let address: std::net::IpAddr = resource.trim().parse().map_err(|_| {
+            ProviderError::Configuration(
+                "CLAWFORGE_TEAM_CYMRU_RESOURCE must be one IP address".to_string(),
+            )
+        })?;
+        if !is_global_address(&address) {
+            return Err(ProviderError::Configuration(
+                "CLAWFORGE_TEAM_CYMRU_RESOURCE must be a public address".to_string(),
+            ));
+        }
+        Ok(Self {
+            provider: Provider {
+                id: "team_cymru".to_string(),
+                name: "Team Cymru".to_string(),
+                source: "Team Cymru".to_string(),
+                interval_seconds: 86400,
+                confidence: 65,
+                enabled: true,
+            },
+            address,
+            server: Self::DEFAULT_SERVER.to_string(),
+        })
+    }
+
+    pub fn with_server(mut self, server: &str) -> Self {
+        self.server = server.to_string();
+        self
+    }
+}
+
+/// Never send private, loopback, link-local or documentation addresses to a public service.
+fn is_global_address(address: &std::net::IpAddr) -> bool {
+    match address {
+        std::net::IpAddr::V4(ip) => {
+            let o = ip.octets();
+            !(ip.is_private()
+                || ip.is_loopback()
+                || ip.is_link_local()
+                || ip.is_unspecified()
+                || ip.is_broadcast()
+                || ip.is_multicast()
+                || ip.is_documentation()
+                || o[0] == 0
+                || (o[0] == 100 && (o[1] & 0xc0) == 64)
+                || o[0] >= 240)
+        }
+        std::net::IpAddr::V6(ip) => {
+            let s = ip.segments();
+            !(ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.is_multicast()
+                || (s[0] & 0xfe00) == 0xfc00
+                || (s[0] & 0xffc0) == 0xfe80
+                || (s[0] == 0x2001 && s[1] == 0x0db8))
+        }
+    }
+}
+
+#[async_trait]
+impl NetworkProvider for TeamCymruProvider {
+    fn provider(&self) -> Provider {
+        self.provider.clone()
+    }
+
+    async fn fetch(&self) -> Result<RawFeed, ProviderError> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let limit = Duration::from_secs(20);
+        let exchange = async {
+            let mut stream = tokio::net::TcpStream::connect(&self.server)
+                .await
+                .map_err(|error| ProviderError::Connection(error.kind().to_string()))?;
+            stream
+                .write_all(format!(" -v {}\r\n", self.address).as_bytes())
+                .await
+                .map_err(|error| ProviderError::Connection(error.kind().to_string()))?;
+            let mut body = Vec::new();
+            stream
+                .take(Self::MAX_ANSWER_BYTES)
+                .read_to_end(&mut body)
+                .await
+                .map_err(|error| ProviderError::Connection(error.kind().to_string()))?;
+            Ok::<_, ProviderError>(body)
+        };
+        let body = tokio::time::timeout(limit, exchange)
+            .await
+            .map_err(|_| ProviderError::Timeout)??;
+        if body.is_empty() {
+            return Err(ProviderError::EmptyResponse);
+        }
+        Ok(RawFeed {
+            body,
+            content_type: Some("text/plain".to_string()),
+            fetched_at: Utc::now(),
+        })
+    }
+
+    fn validate(&self, feed: &RawFeed) -> Result<(), ProviderError> {
+        normalize_cymru_whois(&feed.body, &self.provider, feed.fetched_at).map(|_| ())
+    }
+
+    fn normalize(&self, feed: &RawFeed) -> Result<NetworkBatch, ProviderError> {
+        normalize_cymru_whois(&feed.body, &self.provider, feed.fetched_at)
+    }
+}
 
 pub fn network_providers() -> Result<Vec<Box<dyn NetworkProvider>>, ProviderError> {
     Ok(vec![
@@ -1410,7 +1596,6 @@ pub fn network_providers() -> Result<Vec<Box<dyn NetworkProvider>>, ProviderErro
         Box::new(TeamCymruProvider::new()?),
         Box::new(RipeRisProvider::new()?),
         Box::new(RouteViewsProvider::new()?),
-        Box::new(BgpStreamProvider::new()?),
         Box::new(RpkiProvider::new()?),
     ])
 }
@@ -1825,16 +2010,127 @@ mod provider_tests {
             RpkiStatus::Valid
         );
 
-        let rpki = RpkiProvider::with_resource("198.51.100.0%2F24").unwrap();
+        // Real RIPEstat answer for the pair (AS3333, 193.0.0.0/21), captured 2026-10-22.
+        let rpki = RpkiProvider::with_origin("AS3333", "193.0.0.0/21").unwrap();
         let rpki_feed = RawFeed {
-            body: br#"{"data":{"prefix":"198.51.100.0/24","asn":"AS64500","status":"invalid"}}"#
+            body: br#"{"messages":[],"version":"0.3","data_call_name":"rpki-validation","status":"ok","status_code":200,"data":{"resource":"3333","prefix":"193.0.0.0/21","validating_roas":[{"origin":"3333","prefix":"193.0.0.0/21","validity":"valid","max_length":21}],"status":"valid","validator":"routinator"}}"#
                 .to_vec(),
             content_type: Some("application/json".into()),
             fetched_at: Utc::now(),
         };
         rpki.validate(&rpki_feed).unwrap();
         let batch = rpki.normalize(&rpki_feed).unwrap();
-        assert_eq!(batch.rpki_records[0].status, RpkiStatus::Invalid);
+        assert_eq!(batch.rpki_records.len(), 1);
+        assert_eq!(batch.rpki_records[0].status, RpkiStatus::Valid);
+        assert_eq!(batch.rpki_records[0].prefix, "193.0.0.0/21");
+        assert_eq!(batch.rpki_records[0].asn, "AS3333");
+    }
+
+    #[test]
+    fn rpki_endpoint_carries_the_origin_as_resource_and_the_prefix_separately() {
+        let provider = RpkiProvider::with_origin("3333", "193.0.0.0/21").unwrap();
+        assert_eq!(
+            provider.0.endpoint,
+            "https://stat.ripe.net/data/rpki-validation/data.json?resource=AS3333&prefix=193.0.0.0%2F21"
+        );
+        assert!(RpkiProvider::with_origin("not-an-asn", "193.0.0.0/21").is_err());
+        assert!(RpkiProvider::with_origin("AS3333", "not-a-prefix").is_err());
+        // an invalid answer stays invalid, never coerced to valid
+        let invalid = RawFeed {
+            body: br#"{"data":{"resource":"64500","prefix":"198.51.100.0/24","validating_roas":[],"status":"invalid"}}"#.to_vec(),
+            content_type: None,
+            fetched_at: Utc::now(),
+        };
+        assert_eq!(
+            provider.normalize(&invalid).unwrap().rpki_records[0].status,
+            RpkiStatus::Invalid
+        );
+    }
+
+    const CYMRU_ANSWER: &str = "AS      | IP               | BGP Prefix          | CC | Registry | Allocated  | AS Name\n15169   | 8.8.8.8          | 8.8.8.0/24          | US | arin     | 2023-12-28 | GOOGLE - Google LLC, US\n";
+
+    #[test]
+    fn team_cymru_whois_answer_is_parsed_and_html_or_unannounced_rows_are_refused() {
+        let provider = TeamCymruProvider::with_resource("8.8.8.8").unwrap();
+        let feed = |body: &str| RawFeed {
+            body: body.as_bytes().to_vec(),
+            content_type: Some("text/plain".into()),
+            fetched_at: Utc::now(),
+        };
+        provider.validate(&feed(CYMRU_ANSWER)).unwrap();
+        let batch = provider.normalize(&feed(CYMRU_ANSWER)).unwrap();
+        assert_eq!(batch.asn_records[0].asn, "AS15169");
+        assert_eq!(batch.asn_records[0].prefixes, vec!["8.8.8.0/24"]);
+        assert_eq!(batch.asn_records[0].registry, "arin");
+        assert_eq!(batch.asn_records[0].country, "US");
+        for bad in [
+            "<html><body><form>ASN lookup</form></body></html>",
+            "AS | IP | BGP Prefix | CC | Registry | Allocated | AS Name\nNA | 10.0.0.1 | NA | NA | NA | NA | NA\n",
+            "Error: no ASN or IP match on line 1.",
+            "AS | IP | BGP Prefix | CC | Registry | Allocated | AS Name\n",
+        ] {
+            assert!(provider.validate(&feed(bad)).is_err(), "accepted {bad}");
+        }
+    }
+
+    #[test]
+    fn team_cymru_only_ever_queries_a_public_address() {
+        for refused in [
+            "10.0.0.1",
+            "127.0.0.1",
+            "192.168.1.1",
+            "169.254.1.1",
+            "100.64.0.1",
+            "203.0.113.5",
+            "0.0.0.0",
+            "::1",
+            "fd00::1",
+            "2001:db8::1",
+            "AS3333",
+            "8.8.8.0/24",
+            "",
+        ] {
+            assert!(
+                TeamCymruProvider::with_resource(refused).is_err(),
+                "{refused}"
+            );
+        }
+        assert!(TeamCymruProvider::with_resource("8.8.8.8").is_ok());
+        assert!(TeamCymruProvider::with_resource("2001:4860:4860::8888").is_ok());
+    }
+
+    #[tokio::test]
+    async fn team_cymru_fetch_speaks_the_whois_protocol_and_reports_connection_errors() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut query = Vec::new();
+            let mut byte = [0u8; 1];
+            while stream.read_exact(&mut byte).await.is_ok() {
+                query.push(byte[0]);
+                if query.ends_with(b"\r\n") {
+                    break;
+                }
+            }
+            stream.write_all(CYMRU_ANSWER.as_bytes()).await.unwrap();
+            query
+        });
+        let provider = TeamCymruProvider::with_resource("8.8.8.8")
+            .unwrap()
+            .with_server(&address);
+        let feed = provider.fetch().await.unwrap();
+        assert_eq!(server.await.unwrap(), b" -v 8.8.8.8\r\n");
+        provider.validate(&feed).unwrap();
+        // a closed port is a connection error, not a timeout and not a parse error
+        let closed = TeamCymruProvider::with_resource("8.8.8.8")
+            .unwrap()
+            .with_server("127.0.0.1:1");
+        assert!(matches!(
+            closed.fetch().await,
+            Err(ProviderError::Connection(_))
+        ));
     }
 
     #[test]

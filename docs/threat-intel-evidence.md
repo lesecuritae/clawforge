@@ -94,6 +94,10 @@ Which sources to trust at which confidence (the three settings above), whether t
 the routing-context worker (third-party transfer), the first bridge mode and rule, and the
 release/deploy of migrations 0062-0064 (additive; ledger 61 -> 64 after 0062 ships).
 
+## Retired providers and missing keys
+
+`bgpview_asn` and `bgpstream` are no longer run by any code. `scripts/release/disable-retired-providers.sql` disables their registry rows (reversible, nothing deleted). `ThreatFox`, `URLhaus` and `MalwareBazaar` need an abuse.ch Auth-Key: with an empty secret file they report `provider configuration is missing: ..._AUTH_KEY` on every run and do not call the service. Put the key into the configured secret file; nothing in the code or the database invents one.
+
 ## Limits
 
 BGP anomaly flags exist only for prefixes the BGP providers are configured to monitor; a
