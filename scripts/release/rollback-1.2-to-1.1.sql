@@ -15,12 +15,12 @@ BEGIN;
 LOCK TABLE _sqlx_migrations IN ACCESS EXCLUSIVE MODE;
 DO $$
 BEGIN
-  -- 1.2.0/1.2.1 end at 64; later 1.2.x add 65 (an index only: nothing to archive, it stays)
-  IF (SELECT max(version) FROM _sqlx_migrations) NOT IN (64, 65)
+  -- 1.2.0/1.2.1 end at 64; 1.2.2 adds 65 (an index) and 66 (a policy row): nothing to archive, both stay
+  IF (SELECT max(version) FROM _sqlx_migrations) NOT IN (64, 65, 66)
      OR (SELECT count(*) FROM _sqlx_migrations WHERE version BETWEEN 59 AND (SELECT max(version) FROM _sqlx_migrations) AND success)
         <> (SELECT max(version) FROM _sqlx_migrations) - 58
      OR (SELECT count(*) FROM _sqlx_migrations WHERE NOT success) <> 0 THEN
-    RAISE EXCEPTION 'rollback refused: ledger is not exactly 1.1.0 (58) + the contiguous migrations 59..64/65';
+    RAISE EXCEPTION 'rollback refused: ledger is not exactly 1.1.0 (58) + the contiguous migrations 59..64/65/66';
   END IF;
   IF to_regclass('public.source_network_context') IS NULL THEN
     RAISE EXCEPTION 'rollback refused: public.source_network_context is missing';
@@ -53,7 +53,7 @@ BEGIN
   END LOOP;
 END $$;
 
-DELETE FROM _sqlx_migrations WHERE version BETWEEN 59 AND 65;
+DELETE FROM _sqlx_migrations WHERE version BETWEEN 59 AND 66;
 DO $$
 BEGIN
   IF (SELECT max(version) FROM _sqlx_migrations) <> 58 OR (SELECT count(*) FROM _sqlx_migrations) <> 54 THEN
