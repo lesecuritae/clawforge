@@ -152,12 +152,17 @@ impl RiskConsumer {
         batch: &NetworkBatch,
         store: &PostgresStore,
     ) -> anyhow::Result<usize> {
+        // Decide what is a change BEFORE the upsert overwrites the stored identity.
+        let mut asn_changed = Vec::with_capacity(batch.asn_records.len());
+        for record in &batch.asn_records {
+            asn_changed.push(store.asn_record_differs(record).await?);
+        }
         store.upsert_asn_records(&batch.asn_records).await?;
         store.upsert_bgp_events(&batch.bgp_events).await?;
         store.upsert_rpki_records(&batch.rpki_records).await?;
 
         let mut count = 0;
-        for record in &batch.asn_records {
+        for (record, changed) in batch.asn_records.iter().zip(asn_changed) {
             let indicator = asn_indicator(record);
             let assessment = self.engine.evaluate(
                 &NetworkObservation {
@@ -178,16 +183,20 @@ impl RiskConsumer {
                     &assessment.reasons.join("; "),
                 )
                 .await?;
-            record_event(
-                store,
-                "asn_change",
-                &record.provider,
-                &record.asn,
-                "info",
-                &assessment.reasons.join("; "),
-                serde_json::json!({"country": record.country, "network_type": record.network_type}),
-            )
-            .await;
+            // A canonical event is a CHANGE (and may become part of an incident); the same
+            // record seen again on every sync is inventory and stays in the tables only.
+            if changed {
+                record_event(
+                    store,
+                    "asn_change",
+                    &record.provider,
+                    &record.asn,
+                    "info",
+                    &assessment.reasons.join("; "),
+                    serde_json::json!({"country": record.country, "network_type": record.network_type}),
+                )
+                .await;
+            }
             count += 1;
         }
         for event in &batch.bgp_events {
@@ -213,16 +222,30 @@ impl RiskConsumer {
                     &assessment.reasons.join("; "),
                 )
                 .await?;
-            record_event(
-                store,
-                "bgp_change",
-                &event.source,
-                &event.prefix,
-                if matches!(event.status, clawforge_intelligence::BgpStatus::Anomalous) { "high" } else { "medium" },
-                &assessment.reasons.join("; "),
-                serde_json::json!({"previous_asn": event.previous_asn, "new_asn": event.new_asn, "status": format!("{:?}", event.status)}),
-            )
-            .await;
+            // Only a change or an anomaly is an event. A prefix list (RouteViews, RIPE RIS) returns the
+            // current origin of every prefix with status Unknown/Stable and no previous origin:
+            // that is inventory. Publishing each row as a "medium bgp_change" made every prefix
+            // correlate with its own next sync and produced ~194k "incidents" on production.
+            if matches!(
+                event.status,
+                clawforge_intelligence::BgpStatus::Changed
+                    | clawforge_intelligence::BgpStatus::Anomalous
+            ) {
+                record_event(
+                    store,
+                    "bgp_change",
+                    &event.source,
+                    &event.prefix,
+                    if matches!(event.status, clawforge_intelligence::BgpStatus::Anomalous) {
+                        "high"
+                    } else {
+                        "medium"
+                    },
+                    &assessment.reasons.join("; "),
+                    serde_json::json!({"previous_asn": event.previous_asn, "new_asn": event.new_asn, "status": format!("{:?}", event.status)}),
+                )
+                .await;
+            }
             count += 1;
         }
         for record in &batch.rpki_records {
