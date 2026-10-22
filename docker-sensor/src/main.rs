@@ -368,6 +368,34 @@ async fn flush(
         .store(buffer.len() as u64, Ordering::Relaxed);
 }
 
+const DEFAULT_HEARTBEAT_INTERVAL_SECONDS: u64 = 60;
+
+/// Authenticated liveness ping. This sensor only reports anomalies, so on a quiet system it
+/// delivers nothing for hours, which is indistinguishable from a dead sensor without it.
+async fn send_heartbeat(
+    client: &reqwest::Client,
+    ingress_url: &str,
+    credential: &str,
+    metrics: &Metrics,
+) {
+    match client
+        .post(format!("{ingress_url}/internal/security-events/heartbeat"))
+        .bearer_auth(credential)
+        .send()
+        .await
+    {
+        Ok(response) if response.status().is_success() => {}
+        Ok(response) => {
+            metrics.send_errors_total.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(status = %response.status(), "sensor heartbeat refused by ingress");
+        }
+        Err(error) => {
+            metrics.send_errors_total.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(%error, "sensor heartbeat could not reach ingress");
+        }
+    }
+}
+
 async fn batch_sender_task(
     mut rx: mpsc::Receiver<QueuedEvent>,
     client: reqwest::Client,
@@ -380,6 +408,9 @@ async fn batch_sender_task(
     let mut flush_interval =
         tokio::time::interval(Duration::from_secs(DEFAULT_BATCH_FLUSH_INTERVAL_SECONDS));
     flush_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut heartbeat_interval =
+        tokio::time::interval(Duration::from_secs(DEFAULT_HEARTBEAT_INTERVAL_SECONDS));
+    heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             received = rx.recv() => {
@@ -396,6 +427,9 @@ async fn batch_sender_task(
                         return;
                     }
                 }
+            }
+            _ = heartbeat_interval.tick() => {
+                send_heartbeat(&client, &ingress_url, &credential, &metrics).await;
             }
             _ = flush_interval.tick() => {
                 flush(&mut buffer, &client, &ingress_url, &credential, &checkpoint_path, &metrics).await;

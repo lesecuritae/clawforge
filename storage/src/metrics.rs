@@ -81,6 +81,9 @@ impl PostgresStore {
         for (name, label, sql, string_value) in [
             ("clawforge_provider_sync_status", "provider", "SELECT p.id AS label, COALESCE(s.state, 'never') AS state FROM providers p LEFT JOIN provider_status s ON s.provider_id = p.id ORDER BY p.id", true),
             ("clawforge_event_consumer_up", "consumer", "SELECT name AS label, CASE WHEN last_heartbeat_at > NOW() - INTERVAL '2 minutes' THEN 1 ELSE 0 END AS up FROM event_consumers ORDER BY name", false),
+            // Seconds since an enabled sensor last delivered an authenticated batch (a sensor that
+            // never reported counts as 2e9). Healthy containers prove nothing about a remote sensor.
+            ("clawforge_security_sensor_last_seen_age_seconds", "sensor", "SELECT name AS label, LEAST(2000000000, COALESCE(EXTRACT(EPOCH FROM (NOW() - last_seen_at)), 2000000000))::int AS up FROM security_sensors WHERE enabled AND revoked_at IS NULL ORDER BY name", false),
             ("clawforge_component_up", "component", "SELECT component AS label, CASE WHEN state='running' AND updated_at > NOW() - INTERVAL '2 minutes' THEN 1 ELSE 0 END AS up FROM runtime_status ORDER BY component", false),
         ] {
             if let Some(rows) = self.metrics_query(sql, deadline).await {
