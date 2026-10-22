@@ -416,6 +416,34 @@ async fn flush(
         .store(buffer.len() as u64, Ordering::Relaxed);
 }
 
+const DEFAULT_HEARTBEAT_INTERVAL_SECONDS: u64 = 60;
+
+/// Authenticated liveness ping. This sensor only reports anomalies, so on a quiet system it
+/// delivers nothing for hours, which is indistinguishable from a dead sensor without it.
+async fn send_heartbeat(
+    client: &reqwest::Client,
+    ingress_url: &str,
+    credential: &str,
+    metrics: &Metrics,
+) {
+    match client
+        .post(format!("{ingress_url}/internal/security-events/heartbeat"))
+        .bearer_auth(credential)
+        .send()
+        .await
+    {
+        Ok(response) if response.status().is_success() => {}
+        Ok(response) => {
+            metrics.send_errors_total.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(status = %response.status(), "sensor heartbeat refused by ingress");
+        }
+        Err(error) => {
+            metrics.send_errors_total.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(%error, "sensor heartbeat could not reach ingress");
+        }
+    }
+}
+
 async fn batch_sender_task(
     mut rx: mpsc::Receiver<QueuedEvent>,
     client: reqwest::Client,
@@ -428,6 +456,9 @@ async fn batch_sender_task(
     let mut flush_interval =
         tokio::time::interval(Duration::from_secs(DEFAULT_BATCH_FLUSH_INTERVAL_SECONDS));
     flush_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut heartbeat_interval =
+        tokio::time::interval(Duration::from_secs(DEFAULT_HEARTBEAT_INTERVAL_SECONDS));
+    heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             received = rx.recv() => {
@@ -444,6 +475,9 @@ async fn batch_sender_task(
                         return;
                     }
                 }
+            }
+            _ = heartbeat_interval.tick() => {
+                send_heartbeat(&client, &ingress_url, &credential, &metrics).await;
             }
             _ = flush_interval.tick() => {
                 flush(&mut buffer, &client, &ingress_url, &credential, &checkpoint_path, &metrics).await;
@@ -562,6 +596,49 @@ mod tests {
                 "data": {"accepted": items.len(), "rejected": 0, "results": results}
             })),
         )
+    }
+
+    #[tokio::test]
+    async fn a_heartbeat_is_an_authenticated_post_and_a_refusal_is_counted() {
+        use axum::http::HeaderMap;
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        async fn heartbeat_ok(
+            State(seen): State<Arc<Mutex<Vec<String>>>>,
+            headers: HeaderMap,
+        ) -> StatusCode {
+            let auth = headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            let accepted = auth == "Bearer sensor-secret";
+            seen.lock().unwrap().push(auth);
+            if accepted {
+                StatusCode::OK
+            } else {
+                StatusCode::UNAUTHORIZED
+            }
+        }
+        let app = Router::new()
+            .route("/internal/security-events/heartbeat", post(heartbeat_ok))
+            .with_state(seen.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::new();
+        let metrics = Metrics::default();
+        send_heartbeat(&client, &url, "sensor-secret", &metrics).await;
+        assert_eq!(metrics.send_errors_total.load(Ordering::Relaxed), 0);
+        send_heartbeat(&client, &url, "wrong", &metrics).await;
+        assert_eq!(metrics.send_errors_total.load(Ordering::Relaxed), 1);
+        // an unreachable ingress is an error too, never a silent success
+        send_heartbeat(&client, "http://127.0.0.1:1", "sensor-secret", &metrics).await;
+        assert_eq!(metrics.send_errors_total.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            vec!["Bearer sensor-secret", "Bearer wrong"]
+        );
+        server.abort();
     }
 
     #[tokio::test]

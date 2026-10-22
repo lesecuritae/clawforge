@@ -8157,6 +8157,37 @@ async fn internal_security_events_batch(
     ))
 }
 
+/// Liveness of a remote sensor. A sensor that only reports anomalies is silent when nothing
+/// happens, which looks exactly like a dead sensor; an authenticated heartbeat refreshes
+/// `last_seen_at` (done by the authentication itself) without creating an event or an audit row.
+async fn internal_security_events_heartbeat(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<ApiEnvelope<serde_json::Value>>> {
+    let token = bearer(&headers).ok_or_else(|| {
+        API_AUTH_FAILURES.fetch_add(1, Ordering::Relaxed);
+        api_error(StatusCode::UNAUTHORIZED, "sensor bearer token required")
+    })?;
+    state
+        .store
+        .authenticate_security_sensor(&digest(token))
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "sensor authentication unavailable",
+            )
+        })?
+        .ok_or_else(|| {
+            API_AUTH_FAILURES.fetch_add(1, Ordering::Relaxed);
+            api_error(
+                StatusCode::UNAUTHORIZED,
+                "invalid, disabled or revoked sensor credential",
+            )
+        })?;
+    Ok(envelope(serde_json::json!({"status": "ok"}), None))
+}
+
 async fn internal_events_consume(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -8453,6 +8484,10 @@ fn build_router(app_state: AppState) -> Router {
             "/internal/security-events/batch",
             post(internal_security_events_batch)
                 .layer(DefaultBodyLimit::max(SECURITY_EVENT_BATCH_MAX_BODY_BYTES)),
+        )
+        .route(
+            "/internal/security-events/heartbeat",
+            post(internal_security_events_heartbeat).layer(DefaultBodyLimit::max(1024)),
         )
         .route("/incidents/export", get(export_incidents))
         .route("/intelligence/indicators/export", get(export_indicators))
@@ -9571,6 +9606,57 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        // Heartbeat: authenticated liveness without an event; wrong credentials are refused.
+        let seen_before: Option<chrono::DateTime<Utc>> = sqlx::query_scalar(
+            "SELECT last_seen_at FROM security_sensors WHERE credential_hash=$1",
+        )
+        .bind(digest(&raw_credential))
+        .fetch_one(store.pool())
+        .await?;
+        let events_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM security_events")
+            .fetch_one(store.pool())
+            .await?;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let heartbeat = |token: Option<&str>| {
+            use tower::ServiceExt;
+            let mut builder = Request::builder()
+                .method("POST")
+                .uri("/internal/security-events/heartbeat");
+            if let Some(token) = token {
+                builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
+            }
+            app.clone().oneshot(builder.body(Body::empty()).unwrap())
+        };
+        assert_eq!(
+            heartbeat(None).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            heartbeat(Some("not-a-sensor-credential"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            heartbeat(Some(&raw_credential)).await.unwrap().status(),
+            StatusCode::OK
+        );
+        let seen_after: Option<chrono::DateTime<Utc>> = sqlx::query_scalar(
+            "SELECT last_seen_at FROM security_sensors WHERE credential_hash=$1",
+        )
+        .bind(digest(&raw_credential))
+        .fetch_one(store.pool())
+        .await?;
+        assert!(
+            seen_after > seen_before,
+            "the heartbeat refreshes last_seen_at"
+        );
+        let events_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM security_events")
+            .fetch_one(store.pool())
+            .await?;
+        assert_eq!(events_before, events_after, "a heartbeat creates no event");
 
         // An empty batch is rejected outright.
         let (status, _) =

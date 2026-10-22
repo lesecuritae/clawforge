@@ -138,6 +138,7 @@ export CLAWFORGE_TEST_CORRELATION_DATABASE_URL="$(cat "$secret_dir/database_corr
 run_cargo test -p clawforge-storage --test migration_lineages -- --ignored --test-threads=1
 run_cargo test -p clawforge-storage --test quarantine_approval -- --ignored --test-threads=1
 run_cargo test -p clawforge-storage --test event_delivery_claim -- --ignored --test-threads=1
+run_cargo test -p clawforge-storage --test sensor_metrics -- --ignored --test-threads=1
 
 export CLAWFORGE_TEST_QUARANTINE_DATABASE_URL="$owner_url"
 run_cargo test -p clawforge-storage --test quarantine_intents -- --ignored --test-threads=1
