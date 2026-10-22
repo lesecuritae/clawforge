@@ -21,6 +21,16 @@ def http(n, status):
              "dedupe_key": f"k{i}", "occurred_at": "t", "resource": "203.0.113.2"} for i in range(n)]
 
 
+def ssh_users(names):
+    return [{"event_type": "ssh_login_failure", "username": n, "dedupe_key": f"k{i}",
+             "occurred_at": "t", "resource": "203.0.113.1", "severity": "medium"} for i, n in enumerate(names)]
+
+
+def http_paths(paths):
+    return [{"event_type": "http_anomaly", "path": p, "status_code": 404,
+             "dedupe_key": f"k{i}", "occurred_at": "t", "resource": "203.0.113.2"} for i, p in enumerate(paths)]
+
+
 def case(id, attack, events):
     return {"case": {"id": id, "label_attack": attack}, "events": events}
 
@@ -38,10 +48,29 @@ class ObservablesTests(unittest.TestCase):
                  "abuse": case("abuse", True, http(12, 404))}
         self.assertEqual(observables.compare(cases), [])
 
-    def test_a_different_field_value_separates_cases(self):
-        cases = {"legit": case("legit", False, ssh(6, user="alice")),
-                 "attack": case("attack", True, ssh(6, user="root"))}
+    def test_a_different_account_name_alone_does_not_separate_cases(self):
+        # Whether "alice" is a legitimate account and "root" is not cannot be known from the event.
+        cases = {"legit": case("legit", False, ssh_users(["alice"] * 6)),
+                 "attack": case("attack", True, ssh_users(["root"] * 6))}
+        self.assertEqual(len(observables.compare(cases)), 1)
+
+    def test_many_different_account_names_separate_enumeration_from_a_nat(self):
+        nat = ssh_users(["alice", "bob", "carol"] * 4)
+        walk = ssh_users([f"name{i}" for i in range(12)])
+        cases = {"nat": case("nat", False, nat), "walk": case("walk", True, walk)}
         self.assertEqual(observables.compare(cases), [])
+        self.assertTrue(observables.behaviour(walk)["account_enumeration"])
+        self.assertFalse(observables.behaviour(nat)["account_enumeration"])
+
+    def test_secret_file_probes_separate_a_scanner_from_missing_assets(self):
+        assets = http_paths([f"/static/app.{i}.js" for i in range(10)])
+        probes = http_paths(["/.env", "/.git/config", "/.aws/credentials"] + [f"/static/a{i}.js" for i in range(7)])
+        cases = {"assets": case("assets", False, assets), "scan": case("scan", True, probes)}
+        self.assertEqual(observables.compare(cases), [])
+        self.assertEqual(observables.behaviour(probes)["signature_paths"], 3)
+        # ordinary well-known files are not secret probes
+        benign = http_paths(["/robots.txt", "/.well-known/security.txt", "/favicon.ico"])
+        self.assertEqual(observables.behaviour(benign)["signature_paths"], 0)
 
     def test_only_alerting_legitimate_cases_are_compared(self):
         cases = {"quiet": case("quiet", False, ssh(1)), "loud": case("loud", False, ssh(6)),

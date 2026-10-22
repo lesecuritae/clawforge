@@ -403,3 +403,208 @@ async fn the_hourly_ssh_rule_is_the_same_family_as_the_five_minute_rule() -> Res
     assert_eq!(e.basis(&slow).await?, (2, "independent_event_family"));
     Ok(())
 }
+
+impl Env {
+    /// Events of one family with explicit payloads (usernames, paths), oldest first.
+    async fn events_with(
+        &mut self,
+        event_type: &str,
+        at: DateTime<Utc>,
+        payloads: Vec<serde_json::Value>,
+    ) -> Result<Vec<Uuid>> {
+        let mut ids = Vec::new();
+        for (i, payload) in payloads.into_iter().enumerate() {
+            self.serial += 1;
+            ids.push(
+                self.owner
+                    .publish_event(
+                        event_type,
+                        "test-sensor",
+                        "low",
+                        at + Duration::seconds(i as i64),
+                        Some(&self.resource),
+                        payload,
+                        serde_json::json!({}),
+                        &format!("shape:{}:{}", self.resource, self.serial),
+                    )
+                    .await?,
+            );
+        }
+        Ok(ids)
+    }
+
+    async fn shape(
+        &self,
+        target: &SecurityAssessment,
+    ) -> Result<clawforge_storage::AssessmentShape> {
+        self.policy
+            .assessment_shape(
+                target.id,
+                &attack_shape::ShapeConfig::from_env().path_patterns,
+            )
+            .await
+    }
+}
+
+fn ssh(user: &str) -> serde_json::Value {
+    serde_json::json!({"username": user, "attempt_count": 1})
+}
+
+fn http(path: &str) -> serde_json::Value {
+    serde_json::json!({"path": path, "status_code": 404})
+}
+
+/// Users behind one NAT mistype a few valid accounts; a dictionary run walks through names. The
+/// same number of failed logins is `behavior_only` in the first case and carries the extra,
+/// content-based observation in the second.
+#[tokio::test]
+#[ignore = "requires provisioned roles in an isolated PostgreSQL test container"]
+async fn many_account_names_are_enumeration_a_few_are_a_nat() -> Result<()> {
+    let mut e = Env::new().await?;
+    let now = Utc::now();
+    let nat = e
+        .events_with(
+            "ssh_login_failure",
+            now,
+            [
+                "alice", "bob", "alice", "carol", "bob", "alice", "dave", "alice", "bob", "carol",
+            ]
+            .into_iter()
+            .map(ssh)
+            .collect(),
+        )
+        .await?;
+    let nat_assessment = e.assessment("ssh_bruteforce", now, now, &nat).await?;
+    let counts = e.shape(&nat_assessment).await?;
+    assert_eq!(
+        (
+            counts.events,
+            counts.distinct_usernames,
+            counts.signature_paths
+        ),
+        (10, 4, 0)
+    );
+    assert_eq!(e.basis(&nat_assessment).await?, (1, "behavior_only"));
+
+    let mut e = Env::new().await?;
+    let names = [
+        "root", "admin", "ubuntu", "test", "oracle", "postgres", "git", "user", "guest", "pi",
+    ];
+    let attack = e
+        .events_with(
+            "ssh_login_failure",
+            now,
+            names.into_iter().map(ssh).collect(),
+        )
+        .await?;
+    let attack_assessment = e.assessment("ssh_bruteforce", now, now, &attack).await?;
+    assert_eq!(e.shape(&attack_assessment).await?.distinct_usernames, 10);
+    assert_eq!(e.basis(&attack_assessment).await?, (2, "attack_shape"));
+    // upper/lower case of one account is one account
+    let mut e = Env::new().await?;
+    let same = e
+        .events_with(
+            "ssh_login_failure",
+            now,
+            (0..10)
+                .map(|i| ssh(if i % 2 == 0 { "Root" } else { "ROOT" }))
+                .collect(),
+        )
+        .await?;
+    let same_assessment = e.assessment("ssh_bruteforce", now, now, &same).await?;
+    assert_eq!(e.shape(&same_assessment).await?.distinct_usernames, 1);
+    assert_eq!(e.basis(&same_assessment).await?, (1, "behavior_only"));
+    Ok(())
+}
+
+/// A broken asset release produces many 404s for application files; a scanner asks for secrets.
+#[tokio::test]
+#[ignore = "requires provisioned roles in an isolated PostgreSQL test container"]
+async fn secret_path_probes_are_shape_evidence_missing_assets_are_not() -> Result<()> {
+    let now = Utc::now();
+    let mut e = Env::new().await?;
+    let assets: Vec<_> = (0..12)
+        .map(|i| http(&format!("/static/app.{i:04x}.js")))
+        .chain([
+            http("/robots.txt"),
+            http("/.well-known/security.txt"),
+            http("/favicon.ico"),
+        ])
+        .collect();
+    let ids = e.events_with("http_anomaly", now, assets).await?;
+    let missing = e.assessment("http_scan", now, now, &ids).await?;
+    assert_eq!(e.shape(&missing).await?.signature_paths, 0);
+    assert_eq!(e.basis(&missing).await?, (1, "behavior_only"));
+
+    let mut e = Env::new().await?;
+    let two = e
+        .events_with(
+            "http_anomaly",
+            now,
+            vec![http("/.env"), http("/.env?x=1")]
+                .into_iter()
+                .chain((0..10).map(|i| http(&format!("/static/a{i}.js"))))
+                .collect(),
+        )
+        .await?;
+    let two_assessment = e.assessment("http_scan", now, now, &two).await?;
+    assert_eq!(
+        e.shape(&two_assessment).await?.signature_paths,
+        2,
+        "query string variants of the same file are distinct paths"
+    );
+    assert_eq!(e.basis(&two_assessment).await?, (1, "behavior_only"));
+
+    let mut e = Env::new().await?;
+    let probes = [
+        "/.env",
+        "/config/.env",
+        "/.git/config",
+        "/.aws/credentials",
+        "/aws/credentials",
+        "/.docker/config.json",
+        "/.pypirc",
+        "/backend/.env.production.local",
+        "/.ssh/id_rsa",
+        "/id_rsa",
+    ];
+    let ids = e
+        .events_with("http_anomaly", now, probes.into_iter().map(http).collect())
+        .await?;
+    let scan = e.assessment("http_scan", now, now, &ids).await?;
+    assert_eq!(e.shape(&scan).await?.signature_paths, probes.len() as i64);
+    assert_eq!(e.basis(&scan).await?, (2, "attack_shape"));
+    Ok(())
+}
+
+/// Reputation and the existing independence rules keep their precedence; the shape is shown in
+/// the evidence even when it is not what counts.
+#[tokio::test]
+#[ignore = "requires provisioned roles in an isolated PostgreSQL test container"]
+async fn the_shape_function_returns_numbers_only_and_is_bounded() -> Result<()> {
+    let mut e = Env::new().await?;
+    let now = Utc::now();
+    let ids = e
+        .events_with("ssh_login_failure", now, vec![ssh("root"), ssh("admin")])
+        .await?;
+    let a = e.assessment("ssh_bruteforce", now, now, &ids).await?;
+    let value: serde_json::Value = sqlx::query_scalar("SELECT clawforge_assessment_shape($1, $2)")
+        .bind(a.id)
+        .bind(Vec::<String>::new())
+        .fetch_one(e.policy.pool())
+        .await?;
+    let text = value.to_string();
+    assert!(!text.contains("root") && !text.contains("admin"), "{text}");
+    assert_eq!(value["distinct_usernames"], 2);
+    // too many or too long patterns are refused
+    let too_many: Vec<String> = (0..51).map(|i| format!("^/p{i}$")).collect();
+    assert!(sqlx::query_scalar::<_, serde_json::Value>(
+        "SELECT clawforge_assessment_shape($1, $2)"
+    )
+    .bind(a.id)
+    .bind(&too_many)
+    .fetch_one(e.policy.pool())
+    .await
+    .is_err());
+    Ok(())
+}

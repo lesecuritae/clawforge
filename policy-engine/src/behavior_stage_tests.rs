@@ -178,6 +178,7 @@ async fn evidence_decision_and_enforcement_stages_for_the_labelled_cases() -> Re
 
     let (mut tp, mut fp, mut tn, mut fn_) = (0, 0, 0, 0);
     let mut rows = Vec::new();
+    let mut mismatches: Vec<String> = Vec::new();
     for case in plan["cases"].as_array().unwrap() {
         let id = case["id"].as_str().unwrap();
         let attack = case["label_attack"].as_bool().unwrap();
@@ -224,35 +225,41 @@ async fn evidence_decision_and_enforcement_stages_for_the_labelled_cases() -> Re
         let automatic = by_mode.get("automatic").cloned().unwrap_or_default();
         let propose = by_mode.get("propose").cloned().unwrap_or_default();
         let expected = case["expected_enforcement_requests"].as_u64().unwrap() as usize;
-        assert_eq!(
-            strongest,
-            case["expected_strongest_decision"].as_str().unwrap(),
-            "strongest decision for {id}: {decisions:?}"
-        );
+        let expected_decision = case["expected_strongest_decision"].as_str().unwrap();
+        if strongest != expected_decision {
+            mismatches.push(format!(
+                "strongest decision for {id}: got {strongest}, expected {expected_decision}: {decisions:?}"
+            ));
+        }
         let why = resources
             .get(id)
             .and_then(|r| reasons.get(r))
             .cloned()
             .unwrap_or_default();
-        assert_eq!(
-            automatic.len(),
-            expected,
-            "automatic requests for {id}: {why:?}"
-        );
-        assert_eq!(
-            propose.len(),
-            expected,
-            "propose requests for {id}: {why:?}"
-        );
-        if expected == 1 {
-            assert_eq!(automatic, vec!["pending".to_string()]);
-            assert_eq!(propose, vec!["waiting_approval".to_string()]);
+        if automatic.len() != expected {
+            mismatches.push(format!(
+                "automatic requests for {id}: {} != {expected}: {why:?}",
+                automatic.len()
+            ));
         }
-        if !attack {
-            assert!(
-                automatic.is_empty() && propose.is_empty(),
+        if propose.len() != expected {
+            mismatches.push(format!(
+                "propose requests for {id}: {} != {expected}: {why:?}",
+                propose.len()
+            ));
+        }
+        if expected == 1
+            && (automatic != vec!["pending".to_string()]
+                || propose != vec!["waiting_approval".to_string()])
+        {
+            mismatches.push(format!(
+                "request states for {id}: {automatic:?} / {propose:?}"
+            ));
+        }
+        if !attack && !(automatic.is_empty() && propose.is_empty()) {
+            mismatches.push(format!(
                 "legitimate case {id} must never produce an enforcement request"
-            );
+            ));
         }
         rows.push(
             json!({"id":id,"label_attack":attack,"strongest_decision":strongest,
@@ -289,5 +296,11 @@ async fn evidence_decision_and_enforcement_stages_for_the_labelled_cases() -> Re
         out.join("policy-stage-report.json"),
         serde_json::to_vec_pretty(&report)?,
     )?;
+    // Reported after the artifact is written, all at once, so a review sees every difference.
+    assert!(
+        mismatches.is_empty(),
+        "expectation mismatches:\n{}",
+        mismatches.join("\n")
+    );
     Ok(())
 }

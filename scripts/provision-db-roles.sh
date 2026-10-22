@@ -189,6 +189,8 @@ GRANT EXECUTE ON FUNCTION clawforge_enqueue_goaway_shadow_challenge(UUID)
   TO clawforge_policy_engine;
 -- Independent corroboration (migration 0061): event families only, never payloads.
 GRANT EXECUTE ON FUNCTION clawforge_assessment_event_types(UUID) TO clawforge_policy_engine;
+-- Behaviour counts of one assessment (migration 0067): numbers only, never usernames or paths.
+GRANT EXECUTE ON FUNCTION clawforge_assessment_shape(UUID, TEXT[]) TO clawforge_policy_engine;
 -- Current reputation/routing view of one pseudonymized source (migration 0063).
 GRANT EXECUTE ON FUNCTION clawforge_current_source_intel(TEXT) TO clawforge_policy_engine;
 -- Policy -> execution bridge (migration 0060): the only path by which this role

@@ -41,10 +41,17 @@ fn export_behavioral_scenarios() -> anyhow::Result<()> {
         let mut events = Vec::new();
         for (n, offset) in case["offsets"].as_array().unwrap().iter().enumerate() {
             let ip = format!("203.0.113.{}", index + 1);
-            let path = format!(
-                "/fixture-{}",
-                n % case["distinct_paths"].as_u64().unwrap() as usize
-            );
+            // A case may name the request paths it asks for (`paths`, cycled); without it the
+            // legacy fixture uses `distinct_paths` synthetic paths.
+            let path = match case["paths"].as_array() {
+                Some(paths) if !paths.is_empty() => {
+                    paths[n % paths.len()].as_str().unwrap().to_string()
+                }
+                _ => format!(
+                    "/fixture-{}",
+                    n % case["distinct_paths"].as_u64().unwrap() as usize
+                ),
+            };
             let message = format!("{ip}:54321 [01/Jan/2026:12:00:00.000] fe be/srv 0/0/0/1/1 {} 123 - - ---- 1/1/1/1/0 0/0 \"GET {path} HTTP/1.1\"",case["status"]);
             let line = json!({"__CURSOR":format!("behavior:{}:{n}",case["id"].as_str().unwrap()),
                 "MESSAGE":message,"__REALTIME_TIMESTAMP":((1767268800_i64+offset.as_i64().unwrap())*1_000_000).to_string(),

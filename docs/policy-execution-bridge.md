@@ -40,6 +40,8 @@ policy engine's `runtime_status.last_error`. Shadow decisions are unaffected.
 
 The compose file passes these through empty; empty counts as unset.
 
+`attack_shape` evidence (`behavior-validation.md`) can make a decision *corroborated* in shadow mode, but it never satisfies the bridge: a request still needs a counting reputation listing.
+
 ## What the database checks (all modes)
 
 Decision exists, is a shadow decision, matches the action kind (`block` or
