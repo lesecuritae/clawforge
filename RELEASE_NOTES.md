@@ -1,3 +1,32 @@
+# Clawforge v1.2.2 Delivery claim index, hourly SSH rule, sensor heartbeat
+
+## Performance
+- Event-delivery claim no longer sorts the backlog on every poll (migration 0065, partial index).
+  Build it with `CREATE INDEX CONCURRENTLY` first on large databases (`docs/event-delivery.md`).
+
+## Detection
+- `ssh_bruteforce_slow` v1: >= 15 failed logins per hour from one source (migration 0066 adds its
+  `observe` policy). Bounded cost, yields to the five-minute rule, never independent evidence for it.
+  A busy shared NAT is a known false positive; the quality gate stays red and no enforcement changes.
+
+## Telemetry
+- Sensor heartbeat and `clawforge_security_sensor_last_seen_age_seconds`; alive means an age below
+  about three heartbeat intervals (180 s). Roll the new image out to remote sensors.
+
+## Providers
+- Team Cymru via WHOIS, RPKI validation with separate origin AS/prefix, BGPStream retired.
+  abuse.ch sources still need their Auth-Keys (reported as missing configuration).
+
+## Upgrade
+- Migrations 0065-0066 are additive (ledger 64 to 66); the patch rollback is
+  `scripts/release/rollback-1.2.2-to-1.2.1.sql` (nothing is dropped).
+- Bridge, RIPEstat enrichment, live enforcement and quarantine stay off.
+
+# Clawforge v1.2.1 Provider response shapes and release tooling
+
+- Spamhaus ASN-DROP metadata row accepted (unknown rows still rejected), CAIDA nested ASN envelope.
+- Data-preserving rollback 1.2 -> 1.1 and a strict upgrade rehearsal under `scripts/release/`.
+
 # Clawforge v1.2.0 Evidence-based Detection and Safe Execution Bridge
 
 ## Production fixes
