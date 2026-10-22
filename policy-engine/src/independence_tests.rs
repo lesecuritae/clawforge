@@ -375,3 +375,31 @@ async fn overlapping_decisions_share_one_simulated_challenge() -> Result<()> {
     .await?;
     Ok(())
 }
+
+/// The hourly SSH rule watches the same failures as the five-minute rule: a slow attacker
+/// found by the hourly rule is one observation, and a source that trips both is not
+/// "corroborated" by its own failed logins.
+#[tokio::test]
+#[ignore = "requires provisioned roles in an isolated PostgreSQL test container"]
+async fn the_hourly_ssh_rule_is_the_same_family_as_the_five_minute_rule() -> Result<()> {
+    let mut e = Env::new().await?;
+    let now = Utc::now();
+    let ssh = e.events("ssh_login_failure", now, 20).await?;
+    let slow = e.assessment("ssh_bruteforce_slow", now, now, &ssh).await?;
+    let fast = e.assessment("ssh_bruteforce", now, now, &ssh[..5]).await?;
+    assert_eq!(e.basis(&slow).await?, (1, "behavior_only"));
+    assert_eq!(e.basis(&fast).await?, (1, "behavior_only"));
+    // A genuinely different family still corroborates the slow finding.
+    let http = e
+        .events("http_anomaly", now + Duration::minutes(10), 8)
+        .await?;
+    e.assessment(
+        "http_scan",
+        now + Duration::minutes(10),
+        now + Duration::minutes(10),
+        &http,
+    )
+    .await?;
+    assert_eq!(e.basis(&slow).await?, (2, "independent_event_family"));
+    Ok(())
+}

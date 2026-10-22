@@ -109,6 +109,17 @@ Packets, TTL expiry and rollback are the separate packet lab; the bridge stops a
   one window of one grid. A burst split four-and-four across a bucket boundary is detected
   (shifted-grid assessment, one incident candidate); a spread over a *full* window can still
   fall between both grids (documented limit, tested). No threshold was lowered.
+* **`ssh_bruteforce_slow` v1** (new): at least 15 failed logins from one source within an hour
+  (same two-grid scheme, window 3600 s). The five-minute rule cannot see a source that tries about
+  once a minute; production data from three days showed 71 source-hours with >= 15 failures and no
+  five-minute window at threshold (7 with >= 30). It belongs to the same event family as
+  `ssh_bruteforce`, so it never corroborates it, and a firing reads/records at most 61 events
+  (severity saturates at 4 x threshold), so a very busy source does not make the long window
+  expensive. It also yields: while a five-minute `ssh_bruteforce` assessment overlaps its window the
+  hourly rule stays quiet (one finding per activity). Its policy (migration 0066) is `observe` like the others. Honest limits: one failure
+  every five minutes (12 an hour) stays invisible, and many users behind one NAT at about 20
+  failures an hour trip it (`ssh_busy_shared_nat_over_an_hour`, a measured false positive that the
+  independent-evidence requirement keeps from becoming an attacker finding).
 * HTTP statuses >= 500 no longer count toward `http_anomaly_burst`/`http_scan`; a 5xx burst
   is the new observation-only rule `http_server_fault_burst` (own policy, recorded as
   `observe`, never a challenge, rate limit or block, never counted as corroboration).

@@ -479,3 +479,115 @@ async fn interleaved_out_of_order_arrival_equals_in_order_arrival() -> Result<()
     in_order.finish().await?;
     shuffled.finish().await
 }
+
+/// Roughly one failed login every two minutes never reaches five in five minutes, but is
+/// thirty an hour: the hourly rule sees it, the five-minute rule must stay silent.
+#[tokio::test]
+#[ignore = "requires provisioned roles in an isolated PostgreSQL test container"]
+async fn a_slow_ssh_attacker_is_seen_by_the_hourly_rule_only() -> Result<()> {
+    let mut f = Fixture::new().await?;
+    let start = t(15, 0, 30);
+    let mut events = Vec::new();
+    for i in 0..30 {
+        events.push(f.ssh(start + Duration::seconds(120 * i)).await?);
+    }
+    for event in &events {
+        evaluate_rule(&f.engine, &SSH_BRUTEFORCE, event).await?;
+        evaluate_rule(&f.engine, &SSH_BRUTEFORCE_SLOW, event).await?;
+    }
+    let found = f.assessments().await?;
+    assert!(
+        found
+            .iter()
+            .all(|(rule, _, _)| rule == "ssh_bruteforce_slow"),
+        "the five-minute rule must not fire: {found:?}"
+    );
+    // primary window 15:00-16:00 holds all 30; the shifted windows 14:30-15:30 and 15:30-16:30
+    // each hold half of them (15), which is exactly the threshold
+    let mut counts: Vec<i32> = found.iter().map(|(_, _, c)| *c).collect();
+    counts.sort();
+    assert_eq!(counts, vec![15, 15, 30], "{found:?}");
+    f.finish().await?;
+    Ok(())
+}
+
+/// Twelve an hour (one every five minutes) is below the hourly threshold in every window of
+/// either grid: nothing fires, the honest limit of this rule.
+#[tokio::test]
+#[ignore = "requires provisioned roles in an isolated PostgreSQL test container"]
+async fn a_failure_every_five_minutes_stays_quiet_in_both_rules() -> Result<()> {
+    let mut f = Fixture::new().await?;
+    let start = t(16, 0, 10);
+    let mut events = Vec::new();
+    for i in 0..24 {
+        events.push(f.ssh(start + Duration::seconds(300 * i)).await?);
+    }
+    for event in &events {
+        evaluate_rule(&f.engine, &SSH_BRUTEFORCE, event).await?;
+        evaluate_rule(&f.engine, &SSH_BRUTEFORCE_SLOW, event).await?;
+    }
+    assert!(f.assessments().await?.is_empty());
+    f.finish().await?;
+    Ok(())
+}
+
+/// A very busy source must not make the long window expensive: a firing reads and records at
+/// most `max_members` events (severity already saturates there).
+#[tokio::test]
+#[ignore = "requires provisioned roles in an isolated PostgreSQL test container"]
+async fn the_hourly_rule_reads_a_bounded_number_of_events_for_a_busy_source() -> Result<()> {
+    let mut f = Fixture::new().await?;
+    let start = t(17, 0, 5);
+    let mut last = None;
+    for i in 0..200 {
+        last = Some(f.ssh(start + Duration::seconds(15 * i)).await?);
+    }
+    evaluate_rule(&f.engine, &SSH_BRUTEFORCE_SLOW, &last.unwrap()).await?;
+    let found: Vec<(i32, String)> = sqlx::query_as(
+        "SELECT event_count, severity FROM security_assessments WHERE resource=$1 AND rule_id='ssh_bruteforce_slow'",
+    )
+    .bind(&f.resource)
+    .fetch_all(f.owner.pool())
+    .await?;
+    assert!(!found.is_empty());
+    assert!(
+        found
+            .iter()
+            .all(|(count, severity)| *count == 61 && severity == "critical"),
+        "{found:?}"
+    );
+    let evidence: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM security_assessment_events e JOIN security_assessments a ON a.id=e.assessment_id WHERE a.resource=$1 AND a.rule_id='ssh_bruteforce_slow'",
+    )
+    .bind(&f.resource)
+    .fetch_one(f.owner.pool())
+    .await?;
+    assert_eq!(evidence, 61 * found.len() as i64);
+    f.finish().await?;
+    Ok(())
+}
+
+/// One activity, one finding: a burst the five-minute rule already flagged is not reported a
+/// second time by the hourly rule, even though it also has >= 15 failures in the hour.
+#[tokio::test]
+#[ignore = "requires provisioned roles in an isolated PostgreSQL test container"]
+async fn the_hourly_rule_yields_to_the_five_minute_finding_of_the_same_activity() -> Result<()> {
+    let mut f = Fixture::new().await?;
+    let start = t(18, 0, 5);
+    let mut events = Vec::new();
+    for i in 0..30 {
+        events.push(f.ssh(start + Duration::seconds(2 * i)).await?);
+    }
+    for event in &events {
+        evaluate_rule(&f.engine, &SSH_BRUTEFORCE, event).await?;
+        evaluate_rule(&f.engine, &SSH_BRUTEFORCE_SLOW, event).await?;
+    }
+    let found = f.assessments().await?;
+    assert!(!found.is_empty());
+    assert!(
+        found.iter().all(|(rule, _, _)| rule == "ssh_bruteforce"),
+        "{found:?}"
+    );
+    f.finish().await?;
+    Ok(())
+}

@@ -68,6 +68,7 @@ Currently implemented (`security-engine/src/main.rs`):
 
 - **`ssh_bruteforce`** (v1, `CountThresholdRule`): 5+ `ssh_login_failure`
   events from the same pseudonymous source within 300s.
+- **`ssh_bruteforce_slow`** (v1, `CountThresholdRule`): 15+ `ssh_login_failure` events from one source within a 3600 s window (two grids, the second shifted by 1800 s). Reads at most 61 events per firing. Complements `ssh_bruteforce` for slow sources; same event family, so it is not independent evidence for it.
 - **`http_anomaly_burst`** (v1, `CountThresholdRule`): 10+ `http_anomaly`
   events from the same pseudonymous source within 300s.
 - **`http_scan`** (v1, `DistinctValueThresholdRule`): 8+ *distinct* `path`

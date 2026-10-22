@@ -123,22 +123,62 @@ impl PostgresStore {
         to: DateTime<Utc>,
         status: EventStatusFilter,
     ) -> Result<Vec<(Uuid, DateTime<Utc>)>> {
+        self.list_events_for_bucket_limited(event_type, correlation_id, from, to, status, 1000)
+            .await
+    }
+
+    /// Same membership, oldest first, at most `limit` events (1..=1000). A long-window rule
+    /// only needs to know that its threshold is met and how far over it is: capping the
+    /// membership keeps the per-event cost and the evidence written per firing bounded no
+    /// matter how busy a source is.
+    pub async fn list_events_for_bucket_limited(
+        &self,
+        event_type: &str,
+        correlation_id: &str,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+        status: EventStatusFilter,
+        limit: i64,
+    ) -> Result<Vec<(Uuid, DateTime<Utc>)>> {
         let rows = sqlx::query(&format!(
             "SELECT event_id, occurred_at FROM events \
              WHERE event_type=$1 AND correlation_id=$2 AND occurred_at >= $3 AND occurred_at < $4 \
-             AND {} ORDER BY occurred_at ASC LIMIT 1000",
+             AND {} ORDER BY occurred_at ASC LIMIT $5",
             status.predicate()
         ))
         .bind(event_type)
         .bind(correlation_id)
         .bind(from)
         .bind(to)
+        .bind(limit.clamp(1, 1000))
         .fetch_all(self.pool())
         .await?;
         Ok(rows
             .into_iter()
             .map(|row| (row.get("event_id"), row.get("occurred_at")))
             .collect())
+    }
+
+    /// Whether `resource` already has an assessment of `rule_id` whose window overlaps
+    /// `[from, to)`. A slow, long-window rule uses this to stay out of the way of the
+    /// short-window rule that already flagged the same activity.
+    pub async fn resource_has_assessment_overlapping(
+        &self,
+        resource: &str,
+        rule_id: &str,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) -> Result<bool> {
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM security_assessments WHERE resource=$1 AND rule_id=$2 \
+             AND bucket_start < $4 AND bucket_start + make_interval(secs => window_seconds) > $3)",
+        )
+        .bind(resource)
+        .bind(rule_id)
+        .bind(from)
+        .bind(to)
+        .fetch_one(self.pool())
+        .await?)
     }
 
     /// The best threat-intel hit (highest confidence, ties broken by most

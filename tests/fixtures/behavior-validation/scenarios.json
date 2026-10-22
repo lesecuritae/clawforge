@@ -498,7 +498,111 @@
       "listed_source": false,
       "expected_strongest_decision": "rate_limit",
       "expected_enforcement_requests": 0
+    },
+    {
+      "id": "ssh_slow_attacker_below_the_five_minute_threshold",
+      "kind": "ssh",
+      "event_count": 30,
+      "label_attack": true,
+      "expected_rules": [
+        "ssh_bruteforce_slow"
+      ],
+      "distinct_paths": 1,
+      "offsets": [
+        0,
+        120,
+        240,
+        360,
+        480,
+        600,
+        720,
+        840,
+        960,
+        1080,
+        1200,
+        1320,
+        1440,
+        1560,
+        1680,
+        1800,
+        1920,
+        2040,
+        2160,
+        2280,
+        2400,
+        2520,
+        2640,
+        2760,
+        2880,
+        3000,
+        3120,
+        3240,
+        3360,
+        3480
+      ],
+      "status": 404,
+      "note": "One failed login every two minutes for an hour: never five in five minutes, thirty an hour. Production showed 71 such source-hours in three days. Added with rule ssh_bruteforce_slow v1.",
+      "expected_strongest_decision": "rate_limit",
+      "expected_enforcement_requests": 0
+    },
+    {
+      "id": "ssh_occasional_typos_across_a_day",
+      "kind": "ssh",
+      "event_count": 8,
+      "label_attack": false,
+      "expected_rules": [],
+      "distinct_paths": 1,
+      "offsets": [
+        0,
+        1800,
+        3600,
+        5400,
+        7200,
+        9000,
+        10800,
+        12600
+      ],
+      "status": 404,
+      "note": "One mistyped password every half hour for four hours stays below both the five-minute and the hourly threshold.",
+      "expected_strongest_decision": "none",
+      "expected_enforcement_requests": 0
+    },
+    {
+      "id": "ssh_busy_shared_nat_over_an_hour",
+      "kind": "ssh",
+      "event_count": 20,
+      "label_attack": false,
+      "expected_rules": [
+        "ssh_bruteforce_slow"
+      ],
+      "distinct_paths": 1,
+      "offsets": [
+        0,
+        170,
+        340,
+        510,
+        680,
+        850,
+        1020,
+        1190,
+        1360,
+        1530,
+        1700,
+        1870,
+        2040,
+        2210,
+        2380,
+        2550,
+        2720,
+        2890,
+        3060,
+        3230
+      ],
+      "status": 404,
+      "note": "Many independent users behind one NAT address mistype passwords at about twenty an hour; intentionally measures a detector false positive of the new hourly rule, not a block.",
+      "expected_strongest_decision": "challenge",
+      "expected_enforcement_requests": 0
     }
   ],
-  "revision_note": "Cases 0-14 and their original expected_rules/label_attack are the frozen 2026-10-21 baseline. expected_rules_after_fix records the deterministic behaviour change of detection-fix rule version 2 (staggered windows, 5xx split) for three cases only; intent labels were not changed. Cases 15-17 were added afterwards. expected_strongest_decision / expected_enforcement_requests describe the policy stage with every policy promoted to class automatic and bridge modes automatic and propose configured."
+  "revision_note": "Cases 0-14 and their original expected_rules/label_attack are the frozen 2026-10-21 baseline. expected_rules_after_fix records the deterministic behaviour change of detection-fix rule version 2 (staggered windows, 5xx split) for three cases only; intent labels were not changed. Cases 15-17 were added afterwards. expected_strongest_decision / expected_enforcement_requests describe the policy stage with every policy promoted to class automatic and bridge modes automatic and propose configured. Cases 18-20 (hourly SSH rule) were added with ssh_bruteforce_slow v1; their expected_strongest_decision values are taken from the first real run of the policy stage and reviewed, not chosen to make a gate pass."
 }
