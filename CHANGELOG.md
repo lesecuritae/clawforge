@@ -4,6 +4,17 @@
 
 Weitere Änderungen für die nächste Version werden hier gesammelt.
 
+## [1.2.1] - 2026-10-22
+
+- Intelligence: the Spamhaus ASN-DROP feed's trailing metadata object is accepted
+  (still failing closed on unknown or malformed rows) and CAIDA's nested
+  `data.asn` answer is treated as an envelope instead of an empty record. Real
+  captured answers replay to 442 ASN indicators and one CAIDA ASN record.
+- Release tooling: `scripts/release/` contains the data-preserving rollback from
+  1.2.x to 1.1.x (the only 1.2-only table is archived, never dropped), the
+  restore step for a later re-upgrade, and a strict upgrade/rollback/re-upgrade
+  rehearsal against a copy of the production schema.
+
 ## [1.2.0] - 2026-10-21
 
 - Fixed the persistence of IP resolutions (`security_ip_resolutions`): the
