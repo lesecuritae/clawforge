@@ -21,6 +21,9 @@ import urllib.request
 
 MAX_LINE = 262144
 MAX_PENDING = 10000
+HEARTBEAT_EVERY = 60       # seconds between heartbeats while the engine is demonstrably alive
+STATS_FRESH_WITHIN = 150   # the engine writes stats every 30 s; five missed intervals = not alive
+STATUS_EVERY = 30
 
 
 def integer(value, name, maximum=2**64 - 1):
@@ -78,6 +81,26 @@ def normalize(raw, source):
     return event
 
 
+def engine_stats(raw):
+    """Capture counters of an EVE `stats` record: (record time, kernel_packets, kernel_drops) or
+    None. Numbers only; anything unexpected is ignored rather than trusted."""
+    if b'"stats"' not in raw:
+        return None
+    try:
+        row = json.loads(raw)
+        if not isinstance(row, dict) or row.get('event_type') != 'stats':
+            return None
+        capture = row['stats']['capture']
+        stamp = dt.datetime.fromisoformat(row['timestamp'].replace('Z', '+00:00'))
+        if stamp.utcoffset() is None:
+            return None
+        return (stamp.astimezone(dt.timezone.utc).timestamp(),
+                integer(capture['kernel_packets'], 'kernel_packets'),
+                integer(capture['kernel_drops'], 'kernel_drops'))
+    except (ValueError, KeyError, TypeError, AttributeError, OverflowError):
+        return None
+
+
 def connect(path):
     db = sqlite3.connect(path)
     db.execute('PRAGMA journal_mode=WAL')
@@ -88,6 +111,8 @@ def connect(path):
         CREATE TABLE IF NOT EXISTS pending (seq INTEGER PRIMARY KEY,
           event TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS counters (name TEXT PRIMARY KEY, value INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS engine (id INTEGER PRIMARY KEY CHECK(id=1),
+          stats_at REAL NOT NULL, packets INTEGER NOT NULL, drops INTEGER NOT NULL);
     ''')
     return db
 
@@ -154,7 +179,11 @@ def read_step(db, path, source):
         else:
             outcome = 'queued' if event else 'ignored'
         digest = anchor(stream, end)
+        stats = engine_stats(raw) if outcome == 'ignored' else None
         with db:
+            if stats:
+                db.execute('INSERT OR REPLACE INTO engine VALUES (1,?,?,?)', stats)
+                count(db, 'engine_stats')
             if event:
                 db.execute('INSERT INTO pending(event) VALUES (?)', (json.dumps(event),))
             count(db, outcome)
@@ -221,6 +250,42 @@ def retry_after(error):
     return min(3600, max(0, seconds))
 
 
+def engine_state(db, now=None):
+    """What the engine last reported: alive = its own newest stats record is recent."""
+    now = time.time() if now is None else now
+    row = db.execute('SELECT stats_at,packets,drops FROM engine WHERE id=1').fetchone()
+    if not row:
+        return dict(alive=False, stats_at=None, kernel_packets=None, kernel_drops=None)
+    return dict(alive=now - row[0] <= STATS_FRESH_WITHIN,
+                stats_at=dt.datetime.fromtimestamp(row[0], dt.timezone.utc).isoformat(),
+                kernel_packets=row[1], kernel_drops=row[2])
+
+
+def heartbeat(base_url, credential):
+    """Authenticated liveness ping (refreshes last_seen, creates no event). Only ever sent while
+    the engine is alive, so a dead engine shows up as a stale sensor instead of a quiet one."""
+    request = urllib.request.Request(base_url.rstrip('/') + '/internal/security-events/heartbeat',
+                                     method='POST', data=b'',
+                                     headers={'Authorization': 'Bearer ' + credential})
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+    with opener.open(request, timeout=15) as response:
+        response.read(1024)
+        return 200 <= response.status < 300
+
+
+def write_status(path, db, sent_heartbeat_at):
+    """Atomic, mode-0600 status file for operators and monitoring (numbers and times only)."""
+    counters = dict(db.execute('SELECT name,value FROM counters'))
+    counters['pending'] = db.execute('SELECT count(*) FROM pending').fetchone()[0]
+    state = engine_state(db)
+    status = dict(written_at=dt.datetime.now(dt.timezone.utc).isoformat(), engine=state,
+                  adapter=counters, heartbeat_sent_at=sent_heartbeat_at)
+    tmp = path.with_name(path.name + '.tmp')
+    tmp.write_text(json.dumps(status, sort_keys=True))
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--eve', type=Path, required=True)
@@ -252,6 +317,11 @@ def main():
             db.execute('INSERT OR IGNORE INTO binding VALUES (1,?)', (value,))
             db.commit()
             backoff = 1
+            base_url = args.ingress
+            status_path = args.state.with_name('status.json')
+            last_heartbeat = last_status = 0.0
+            heartbeat_at = None
+            last_drops = None
             while True:
                 progressed = False
                 for _ in range(100):
@@ -271,6 +341,25 @@ def main():
                     backoff = min(backoff * 2, 60)
                     continue
                 backoff = 1
+                clock = time.monotonic()
+                state = engine_state(db)
+                if state['kernel_drops'] is not None and state['kernel_drops'] != last_drops:
+                    if last_drops is not None and state['kernel_drops'] > last_drops:
+                        print(json.dumps({'status': 'capture_drops',
+                                          'new_drops': state['kernel_drops'] - last_drops,
+                                          'kernel_packets': state['kernel_packets']}), flush=True)
+                    last_drops = state['kernel_drops']
+                if not args.once and state['alive'] and clock - last_heartbeat >= HEARTBEAT_EVERY:
+                    last_heartbeat = clock
+                    try:
+                        if heartbeat(base_url, credential):
+                            heartbeat_at = dt.datetime.now(dt.timezone.utc).isoformat()
+                    except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+                        with db:
+                            count(db, 'heartbeat_errors')
+                if not args.once and clock - last_status >= STATUS_EVERY:
+                    last_status = clock
+                    write_status(status_path, db, heartbeat_at)
                 if args.once and not progressed and not sent:
                     stats = dict(db.execute('SELECT name,value FROM counters'))
                     stats['pending'] = db.execute('SELECT count(*) FROM pending').fetchone()[0]

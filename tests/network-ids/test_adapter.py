@@ -1,5 +1,7 @@
+import datetime as dt
 import importlib.util
 import json
+import time
 from pathlib import Path
 import tempfile
 import threading
@@ -220,6 +222,104 @@ class AdapterTests(unittest.TestCase):
                 a.endpoint(url, False)
         self.assertEqual(a.endpoint('http://127.0.0.1:8080', False),
                          'http://127.0.0.1:8080/internal/security-events/batch')
+
+
+def stats_line(at, packets, drops, **changes):
+    row = dict(timestamp=at, event_type='stats',
+               stats=dict(uptime=10, capture=dict(kernel_packets=packets, kernel_drops=drops)))
+    row.update(changes)
+    return line(row)
+
+
+class EngineHealthTests(unittest.TestCase):
+    """Engine liveness and packet loss come from EVE `stats`; they never become security events."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.eve = self.root / 'eve.json'
+        self.eve.touch()
+        self.db = a.connect(self.root / 'state.db')
+        self.addCleanup(self.db.close)
+
+    def stamp(self, ago):
+        when = dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=ago)
+        return when.strftime('%Y-%m-%dT%H:%M:%S.000000+0000')
+
+    def test_stats_record_yields_numbers_only_and_no_event(self):
+        got = a.engine_stats(stats_line('2026-10-23T09:00:00.000000+0000', 1000, 7))
+        self.assertEqual(got[1:], (1000, 7))
+        self.assertIsNone(a.normalize(stats_line('2026-10-23T09:00:00.000000+0000', 1, 0), 'suricata:lab'))
+        self.eve.write_bytes(stats_line(self.stamp(5), 1000, 7))
+        self.assertTrue(a.read_step(self.db, self.eve, 'suricata:lab'))
+        self.assertEqual(self.db.execute('SELECT count(*) FROM pending').fetchone()[0], 0)
+        state = a.engine_state(self.db)
+        self.assertTrue(state['alive'])
+        self.assertEqual((state['kernel_packets'], state['kernel_drops']), (1000, 7))
+
+    def test_hostile_or_malformed_stats_are_ignored(self):
+        for bad in (b'{"event_type":"stats","stats":{}}\n',
+                    stats_line(self.stamp(1), -1, 0), stats_line(self.stamp(1), True, 0),
+                    stats_line('2026-10-23T09:00:00', 1, 0), b'not json "stats"\n'):
+            with self.subTest(bad=bad):
+                self.assertIsNone(a.engine_stats(bad))
+
+    def test_a_silent_engine_is_not_alive_even_if_it_once_was(self):
+        # stats records from before the freshness window: a dead engine, not a quiet one
+        self.eve.write_bytes(stats_line(self.stamp(a.STATS_FRESH_WITHIN + 60), 5, 0))
+        a.read_step(self.db, self.eve, 'suricata:lab')
+        self.assertFalse(a.engine_state(self.db)['alive'])
+        self.assertFalse(a.engine_state(self.db, now=time.time())['alive'])
+        self.assertFalse(a.engine_state(a.connect(self.root / 'empty.db'))['alive'])
+
+    def test_replaying_an_old_backlog_does_not_make_the_engine_look_alive(self):
+        self.eve.write_bytes(stats_line('2026-10-01T00:00:00.000000+0000', 5, 0))
+        a.read_step(self.db, self.eve, 'suricata:lab')
+        self.assertFalse(a.engine_state(self.db)['alive'])
+
+    def test_heartbeat_is_an_authenticated_bodyless_post_without_redirects(self):
+        seen = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                seen.append((self.path, self.headers['Authorization'], self.headers.get('Content-Length')))
+                if self.path.startswith('/redir'):
+                    self.send_response(302)
+                    self.send_header('Location', '/stolen')
+                    self.end_headers()
+                    return
+                self.send_response(200)
+                self.send_header('Content-Length', '2')
+                self.end_headers()
+                self.wfile.write(b'{}')
+
+            def log_message(self, *args):
+                pass
+
+        server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        base = 'http://127.0.0.1:%s' % server.server_port
+        self.assertTrue(a.heartbeat(base, 'tok'))
+        self.assertEqual(seen, [('/internal/security-events/heartbeat', 'Bearer tok', '0')])
+        import urllib.error
+        with self.assertRaises(urllib.error.HTTPError):
+            a.heartbeat(base + '/redir', 'tok')
+        self.assertEqual(len(seen), 2, 'a redirect is not followed')
+
+    def test_status_file_is_private_and_holds_numbers_only(self):
+        self.eve.write_bytes(stats_line(self.stamp(3), 99, 2))
+        a.read_step(self.db, self.eve, 'suricata:lab')
+        path = self.root / 'status.json'
+        a.write_status(path, self.db, None)
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        status = json.loads(path.read_text())
+        self.assertTrue(status['engine']['alive'])
+        self.assertEqual(status['engine']['kernel_drops'], 2)
+        self.assertEqual(status['adapter']['pending'], 0)
+        self.assertFalse(list(self.root.glob('*.tmp')))
 
 
 if __name__ == '__main__':

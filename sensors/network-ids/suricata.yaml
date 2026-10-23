@@ -1,12 +1,20 @@
 %YAML 1.1
 ---
-# Clawforge passive sensor configuration. No inline queue, routing, or drop rules.
-# Replace HOME_NET with the explicitly protected networks before deployment.
+# Clawforge passive sensor configuration: no inline queue, no routing, no drop rules, no
+# promiscuity request from the engine. Protected networks are the private ranges and the CGNAT
+# range used by Tailscale; replace HOME_NET (mount an edited copy) when the site differs.
 vars:
   address-groups:
-    HOME_NET: "any"
-    EXTERNAL_NET: "any"
+    HOME_NET: "[192.168.0.0/16,10.0.0.0/8,172.16.0.0/12,100.64.0.0/10,fc00::/7,fe80::/10]"
+    EXTERNAL_NET: "!$HOME_NET"
+  port-groups:
+    HTTP_PORTS: "80"
+    SSH_PORTS: "22"
+default-log-dir: /var/log/suricata
 default-rule-path: /rules
+classification-file: /opt/clawforge/suricata/classification.config
+reference-config-file: /opt/clawforge/suricata/reference.config
+threshold-file: /opt/clawforge/suricata/threshold.config
 rule-files:
   - suricata.rules
 outputs:
@@ -14,6 +22,9 @@ outputs:
       enabled: yes
       filetype: regular
       filename: eve.json
+      # Rotated files (eve.<timestamp>.json) stay until the Clawforge adapter has drained them;
+      # scripts/retention in docs/network-ids.md removes old ones.
+      rotate-interval: 1d
       types:
         - alert:
             payload: no
@@ -25,13 +36,33 @@ outputs:
 stats:
   enabled: yes
   interval: 30
+# Bounded memory: the container limit is the hard cap, these keep the engine well inside it.
+flow:
+  memcap: 64mb
+  hash-size: 65536
+  prealloc: 5000
+stream:
+  memcap: 128mb
+  reassembly:
+    memcap: 128mb
+defrag:
+  memcap: 32mb
+host:
+  memcap: 16mb
+detect:
+  profile: medium
+threading:
+  set-cpu-affinity: no
 af-packet:
   - interface: default
+    threads: 2
     cluster-id: 91
     cluster-type: cluster_flow
     defrag: yes
     use-mmap: yes
     tpacket-v3: yes
+    ring-size: 4096
+    block-size: 32768
     promisc: no
 logging:
   default-log-level: notice
