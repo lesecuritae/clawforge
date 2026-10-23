@@ -517,21 +517,18 @@ async fn main() -> Result<()> {
     }
     info!(shadow_mode = true, "Clawforge policy engine started");
     let mut interval = tokio::time::interval(poll);
+    let mut last_state = "running";
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                if let Err(error) = store.set_runtime_status("policy-engine", "running", bridge_error.as_deref()).await {
-                    warn!(%error, "could not heartbeat policy-engine runtime status");
+                let cycle = run_cycle(&store, limit, bridge.as_ref()).await;
+                let (state, detail) = runtime_report(&cycle, bridge_error.as_deref());
+                if state != last_state {
+                    warn!(state, "policy-engine runtime state changed");
+                    last_state = state;
                 }
-                match store.list_security_assessments(None, limit).await {
-                    Ok(assessments) => {
-                        for assessment in assessments {
-                            if let Err(error) = evaluate_assessment(&store, &assessment, bridge.as_ref()).await {
-                                warn!(%error, assessment_id = %assessment.id, "policy evaluation failed");
-                            }
-                        }
-                    }
-                    Err(error) => warn!(%error, "could not list recent security assessments"),
+                if let Err(error) = store.set_runtime_status("policy-engine", state, detail.as_deref()).await {
+                    warn!(%error, "could not heartbeat policy-engine runtime status");
                 }
             }
             _ = shutdown_signal() => { info!("Clawforge policy engine shutting down"); break; }
@@ -541,6 +538,84 @@ async fn main() -> Result<()> {
         .set_runtime_status("policy-engine", "stopped", None)
         .await?;
     Ok(())
+}
+
+/// One polling cycle: evaluate the recent assessments and report how it went.
+async fn run_cycle(
+    store: &PostgresStore,
+    limit: i64,
+    bridge: Option<&BridgeConfig>,
+) -> CycleHealth {
+    let mut cycle = CycleHealth::default();
+    match store.list_security_assessments(None, limit).await {
+        Ok(assessments) => {
+            for assessment in assessments {
+                match evaluate_assessment(store, &assessment, bridge).await {
+                    Ok(()) => cycle.ok += 1,
+                    Err(error) => {
+                        warn!(%error, assessment_id = %assessment.id, "policy evaluation failed");
+                        cycle.record_failure(&error.to_string());
+                    }
+                }
+            }
+        }
+        Err(error) => {
+            warn!(%error, "could not list recent security assessments");
+            cycle.listing_failed = true;
+            cycle.record_failure(&error.to_string());
+        }
+    }
+    cycle
+}
+
+/// What one polling cycle achieved. "Nothing to do" is healthy; "everything I tried failed" is not, even
+/// though the process is alive and heartbeating (release 1.2.3: the engine lacked EXECUTE on one function,
+/// every evaluation failed for ~15 hours and the status still read `running`).
+#[derive(Debug, Default)]
+struct CycleHealth {
+    ok: u32,
+    failed: u32,
+    listing_failed: bool,
+    last_error: Option<String>,
+}
+
+impl CycleHealth {
+    fn record_failure(&mut self, error: &str) {
+        self.failed += 1;
+        // short, single-line and bounded: the text is shown in the status view
+        let clean: String = error
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .take(160)
+            .collect();
+        self.last_error = Some(clean);
+    }
+}
+
+/// Failures needed in one cycle (with no success) before the engine reports itself degraded; a single
+/// malformed assessment must not flap the status.
+const DEGRADED_AFTER_FAILURES: u32 = 3;
+
+/// `(state, detail)` for `set_runtime_status`. `degraded` stops refreshing the heartbeat, so the existing
+/// `clawforge_component_up` metric drops to 0 and the database-side bridge gate (which requires a running,
+/// fresh policy engine) fails closed.
+fn runtime_report(
+    cycle: &CycleHealth,
+    bridge_error: Option<&str>,
+) -> (&'static str, Option<String>) {
+    let degraded =
+        cycle.listing_failed || (cycle.ok == 0 && cycle.failed >= DEGRADED_AFTER_FAILURES);
+    if degraded {
+        let reason = cycle.last_error.as_deref().unwrap_or("unknown error");
+        return (
+            "degraded",
+            Some(format!(
+                "policy evaluation failing ({} failed, {} ok): {reason}",
+                cycle.failed, cycle.ok
+            )),
+        );
+    }
+    ("running", bridge_error.map(str::to_string))
 }
 
 async fn shutdown_signal() {
@@ -553,6 +628,66 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+#[cfg(test)]
+mod runtime_report_tests {
+    use super::*;
+
+    fn cycle(ok: u32, failed: u32) -> CycleHealth {
+        let mut c = CycleHealth {
+            ok,
+            ..CycleHealth::default()
+        };
+        for _ in 0..failed {
+            c.record_failure("permission denied for function clawforge_assessment_shape");
+        }
+        c
+    }
+
+    #[test]
+    fn an_idle_engine_is_healthy_and_keeps_the_bridge_notice() {
+        assert_eq!(runtime_report(&cycle(0, 0), None), ("running", None));
+        assert_eq!(
+            runtime_report(&cycle(0, 0), Some("policy bridge disabled: x")),
+            ("running", Some("policy bridge disabled: x".to_string()))
+        );
+    }
+
+    #[test]
+    fn one_or_two_bad_assessments_do_not_flap_the_status() {
+        assert_eq!(runtime_report(&cycle(0, 2), None).0, "running");
+        assert_eq!(
+            runtime_report(&cycle(5, 40), None).0,
+            "running",
+            "some success means the engine works"
+        );
+    }
+
+    #[test]
+    fn every_evaluation_failing_is_degraded_with_a_bounded_single_line_reason() {
+        let (state, detail) = runtime_report(&cycle(0, 3), None);
+        assert_eq!(state, "degraded");
+        let detail = detail.unwrap();
+        assert!(detail.contains("permission denied"), "{detail}");
+        assert!(!detail.contains('\n') && detail.len() < 260, "{detail}");
+        let mut c = CycleHealth::default();
+        c.record_failure(&format!("line1\nline2 {}", "x".repeat(500)));
+        assert!(
+            c.last_error.as_ref().unwrap().chars().count() <= 160
+                && !c.last_error.as_ref().unwrap().contains('\n')
+        );
+    }
+
+    #[test]
+    fn a_failed_listing_is_degraded_even_without_evaluations() {
+        let mut c = CycleHealth {
+            listing_failed: true,
+            ..CycleHealth::default()
+        };
+        c.record_failure("connection refused");
+        assert_eq!(runtime_report(&c, None).0, "degraded");
     }
 }
 
