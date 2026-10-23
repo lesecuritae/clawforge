@@ -4,8 +4,9 @@
 - Assessments that fell out of the policy engine's "newest 200" window were never decided (167 after the
   1.2.3 incident). Every cycle now also catches up, bounded, assessments of the last 24 hours without any
   decision (`CLAWFORGE_POLICY_ENGINE_BACKLOG_LIMIT`, default 100). Same logic and shadow-only output as any
-  other evaluation; no execution request is created by the catch-up with the bridge off, and the bridge's own
-  database check still rejects stale evidence.
+  other evaluation. With the bridge off the catch-up creates no bridge request; like any `challenge` decision it
+  can enqueue the existing simulation-only Go-Away request (13 right after the 1.2.7 deploy), which never
+  executes live. The bridge's own database check still rejects stale evidence.
 
 ## Tooling
 - `scripts/ops/pipeline-completeness-audit.sql`: read-only recomputation of the expected windows from the
