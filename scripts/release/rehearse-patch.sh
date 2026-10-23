@@ -87,6 +87,7 @@ assert "roles script after migrate" "$(ROLES "$NEW_ROLES" >> "$LOG" 2>&1; echo $
 assert "ledger" "$(P -c "select max(version)||'/'||count(*) from _sqlx_migrations where success")" "$NMAX/$NFILES"
 assert "ready index present and valid" "$(P -c "select indisvalid from pg_index where indexrelid=to_regclass('event_delivery_ready_idx')")" t
 assert "slow-rule policy present" "$(P -c "select count(*) from security_policies where rule_id='ssh_bruteforce_slow' and status='active'")" 1
+assert "no orphaned SECURITY DEFINER function after the new roles script" "$(P -f - < "$HERE/check-role-grants.sql")" ""
 if [ -n "$TOP" ]; then assert "assessment-shape function present" "$(P -c "select count(*) from pg_proc where proname='clawforge_assessment_shape'")" 1; fi
 assert "previous patch image REFUSES the newer ledger" "$(MIG_PREV >> "$LOG" 2>&1; [ $? -ne 0 ] && echo refused || echo accepted)" refused
 UP1_SIG="$(LEDGER_SIG)"

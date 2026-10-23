@@ -86,6 +86,11 @@ docker run --rm --network host \
   -v "$repo_dir/scripts/provision-db-roles.sh:/usr/local/bin/provision-db-roles.sh:ro" \
   postgres:16-alpine sh /usr/local/bin/provision-db-roles.sh
 
+# Every SECURITY DEFINER function must be callable by some product role after the roles script ran:
+# a roles script that lags behind its migration silently disables the caller (release 1.2.3).
+orphans="$(docker run --rm -i --network host postgres:16-alpine psql "$owner_url" -At -f - < "$repo_dir/scripts/release/check-role-grants.sql")"
+if [ -n "$orphans" ]; then echo "SECURITY DEFINER functions nobody may execute: $orphans" >&2; exit 1; fi
+
 # IP anonymization defaults to on (CLAWFORGE_ANALYZER_ANONYMIZE_IPS) and, with
 # no key configured, publish_event now fails closed on any IP-shaped
 # correlation id or payload/metadata field - which several fixtures below use
