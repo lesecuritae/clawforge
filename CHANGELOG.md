@@ -4,6 +4,8 @@
 
 Weitere Änderungen für die nächste Version werden hier gesammelt.
 
+## [1.2.4] - 2026-10-23
+
 - Network IDS: passive Suricata 8.0.7 integration. New `network_ids_alert` security event (migration 0068, additive CHECK widening), owned EVE adapter with a disk outbox, engine `stats`-gated heartbeat and `status.json` (capture drops visible), hardened derived engine image (own network namespace holding only the mirror NIC, drops to an unprivileged user, bounded memory/CPU), ET Open rule updater with engine validation and atomic swap, reversible host mirror script (tc ingress mirror, exactly one copy per frame) and an end-to-end self-test. Observations never become incidents or enforcement requests; executor dry-run, approvals and gates are unchanged. Operations guide: `docs/network-ids.md`.
 - Fix: a threat feed re-read on every sync no longer republishes its unchanged entries as `new_threat_indicator` events (a refreshed expiry/metadata is inventory; a new indicator or changed categories/confidence is still an event). On production the hourly Spamhaus DROP/ASN sync (~2,100 entries) created ~2,150 `info` incidents per hour (51k/day). `asn_change` is no longer raised when two providers describe one ASN differently (`asn_records` has one row per ASN, so the providers overwrote each other every hour); only a new ASN or the same provider's own changed view is a change. No migration. Existing incidents are untouched.
 ## [1.2.3] - 2026-10-22
