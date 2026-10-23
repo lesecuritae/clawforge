@@ -22,7 +22,8 @@ guests / LAN ──(tc ingress mirror, copies only)──► dedicated mirror NI
   (`/etc/suricata`), where they are `0600` for another UID, to `/opt/clawforge/suricata`.
 * **Privileges**: the container starts as `0:998` with `NET_RAW`, `NET_ADMIN`, `SYS_NICE`, `SETUID`,
   `SETGID`, `SETPCAP` only, opens the capture socket and drops to the unprivileged `suricata` user
-  (`run-as`); verified live: `Uid 998`, effective capabilities `NET_ADMIN|NET_RAW|SYS_NICE`. `NET_ADMIN`
+  (`run-as`, in `suricata-capture.yaml`; replay, validation and the rule updater use the base
+  `suricata.yaml` without any privilege change); verified live: `Uid 998`, effective capabilities `NET_ADMIN|NET_RAW|SYS_NICE`. `NET_ADMIN`
   is required by the engine's own AF_PACKET privilege code (without it the drop fails). It acts only
   inside the container's network namespace, which contains the mirror NIC and nothing else: no host
   networking, no Docker socket, no route to anything. Read-only root filesystem, `no-new-privileges`,
@@ -129,6 +130,16 @@ looping target is refused, forwarding is unaffected.
   previous file stays as `suricata.rules.prev`) and asks the running engine to reload (`SIGUSR2`). A
   failed update keeps the running rules and is recorded in `rules-status.json`. Schedule it daily with a
   systemd timer or cron on the sensor VM. `disable.conf` holds site decisions; it is empty by default.
+  **Local isolation**: staging and work directories are `mktemp` directories (mode 0700) owned by the
+  identity that runs the containers, so no other local user can swap the validated ruleset before it is
+  installed. A normal operator's containers run as that operator's own UID:GID (no `chown`, no
+  privilege); when run as root the containers use `10001:10001` and the directories are handed over by a
+  required `chown` (a failure stops the update). The same identity runs updater, validator and cleanup.
+  A rules directory that is group- or world-writable is refused. The upstream `/etc/suricata` volume
+  (files `0600` for another UID) is covered by an empty tmpfs in the updater container.
+  `tests/network-ids/update_rules_security.sh` proves it with a real update: a second local user is
+  denied on every probe while the update runs, unsafe rules directories are refused, and the root path
+  works.
 * `local.rules` contains only the self-test canary (SID 1000001) used by `ids-selftest.sh`.
 * `HOME_NET` defaults to the private ranges, the Tailscale CGNAT range and IPv6 ULA/link-local; mount an
   edited `suricata.yaml` if the site differs. The usual `*_SERVERS` roles all map to `HOME_NET`.
@@ -174,6 +185,7 @@ sensors/network-ids/host/ids-selftest.sh /srv/clawforge-suricata/eve/eve.json /s
 ```sh
 python3 -m unittest discover -s tests/network-ids -v      # adapter, health, rotation, delivery
 bash tests/network-ids/mirror_lab.sh                         # mirror script (root, throw-away namespaces)
+bash tests/network-ids/update_rules_security.sh              # rule updater ownership/isolation (docker, network, sudo)
 sh tests/network-ids/replay.sh                               # final image on a controlled PCAP, no network
 cargo test -p clawforge-security-events
 cargo test -p clawforge-api --bin clawforge-api \

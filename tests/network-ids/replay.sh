@@ -24,7 +24,7 @@ alerts=[a.normalize(line,'suricata:lab') for line in Path(sys.argv[2]).read_byte
 alerts=[v for v in alerts if v is not None]
 assert len(alerts)==2,alerts
 assert all(v['signature_id']==1000001 and v['event_type']=='network_ids_alert' for v in alerts)
-if len(sys.argv)>3:
+if len(sys.argv)>3 and sys.argv[3]:
     Path(sys.argv[3]).write_text(json.dumps(alerts,indent=2,sort_keys=True)+'\n')
 print(json.dumps({'packets':3,'controlled_markers':2,'benign':1,'alerts':len(alerts),'network':'none','passed':True}))
 PY

@@ -106,11 +106,6 @@ af-packet:
     ring-size: 4096
     block-size: 131072
     promisc: no
-# Start with the few capabilities needed to open the capture socket, then drop to an unprivileged
-# user for the whole packet-processing lifetime (the container never keeps root).
-run-as:
-  user: suricata
-  group: suricata
 logging:
   default-log-level: notice
   outputs:

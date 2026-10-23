@@ -41,7 +41,7 @@ jobs:
       - run: python3 -m unittest discover -s tests/network-ids
       - run: |
           sh -n sensors/network-ids/host/clawforge-ids-mirror
-          bash -n sensors/network-ids/host/ids-selftest.sh sensors/network-ids/update-rules.sh tests/network-ids/mirror_lab.sh
+          bash -n sensors/network-ids/host/ids-selftest.sh sensors/network-ids/update-rules.sh tests/network-ids/mirror_lab.sh tests/network-ids/update_rules_security.sh
       - run: ./scripts/test-postgres.sh
       - run: cargo clippy --workspace --all-targets -- -D warnings
 

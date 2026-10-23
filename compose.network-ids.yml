@@ -53,12 +53,12 @@ services:
       dockerfile: sensors/network-ids/Suricata.Dockerfile
     container_name: clawforge-suricata
     # Starts as root with the minimum capabilities to open the capture socket, then the engine
-    # drops to the image's unprivileged `suricata` user (suricata.yaml run-as). Group 998 gives the
+    # drops to the image's unprivileged `suricata` user (suricata-capture.yaml run-as). Group 998 gives the
     # pre-drop write check on the log directory without any DAC capability.
     user: "0:998"
     command:
       - -c
-      - /opt/clawforge/suricata/suricata.yaml
+      - /opt/clawforge/suricata/suricata-capture.yaml
       - --af-packet=eth0
       - -l
       - /var/log/suricata

@@ -10,8 +10,9 @@ RUN mkdir -p /opt/clawforge/suricata /rules \
  && cp /etc/suricata/classification.config /etc/suricata/reference.config /etc/suricata/threshold.config /opt/clawforge/suricata/ \
  && chmod 0755 /opt/clawforge /opt/clawforge/suricata \
  && chmod 0644 /opt/clawforge/suricata/*.config
-COPY sensors/network-ids/suricata.yaml /opt/clawforge/suricata/suricata.yaml
-RUN chmod 0644 /opt/clawforge/suricata/suricata.yaml
-# Root only until the capture socket is open: suricata.yaml `run-as` then drops to the image's
-# unprivileged `suricata` user (998). Replay/validation runs override --user.
+COPY sensors/network-ids/suricata.yaml sensors/network-ids/suricata-capture.yaml /opt/clawforge/suricata/
+RUN chmod 0644 /opt/clawforge/suricata/suricata.yaml /opt/clawforge/suricata/suricata-capture.yaml
+# Live capture starts as root with minimal capabilities and suricata-capture.yaml (`run-as`) drops to the
+# image's unprivileged `suricata` user (998). Replay, validation and the rule updater use the base
+# suricata.yaml and run unprivileged under the caller's UID.
 ENTRYPOINT ["/usr/bin/suricata"]
