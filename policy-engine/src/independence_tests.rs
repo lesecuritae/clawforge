@@ -450,6 +450,15 @@ fn ssh(user: &str) -> serde_json::Value {
     serde_json::json!({"username": user, "attempt_count": 1})
 }
 
+/// A failed login with sshd's verdict on the account (`None` = an older sensor that does not say).
+fn ssh_known(user: &str, invalid: Option<bool>) -> serde_json::Value {
+    let mut value = ssh(user);
+    if let Some(invalid) = invalid {
+        value["invalid_user"] = serde_json::json!(invalid);
+    }
+    value
+}
+
 fn http(path: &str) -> serde_json::Value {
     serde_json::json!({"path": path, "status_code": 404})
 }
@@ -514,6 +523,64 @@ async fn many_account_names_are_enumeration_a_few_are_a_nat() -> Result<()> {
     let same_assessment = e.assessment("ssh_bruteforce", now, now, &same).await?;
     assert_eq!(e.shape(&same_assessment).await?.distinct_usernames, 1);
     assert_eq!(e.basis(&same_assessment).await?, (1, "behavior_only"));
+    Ok(())
+}
+
+/// sshd says whether an account exists. Users behind a NAT, or one user mistyping their own name,
+/// produce nothing or very few distinct nonexistent names; a short dictionary of guessed names
+/// (fewer than the eight of plain enumeration) produces several. Events from sensors that do not
+/// report the verdict never count as invalid.
+#[tokio::test]
+#[ignore = "requires provisioned roles in an isolated PostgreSQL test container"]
+async fn several_nonexistent_accounts_are_a_probe_one_or_two_are_a_typo() -> Result<()> {
+    let now = Utc::now();
+    let run = |logins: Vec<serde_json::Value>| async move {
+        let mut e = Env::new().await?;
+        let ids = e.events_with("ssh_login_failure", now, logins).await?;
+        let a = e.assessment("ssh_bruteforce", now, now, &ids).await?;
+        let counts = e.shape(&a).await?;
+        let basis = e.basis(&a).await?;
+        anyhow::Ok((
+            counts.distinct_usernames,
+            counts.distinct_invalid_usernames,
+            basis,
+        ))
+    };
+    // a user mistyping their own name two ways, plus the right one: invalid names 2 -> no shape
+    let typo = run(["alice", "alise", "alice", "alic", "alice", "alise"]
+        .into_iter()
+        .map(|n| ssh_known(n, Some(n != "alice")))
+        .collect())
+    .await?;
+    assert_eq!((typo.0, typo.1, typo.2 .1), (3, 2, "behavior_only"));
+    // five guessed names (root exists): 4 invalid, only 5 in total (< 8 enumeration)
+    let probe = run(
+        ["root", "admin", "test", "oracle", "ubuntu", "root", "admin"]
+            .into_iter()
+            .map(|n| ssh_known(n, Some(n != "root")))
+            .collect(),
+    )
+    .await?;
+    assert_eq!((probe.0, probe.1, probe.2 .1), (5, 4, "attack_shape"));
+    // the same five names from an older sensor that does not report the verdict: unknown
+    let unknown = run(
+        ["root", "admin", "test", "oracle", "ubuntu", "root", "admin"]
+            .into_iter()
+            .map(|n| ssh_known(n, None))
+            .collect(),
+    )
+    .await?;
+    assert_eq!(
+        (unknown.0, unknown.1, unknown.2 .1),
+        (5, 0, "behavior_only")
+    );
+    // case of one invalid name is one name
+    let cased = run(["Admin", "ADMIN", "admin", "Admin", "ADMIN", "admin"]
+        .into_iter()
+        .map(|n| ssh_known(n, Some(true)))
+        .collect())
+    .await?;
+    assert_eq!((cased.0, cased.1, cased.2 .1), (1, 1, "behavior_only"));
     Ok(())
 }
 

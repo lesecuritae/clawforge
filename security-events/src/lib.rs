@@ -283,6 +283,11 @@ pub struct SshLoginFailureEvidence {
     pub username: String,
     pub source_ip: String,
     pub attempt_count: u32,
+    /// What sshd itself said about the account: `Some(true)` = "invalid user" (the account does
+    /// not exist on the host), `Some(false)` = the account exists, `None` = the sensor does not
+    /// know (older sensors, other sources). Omitted from the wire when unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invalid_user: Option<bool>,
 }
 
 impl SshLoginFailureEvidence {
@@ -708,6 +713,7 @@ pub mod fixtures {
                 username: "root".into(),
                 source_ip: "203.0.113.7".into(),
                 attempt_count: 5,
+                invalid_user: None,
             }),
         )
         .expect("ssh_login_failure fixture is valid")
@@ -1036,6 +1042,7 @@ mod tests {
                     username: "root".into(),
                     source_ip: "203.0.113.7".into(),
                     attempt_count: 1,
+                    invalid_user: None,
                 }),
             )
             .unwrap_err(),
@@ -1055,6 +1062,7 @@ mod tests {
                     username: "root".into(),
                     source_ip: "203.0.113.7".into(),
                     attempt_count: 1,
+                    invalid_user: None,
                 }),
             )
             .unwrap_err(),

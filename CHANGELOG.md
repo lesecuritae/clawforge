@@ -4,6 +4,7 @@
 
 Weitere Änderungen für die nächste Version werden hier gesammelt.
 
+- Detection: sshd's own `invalid user` verdict is carried by the Linux sensor (`invalid_user`, optional on the wire) and counted by the shape function (migration 0069, `distinct_invalid_usernames`). New shape `invalid_account_probe` (>= 4 different nonexistent account names); sensors that do not report the verdict never count. Behaviour harness: fixed host account model, three new scenarios (24): stage 1 TP 12 / FP 6 / TN 6 / FN 0, attacker finding TP 8 / FP 0 / TN 12 / FN 4, quality gate still false.
 ## [1.2.4] - 2026-10-23
 
 - Network IDS: passive Suricata 8.0.7 integration. New `network_ids_alert` security event (migration 0068, additive CHECK widening), owned EVE adapter with a disk outbox, engine `stats`-gated heartbeat and `status.json` (capture drops visible), hardened derived engine image (own network namespace holding only the mirror NIC, drops to an unprivileged user, bounded memory/CPU), ET Open rule updater with engine validation and atomic swap, reversible host mirror script (tc ingress mirror, exactly one copy per frame) and an end-to-end self-test. Observations never become incidents or enforcement requests; executor dry-run, approvals and gates are unchanged. Operations guide: `docs/network-ids.md`.

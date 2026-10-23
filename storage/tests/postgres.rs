@@ -1376,6 +1376,7 @@ async fn ip_reputation_lookup_flags_a_match_without_ever_storing_the_raw_ip() ->
                 username: "root".into(),
                 source_ip: ip.into(),
                 attempt_count: 5,
+                invalid_user: None,
             }),
         )?;
         store.record_security_event(sensor_id, &envelope).await

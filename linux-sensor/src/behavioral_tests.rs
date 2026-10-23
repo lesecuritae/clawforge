@@ -23,12 +23,19 @@ fn reviewed_free_model_parser_vectors() {
 }
 
 /// The sshd line of event `n`. A case may name the accounts its failed logins try (`usernames`,
-/// cycled); without it the legacy fixture uses a new, invalid account name for every event.
-fn ssh_message(case: &Value, n: usize, ip: &str) -> String {
+/// cycled); without it the legacy fixture uses a new, invalid account name for every event. The
+/// scenario file fixes which accounts exist on the fixture host (`host_accounts`): sshd says
+/// "invalid user" for every other name, as the real daemon does. Without `host_accounts` every
+/// named account exists.
+fn ssh_message(plan: &Value, case: &Value, n: usize, ip: &str) -> String {
     match case["usernames"].as_array() {
         Some(names) if !names.is_empty() => {
             let name = names[n % names.len()].as_str().unwrap();
-            format!("Failed password for {name} from {ip} port 2222 ssh2")
+            let exists = plan["host_accounts"]
+                .as_array()
+                .is_none_or(|hosts| hosts.iter().any(|h| h.as_str() == Some(name)));
+            let invalid = if exists { "" } else { "invalid user " };
+            format!("Failed password for {invalid}{name} from {ip} port 2222 ssh2")
         }
         _ => format!("Failed password for invalid user fixture{n} from {ip} port 2222 ssh2"),
     }
@@ -50,7 +57,7 @@ fn export_behavioral_scenarios() -> anyhow::Result<()> {
         for (n, offset) in case["offsets"].as_array().unwrap().iter().enumerate() {
             let ip = format!("203.0.113.{}", index + 1);
             let line = json!({"__CURSOR":format!("behavior:{}:{n}",case["id"].as_str().unwrap()),
-                "MESSAGE":ssh_message(case, n, &ip),
+                "MESSAGE":ssh_message(&plan, case, n, &ip),
                 "__REALTIME_TIMESTAMP":((1767268800_i64+offset.as_i64().unwrap())*1_000_000).to_string(),
                 "_HOSTNAME":"isolated-fixture"});
             let parsed =

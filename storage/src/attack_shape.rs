@@ -1,4 +1,4 @@
-//! Behaviour counts of one assessment (migration 0067). Numbers only: the policy engine never
+//! Behaviour counts of one assessment (migrations 0067, 0069). Numbers only: the policy engine never
 //! sees usernames or request paths.
 use crate::PostgresStore;
 use anyhow::Result;
@@ -10,6 +10,9 @@ pub struct AssessmentShape {
     pub events: i64,
     /// Different account names tried by the failed SSH logins among them.
     pub distinct_usernames: i64,
+    /// Different account names among them that sshd itself reported as nonexistent ("invalid
+    /// user"); events from sensors that do not report it count as unknown, not as invalid.
+    pub distinct_invalid_usernames: i64,
     /// Distinct request paths among the HTTP anomalies that match a supplied expression.
     pub signature_paths: i64,
 }
@@ -35,6 +38,7 @@ impl PostgresStore {
         Ok(AssessmentShape {
             events: number("events"),
             distinct_usernames: number("distinct_usernames"),
+            distinct_invalid_usernames: number("distinct_invalid_usernames"),
             signature_paths: number("signature_paths"),
         })
     }

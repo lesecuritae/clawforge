@@ -128,15 +128,38 @@ many names; scanners: secret files), not the outcome, and production shows both 
 source-hours with >= 10 distinct usernames; mass `/.env*`, `/.git/config`, `/.aws/credentials` probes).
 The improvement below is therefore only as real as that modelling; it is not a general-population estimate.
 
-Result over the 21 scenarios (stage 1 unchanged at TP 11 / FP 4 / TN 6 / FN 0, gate still false):
+Result over the original 21 scenarios (stage 1 unchanged at TP 11 / FP 4 / TN 6 / FN 0, gate still false):
 attacker finding (stage 2) **TP 7 / FP 0 / TN 10 / FN 4** (was TP 2 / FP 0 / TN 10 / FN 9). The four
 remaining false negatives are single-account guessing against root (`ssh_bruteforce_threshold`,
 `ssh_boundary_evasion`, `ssh_slow_attacker...`) and a flood of one path (`http_abusive_burst`): from
 these fields they are identical to a forgetful user or a retrying client (`observables.json`), so they stay
 unconfirmed until independent evidence exists. Missing signals, concretely: a successful login from the
-same source (separates a user who finally got in), the sshd distinction between `invalid user` and a valid
-account (the Linux sensor currently drops it), and per-source success ratios on HTTP. None of them is
-collected yet.
+same source (separates a user who finally got in) and per-source success ratios on HTTP; neither is
+collected yet. The third signal named earlier, sshd's own verdict `invalid user`, is now carried (below).
+
+### sshd's `invalid user` verdict as shape evidence (migration 0069)
+
+The Linux sensor used to drop the distinction between an account that exists and one that does not.
+`SshLoginFailureEvidence.invalid_user` (`Some(true)` = sshd logged "invalid user", `Some(false)` = the
+account exists, absent = an older sensor that does not say) is now carried on the wire, and
+`clawforge_assessment_shape` returns `distinct_invalid_usernames`. The policy engine adds the shape
+`invalid_account_probe`: at least **4** different account names that sshd itself reports as nonexistent
+(`CLAWFORGE_ATTACK_SHAPE_MIN_INVALID_USERNAMES`, never below 2). A user mistypes their own name once or
+twice; guessing walks through names nobody has. Events from sensors that do not report the verdict never
+count. The fixtures now fix which accounts exist on the fixture host (`host_accounts`: root, alice, bob,
+carol, dave, erin); sshd reports every other name as invalid, as the real daemon does.
+
+Three scenarios were added (24 in total), modelled from their descriptions and run unchanged through the
+isolated harness: `ssh_small_dictionary_probe` (five names, four nonexistent; fewer than the eight of
+plain enumeration), `ssh_user_mistypes_own_name` (two nonexistent spellings) and the boundary case
+`ssh_user_mistypes_own_name_three_ways` (three nonexistent spellings, one below the threshold).
+Result: stage 1 TP 12 / FP 6 / TN 6 / FN 0 (the two legitimate typo cases are raw alerts like the other
+legitimate cases, so FP rises by two), attacker finding (stage 2) **TP 8 / FP 0 / TN 12 / FN 4**, quality
+gate still false. The small dictionary is corroborated; both typo cases are not. The threshold is a real
+trade-off: a legitimate user who tries four different nonexistent spellings within one assessment would
+be indistinguishable from a probe, which is why the boundary case is kept. The four remaining false
+negatives are unchanged (single valid account `root`, one path flood): sshd's verdict cannot separate
+them, only a successful-login signal or an HTTP success ratio could.
 
 ### What changed in the product (rule versions)
 

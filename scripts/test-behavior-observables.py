@@ -26,6 +26,18 @@ def ssh_users(names):
              "occurred_at": "t", "resource": "203.0.113.1", "severity": "medium"} for i, n in enumerate(names)]
 
 
+def ssh_verdicts(logins):
+    """(name, invalid) pairs: invalid is sshd's own verdict on the account (None = not reported)."""
+    out = []
+    for i, (n, invalid) in enumerate(logins):
+        event = {"event_type": "ssh_login_failure", "username": n, "dedupe_key": f"k{i}",
+                 "occurred_at": "t", "resource": "203.0.113.1", "severity": "medium"}
+        if invalid is not None:
+            event["invalid_user"] = invalid
+        out.append(event)
+    return out
+
+
 def http_paths(paths):
     return [{"event_type": "http_anomaly", "path": p, "status_code": 404,
              "dedupe_key": f"k{i}", "occurred_at": "t", "resource": "203.0.113.2"} for i, p in enumerate(paths)]
@@ -53,6 +65,19 @@ class ObservablesTests(unittest.TestCase):
         cases = {"legit": case("legit", False, ssh_users(["alice"] * 6)),
                  "attack": case("attack", True, ssh_users(["root"] * 6))}
         self.assertEqual(len(observables.compare(cases)), 1)
+
+    def test_sshd_saying_the_accounts_do_not_exist_separates_a_short_dictionary_from_a_typo(self):
+        typo = ssh_verdicts([("alice", False), ("alise", True)] * 3)
+        dictionary = ssh_verdicts([(n, n != "root") for n in ["root", "admin", "test", "oracle", "ubuntu", "root"]])
+        self.assertEqual(observables.behaviour(typo)["distinct_invalid_usernames"], 1)
+        self.assertFalse(observables.behaviour(typo)["invalid_account_probe"])
+        self.assertTrue(observables.behaviour(dictionary)["invalid_account_probe"])
+        cases = {"typo": case("typo", False, typo), "dictionary": case("dictionary", True, dictionary)}
+        self.assertEqual(observables.compare(cases), [])
+
+    def test_a_sensor_that_does_not_report_the_verdict_never_counts_as_invalid(self):
+        unknown = ssh_verdicts([(n, None) for n in ["root", "admin", "test", "oracle", "ubuntu"]])
+        self.assertEqual(observables.behaviour(unknown)["distinct_invalid_usernames"], 0)
 
     def test_many_different_account_names_separate_enumeration_from_a_nat(self):
         nat = ssh_users(["alice", "bob", "carol"] * 4)
