@@ -498,6 +498,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     let poll = poll_interval();
     let limit = recent_assessments_limit();
+    let backlog = backlog_limit();
     let store = PostgresStore::connect_runtime(&database_url_from_env()?).await?;
     // An invalid bridge configuration disables the bridge entirely and stays
     // visible in the runtime status; shadow decisions keep running.
@@ -521,7 +522,7 @@ async fn main() -> Result<()> {
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                let cycle = run_cycle(&store, limit, bridge.as_ref()).await;
+                let cycle = run_cycle(&store, limit, backlog, bridge.as_ref()).await;
                 let (state, detail) = runtime_report(&cycle, bridge_error.as_deref());
                 if state != last_state {
                     warn!(state, "policy-engine runtime state changed");
@@ -540,14 +541,45 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// One polling cycle: list the recent assessments, evaluate them and report how it went.
+/// How far back an assessment without any decision is still picked up. Older ones are history.
+const BACKLOG_WINDOW_HOURS: i64 = 24;
+
+fn backlog_limit() -> i64 {
+    env::var("CLAWFORGE_POLICY_ENGINE_BACKLOG_LIMIT")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| (1..=500).contains(value))
+        // ~20 ms per evaluation in the isolated lab: 200 newest + 100 catch-up stays well inside the 15 s poll
+        .unwrap_or(100)
+}
+
+/// One polling cycle: the newest assessments (they are re-evaluated while their bucket grows) plus,
+/// bounded, older ones that never received a decision. A "newest N" listing alone can never reach an
+/// assessment once more than N newer ones exist - after an outage or in a distributed burst - so
+/// those stayed undecided forever (167 of them after the 1.2.3 incident).
 async fn run_cycle(
     store: &PostgresStore,
     limit: i64,
+    backlog_limit: i64,
     bridge: Option<&BridgeConfig>,
 ) -> CycleHealth {
     match store.list_security_assessments(None, limit).await {
-        Ok(assessments) => evaluate_all(store, &assessments, bridge).await,
+        Ok(mut assessments) => {
+            let since = chrono::Utc::now() - chrono::Duration::hours(BACKLOG_WINDOW_HOURS);
+            match store
+                .list_undecided_security_assessments(since, backlog_limit)
+                .await
+            {
+                Ok(backlog) => {
+                    let known: std::collections::HashSet<_> =
+                        assessments.iter().map(|a| a.id).collect();
+                    assessments.extend(backlog.into_iter().filter(|a| !known.contains(&a.id)));
+                }
+                // the newest assessments are still evaluated; only the catch-up is skipped
+                Err(error) => warn!(%error, "could not list undecided security assessments"),
+            }
+            evaluate_all(store, &assessments, bridge).await
+        }
         Err(error) => {
             warn!(%error, "could not list recent security assessments");
             let mut cycle = CycleHealth {

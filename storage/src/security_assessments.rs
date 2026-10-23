@@ -625,41 +625,67 @@ impl PostgresStore {
         incident_id: Option<Uuid>,
         limit: i64,
     ) -> Result<Vec<SecurityAssessment>> {
-        let rows = sqlx::query(
-            "SELECT id,rule_id,rule_version,resource,confidence,severity,summary,event_count,\
-             bucket_start,incident_id,threat_intel_corroborated,threat_intel_source,\
-             threat_intel_confidence,threat_intel_indicator_last_seen FROM security_assessments \
+        let rows = sqlx::query(&format!(
+            "SELECT {ASSESSMENT_COLUMNS} FROM security_assessments \
              WHERE $1::uuid IS NULL OR incident_id = $1 \
-             ORDER BY bucket_start DESC LIMIT $2",
-        )
+             ORDER BY bucket_start DESC LIMIT $2"
+        ))
         .bind(incident_id)
         .bind(limit.clamp(1, 500))
         .fetch_all(self.pool())
         .await?;
-        Ok(rows
-            .into_iter()
-            .map(|row| {
-                let threat_intel_source: Option<String> = row.get("threat_intel_source");
-                let threat_intel = threat_intel_source.map(|source| crate::IpReputationHit {
-                    source,
-                    confidence: row.get("threat_intel_confidence"),
-                    last_seen: row.get("threat_intel_indicator_last_seen"),
-                });
-                SecurityAssessment {
-                    id: row.get("id"),
-                    rule_id: row.get("rule_id"),
-                    rule_version: row.get("rule_version"),
-                    resource: row.get("resource"),
-                    severity: row.get("severity"),
-                    confidence: row.get("confidence"),
-                    summary: row.get("summary"),
-                    event_count: row.get("event_count"),
-                    bucket_start: row.get("bucket_start"),
-                    incident_id: row.get("incident_id"),
-                    threat_intel_corroborated: row.get("threat_intel_corroborated"),
-                    threat_intel,
-                }
-            })
-            .collect())
+        Ok(rows.iter().map(assessment_from_row).collect())
+    }
+
+    /// Assessments created since `since` that have no policy decision at all although an active
+    /// policy exists for their rule - the ones a "newest N" listing can never reach again once more
+    /// than N newer assessments exist (a backlog after an outage, or a distributed burst). Newest
+    /// first, bounded by `limit`. Evaluating them is the same idempotent upsert as for any other
+    /// assessment; the bridge's database function still refuses stale evidence on its own.
+    pub async fn list_undecided_security_assessments(
+        &self,
+        since: DateTime<Utc>,
+        limit: i64,
+    ) -> Result<Vec<SecurityAssessment>> {
+        let rows = sqlx::query(&format!(
+            "SELECT {ASSESSMENT_COLUMNS} FROM security_assessments a \
+             WHERE a.created_at >= $1 \
+               AND NOT EXISTS (SELECT 1 FROM security_policy_decisions d WHERE d.assessment_id = a.id) \
+               AND EXISTS (SELECT 1 FROM security_policies p WHERE p.rule_id = a.rule_id AND p.status = 'active') \
+             ORDER BY a.bucket_start DESC LIMIT $2"
+        ))
+        .bind(since)
+        .bind(limit.clamp(1, 500))
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows.iter().map(assessment_from_row).collect())
+    }
+}
+
+const ASSESSMENT_COLUMNS: &str =
+    "id,rule_id,rule_version,resource,confidence,severity,summary,event_count,\
+     bucket_start,incident_id,threat_intel_corroborated,threat_intel_source,\
+     threat_intel_confidence,threat_intel_indicator_last_seen";
+
+fn assessment_from_row(row: &sqlx::postgres::PgRow) -> SecurityAssessment {
+    let threat_intel_source: Option<String> = row.get("threat_intel_source");
+    let threat_intel = threat_intel_source.map(|source| crate::IpReputationHit {
+        source,
+        confidence: row.get("threat_intel_confidence"),
+        last_seen: row.get("threat_intel_indicator_last_seen"),
+    });
+    SecurityAssessment {
+        id: row.get("id"),
+        rule_id: row.get("rule_id"),
+        rule_version: row.get("rule_version"),
+        resource: row.get("resource"),
+        severity: row.get("severity"),
+        confidence: row.get("confidence"),
+        summary: row.get("summary"),
+        event_count: row.get("event_count"),
+        bucket_start: row.get("bucket_start"),
+        incident_id: row.get("incident_id"),
+        threat_intel_corroborated: row.get("threat_intel_corroborated"),
+        threat_intel,
     }
 }

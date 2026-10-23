@@ -196,6 +196,32 @@ false-positive rate: the host has no labelled legitimate bursts.
   2026-10-23T12:48Z; the earliest meaningful evaluation is 2026-10-24T12:50Z with
   `scripts/ops/shape-evidence-report.sql`. No earlier statement about its effect is made.
 
+### Pipeline completeness on real data and the undecided-backlog fix (2026-10-23)
+
+Real data (production, read-only `scripts/ops/pipeline-completeness-audit.sql`, which recomputes the expected
+windows from the events table itself): all 464 SSH `ssh_bruteforce` windows of the last 24 h have an assessment
+with the same count (cap 1000); all HTTP burst/scan windows since the staggered grids (22 Oct) have theirs (4/4 and
+4/4; earlier "missing" windows were exactly the shifted-grid windows that rule version 1 did not have); no
+corroborated decision has fewer than two evidence sources and no block is uncorroborated. The one real gap: 167
+assessments without any decision, left by the 1.2.3 incident, because the policy engine only evaluated the 200
+newest assessments per poll. Before that incident none of ~2,800 assessments (15-21 Oct) was undecided, and the
+real peak was 13 new assessments per minute against a window of 200 per 15 s, so starvation has not been seen in
+normal operation; a distributed burst of more than 200 assessments per poll would produce it.
+
+The fix catches up undecided assessments of the last 24 h, bounded per cycle. Regression tests run against
+PostgreSQL with the real least-privilege roles: old assessments pushed out of the newest-N window are decided
+(precondition asserted: they are not in the listing), a shared-NAT burst stays `behavior_only` and is never a
+block, an account enumeration is corroborated by `attack_shape`, decisions stay shadow-only, no execution request
+appears, re-running creates no duplicates, work per cycle is bounded by limit + backlog, and history older than
+24 h is not touched. With the catch-up disabled both tests fail (negative control). The behaviour harness is
+unchanged by the fix: stage 1 TP 12 / FP 6 / TN 6 / FN 0, attacker finding TP 8 / FP 0 / TN 12 / FN 4, quality gate
+false.
+
+Isolated lab measurement (synthetic, **not** production evidence and not a throughput claim): a 400-assessment
+backlog drained in 5 cycles at 50 newest + 100 catch-up; the slowest cycle (150 evaluations) took about 3 s, so
+roughly 20 ms per evaluation on the lab machine. The default catch-up of 100 keeps a worst-case cycle well inside
+the 15 s poll.
+
 ### What changed in the product (rule versions)
 
 * `ssh_bruteforce`, `http_anomaly_burst`, `http_scan` are now **v2**: every rule runs on two
