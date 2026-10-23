@@ -161,6 +161,41 @@ be indistinguishable from a probe, which is why the boundary case is kept. The f
 negatives are unchanged (single valid account `root`, one path flood): sshd's verdict cannot separate
 them, only a successful-login signal or an HTTP success ratio could.
 
+### Real-population measurement (2026-10-23): do the missing signals have anything to separate?
+
+The fixtures are modelled; this section measures the real hosts. `scripts/ops/ssh-burst-population.py` and
+`scripts/ops/http-burst-population.py` print counts only (no addresses, account names or paths) from the sshd
+journal and the HAProxy httplog on the sensor host; run them as root there. Window: the last 7 days on
+`srv19680` (HAProxy: the 916 requests the retained log files hold). A frequency below is **not** a
+false-positive rate: the host has no labelled legitimate bursts.
+
+* **SSH**: 1,063 sources with failures, **none** of them ever had an accepted login (2 other sources only ever
+  logged in). 340 sources had a burst (>= 5 failures in 300 s): 231 (68 %) enumeration (>= 8 names), **25 (7 %)
+  are newly corroborated by `invalid_account_probe`** (>= 4 nonexistent names, < 8 total), 56 (16 %) tried one
+  existing account (median 16 attempts, up to 913), 25 mixed below both thresholds, 3 one nonexistent account.
+* **HTTP**: 270 sources, 11 with >= 8 error responses in 300 s; 2 had no success at all, 9 some but < 50 %, **0**
+  were mostly successes.
+* **Consequence for "a successful login from the same source" and "HTTP success ratio"**: in the real
+  populations no burst source has a login success and no error burst is mostly successful, so neither signal
+  would ever fire here and neither can be validated or its threshold chosen from real data. The only legitimate
+  bursts that exist are the fixture scenarios, and adding a success signal to them would be tuning the matrix to
+  the fixtures. Neither signal was implemented. The success-login signal also cannot exonerate a source: a
+  guessed password produces the same "failures then success", so it could only ever be a separate compromise
+  indicator, not a way to demote a burst.
+* **The four missed attacks** (single valid account `root`, one-path flood) are the 56-source class above in
+  real life: automated by volume (median 16, up to 913 attempts) but identical, field for field, to a forgetful
+  user at the threshold. Volume is what the count rule already uses, so it cannot also be its independent
+  corroboration (`a_long_sustained_attack_does_not_corroborate_itself`); reputation or prior-episode history is
+  what confirms them today (SSH shadow decisions of the last 7 days with a basis: `threat_intel_ip` 270,
+  `behavior_only` 272, `prior_episode_history` 103, `threat_intel_snapshot` 41, `attack_shape` 15).
+* **What would make the question answerable**: labelled legitimate bursts from real operation (an operator
+  confirming a source as legitimate), or a second protected host whose users actually log in. Until then the
+  quality gate stays false and the stage-1 false positives are an unmeasured risk on production, not a measured
+  zero.
+* **Next real observation**: the invalid-account shape and the 24 h shape window start with the 1.2.5 sensor at
+  2026-10-23T12:48Z; the earliest meaningful evaluation is 2026-10-24T12:50Z with
+  `scripts/ops/shape-evidence-report.sql`. No earlier statement about its effect is made.
+
 ### What changed in the product (rule versions)
 
 * `ssh_bruteforce`, `http_anomaly_burst`, `http_scan` are now **v2**: every rule runs on two
