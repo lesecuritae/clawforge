@@ -782,12 +782,15 @@ async fn newer_assessments(e: &mut Env, n: usize, base: DateTime<Utc>) -> Result
     Ok(())
 }
 
-async fn execution_requests(e: &Env) -> Result<i64> {
-    Ok(
-        sqlx::query_scalar("SELECT count(*) FROM execution_requests")
-            .fetch_one(e.owner.pool())
-            .await?,
+/// Requests that are NOT simulation-only. A `challenge` decision may enqueue the existing simulation-only
+/// Go-Away request (normal operation), so the safety property is about everything else.
+async fn non_simulated_requests(e: &Env) -> Result<i64> {
+    Ok(sqlx::query_scalar(
+        "SELECT count(*) FROM execution_requests \
+          WHERE COALESCE((approval_context->'target'->>'simulation_only')::boolean, FALSE) = FALSE",
     )
+    .fetch_one(e.owner.pool())
+    .await?)
 }
 
 #[tokio::test]
@@ -848,7 +851,7 @@ async fn assessments_pushed_out_of_the_newest_window_are_still_decided_with_the_
         .any(|a| a.id == nat_assessment.id || a.id == attack_assessment.id));
     assert_eq!(decisions_of(&nat, nat_assessment.id).await?.0, 0);
 
-    let requests_before = execution_requests(&nat).await?;
+    let requests_before = non_simulated_requests(&nat).await?;
     let mut rounds = 0;
     while rounds < 12 {
         let cycle = run_cycle(&nat.policy, 10, 10, None).await;
@@ -892,8 +895,8 @@ async fn assessments_pushed_out_of_the_newest_window_are_still_decided_with_the_
     assert_eq!(attack.basis(&attack_assessment).await?.1, "attack_shape");
     assert_eq!(a_corroborated, Some(true));
     assert!(a_decision.is_some());
-    // catching up creates no execution request (bridge off) and is idempotent
-    assert_eq!(execution_requests(&nat).await?, requests_before);
+    // catching up creates no non-simulated execution request (bridge off) and is idempotent
+    assert_eq!(non_simulated_requests(&nat).await?, requests_before);
     let before = (
         decisions_of(&nat, nat_assessment.id).await?.0,
         decisions_of(&nat, attack_assessment.id).await?.0,

@@ -211,8 +211,9 @@ normal operation; a distributed burst of more than 200 assessments per poll woul
 The fix catches up undecided assessments of the last 24 h, bounded per cycle. Regression tests run against
 PostgreSQL with the real least-privilege roles: old assessments pushed out of the newest-N window are decided
 (precondition asserted: they are not in the listing), a shared-NAT burst stays `behavior_only` and is never a
-block, an account enumeration is corroborated by `attack_shape`, decisions stay shadow-only, no execution request
-appears, re-running creates no duplicates, work per cycle is bounded by limit + backlog, and history older than
+block, an account enumeration is corroborated by `attack_shape`, decisions stay shadow-only, no non-simulated
+execution request appears (a `challenge` decision may enqueue the existing simulation-only Go-Away request, as it
+does in normal operation; on production the catch-up of the 167 produced 13 of them, all `simulation_only`), re-running creates no duplicates, work per cycle is bounded by limit + backlog, and history older than
 24 h is not touched. With the catch-up disabled both tests fail (negative control). The behaviour harness is
 unchanged by the fix: stage 1 TP 12 / FP 6 / TN 6 / FN 0, attacker finding TP 8 / FP 0 / TN 12 / FN 4, quality gate
 false.
