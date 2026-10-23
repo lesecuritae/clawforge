@@ -1,0 +1,14 @@
+[Unit]
+Description=Clawforge passive IDS: rule update (validated, atomic) and rotated EVE retention
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=production
+Group=production
+Nice=15
+IOSchedulingClass=idle
+ExecStart=/srv/clawforge-suricata/app/sensors/network-ids/update-rules.sh /srv/clawforge-suricata/rules clawforge-suricata
+# Rotated EVE files are only deleted after seven days; the adapter drains them within seconds.
+ExecStart=/usr/bin/find /srv/clawforge-suricata/eve -maxdepth 1 -name 'eve.*.json' -mtime +7 -delete
