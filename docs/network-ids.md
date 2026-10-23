@@ -204,6 +204,58 @@ event type may stay in the database: the previous API lists the rows by raw `eve
 nothing else reads them. Release rollback of the migration: `scripts/release/rollback-last-migration.sql
 -v top=68` (the widened CHECK constraint is harmless to the previous image).
 
+## Verified deployment: production VM100 (2026-10-23)
+
+Everything below was measured on the live system, not inferred from container status.
+
+* **Release**: Clawforge 1.2.4 (`600888c`), schema 68/64. Sensor `suricata-vm100`, passive only; executor
+  dry-run, live authorization, approvals and the bridge are unchanged and nothing consumes the events.
+* **Mirror**: `vmbr9` (isolated, no ports) with VM100's second NIC (`net1`, `tap100i1`, `ens19` in the
+  guest). Mirrored ingress of `tap100i0` (VM100), `tap101i0` (VM101) and `nic0` (LAN uplink). Routes,
+  `vmbr0`, the management address and `ens18` verified unchanged afterwards; the hotplug did not touch
+  Plex (HTTP 200 throughout, VM uptime unchanged). In the guest the mirror NIC has no address, IPv6 off
+  (`/etc/sysctl.d/60-clawforge-ids-mirror.conf`), GRO/LRO off (`ethtool`, required package).
+* **Counters (read-only `tc -s`)** after about 20 minutes: `tap100i0` 72,449 packets, `nic0` 55,348,
+  `tap101i0` 183, all with 0 dropped; the target tap transmitted 114,900 packets with 0 errors/drops.
+  VM101 is visible but quiet; traffic that does not cross this host remains invisible (table above).
+* **Engine**: Suricata 8.0.7, uid 998, effective capabilities `NET_ADMIN|NET_RAW|SYS_NICE`, own network
+  namespace with only the mirror NIC. 463-470 MiB RSS with 53,271 rules, 0.3-0.5 % of one core at
+  roughly 100 packets/s, **0 kernel drops** (32,145 packets in the first five minutes, 55,183 later).
+  Engine start to ready: about 40 s. Host load average unchanged (about 2.5).
+* **End to end** (`ids-selftest.sh`, run four times including after a rule reload and after an engine
+  restart): 5/3/4/4 controlled marker datagrams from VM100 to the gateway produced exactly that many
+  `signature_id 1000001` alerts in EVE and were accepted by the authenticated ingress. Independent
+  check in the production database: all stored observations have pseudonymized source and destination,
+  only the allow-listed evidence keys (no payload, no signature text), and 0 security assessments or
+  incidents were created from them.
+* **Real traffic**: besides the markers the engine saw ordinary LAN traffic (ET INFO STUN from
+  Tailscale, one SSDP match). 99 % of the first alerts were the two informational STUN rules
+  (SIDs 2016149/2016150, about 2/s); they are disabled in `disable.conf` with the reason recorded, via
+  the validated updater and a live `SIGUSR2` reload (alert rate fell to about one per minute).
+* **Outage and recovery**: stopping the engine made the adapter report `alive=false` after the freshness
+  window and the sensor's `last_seen_at` age grew to 4 m 17 s (visible as stale, not as quiet); after the
+  restart the age returned to seconds and the self-test passed again.
+* **udev hook**: removing the `tap101i0` filter and replaying an `add` event restored it (journal tag
+  `clawforge-ids-mirror`). A real guest restart was not exercised (production VM).
+* **Maintenance**: `clawforge-ids-maintenance.timer` (daily 03:30 UTC +-30 min) runs the validated rule
+  update with live reload and deletes rotated EVE files older than seven days.
+
+### Exact rollback
+
+```sh
+# 1. Stop the sensor (VM100)
+cd /srv/clawforge-suricata/app && docker compose -f compose.network-ids.yml --env-file ids.env down
+sudo systemctl disable --now clawforge-ids-maintenance.timer
+# 2. Remove the mirror (Proxmox host); then the NIC and the bridge
+/usr/local/sbin/clawforge-ids-mirror down
+rm /etc/udev/rules.d/99-clawforge-ids-mirror.rules /etc/default/clawforge-ids-mirror /usr/local/sbin/clawforge-ids-mirror
+udevadm control --reload
+qm set 100 --delete net1                  # hot-unplug; baseline config saved in /root/clawforge-ids-20261023/
+ip link del vmbr9                         # and remove its stanza from /etc/network/interfaces (backup: interfaces.pre)
+# 3. Revoke the sensor credential through the sensor-management path; keep the adapter state for replay.
+# 4. Clawforge release rollback (not needed for the sensor alone): clawforge-release-1.2.4.sh rollback --go
+```
+
 ## Not established
 
 Detection coverage and false-positive rate on this network, throughput beyond the home-lab traffic

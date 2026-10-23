@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily Clawforge passive IDS maintenance (outside the 22:00-23:45 UTC backup window)
+
+[Timer]
+OnCalendar=*-*-* 03:30:00 UTC
+RandomizedDelaySec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
