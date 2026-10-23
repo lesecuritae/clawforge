@@ -2415,6 +2415,29 @@ impl PostgresStore {
         Ok(())
     }
 
+    /// Keep a component's runtime status fresh: write `running` every `period` until the returned
+    /// handle is aborted. A component that only wrote its status at startup looked down to
+    /// `clawforge_component_up` two minutes later while its container was healthy (api and incidents
+    /// in 1.2.7). Abort the handle BEFORE writing `stopped`, otherwise a late tick overwrites it.
+    pub fn spawn_runtime_heartbeat(
+        &self,
+        component: &'static str,
+        period: std::time::Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        let store = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(period);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            interval.tick().await; // the caller has just written the starting status
+            loop {
+                interval.tick().await;
+                if let Err(error) = store.set_runtime_status(component, "running", None).await {
+                    tracing::warn!(%error, component, "runtime heartbeat failed");
+                }
+            }
+        })
+    }
+
     pub async fn upsert_provider(&self, provider: &Provider) -> Result<()> {
         sqlx::query("INSERT INTO providers (id, name, source, interval_seconds, confidence, quality_score, enabled) VALUES ($1,$2,$3,$4,$5,$5,$6) ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name, source=EXCLUDED.source, confidence=EXCLUDED.confidence, updated_at=NOW()")
             .bind(&provider.id).bind(&provider.name).bind(&provider.source)

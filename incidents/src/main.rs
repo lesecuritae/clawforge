@@ -22,12 +22,33 @@ async fn main() -> Result<()> {
     let poll = poll_interval();
     info!(?poll, "Clawforge incident management started");
     let mut interval = tokio::time::interval(poll);
+    // The status follows the loop: it is refreshed while promotion works and reports `error` (once, the
+    // transition writes an operational event) while it fails, instead of staying `running` from startup.
+    let mut reported_error = false;
     loop {
         tokio::select! {
-            _ = interval.tick() => match store.promote_incident_candidates(50).await {
-                Ok(promoted) if promoted > 0 => info!(promoted, "incident candidates promoted"),
-                Ok(_) => {},
-                Err(error) => warn!(%error, "incident candidate promotion failed"),
+            _ = interval.tick() => {
+                match store.promote_incident_candidates(50).await {
+                    Ok(promoted) => {
+                        if promoted > 0 {
+                            info!(promoted, "incident candidates promoted");
+                        }
+                        if let Err(error) = store.set_runtime_status("incidents", "running", None).await {
+                            warn!(%error, "could not heartbeat incidents runtime status");
+                        }
+                        reported_error = false;
+                    }
+                    Err(error) => {
+                        warn!(%error, "incident candidate promotion failed");
+                        if !reported_error {
+                            let detail = error.to_string().chars().take(160).collect::<String>();
+                            match store.set_runtime_status("incidents", "error", Some(&detail)).await {
+                                Ok(()) => reported_error = true,
+                                Err(status_error) => warn!(%status_error, "could not report incidents error state"),
+                            }
+                        }
+                    }
+                }
             },
             _ = shutdown_signal() => {
                 info!("Clawforge incident management shutting down");
