@@ -3719,6 +3719,240 @@ mod tests {
         assert!(removed.success());
     }
 
+    /// Lab measurement series (isolated disposable namespace, controlled lab traffic - NOT production
+    /// evidence): a series of apply -> blocked TCP -> rollback -> restored TCP cycles on distinct
+    /// documentation addresses, and a series of kernel-timeout expiries without any rollback call. It
+    /// reports the latency distribution; the assertions are correctness (every block really drops
+    /// traffic, every restore really restores it) plus a loose regression bound, not a gate.
+    #[tokio::test]
+    #[ignore = "requires isolated nftables lab with iproute2 (NET_ADMIN/NET_RAW)"]
+    async fn kernel_lab_series_apply_block_rollback_restore_and_native_expiry() {
+        use tokio::net::{TcpListener, TcpSocket};
+        use tokio::time::{timeout, Duration, Instant};
+
+        const CYCLES: usize = 40;
+        const EXPIRY_CYCLES: usize = 5;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let destination = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let _ = listener.accept().await;
+            }
+        });
+        let ip = |args: &[&str]| {
+            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            async move {
+                tokio::process::Command::new("ip")
+                    .args(args)
+                    .status()
+                    .await
+                    .expect("iproute2 must be installed in the isolated lab")
+                    .success()
+            }
+        };
+        let connect = |address: String| async move {
+            let source: std::net::SocketAddr = format!("{address}:0").parse().unwrap();
+            let socket = TcpSocket::new_v4()?;
+            socket.bind(source)?;
+            socket.connect(destination).await
+        };
+        let adapter = lab_adapter().await;
+        let mut apply_ms = Vec::new();
+        let mut rollback_ms = Vec::new();
+        let mut restore_ms = Vec::new();
+        for n in 0..CYCLES {
+            let address = format!("198.51.100.{}", 10 + n);
+            assert!(ip(&["addr", "add", &format!("{address}/32"), "dev", "lo"]).await);
+            timeout(Duration::from_secs(2), connect(address.clone()))
+                .await
+                .expect("baseline connect timed out")
+                .expect("baseline connect failed");
+            let action = action_for(indicator(&address));
+            let started = Instant::now();
+            adapter.apply(&action, false).await.unwrap();
+            assert_eq!(
+                adapter.verify(&action.target).await.unwrap(),
+                VerificationResult::Verified
+            );
+            apply_ms.push(started.elapsed().as_millis());
+            assert!(
+                timeout(Duration::from_millis(400), connect(address.clone()))
+                    .await
+                    .is_err(),
+                "cycle {n}: an applied block must drop real TCP traffic"
+            );
+            let started = Instant::now();
+            adapter.rollback(&action).await.unwrap();
+            assert_eq!(
+                adapter.verify(&action.target).await.unwrap(),
+                VerificationResult::NotPresent
+            );
+            rollback_ms.push(started.elapsed().as_millis());
+            // traffic is back as soon as the kernel set no longer holds the element
+            let restored = Instant::now();
+            loop {
+                if let Ok(Ok(_)) =
+                    timeout(Duration::from_millis(300), connect(address.clone())).await
+                {
+                    break;
+                }
+                assert!(
+                    restored.elapsed() < Duration::from_secs(5),
+                    "cycle {n}: traffic not restored within 5 s after rollback"
+                );
+            }
+            restore_ms.push(started.elapsed().as_millis());
+            assert!(ip(&["addr", "del", &format!("{address}/32"), "dev", "lo"]).await);
+        }
+        // native kernel expiry with no rollback call at all (a dead executor)
+        let mut expiry_overshoot_ms = Vec::new();
+        for n in 0..EXPIRY_CYCLES {
+            let address = format!("198.51.100.{}", 100 + n);
+            assert!(ip(&["addr", "add", &format!("{address}/32"), "dev", "lo"]).await);
+            let mut action = action_for(indicator(&address));
+            action.ttl_seconds = 2;
+            adapter.apply(&action, false).await.unwrap();
+            let applied = Instant::now();
+            assert!(
+                timeout(Duration::from_millis(400), connect(address.clone()))
+                    .await
+                    .is_err(),
+                "expiry cycle {n}: the block must drop traffic while it lives"
+            );
+            loop {
+                if let Ok(Ok(_)) =
+                    timeout(Duration::from_millis(300), connect(address.clone())).await
+                {
+                    break;
+                }
+                assert!(
+                    applied.elapsed() < Duration::from_secs(8),
+                    "expiry cycle {n}: the kernel timeout did not restore traffic"
+                );
+            }
+            expiry_overshoot_ms.push(applied.elapsed().as_millis().saturating_sub(2000));
+            assert_eq!(
+                adapter.verify(&action.target).await.unwrap(),
+                VerificationResult::NotPresent
+            );
+            assert!(ip(&["addr", "del", &format!("{address}/32"), "dev", "lo"]).await);
+        }
+        let percentile = |values: &Vec<u128>, p: f64| {
+            let mut sorted = values.clone();
+            sorted.sort_unstable();
+            sorted[(((sorted.len() - 1) as f64) * p).round() as usize]
+        };
+        let summary = |values: &Vec<u128>| {
+            serde_json::json!({"n": values.len(), "p50_ms": percentile(values, 0.5),
+                "p95_ms": percentile(values, 0.95), "max_ms": values.iter().max()})
+        };
+        let report = serde_json::json!({
+            "scope": "isolated disposable network namespace, controlled lab traffic; not production evidence",
+            "apply_and_verify": summary(&apply_ms),
+            "rollback_and_verify": summary(&rollback_ms),
+            "rollback_to_traffic_restored": summary(&restore_ms),
+            "native_expiry_overshoot_after_ttl_2s": summary(&expiry_overshoot_ms),
+        });
+        println!("LAB_SERIES {report}");
+        // loose regression bounds only; the reviewed 5 s p95 target is judged by the operator on real evidence
+        assert!(percentile(&restore_ms, 0.95) <= 5000);
+        assert!(percentile(&expiry_overshoot_ms, 1.0) <= 3000);
+    }
+
+    /// The never-block list against real traffic in the disposable lab: a target inside a configured
+    /// protected range is refused, nothing lands in the kernel set and its traffic keeps flowing; a target
+    /// outside the range is still blockable. A malformed list refuses everything (fail closed).
+    #[tokio::test]
+    #[ignore = "requires isolated nftables lab with iproute2 (NET_ADMIN/NET_RAW)"]
+    async fn kernel_lab_never_block_list_protects_real_traffic_and_fails_closed() {
+        use tokio::net::{TcpListener, TcpSocket};
+        use tokio::time::{timeout, Duration};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let destination = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let _ = listener.accept().await;
+            }
+        });
+        for address in ["198.51.100.201", "198.51.100.202"] {
+            let added = tokio::process::Command::new("ip")
+                .args(["addr", "add", &format!("{address}/32"), "dev", "lo"])
+                .status()
+                .await
+                .unwrap();
+            assert!(added.success());
+        }
+        let connect = |address: &'static str| async move {
+            let socket = TcpSocket::new_v4()?;
+            socket.bind(format!("{address}:0").parse().unwrap())?;
+            socket.connect(destination).await
+        };
+        // the protected (management-like) range covers .201 only
+        std::env::set_var("CLAWFORGE_FIREWALL_NEVER_BLOCK_CIDRS", "198.51.100.201/32");
+        let adapter = NftablesAdapter::new();
+        let protected = action_for(indicator("198.51.100.201"));
+        assert!(
+            adapter.apply(&protected, false).await.is_err(),
+            "a protected target must be refused"
+        );
+        assert_eq!(
+            adapter.verify(&protected.target).await.unwrap(),
+            VerificationResult::NotPresent,
+            "a refused target must leave nothing in the kernel set"
+        );
+        timeout(Duration::from_secs(2), connect("198.51.100.201"))
+            .await
+            .expect("protected traffic must flow")
+            .expect("protected traffic must connect");
+        // a broad target that merely CONTAINS the protected address is refused too
+        let broad = action_for(indicator("198.51.100.0/24"));
+        assert!(
+            adapter.apply(&broad, false).await.is_err(),
+            "a CIDR containing a protected address must be refused"
+        );
+        timeout(Duration::from_secs(2), connect("198.51.100.201"))
+            .await
+            .unwrap()
+            .unwrap();
+        // an unprotected neighbour is still blockable
+        let other = action_for(indicator("198.51.100.202"));
+        adapter.apply(&other, false).await.unwrap();
+        assert!(
+            timeout(Duration::from_millis(400), connect("198.51.100.202"))
+                .await
+                .is_err()
+        );
+        adapter.rollback(&other).await.unwrap();
+        timeout(Duration::from_secs(2), connect("198.51.100.202"))
+            .await
+            .unwrap()
+            .unwrap();
+        // a malformed list fails the whole list closed: even the neighbour is refused
+        std::env::set_var(
+            "CLAWFORGE_FIREWALL_NEVER_BLOCK_CIDRS",
+            "198.51.100.201/32,not-an-address",
+        );
+        let broken = NftablesAdapter::new();
+        assert!(
+            broken.apply(&other, false).await.is_err(),
+            "a malformed list must refuse every target"
+        );
+        assert_eq!(
+            broken.verify(&other.target).await.unwrap(),
+            VerificationResult::NotPresent
+        );
+        std::env::remove_var("CLAWFORGE_FIREWALL_NEVER_BLOCK_CIDRS");
+        for address in ["198.51.100.201", "198.51.100.202"] {
+            let removed = tokio::process::Command::new("ip")
+                .args(["addr", "del", &format!("{address}/32"), "dev", "lo"])
+                .status()
+                .await
+                .unwrap();
+            assert!(removed.success());
+        }
+    }
+
     #[tokio::test]
     #[ignore = "requires nftables (NET_ADMIN/NET_RAW) - run via scripts/test-firewall-lab.sh"]
     async fn apply_verify_rollback_round_trip_for_ipv6() {
