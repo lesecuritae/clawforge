@@ -4,7 +4,9 @@
 //! ~194k "incidents" on production.
 use anyhow::Result;
 use chrono::Utc;
-use clawforge_intelligence::{AsnRecord, BgpEvent, BgpStatus, NetworkBatch, RpkiStatus};
+use clawforge_intelligence::{
+    AsnRecord, BgpEvent, BgpStatus, Indicator, IndicatorType, NetworkBatch, RpkiStatus,
+};
 use clawforge_storage::PostgresStore;
 use clawforge_worker::RiskConsumer;
 use sqlx::PgPool;
@@ -148,6 +150,120 @@ async fn an_asn_record_is_an_event_when_new_or_changed_not_when_seen_again() -> 
         events_for(&owner, &number, "asn_change").await?,
         2,
         "a change is an event"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires provisioned roles in an isolated PostgreSQL test container"]
+async fn two_providers_describing_one_asn_do_not_flap_into_events() -> Result<()> {
+    let owner = PgPool::connect(&std::env::var("CLAWFORGE_TEST_DATABASE_URL")?).await?;
+    let store =
+        PostgresStore::connect_runtime(&std::env::var("CLAWFORGE_TEST_WORKER_DATABASE_URL")?)
+            .await?;
+    let number = format!(
+        "AS{}",
+        4_200_000_000_u64 + (Uuid::new_v4().as_u128() % 90_000_000) as u64
+    );
+    let consumer = RiskConsumer::default();
+    // `asn_records` has one row per ASN: provider B overwrites provider A's row on every sync.
+    let from = |provider: &str, country: &str, name: &str| {
+        let mut record = asn(&number, name);
+        record.provider = provider.to_string();
+        record.country = country.to_string();
+        NetworkBatch {
+            asn_records: vec![record],
+            ..NetworkBatch::default()
+        }
+    };
+    consumer
+        .consume_network(&from("provider-a", "NL", "Example"), &store)
+        .await?;
+    assert_eq!(
+        events_for(&owner, &number, "asn_change").await?,
+        1,
+        "first sight"
+    );
+    for _ in 0..3 {
+        consumer
+            .consume_network(&from("provider-b", "", "Example B"), &store)
+            .await?;
+        consumer
+            .consume_network(&from("provider-a", "NL", "Example"), &store)
+            .await?;
+    }
+    assert_eq!(
+        events_for(&owner, &number, "asn_change").await?,
+        1,
+        "a different provider describing the ASN differently is not a change"
+    );
+    // the stored view is now provider-a's again: its own change is reported
+    consumer
+        .consume_network(&from("provider-a", "DE", "Example"), &store)
+        .await?;
+    assert_eq!(
+        events_for(&owner, &number, "asn_change").await?,
+        2,
+        "the same provider reporting a different country is a change"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires provisioned roles in an isolated PostgreSQL test container"]
+async fn a_feed_reread_does_not_republish_unchanged_indicators() -> Result<()> {
+    let owner = PgPool::connect(&std::env::var("CLAWFORGE_TEST_DATABASE_URL")?).await?;
+    let store =
+        PostgresStore::connect_runtime(&std::env::var("CLAWFORGE_TEST_WORKER_DATABASE_URL")?)
+            .await?;
+    let tag = Uuid::new_v4().simple().to_string();
+    let prefix = format!(
+        "100.{}.{}.0/24",
+        u8::from_str_radix(&tag[..2], 16)?,
+        u8::from_str_radix(&tag[2..4], 16)?
+    );
+    let consumer = RiskConsumer::default();
+    let indicator = |confidence: u8, hours: i64| {
+        let now = Utc::now();
+        Indicator {
+            value: prefix.clone(),
+            indicator_type: IndicatorType::Prefix,
+            categories: vec!["spamhaus-drop".to_string()],
+            confidence,
+            source: "spamhaus_drop_test".to_string(),
+            first_seen: now,
+            last_seen: now,
+            expires_at: now + chrono::Duration::hours(hours),
+            metadata: serde_json::json!({"seen": now.to_rfc3339()}),
+        }
+    };
+    consumer.consume(&[indicator(80, 24)], &store).await?;
+    assert_eq!(
+        events_for(&owner, &prefix, "new_threat_indicator").await?,
+        1,
+        "new indicator"
+    );
+    // the next syncs list the same entry with a refreshed expiry and metadata
+    consumer.consume(&[indicator(80, 48)], &store).await?;
+    consumer.consume(&[indicator(80, 72)], &store).await?;
+    assert_eq!(
+        events_for(&owner, &prefix, "new_threat_indicator").await?,
+        1,
+        "a refreshed entry is inventory"
+    );
+    // it is stored and refreshed regardless
+    let expires: chrono::DateTime<Utc> = sqlx::query_scalar(
+        "SELECT expires_at FROM indicators WHERE value=$1 AND source='spamhaus_drop_test'",
+    )
+    .bind(&prefix)
+    .fetch_one(&owner)
+    .await?;
+    assert!(expires > Utc::now() + chrono::Duration::hours(70));
+    // a materially different confidence is an event again
+    consumer.consume(&[indicator(95, 72)], &store).await?;
+    assert_eq!(
+        events_for(&owner, &prefix, "new_threat_indicator").await?,
+        2
     );
     Ok(())
 }
