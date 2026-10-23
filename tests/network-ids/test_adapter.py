@@ -126,8 +126,10 @@ class AdapterTests(unittest.TestCase):
         self.eve.write_bytes(line(alert()))
         self.read()
         self.eve.rename(self.root / 'old')
-        (self.root / 'old').unlink()
+        # create the new file BEFORE deleting the old one: a different inode is guaranteed (a
+        # filesystem may hand the same inode number to a file created right after an unlink)
         self.eve.write_bytes(line(alert()))
+        (self.root / 'old').unlink()
         with self.assertRaisesRegex(RuntimeError, 'input gap'):
             self.read()
 
