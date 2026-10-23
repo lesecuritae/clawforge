@@ -4247,11 +4247,15 @@ impl PostgresStore {
         Ok(())
     }
 
-    /// Whether `record` is new or differs from the stored identity of its ASN (provider, name,
-    /// organisation, country, registry, announced prefixes). An unchanged record seen again on the
-    /// next sync is inventory, not a change.
+    /// Whether `record` is a CHANGE of what is stored for its ASN (name, organisation, country,
+    /// registry, announced prefixes). An unchanged record seen again on the next sync is
+    /// inventory, not a change. `asn_records` holds one row per ASN, so when two providers
+    /// describe the same ASN the row belongs to whichever wrote last: a record from a different
+    /// provider than the stored one cannot be attributed to a change (the two providers simply
+    /// describe it differently) and is not reported; only a new ASN, or a record that differs from
+    /// the same provider's own stored view, is a change.
     pub async fn asn_record_differs(&self, record: &AsnRecord) -> Result<bool> {
-        let same: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM asn_records WHERE asn=$1 AND name=$2 AND organisation=$3 AND provider=$4 AND country=$5 AND registry=$6 AND prefixes=$7)")
+        let stored: Option<bool> = sqlx::query_scalar("SELECT provider=$4 AND NOT (name=$2 AND organisation=$3 AND country=$5 AND registry=$6 AND prefixes=$7) FROM asn_records WHERE asn=$1")
             .bind(&record.asn)
             .bind(&record.name)
             .bind(&record.organisation)
@@ -4259,6 +4263,21 @@ impl PostgresStore {
             .bind(&record.country)
             .bind(&record.registry)
             .bind(serde_json::to_value(&record.prefixes)?)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(stored.unwrap_or(true))
+    }
+
+    /// Whether `indicator` is NEW for its (value, type, source) or its categories or confidence
+    /// changed. A feed that is re-read on every sync republishes the same entries; their refreshed
+    /// expiry/last-seen is inventory, not a new threat indicator.
+    pub async fn indicator_differs(&self, indicator: &Indicator) -> Result<bool> {
+        let same: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM indicators WHERE value=$1 AND indicator_type=$2 AND source=$3 AND categories=$4 AND confidence=$5)")
+            .bind(&indicator.value)
+            .bind(format!("{:?}", indicator.indicator_type))
+            .bind(&indicator.source)
+            .bind(serde_json::to_value(&indicator.categories)?)
+            .bind(indicator.confidence as i16)
             .fetch_one(&self.pool)
             .await?;
         Ok(!same)

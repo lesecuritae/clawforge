@@ -4,6 +4,7 @@
 
 Weitere Änderungen für die nächste Version werden hier gesammelt.
 
+- Fix: a threat feed re-read on every sync no longer republishes its unchanged entries as `new_threat_indicator` events (a refreshed expiry/metadata is inventory; a new indicator or changed categories/confidence is still an event). On production the hourly Spamhaus DROP/ASN sync (~2,100 entries) created ~2,150 `info` incidents per hour (51k/day). `asn_change` is no longer raised when two providers describe one ASN differently (`asn_records` has one row per ASN, so the providers overwrote each other every hour); only a new ASN or the same provider's own changed view is a change. No migration. Existing incidents are untouched.
 ## [1.2.3] - 2026-10-22
 
 - Detection: `attack_shape` evidence (migration 0067): account enumeration (>= 8 account names tried) and secret-file probes (>= 3 distinct `/.env`-style paths) corroborate an assessment as a content-based second source; counts only, never usernames or paths. Enforcement still needs a reputation listing. Fixtures carry explicit username/path models; attacker findings over the 21 scenarios TP 2 -> 7 at FP 0; quality gate stays false.

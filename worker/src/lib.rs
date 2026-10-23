@@ -117,6 +117,8 @@ impl RiskConsumer {
                 std::slice::from_ref(indicator),
                 &RiskSignals::default(),
             );
+            // Decide what is NEW before the upsert overwrites the stored view.
+            let changed = store.indicator_differs(indicator).await?;
             let id = store.upsert_indicator(indicator).await?;
             let reason = if assessment.reasons.is_empty() {
                 "provider indicator".to_string()
@@ -133,16 +135,20 @@ impl RiskConsumer {
                     &reason,
                 )
                 .await?;
-            record_event(
-                store,
-                "new_threat_indicator",
-                &indicator.source,
-                &indicator.value,
-                if assessment.risk_score >= 70 { "high" } else { "info" },
-                &reason,
-                serde_json::json!({"risk_score": assessment.risk_score, "trust_score": assessment.trust_score}),
-            )
-            .await;
+            // A feed re-read on every sync lists the same entries again: only a new indicator or a
+            // changed one is an event (and may become part of an incident).
+            if changed {
+                record_event(
+                    store,
+                    "new_threat_indicator",
+                    &indicator.source,
+                    &indicator.value,
+                    if assessment.risk_score >= 70 { "high" } else { "info" },
+                    &reason,
+                    serde_json::json!({"risk_score": assessment.risk_score, "trust_score": assessment.trust_score}),
+                )
+                .await;
+            }
         }
         Ok(())
     }
