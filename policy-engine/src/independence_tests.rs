@@ -50,6 +50,22 @@ impl Env {
         Ok(ids)
     }
 
+    /// One ssh failure event at `at` (for assessments that need a member but no particular shape).
+    async fn events_one(&self, at: DateTime<Utc>) -> Result<Uuid> {
+        self.owner
+            .publish_event(
+                "ssh_login_failure",
+                "test-sensor",
+                "critical",
+                at,
+                Some(&self.resource),
+                serde_json::json!({"username": "root", "attempt_count": 1}),
+                serde_json::json!({}),
+                &format!("control:{}:{}", self.resource, at.timestamp()),
+            )
+            .await
+    }
+
     /// An assessment of `rule` over the given events, last active at `last_seen`.
     async fn assessment(
         &self,
@@ -1037,5 +1053,212 @@ async fn a_four_hundred_assessment_backlog_drains_at_the_configured_rate_without
         cycles >= 4,
         "a backlog of 400 at 100 per cycle cannot drain in fewer than 4 cycles (got {cycles})"
     );
+    Ok(())
+}
+
+// ---- non-reputation corroboration vs the bridge --------------------------------------------------
+// A decision can be "corroborated" by an attack shape, an earlier episode of the same source, or a second
+// event family. That makes it a shadow `block`, but none of those is a reputation listing: a shared NAT that
+// trips on several days is corroborated by its own history, and a legitimate user that mistypes four wrong
+// names matches the invalid-account shape. The bridge must keep requiring a qualifying listing for any
+// request (default `REQUIRE_THREAT_INTEL=true`, always for `automatic`). End to end through the policy
+// engine, with the real roles; the positive control proves the harness does create a request.
+
+fn simulate_bridge() -> BridgeConfig {
+    let pairs = [
+        (bridge::MODE, "simulate"),
+        (bridge::BLOCK_ACTION, "nftables.block_incident_source"),
+        (bridge::TTL_SECONDS, "60"),
+        (bridge::MAX_PER_WINDOW, "50"),
+        (bridge::WINDOW_SECONDS, "300"),
+        (bridge::MAX_EVIDENCE_AGE_SECONDS, "900"),
+        (bridge::MIN_INTEL_CONFIDENCE, "50"),
+    ];
+    BridgeConfig::from_lookup(|name| {
+        pairs
+            .iter()
+            .find(|(k, _)| *k == name)
+            .map(|(_, v)| v.to_string())
+    })
+    .expect("valid bridge configuration")
+    .expect("bridge configured")
+}
+
+async fn bridge_requests_for(e: &Env) -> Result<i64> {
+    Ok(sqlx::query_scalar(
+        "SELECT count(*) FROM execution_requests WHERE requested_by = 'policy-bridge' \
+           AND approval_context->'target'->>'pseudonym' = $1",
+    )
+    .bind(&e.resource)
+    .fetch_one(e.owner.pool())
+    .await?)
+}
+
+/// (decision, corroborated, evidence basis) of the one decision stored for an assessment.
+async fn stored_decision(e: &Env, id: Uuid) -> Result<(String, bool, String)> {
+    Ok(sqlx::query_as(
+        "SELECT decision, corroborated, evidence_snapshot->>'evidence_basis' FROM security_policy_decisions \
+          WHERE assessment_id = $1 ORDER BY decided_at DESC LIMIT 1",
+    )
+    .bind(id)
+    .fetch_one(e.owner.pool())
+    .await?)
+}
+
+#[tokio::test]
+#[ignore = "requires provisioned roles in an isolated PostgreSQL test container"]
+async fn history_shape_and_second_family_corroboration_never_create_a_bridge_request() -> Result<()>
+{
+    sqlx::query("UPDATE actions SET enabled = FALSE WHERE name = 'nftables.block_incident_source'")
+        .execute(Env::new().await?.owner.pool())
+        .await?;
+    let config = simulate_bridge();
+    let now = Utc::now();
+    let mut seen = Vec::new();
+
+    // 1. attack shape only: ten different account names, sshd says nine of them do not exist
+    let mut shape = Env::new().await?;
+    let names = [
+        "root", "admin", "ubuntu", "test", "oracle", "postgres", "git", "user", "guest", "pi",
+    ];
+    let ids = shape
+        .events_with(
+            "ssh_login_failure",
+            now,
+            names
+                .into_iter()
+                .map(|n| ssh_known(n, Some(n != "root")))
+                .collect(),
+        )
+        .await?;
+    let target = shape.assessment("ssh_bruteforce", now, now, &ids).await?;
+    evaluate_assessment(&shape.policy, &target, Some(&config)).await?;
+    seen.push((
+        "attack_shape",
+        stored_decision(&shape, target.id).await?,
+        bridge_requests_for(&shape).await?,
+    ));
+
+    // 2. prior episode only: the same source tripped a detection three hours earlier (a repeating shared NAT)
+    let mut history = Env::new().await?;
+    let earlier = history
+        .events("ssh_login_failure", now - Duration::hours(3), 5)
+        .await?;
+    history
+        .assessment(
+            "ssh_bruteforce",
+            now - Duration::hours(3),
+            now - Duration::hours(3),
+            &earlier,
+        )
+        .await?;
+    let ids = history
+        .events_with(
+            "ssh_login_failure",
+            now,
+            ["alice", "bob", "carol", "alice", "bob"]
+                .into_iter()
+                .map(|n| ssh_known(n, Some(false)))
+                .collect(),
+        )
+        .await?;
+    let target = history.assessment("ssh_bruteforce", now, now, &ids).await?;
+    evaluate_assessment(&history.policy, &target, Some(&config)).await?;
+    seen.push((
+        "prior_episode_history",
+        stored_decision(&history, target.id).await?,
+        bridge_requests_for(&history).await?,
+    ));
+
+    // 3. second event family only: the same source also produced HTTP anomalies
+    let mut family = Env::new().await?;
+    let http = family
+        .events("http_anomaly", now + Duration::minutes(10), 8)
+        .await?;
+    family
+        .assessment(
+            "http_scan",
+            now + Duration::minutes(10),
+            now + Duration::minutes(10),
+            &http,
+        )
+        .await?;
+    let ids = family.events("ssh_login_failure", now, 5).await?;
+    let target = family.assessment("ssh_bruteforce", now, now, &ids).await?;
+    evaluate_assessment(&family.policy, &target, Some(&config)).await?;
+    seen.push((
+        "independent_event_family",
+        stored_decision(&family, target.id).await?,
+        bridge_requests_for(&family).await?,
+    ));
+
+    for (basis, (decision, corroborated, stored_basis), requests) in &seen {
+        assert_eq!(
+            stored_basis, basis,
+            "the decision is corroborated by exactly this kind of evidence"
+        );
+        assert!(*corroborated, "{basis}: corroborated");
+        assert!(
+            decision == "block" || decision == "rate_limit",
+            "{basis}: the decision must be one the bridge looks at (got {decision})"
+        );
+        assert_eq!(
+            *requests, 0,
+            "{basis}: no bridge request without a qualifying reputation listing"
+        );
+    }
+
+    // positive control: with a fresh qualifying reputation snapshot the same pipeline does create one request
+    let control = Env::new().await?;
+    let at = now + Duration::days(3);
+    let event = control.events_one(at).await?;
+    let id = control
+        .owner
+        .persist_security_assessment(clawforge_storage::SecurityAssessmentUpsert {
+            rule_id: "ssh_bruteforce",
+            rule_version: "2",
+            engine_version: "test",
+            dedupe_key: &format!("control:{}", control.resource),
+            resource: &control.resource,
+            severity: "critical",
+            confidence: 99,
+            summary: "positive control",
+            event_count: 20,
+            window_seconds: 300,
+            bucket_start: at,
+            first_seen: at,
+            last_seen: at,
+            event_ids: &[event],
+            threat_intel: Some(clawforge_storage::IpReputationHit {
+                source: "spamhaus_drop".to_string(),
+                confidence: 90,
+                last_seen: Utc::now(),
+            }),
+        })
+        .await?;
+    let assessment = control
+        .policy
+        .list_security_assessments(None, 500)
+        .await?
+        .into_iter()
+        .find(|a| a.id == id)
+        .expect("control assessment is listable");
+    evaluate_assessment(&control.policy, &assessment, Some(&config)).await?;
+    assert_eq!(
+        bridge_requests_for(&control).await?,
+        1,
+        "the harness does create a request when the evidence qualifies"
+    );
+    // keep later suites independent: the bridge budget counts every policy-bridge request in its window,
+    // cancelled ones too, so cancel this test's requests and move them out of that window
+    for e in [&control, &shape, &history, &family] {
+        sqlx::query(
+            "UPDATE execution_requests SET status = 'cancelled', created_at = now() - interval '2 days' \
+              WHERE requested_by = 'policy-bridge' AND approval_context->'target'->>'pseudonym' = $1",
+        )
+        .bind(&e.resource)
+        .execute(e.owner.pool())
+        .await?;
+    }
     Ok(())
 }
