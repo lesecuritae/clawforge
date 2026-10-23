@@ -540,29 +540,40 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// One polling cycle: evaluate the recent assessments and report how it went.
+/// One polling cycle: list the recent assessments, evaluate them and report how it went.
 async fn run_cycle(
     store: &PostgresStore,
     limit: i64,
     bridge: Option<&BridgeConfig>,
 ) -> CycleHealth {
-    let mut cycle = CycleHealth::default();
     match store.list_security_assessments(None, limit).await {
-        Ok(assessments) => {
-            for assessment in assessments {
-                match evaluate_assessment(store, &assessment, bridge).await {
-                    Ok(()) => cycle.ok += 1,
-                    Err(error) => {
-                        warn!(%error, assessment_id = %assessment.id, "policy evaluation failed");
-                        cycle.record_failure(&error.to_string());
-                    }
-                }
-            }
-        }
+        Ok(assessments) => evaluate_all(store, &assessments, bridge).await,
         Err(error) => {
             warn!(%error, "could not list recent security assessments");
-            cycle.listing_failed = true;
+            let mut cycle = CycleHealth {
+                listing_failed: true,
+                ..CycleHealth::default()
+            };
             cycle.record_failure(&error.to_string());
+            cycle
+        }
+    }
+}
+
+/// Evaluate the given assessments; the outcome tells "nothing to do" from "everything failed".
+async fn evaluate_all(
+    store: &PostgresStore,
+    assessments: &[clawforge_storage::SecurityAssessment],
+    bridge: Option<&BridgeConfig>,
+) -> CycleHealth {
+    let mut cycle = CycleHealth::default();
+    for assessment in assessments {
+        match evaluate_assessment(store, assessment, bridge).await {
+            Ok(()) => cycle.ok += 1,
+            Err(error) => {
+                warn!(%error, assessment_id = %assessment.id, "policy evaluation failed");
+                cycle.record_failure(&error.to_string());
+            }
         }
     }
     cycle

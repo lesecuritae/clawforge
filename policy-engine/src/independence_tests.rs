@@ -685,25 +685,29 @@ async fn the_shape_function_returns_numbers_only_and_is_bounded() -> Result<()> 
 async fn a_cycle_where_every_evaluation_is_denied_reports_the_engine_degraded() -> Result<()> {
     let mut e = Env::new().await?;
     let now = Utc::now();
+    let mut mine = Vec::new();
     for i in 0..4 {
         let ids = e
             .events("ssh_login_failure", now + Duration::seconds(i * 700), 5)
             .await?;
-        e.assessment(
-            "ssh_bruteforce",
-            now + Duration::seconds(i * 700),
-            now + Duration::seconds(i * 700),
-            &ids,
-        )
-        .await?;
+        mine.push(
+            e.assessment(
+                "ssh_bruteforce",
+                now + Duration::seconds(i * 700),
+                now + Duration::seconds(i * 700),
+                &ids,
+            )
+            .await?,
+        );
     }
+    // exactly these four, independent of whatever other suites left in a shared database
     let function = "clawforge_assessment_shape(uuid, text[])";
     sqlx::query(&format!(
         "REVOKE EXECUTE ON FUNCTION {function} FROM clawforge_policy_engine"
     ))
     .execute(e.owner.pool())
     .await?;
-    let denied = run_cycle(&e.policy, 200, None).await;
+    let denied = evaluate_all(&e.policy, &mine, None).await;
     let denied_report = runtime_report(&denied, None);
     e.policy
         .set_runtime_status("policy-engine", denied_report.0, denied_report.1.as_deref())
@@ -723,13 +727,13 @@ async fn a_cycle_where_every_evaluation_is_denied_reports_the_engine_degraded() 
         denied.ok, 0,
         "no evaluation can succeed without the privilege"
     );
-    assert!(denied.failed >= 3, "failed={}", denied.failed);
+    assert_eq!(denied.failed, 4, "all four evaluations are denied");
     assert_eq!(stored.0, "degraded");
     assert!(stored.1.unwrap_or_default().contains("permission denied"));
 
-    let healthy = run_cycle(&e.policy, 200, None).await;
+    let healthy = evaluate_all(&e.policy, &mine, None).await;
     assert!(
-        healthy.ok >= 3 && healthy.failed == 0,
+        healthy.ok == 4 && healthy.failed == 0,
         "ok={} failed={}",
         healthy.ok,
         healthy.failed
