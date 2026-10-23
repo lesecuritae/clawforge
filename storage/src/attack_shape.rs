@@ -1,4 +1,4 @@
-//! Behaviour counts of one assessment (migrations 0067, 0068). Numbers only: the policy engine never
+//! Behaviour counts of one assessment (migrations 0067, 0069). Numbers only: the policy engine never
 //! sees usernames or request paths.
 use crate::PostgresStore;
 use anyhow::Result;

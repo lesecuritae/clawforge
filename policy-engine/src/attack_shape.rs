@@ -6,7 +6,7 @@
 //!   through dozens of names.
 //! * `invalid_account_probe` - a source that tried several different account names which sshd
 //!   itself reported as nonexistent. A user mistypes their OWN name once or twice; guessing walks
-//!   through names no one has. Needs a sensor that reports sshd's verdict (migration 0068);
+//!   through names no one has. Needs a sensor that reports sshd's verdict (migration 0069);
 //!   events without it never count.
 //! * `secret_path_probe` - a source asking for several distinct paths that no legitimate client
 //!   requests (`/.env*`, `/.git/...`, `/.aws/...`, SSH keys, ...). A broken asset release or a
