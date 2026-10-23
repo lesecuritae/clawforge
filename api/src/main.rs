@@ -8600,6 +8600,7 @@ async fn main() -> anyhow::Result<()> {
     runtime_store
         .set_runtime_status("api", "running", None)
         .await?;
+    let heartbeat = runtime_store.spawn_runtime_heartbeat("api", StdDuration::from_secs(30));
     let app_state = AppState {
         store,
         config: RuntimeConfig {
@@ -8628,6 +8629,7 @@ async fn main() -> anyhow::Result<()> {
     )
     .with_graceful_shutdown(shutdown_signal())
     .await?;
+    heartbeat.abort();
     runtime_store
         .set_runtime_status("api", "stopped", None)
         .await?;

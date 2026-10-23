@@ -191,6 +191,8 @@ GRANT EXECUTE ON FUNCTION clawforge_enqueue_goaway_shadow_challenge(UUID)
 GRANT EXECUTE ON FUNCTION clawforge_assessment_event_types(UUID) TO clawforge_policy_engine;
 -- Behaviour counts of one assessment (migration 0067): numbers only, never usernames or paths.
 GRANT EXECUTE ON FUNCTION clawforge_assessment_shape(UUID, TEXT[]) TO clawforge_policy_engine;
+-- Retention that keeps the evidence behind real execution requests (migration 0070): the worker cannot read execution_requests itself.
+GRANT EXECUTE ON FUNCTION clawforge_delete_expired_security_assessments(TIMESTAMPTZ) TO clawforge_worker;
 -- Current reputation/routing view of one pseudonymized source (migration 0063).
 GRANT EXECUTE ON FUNCTION clawforge_current_source_intel(TEXT) TO clawforge_policy_engine;
 -- Policy -> execution bridge (migration 0060): the only path by which this role

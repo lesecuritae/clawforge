@@ -1754,6 +1754,39 @@ async fn dispatch(
     )
 }
 
+/// Why a productive start must be refused even with a valid live authorization, or `None`.
+///
+/// A real apply is only acceptable when the operator has said which addresses must never be blocked
+/// (management network, the operator's own ISP/VPN, DNS, gateway). The adapter's built-in net covers only
+/// loopback and link-local, so an unset `CLAWFORGE_FIREWALL_NEVER_BLOCK_CIDRS` is not "nothing to protect"
+/// but "nothing decided". An authorization with an empty class list authorizes nothing and is not refused.
+fn productive_start_refusal(
+    dry_run: bool,
+    auth: Option<&live_authorization::LiveAuthorization>,
+    never_block_cidrs: Option<&str>,
+) -> Option<String> {
+    if dry_run || !auth.is_some_and(|a| !a.actions.is_empty()) {
+        return None;
+    }
+    let configured = never_block_cidrs
+        .map(|value| {
+            value
+                .split(',')
+                .filter(|entry| !entry.trim().is_empty())
+                .count()
+        })
+        .unwrap_or(0);
+    if configured == 0 {
+        return Some(
+            "productive firewall execution is refused: CLAWFORGE_FIREWALL_NEVER_BLOCK_CIDRS names no \
+             address. Set the operator's management network, own ISP/VPN ranges, DNS and gateway first; \
+             the built-in loopback/link-local list alone is not a protection decision"
+                .to_string(),
+        );
+    }
+    None
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -1769,6 +1802,15 @@ async fn main() -> anyhow::Result<()> {
              (CLAWFORGE_EXECUTOR_LIVE_AUTHORIZATION); with none set, \
              CLAWFORGE_EXECUTOR_DRY_RUN must remain true"
         );
+    }
+    if let Some(reason) = productive_start_refusal(
+        dry_run_from_env(),
+        live_authorization.as_ref(),
+        env::var("CLAWFORGE_FIREWALL_NEVER_BLOCK_CIDRS")
+            .ok()
+            .as_deref(),
+    ) {
+        anyhow::bail!(reason);
     }
     if let Some(auth) = &live_authorization {
         tracing::warn!(
@@ -3019,6 +3061,42 @@ mod tests {
             "recovery_required is not retried by the sweep"
         );
         Ok(())
+    }
+
+    #[test]
+    fn productive_start_needs_an_operator_defined_never_block_list() {
+        let auth = |actions: &str| {
+            live_authorization::LiveAuthorization::parse(&format!(
+                r#"{{"version":1,"authorization_id":"t","approved_by":"operator","actions":{actions}}}"#
+            ))
+            .unwrap()
+        };
+        let nftables = auth(r#"["nftables"]"#);
+        let empty = auth("[]");
+        // dry-run never needs it (today's production: dry-run true, nothing authorized, nothing configured)
+        assert!(productive_start_refusal(true, None, None).is_none());
+        assert!(productive_start_refusal(true, Some(&nftables), None).is_none());
+        // an authorization without classes authorizes nothing and is not refused
+        assert!(productive_start_refusal(false, Some(&empty), None).is_none());
+        // a real apply class without a protection decision is refused: unset, empty, blanks and commas only
+        for value in [None, Some(""), Some("   "), Some(", ,"), Some(",")] {
+            let reason = productive_start_refusal(false, Some(&nftables), value);
+            assert!(
+                reason.as_deref().is_some_and(|r| r.contains("NEVER_BLOCK")),
+                "{value:?}"
+            );
+        }
+        // one or more entries is a decision (their syntax is validated by the adapter, fail-closed)
+        for value in [
+            "192.168.0.0/24",
+            "192.168.0.0/24, 100.64.0.0/10",
+            " 10.0.0.1 ",
+        ] {
+            assert!(
+                productive_start_refusal(false, Some(&nftables), Some(value)).is_none(),
+                "{value}"
+            );
+        }
     }
 }
 

@@ -3148,3 +3148,175 @@ async fn decision_incident_projection_preserves_direct_event_counts_and_permissi
     }
     Ok(())
 }
+
+/// Retention must not erase the evidence behind a REAL execution request (migration 0070). The worker
+/// role runs the deletion through a database function because it cannot read `execution_requests`.
+/// Simulation-only requests (a Go-Away challenge is simulated for every challenge decision) must NOT
+/// protect anything, otherwise retention would be defeated. The control reproduces the previous
+/// behaviour (the two plain statements) inside a rolled-back transaction: it loses the decision.
+#[tokio::test]
+#[ignore = "requires provisioned roles in an isolated PostgreSQL test container"]
+async fn retention_keeps_the_evidence_behind_real_requests_and_only_those() -> anyhow::Result<()> {
+    let owner = sqlx::PgPool::connect(&std::env::var("CLAWFORGE_TEST_DATABASE_URL")?).await?;
+    let worker =
+        PostgresStore::connect_runtime(&std::env::var("CLAWFORGE_TEST_WORKER_DATABASE_URL")?)
+            .await?;
+    let suffix = uuid::Uuid::new_v4();
+    let old = Utc::now() - Duration::days(120);
+    let cutoff = Utc::now() - Duration::days(90);
+    let action_id: uuid::Uuid =
+        sqlx::query_scalar("SELECT id FROM actions WHERE name = 'nftables.block_incident_source'")
+            .fetch_one(&owner)
+            .await?;
+    let policy_id = uuid::Uuid::new_v4();
+    sqlx::query("INSERT INTO security_policies (id,name,version,status,class,rule_id,min_severity) VALUES ($1,$2,1,'active','observe','ssh_bruteforce','medium')")
+        .bind(policy_id)
+        .bind(format!("retention-real-requests-{suffix}"))
+        .execute(&owner)
+        .await?;
+
+    // old, never promoted, one decision each
+    async fn seed(
+        owner: &sqlx::PgPool,
+        policy_id: uuid::Uuid,
+        tag: &str,
+        at: chrono::DateTime<Utc>,
+    ) -> anyhow::Result<(uuid::Uuid, uuid::Uuid)> {
+        let assessment: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO security_assessments (id,rule_id,rule_version,engine_version,dedupe_key,resource,severity,confidence,summary,event_count,window_seconds,bucket_start,first_seen,last_seen) \
+             VALUES (gen_random_uuid(),'ssh_bruteforce','1','test',$1,$2,'critical',90,'fixture',10,300,$3,$3,$3) RETURNING id",
+        )
+        .bind(format!("retention-real:{tag}"))
+        .bind(format!("ip-pseudonym:retention-real-{tag}"))
+        .bind(at)
+        .fetch_one(owner)
+        .await?;
+        let decision: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO security_policy_decisions (id,policy_id,policy_version,assessment_id,decision,risk_score,evidence_sources,corroborated,rationale,evidence_snapshot,evidence_hash,is_shadow,dedupe_key) \
+             VALUES (gen_random_uuid(),$1,1,$2,'block',90,2,TRUE,'fixture','{\"evidence_basis\":\"threat_intel_ip\"}'::jsonb,$3,TRUE,$4) RETURNING id",
+        )
+        .bind(policy_id)
+        .bind(assessment)
+        .bind("0".repeat(64))
+        .bind(format!("retention-real-decision:{tag}"))
+        .fetch_one(owner)
+        .await?;
+        Ok((assessment, decision))
+    }
+    let (plain_a, plain_d) = seed(&owner, policy_id, &format!("plain-{suffix}"), old).await?;
+    let (sim_a, sim_d) = seed(&owner, policy_id, &format!("simulated-{suffix}"), old).await?;
+    let (real_a, real_d) = seed(&owner, policy_id, &format!("real-{suffix}"), old).await?;
+    let (bridge_a, bridge_d) = seed(&owner, policy_id, &format!("bridge-{suffix}"), old).await?;
+    let (recent_a, _recent_d) = seed(
+        &owner,
+        policy_id,
+        &format!("recent-{suffix}"),
+        Utc::now() - Duration::days(1),
+    )
+    .await?;
+
+    let insert_request = |context: serde_json::Value| {
+        let owner = owner.clone();
+        async move {
+            sqlx::query("INSERT INTO execution_requests(id,action_id,requested_by,status,approval_context) VALUES(gen_random_uuid(),$1,'policy-engine','pending',$2)")
+                .bind(action_id)
+                .bind(context)
+                .execute(&owner)
+                .await
+        }
+    };
+    // a Go-Away style simulation: top-level decision id, simulation_only true
+    insert_request(serde_json::json!({"version":1,"security_policy_decision_id":sim_d,"simulation_only":true,"target":{"kind":"incident_source","simulation_only":true}})).await?;
+    // a real request that carries the decision id inside the bridge block of its context
+    insert_request(serde_json::json!({"version":1,"policy_bridge":{"security_policy_decision_id":real_d,"mode":"propose"},"target":{"kind":"incident_source"}})).await?;
+    // a second real request, bridge `automatic`-style context with the id only in the bridge block
+    insert_request(serde_json::json!({"version":1,"policy_bridge":{"security_policy_decision_id":bridge_d,"mode":"automatic"},"target":{"kind":"incident_source"}})).await?;
+
+    // control: the previous two statements would have deleted the decision behind the real request
+    let mut tx = owner.begin().await?;
+    sqlx::query("DELETE FROM security_policy_decisions WHERE assessment_id IN (SELECT id FROM security_assessments WHERE incident_id IS NULL AND last_seen < $1)")
+        .bind(cutoff)
+        .execute(&mut *tx)
+        .await?;
+    let lost: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM security_policy_decisions WHERE id = $1")
+            .bind(real_d)
+            .fetch_one(&mut *tx)
+            .await?;
+    tx.rollback().await?;
+    assert_eq!(
+        lost, 0,
+        "control: the previous retention statements lose the evidence of a real request"
+    );
+
+    let removed = worker.delete_expired_security_assessments(cutoff).await?;
+    assert!(
+        removed >= 2,
+        "at least the plain and the simulated assessment are removed (removed {removed})"
+    );
+    let exists = |table: &'static str, id: uuid::Uuid| {
+        let owner = owner.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(&format!("SELECT count(*) FROM {table} WHERE id = $1"))
+                .bind(id)
+                .fetch_one(&owner)
+                .await
+        }
+    };
+    assert_eq!(
+        exists("security_assessments", plain_a).await?,
+        0,
+        "plain old assessment removed"
+    );
+    assert_eq!(
+        exists("security_policy_decisions", plain_d).await?,
+        0,
+        "its decision removed"
+    );
+    assert_eq!(
+        exists("security_assessments", sim_a).await?,
+        0,
+        "a simulation-only request protects nothing"
+    );
+    assert_eq!(exists("security_policy_decisions", sim_d).await?, 0);
+    for (assessment, decision, what) in [
+        (real_a, real_d, "bridge-context reference"),
+        (bridge_a, bridge_d, "automatic-mode reference"),
+    ] {
+        assert_eq!(
+            exists("security_assessments", assessment).await?,
+            1,
+            "{what}: assessment kept"
+        );
+        assert_eq!(
+            exists("security_policy_decisions", decision).await?,
+            1,
+            "{what}: decision kept"
+        );
+    }
+    assert_eq!(
+        exists("security_assessments", recent_a).await?,
+        1,
+        "recent assessment kept"
+    );
+    // idempotent: a second run removes nothing of the protected evidence
+    worker.delete_expired_security_assessments(cutoff).await?;
+    assert_eq!(exists("security_policy_decisions", real_d).await?, 1);
+    // cleanup of this test's rows so the shared fixture stays tidy
+    sqlx::query("DELETE FROM execution_requests WHERE approval_context ->> 'security_policy_decision_id' = $1 OR approval_context -> 'policy_bridge' ->> 'security_policy_decision_id' = $2 OR approval_context -> 'policy_bridge' ->> 'security_policy_decision_id' = $3")
+        .bind(sim_d.to_string()).bind(real_d.to_string()).bind(bridge_d.to_string())
+        .execute(&owner).await?;
+    sqlx::query("DELETE FROM security_policy_decisions WHERE policy_id = $1")
+        .bind(policy_id)
+        .execute(&owner)
+        .await?;
+    sqlx::query("DELETE FROM security_assessments WHERE id = ANY($1)")
+        .bind(vec![real_a, bridge_a, recent_a])
+        .execute(&owner)
+        .await?;
+    sqlx::query("DELETE FROM security_policies WHERE id = $1")
+        .bind(policy_id)
+        .execute(&owner)
+        .await?;
+    Ok(())
+}
