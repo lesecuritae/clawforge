@@ -12,5 +12,6 @@ RUN mkdir -p /opt/clawforge/suricata /rules \
  && chmod 0644 /opt/clawforge/suricata/*.config
 COPY sensors/network-ids/suricata.yaml /opt/clawforge/suricata/suricata.yaml
 RUN chmod 0644 /opt/clawforge/suricata/suricata.yaml
-USER 10001:10001
+# Root only until the capture socket is open: suricata.yaml `run-as` then drops to the image's
+# unprivileged `suricata` user (998). Replay/validation runs override --user.
 ENTRYPOINT ["/usr/bin/suricata"]

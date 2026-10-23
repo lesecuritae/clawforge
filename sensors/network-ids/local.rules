@@ -1,0 +1,3 @@
+# Clawforge self-test canary: proves engine -> EVE -> adapter -> ingress end to end with traffic that
+# contains only this literal marker. It is plumbing, not attack coverage.
+alert udp any any -> any 9999 (msg:"Clawforge controlled IDS lab"; content:"CLAWFORGE_IDS_LAB_MARKER"; sid:1000001; rev:1;)

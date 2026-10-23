@@ -1,7 +1,20 @@
-# Optional adapter only. Does not install/start a capture engine or redirect traffic.
+# Passive network IDS: Suricata (engine) + Clawforge EVE adapter. Standalone project: it never
+# touches the main Clawforge compose project. It only joins the existing backend network to reach
+# the authenticated sensor ingress.
+#
+#   docker compose -f compose.network-ids.yml --env-file ids.env config --quiet
+#   docker compose -f compose.network-ids.yml --env-file ids.env up -d      # engine + adapter
+#   docker compose -f compose.network-ids.yml --env-file ids.env --profile adapter-only up -d clawforge-network-ids-sensor
+#
+# The engine sees ONLY the dedicated mirror interface (a macvlan "passthru" network on
+# CLAWFORGE_MIRROR_INTERFACE): it has no host networking, no route, no address that matters, no
+# Docker socket. NET_ADMIN/NET_RAW therefore act inside a network namespace that contains nothing
+# but the mirror NIC. See docs/network-ids.md.
+name: clawforge-ids
 services:
   clawforge-network-ids-sensor:
-    profiles: [network-ids]
+    profiles: [default, adapter-only]
+    image: local/clawforge-network-ids-adapter:${CLAWFORGE_IDS_VERSION:-dev}
     build:
       context: .
       dockerfile: sensors/network-ids/Dockerfile
@@ -9,7 +22,7 @@ services:
       - --eve=/eve/eve.json
       - --state=/state/adapter.sqlite
       - --source=${CLAWFORGE_IDS_SOURCE:-suricata:production}
-      - --ingress=http://clawforge-api:8080
+      - --ingress=${CLAWFORGE_IDS_INGRESS:-http://clawforge-api:8080}
       - --allow-http
       - --credential-file=/run/secrets/network_ids_sensor_credential
     user: "${CLAWFORGE_IDS_UID:-10001}:${CLAWFORGE_IDS_GID:-10001}"
@@ -21,39 +34,66 @@ services:
     networks: [backend]
     read_only: true
     cap_drop: [ALL]
-    security_opt: [no-new-privileges:true]
+    security_opt: ["no-new-privileges:true"]
     pids_limit: 32
     mem_limit: 128m
     cpus: 0.5
-    restart: on-failure:5
+    restart: unless-stopped
+    healthcheck:
+      # alive = the adapter wrote its status recently
+      test: ["CMD", "python3", "-I", "-c", "import os,sys,time;sys.exit(0 if time.time()-os.stat('/state/status.json').st_mtime<120 else 1)"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
   clawforge-suricata:
-    profiles: [packet-capture]
     image: local/clawforge-suricata:8.0.7
     build:
       context: .
       dockerfile: sensors/network-ids/Suricata.Dockerfile
-    entrypoint: [/usr/bin/suricata]
+    container_name: clawforge-suricata
+    # Starts as root with the minimum capabilities to open the capture socket, then the engine
+    # drops to the image's unprivileged `suricata` user (suricata.yaml run-as). Group 998 gives the
+    # pre-drop write check on the log directory without any DAC capability.
+    user: "0:998"
     command:
       - -c
-      - /etc/clawforge/suricata.yaml
-      - --af-packet=${CLAWFORGE_SURICATA_INTERFACE:?set verified capture interface}
+      - /opt/clawforge/suricata/suricata.yaml
+      - --af-packet=eth0
       - -l
       - /var/log/suricata
-    # Only packets visible on this Linux host. No forwarding or inline filtering.
-    network_mode: host
-    user: "${CLAWFORGE_IDS_UID:-10001}:${CLAWFORGE_IDS_GID:-10001}"
+    networks: [ids_mirror]
     volumes:
-      - ./sensors/network-ids/suricata.yaml:/etc/clawforge/suricata.yaml:ro
       - ${CLAWFORGE_SURICATA_RULES_DIRECTORY:?set reviewed rules directory}:/rules:ro
       - ${CLAWFORGE_EVE_DIRECTORY:?set existing EVE log directory}:/var/log/suricata
     cap_drop: [ALL]
-    cap_add: [NET_RAW]
+    # NET_RAW: capture socket. NET_ADMIN, SYS_NICE: kept by the engine's own privilege code for
+    # AF_PACKET (without them it fails to drop privileges). SETUID/SETGID/SETPCAP: the drop itself.
+    cap_add: [NET_RAW, NET_ADMIN, SYS_NICE, SETUID, SETGID, SETPCAP]
     read_only: true
-    security_opt: [no-new-privileges:true]
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    security_opt: ["no-new-privileges:true"]
     pids_limit: 64
-    mem_limit: 512m
-    cpus: 1.0
-    restart: on-failure:5
+    mem_limit: 1536m
+    # Low weight: under CPU contention Plex and the Clawforge services win; the engine may then drop
+    # packets (visible in the adapter status), it never starves them.
+    cpus: 1.5
+    cpu_shares: 128
+    restart: unless-stopped
+
+networks:
+  backend:
+    name: clawforge_backend
+    external: true
+  ids_mirror:
+    driver: macvlan
+    driver_opts:
+      parent: ${CLAWFORGE_MIRROR_INTERFACE:?set the dedicated mirror NIC}
+      macvlan_mode: passthru
+    ipam:
+      config:
+        - subnet: 169.254.77.0/29
 
 secrets:
   network_ids_sensor_credential:

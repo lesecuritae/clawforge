@@ -1,0 +1,4 @@
+# Re-apply the passive IDS mirror whenever a guest tap device appears (guest start/restart): the tc
+# filters live on the tap devices and vanish with them. The script is idempotent and exits quietly
+# when the sensor VM's mirror NIC is not (yet) there.
+ACTION=="add", SUBSYSTEM=="net", KERNEL=="tap*", RUN+="/usr/bin/systemd-run --no-block --quiet --unit=clawforge-ids-mirror-%k /usr/local/sbin/clawforge-ids-mirror up"

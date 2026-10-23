@@ -1,0 +1,13 @@
+# Sensor VM (guest): the dedicated mirror NIC. No address, no route, no DHCP; link up so the engine
+# can capture. Offloads off so the engine sees packets as they were on the wire.
+network:
+  version: 2
+  ethernets:
+    ens19:
+      dhcp4: false
+      dhcp6: false
+      accept-ra: false
+      link-local: []
+      optional: true
+      generic-receive-offload: false
+      large-receive-offload: false
