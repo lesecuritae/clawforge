@@ -1,3 +1,21 @@
+# Clawforge v1.2.7 Policy engine decides every assessment
+
+## Fix
+- Assessments that fell out of the policy engine's "newest 200" window were never decided (167 after the
+  1.2.3 incident). Every cycle now also catches up, bounded, assessments of the last 24 hours without any
+  decision (`CLAWFORGE_POLICY_ENGINE_BACKLOG_LIMIT`, default 100). Same logic and shadow-only output as any
+  other evaluation; no execution request is created by the catch-up with the bridge off, and the bridge's own
+  database check still rejects stale evidence.
+
+## Tooling
+- `scripts/ops/pipeline-completeness-audit.sql`: read-only recomputation of the expected windows from the
+  events and a check that each assessment has a decision. Real-data result and the separate isolated lab
+  measurement are in `docs/behavior-validation.md`.
+
+## Upgrade
+- Image-only patch (schema stays 69); rollback is the previous image tag. Bridge, RIPEstat enrichment, live
+  enforcement and quarantine stay off. The quality gate is unchanged (red).
+
 # Clawforge v1.2.6 Policy engine reports itself degraded
 
 ## Observability

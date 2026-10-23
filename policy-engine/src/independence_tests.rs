@@ -745,3 +745,294 @@ async fn a_cycle_where_every_evaluation_is_denied_reports_the_engine_degraded() 
         .await?;
     Ok(())
 }
+
+// ---- undecided backlog -------------------------------------------------------------------------
+// A "newest N" listing can never reach an assessment once more than N newer ones exist (an outage
+// backlog, a distributed burst). These tests use the real least-privilege roles; the shared database
+// may hold assessments of other suites, so every assertion is about this test's own assessments.
+
+/// Decisions stored for one assessment: (policy count, shadow count, strongest decision, corroborated).
+async fn decisions_of(e: &Env, id: Uuid) -> Result<(i64, i64, Option<String>, Option<bool>)> {
+    let row: (i64, i64, Option<String>, Option<bool>) = sqlx::query_as(
+        "SELECT count(*), count(*) FILTER (WHERE is_shadow), \
+                (array_agg(decision ORDER BY CASE decision WHEN 'block' THEN 3 WHEN 'rate_limit' THEN 2 WHEN 'challenge' THEN 1 ELSE 0 END DESC))[1], \
+                bool_or(corroborated) \
+           FROM security_policy_decisions WHERE assessment_id = $1",
+    )
+    .bind(id)
+    .fetch_one(e.owner.pool())
+    .await?;
+    Ok(row)
+}
+
+/// A burst of `n` recent assessments (other sources) that push older ones out of the newest-N window.
+async fn newer_assessments(e: &mut Env, n: usize, base: DateTime<Utc>) -> Result<()> {
+    for k in 0..n {
+        let ids = e
+            .events("ssh_login_failure", base + Duration::minutes(k as i64), 5)
+            .await?;
+        e.assessment(
+            "ssh_bruteforce",
+            base + Duration::minutes(k as i64),
+            base + Duration::minutes(k as i64),
+            &ids,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn execution_requests(e: &Env) -> Result<i64> {
+    Ok(
+        sqlx::query_scalar("SELECT count(*) FROM execution_requests")
+            .fetch_one(e.owner.pool())
+            .await?,
+    )
+}
+
+#[tokio::test]
+#[ignore = "requires provisioned roles in an isolated PostgreSQL test container"]
+async fn assessments_pushed_out_of_the_newest_window_are_still_decided_with_the_same_logic(
+) -> Result<()> {
+    let now = Utc::now();
+    // legitimate users behind one NAT: three existing accounts, nothing nonexistent
+    let mut nat = Env::new().await?;
+    let nat_events = nat
+        .events_with(
+            "ssh_login_failure",
+            now - Duration::hours(3),
+            ["alice", "bob", "carol", "alice", "bob", "carol"]
+                .into_iter()
+                .map(|n| ssh_known(n, Some(false)))
+                .collect(),
+        )
+        .await?;
+    let nat_assessment = nat
+        .assessment(
+            "ssh_bruteforce",
+            now - Duration::hours(3),
+            now - Duration::hours(3),
+            &nat_events,
+        )
+        .await?;
+    // an attacker walking through many account names
+    let mut attack = Env::new().await?;
+    let names = [
+        "root", "admin", "ubuntu", "test", "oracle", "postgres", "git", "user", "guest", "pi",
+    ];
+    let attack_events = attack
+        .events_with(
+            "ssh_login_failure",
+            now - Duration::hours(3),
+            names
+                .into_iter()
+                .map(|n| ssh_known(n, Some(n != "root")))
+                .collect(),
+        )
+        .await?;
+    let attack_assessment = attack
+        .assessment(
+            "ssh_bruteforce",
+            now - Duration::hours(3),
+            now - Duration::hours(3),
+            &attack_events,
+        )
+        .await?;
+    // thirty newer assessments from other sources fill the newest-N window (N = 10)
+    newer_assessments(&mut nat, 30, now - Duration::minutes(30)).await?;
+
+    // precondition = the defect: neither old assessment is among the newest ten
+    let newest = nat.policy.list_security_assessments(None, 10).await?;
+    assert!(!newest
+        .iter()
+        .any(|a| a.id == nat_assessment.id || a.id == attack_assessment.id));
+    assert_eq!(decisions_of(&nat, nat_assessment.id).await?.0, 0);
+
+    let requests_before = execution_requests(&nat).await?;
+    let mut rounds = 0;
+    while rounds < 12 {
+        let cycle = run_cycle(&nat.policy, 10, 10, None).await;
+        assert!(
+            cycle.ok + cycle.failed <= 20,
+            "work per cycle is bounded by limit + backlog"
+        );
+        rounds += 1;
+        if decisions_of(&nat, nat_assessment.id).await?.0 > 0
+            && decisions_of(&nat, attack_assessment.id).await?.0 > 0
+        {
+            break;
+        }
+    }
+    let (n_policies, n_shadow, n_decision, n_corroborated) =
+        decisions_of(&nat, nat_assessment.id).await?;
+    let (a_policies, a_shadow, a_decision, a_corroborated) =
+        decisions_of(&nat, attack_assessment.id).await?;
+    assert!(
+        n_policies > 0 && a_policies > 0,
+        "both old assessments were decided within {rounds} cycles"
+    );
+    assert_eq!(
+        (n_policies, n_shadow),
+        (n_policies, n_policies),
+        "shadow only"
+    );
+    assert_eq!(
+        (a_policies, a_shadow),
+        (a_policies, a_policies),
+        "shadow only"
+    );
+    // same logic as any other evaluation: the NAT stays unconfirmed, the enumeration is corroborated
+    assert_eq!(nat.basis(&nat_assessment).await?, (1, "behavior_only"));
+    assert_eq!(n_corroborated, Some(false));
+    assert_ne!(
+        n_decision.as_deref(),
+        Some("block"),
+        "an uncorroborated NAT is never a block"
+    );
+    assert_eq!(attack.basis(&attack_assessment).await?.1, "attack_shape");
+    assert_eq!(a_corroborated, Some(true));
+    assert!(a_decision.is_some());
+    // catching up creates no execution request (bridge off) and is idempotent
+    assert_eq!(execution_requests(&nat).await?, requests_before);
+    let before = (
+        decisions_of(&nat, nat_assessment.id).await?.0,
+        decisions_of(&nat, attack_assessment.id).await?.0,
+    );
+    run_cycle(&nat.policy, 10, 10, None).await;
+    run_cycle(&nat.policy, 10, 10, None).await;
+    assert_eq!(
+        before,
+        (
+            decisions_of(&nat, nat_assessment.id).await?.0,
+            decisions_of(&nat, attack_assessment.id).await?.0
+        ),
+        "re-running creates no duplicate decisions"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires provisioned roles in an isolated PostgreSQL test container"]
+async fn the_catch_up_is_bounded_per_cycle_and_ignores_history_older_than_a_day() -> Result<()> {
+    let now = Utc::now();
+    let mut e = Env::new().await?;
+    let mut old = Vec::new();
+    for k in 0..4 {
+        let ids = e
+            .events(
+                "ssh_login_failure",
+                now - Duration::hours(4) + Duration::minutes(k),
+                5,
+            )
+            .await?;
+        old.push(
+            e.assessment(
+                "ssh_bruteforce",
+                now - Duration::hours(4) + Duration::minutes(k),
+                now - Duration::hours(4) + Duration::minutes(k),
+                &ids,
+            )
+            .await?,
+        );
+    }
+    // one of them is older than the catch-up window
+    sqlx::query(
+        "UPDATE security_assessments SET created_at = now() - interval '48 hours' WHERE id = $1",
+    )
+    .bind(old[3].id)
+    .execute(e.owner.pool())
+    .await?;
+    newer_assessments(&mut e, 12, now - Duration::minutes(20)).await?;
+
+    // a backlog limit of one decides at most one backlog assessment per cycle
+    let mut decided_per_round = Vec::new();
+    for _ in 0..40 {
+        let mut now_decided = 0;
+        for a in &old[..3] {
+            if decisions_of(&e, a.id).await?.0 > 0 {
+                now_decided += 1;
+            }
+        }
+        decided_per_round.push(now_decided);
+        if now_decided == 3 {
+            break;
+        }
+        let cycle = run_cycle(&e.policy, 3, 1, None).await;
+        assert!(
+            cycle.ok + cycle.failed <= 4,
+            "limit 3 + backlog 1 bounds one cycle"
+        );
+    }
+    assert_eq!(
+        *decided_per_round.last().unwrap(),
+        3,
+        "all three recent ones are eventually decided: {decided_per_round:?}"
+    );
+    assert!(
+        decided_per_round.windows(2).all(|w| w[1] - w[0] <= 1),
+        "at most one backlog assessment of this test per cycle: {decided_per_round:?}"
+    );
+    assert_eq!(
+        decisions_of(&e, old[3].id).await?.0,
+        0,
+        "history older than 24 h is not caught up"
+    );
+    Ok(())
+}
+
+/// Isolated lab measurement (never production): a 400-assessment backlog drains at the configured rate,
+/// each cycle's work stays bounded by limit + backlog, and the newest assessments keep being served. This
+/// is a correctness and back-pressure check of the actual evaluation code against PostgreSQL, not a
+/// throughput claim for the production machine.
+#[tokio::test]
+#[ignore = "requires provisioned roles in an isolated PostgreSQL test container"]
+async fn a_four_hundred_assessment_backlog_drains_at_the_configured_rate_without_unbounded_work(
+) -> Result<()> {
+    let now = Utc::now();
+    let mut e = Env::new().await?;
+    let mut mine = Vec::new();
+    for k in 0..400 {
+        let at = now - Duration::hours(6) + Duration::seconds(k as i64 * 20);
+        let ids = e.events("ssh_login_failure", at, 5).await?;
+        mine.push(e.assessment("ssh_bruteforce", at, at, &ids).await?.id);
+    }
+    newer_assessments(&mut e, 30, now - Duration::minutes(25)).await?;
+    let undecided = |e: &Env, ids: Vec<Uuid>| {
+        let pool = e.owner.pool().clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM unnest($1::uuid[]) AS m(id) WHERE NOT EXISTS (SELECT 1 FROM security_policy_decisions d WHERE d.assessment_id = m.id)",
+            )
+            .bind(ids)
+            .fetch_one(&pool)
+            .await
+        }
+    };
+    let (limit, backlog) = (50_i64, 100_i64);
+    let mut cycles = 0;
+    let mut worst_ms = 0_u128;
+    let mut remaining = undecided(&e, mine.clone()).await?;
+    assert_eq!(remaining, 400);
+    while remaining > 0 && cycles < 40 {
+        let started = std::time::Instant::now();
+        let cycle = run_cycle(&e.policy, limit, backlog, None).await;
+        worst_ms = worst_ms.max(started.elapsed().as_millis());
+        assert_eq!(cycle.failed, 0, "no evaluation fails during the drain");
+        assert!(
+            i64::from(cycle.ok) <= limit + backlog,
+            "cycle work {} exceeds limit + backlog",
+            cycle.ok
+        );
+        let now_remaining = undecided(&e, mine.clone()).await?;
+        assert!(now_remaining <= remaining, "the backlog never grows");
+        remaining = now_remaining;
+        cycles += 1;
+    }
+    eprintln!("LAB backlog 400, limit {limit}, backlog {backlog}: drained in {cycles} cycles, slowest cycle {worst_ms} ms");
+    assert_eq!(remaining, 0, "backlog drained within {cycles} cycles");
+    assert!(
+        cycles >= 4,
+        "a backlog of 400 at 100 per cycle cannot drain in fewer than 4 cycles (got {cycles})"
+    );
+    Ok(())
+}

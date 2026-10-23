@@ -4,6 +4,10 @@
 
 Weitere Änderungen für die nächste Version werden hier gesammelt.
 
+## [1.2.7] - 2026-10-23
+
+- Fix: the policy engine no longer leaves assessments undecided forever. It evaluated only the 200 newest assessments each poll, so an assessment that fell out of that window (after an outage, or in a distributed burst of more than 200 assessments per poll) never received a decision: 167 stayed undecided after the 1.2.3 incident. Each cycle now also evaluates, bounded (`CLAWFORGE_POLICY_ENGINE_BACKLOG_LIMIT`, default 100, at most 500), assessments of the last 24 hours that have no decision although an active policy exists for their rule. Same idempotent upsert and the same evidence logic as any other evaluation (a shared-NAT burst stays unconfirmed, an enumeration is corroborated); the bridge's database function still refuses stale evidence on its own. Bounded isolated lab drain: a 400-assessment backlog drains in 5 cycles at 50 + 100. No schema change.
+- Tooling: `scripts/ops/pipeline-completeness-audit.sql` (read-only) recomputes the expected assessment windows from the events table and checks decisions. On production (2026-10-23): 464 of 464 SSH windows and all HTTP windows since the staggered grids have their assessment with matching counts; the only gap is the 167 undecided assessments fixed above.
 ## [1.2.6] - 2026-10-23
 
 - Observability: the policy engine reports `degraded` (runtime status, short single-line reason) when a polling cycle fails entirely (>= 3 failed evaluations and none succeeded, or the assessment listing fails), instead of heartbeating `running` while producing nothing. The heartbeat then stops refreshing, `clawforge_component_up` drops to 0 and the database-side bridge gate fails closed. Motivated by the 1.2.3 incident (missing EXECUTE grant, ~15 h without shadow decisions). Proven against PostgreSQL with the privilege really revoked and restored. No schema change.
