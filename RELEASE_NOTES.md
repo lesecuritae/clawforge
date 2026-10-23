@@ -1,3 +1,18 @@
+# Clawforge v1.2.6 Policy engine reports itself degraded
+
+## Observability
+- The policy engine no longer reports `running` while every evaluation fails. A cycle with at least three
+  failed evaluations and no success, or a failed assessment listing, sets the runtime status to `degraded`
+  with a short single-line reason, stops refreshing the heartbeat (`clawforge_component_up` drops to 0) and
+  makes the database-side bridge gate fail closed. A few bad assessments among successes do not change it.
+- Background: in 1.2.3 a stale roles script left the engine without EXECUTE on one function; it produced no
+  shadow decisions for about 15 hours while the status read `running` (fixed in production, guarded by
+  `scripts/release/check-role-grants.sql`).
+
+## Upgrade
+- Image-only patch (schema stays 69); rollback is the previous image tag.
+- Bridge, RIPEstat enrichment, live enforcement and quarantine stay off. The quality gate is unchanged (red).
+
 # Clawforge v1.2.5 sshd invalid-user verdict as shape evidence
 
 ## Detection
