@@ -1,6 +1,14 @@
 {
   "schema_version": 1,
   "label_scope": "deliberately controlled scenario intent; detector alerts are not automatic block verdicts",
+  "host_accounts": [
+    "root",
+    "alice",
+    "bob",
+    "carol",
+    "dave",
+    "erin"
+  ],
   "cases": [
     {
       "id": "ssh_typo",
@@ -821,7 +829,102 @@
         "dave",
         "erin"
       ]
+    },
+    {
+      "id": "ssh_small_dictionary_probe",
+      "kind": "ssh",
+      "event_count": 12,
+      "label_attack": true,
+      "expected_rules": [
+        "ssh_bruteforce"
+      ],
+      "distinct_paths": 1,
+      "offsets": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11
+      ],
+      "status": 404,
+      "note": "A short dictionary of guessed account names (five names, fewer than the eight of plain enumeration); sshd reports four of them as nonexistent on this host. Content-based attack_shape evidence (invalid_account_probe) corroborates it. Observed in the isolated run: corroborated (attack_shape), shadow decision rate_limit (confidence 88; the decision ladder depends on the event count, the 12 events here are fewer than the 20 of the long dictionary run); no listing, so no enforcement request.",
+      "expected_strongest_decision": "rate_limit",
+      "expected_enforcement_requests": 0,
+      "usernames": [
+        "root",
+        "admin",
+        "test",
+        "oracle",
+        "ubuntu"
+      ]
+    },
+    {
+      "id": "ssh_user_mistypes_own_name",
+      "kind": "ssh",
+      "event_count": 6,
+      "label_attack": false,
+      "expected_rules": [
+        "ssh_bruteforce"
+      ],
+      "distinct_paths": 1,
+      "offsets": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5
+      ],
+      "status": 404,
+      "note": "One user mistypes their own account name two different ways while retrying; sshd reports those two names as nonexistent, below the invalid-account threshold. Intentionally measures a detector false positive of the five-minute rule, not a block.",
+      "expected_strongest_decision": "challenge",
+      "expected_enforcement_requests": 0,
+      "usernames": [
+        "alice",
+        "alise",
+        "alice",
+        "alic",
+        "alice",
+        "alise"
+      ]
+    },
+    {
+      "id": "ssh_user_mistypes_own_name_three_ways",
+      "kind": "ssh",
+      "event_count": 8,
+      "label_attack": false,
+      "expected_rules": [
+        "ssh_bruteforce"
+      ],
+      "distinct_paths": 1,
+      "offsets": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "status": 404,
+      "note": "Boundary: one user tries three different wrong spellings of their own name (three nonexistent names, one below the threshold of four). Documents the trade-off of the threshold: a fourth spelling would be indistinguishable from a probe. Observed in the isolated run: NOT corroborated (behavior_only, one source), shadow decision rate_limit from the event count alone (8 events); a shadow decision, never a request.",
+      "expected_strongest_decision": "rate_limit",
+      "expected_enforcement_requests": 0,
+      "usernames": [
+        "alice",
+        "alise",
+        "alic",
+        "alcie"
+      ]
     }
   ],
-  "revision_note": "Cases 0-14 and their original expected_rules/label_attack are the frozen 2026-10-21 baseline. expected_rules_after_fix records the deterministic behaviour change of detection-fix rule version 2 (staggered windows, 5xx split) for three cases only; intent labels were not changed. Cases 15-17 were added afterwards. expected_strongest_decision / expected_enforcement_requests describe the policy stage with every policy promoted to class automatic and bridge modes automatic and propose configured. Cases 18-20 (hourly SSH rule) were added with ssh_bruteforce_slow v1; their expected_strongest_decision values are taken from the first real run of the policy stage and reviewed, not chosen to make a gate pass. Cases carry an explicit username/path model since 2026-10-22 (fields `usernames`, `paths`; the generator used a new invalid account name per SSH failure and synthetic /fixture-N paths before, which made every SSH case look like a dictionary run). The model follows the scenario description, not its outcome: legitimate cases use a few valid accounts / ordinary application paths; password guessing against root uses one account, dictionary runs many names; scanners ask for secret and config files (production: 112 source-hours with >= 10 distinct usernames and mass /.env*, /.git/config, /.aws/credentials probes in three days). Labels, offsets, counts and expected detector rules are unchanged."
+  "revision_note": "Cases 0-14 and their original expected_rules/label_attack are the frozen 2026-10-21 baseline. expected_rules_after_fix records the deterministic behaviour change of detection-fix rule version 2 (staggered windows, 5xx split) for three cases only; intent labels were not changed. Cases 15-17 were added afterwards. expected_strongest_decision / expected_enforcement_requests describe the policy stage with every policy promoted to class automatic and bridge modes automatic and propose configured. Cases 18-20 (hourly SSH rule) were added with ssh_bruteforce_slow v1; their expected_strongest_decision values are taken from the first real run of the policy stage and reviewed, not chosen to make a gate pass. Cases carry an explicit username/path model since 2026-10-22 (fields `usernames`, `paths`; the generator used a new invalid account name per SSH failure and synthetic /fixture-N paths before, which made every SSH case look like a dictionary run). The model follows the scenario description, not its outcome: legitimate cases use a few valid accounts / ordinary application paths; password guessing against root uses one account, dictionary runs many names; scanners ask for secret and config files (production: 112 source-hours with >= 10 distinct usernames and mass /.env*, /.git/config, /.aws/credentials probes in three days). Labels, offsets, counts and expected detector rules are unchanged. Cases 21-23 and host_accounts (the fixed set of accounts that exist on the fixture host; sshd reports every other name as an invalid user) were added with the invalid_user signal (migration 0068)."
 }

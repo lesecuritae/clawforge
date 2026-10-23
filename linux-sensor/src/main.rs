@@ -75,6 +75,8 @@ struct QueuedEvent {
 struct SshFailure {
     username: String,
     source_ip: String,
+    /// sshd's own verdict on the account: it logs "invalid user" for a name that does not exist.
+    invalid_user: bool,
 }
 
 /// Recognizes the three common sshd MESSAGE shapes for a failed
@@ -92,6 +94,7 @@ fn parse_sshd_message(message: &str) -> Option<SshFailure> {
         .or_else(|| message.strip_prefix("Failed none for "))
         .or_else(|| message.strip_prefix("Failed publickey for "))
         .or_else(|| message.strip_prefix("Invalid user "))?;
+    let invalid_user = message.starts_with("Invalid user ") || rest.starts_with("invalid user ");
     let rest = rest.strip_prefix("invalid user ").unwrap_or(rest);
     let (username, rest) = rest.split_once(" from ")?;
     let (source_ip, _) = rest.split_once(" port ").unwrap_or((rest, ""));
@@ -103,6 +106,7 @@ fn parse_sshd_message(message: &str) -> Option<SshFailure> {
     Some(SshFailure {
         username: username.to_string(),
         source_ip: source_ip.to_string(),
+        invalid_user,
     })
 }
 
@@ -169,6 +173,7 @@ fn parse_journal_line(line: &str, metrics: &Metrics) -> Option<QueuedEvent> {
             username: failure.username,
             source_ip: failure.source_ip,
             attempt_count: 1,
+            invalid_user: Some(failure.invalid_user),
         }),
     ) {
         Ok(envelope) => {
@@ -630,7 +635,8 @@ mod tests {
             parse_sshd_message("Failed password for root from 203.0.113.7 port 51234 ssh2"),
             Some(SshFailure {
                 username: "root".into(),
-                source_ip: "203.0.113.7".into()
+                source_ip: "203.0.113.7".into(),
+                invalid_user: false
             })
         );
     }
@@ -643,7 +649,8 @@ mod tests {
             ),
             Some(SshFailure {
                 username: "admin".into(),
-                source_ip: "198.51.100.5".into()
+                source_ip: "198.51.100.5".into(),
+                invalid_user: true
             })
         );
     }
@@ -654,7 +661,8 @@ mod tests {
             parse_sshd_message("Invalid user test from 203.0.113.9 port 54321"),
             Some(SshFailure {
                 username: "test".into(),
-                source_ip: "203.0.113.9".into()
+                source_ip: "203.0.113.9".into(),
+                invalid_user: true
             })
         );
     }
@@ -665,7 +673,8 @@ mod tests {
             parse_sshd_message("Failed publickey for git from 203.0.113.1 port 40000 ssh2"),
             Some(SshFailure {
                 username: "git".into(),
-                source_ip: "203.0.113.1".into()
+                source_ip: "203.0.113.1".into(),
+                invalid_user: false
             })
         );
         assert_eq!(
@@ -674,9 +683,26 @@ mod tests {
             ),
             Some(SshFailure {
                 username: "probe".into(),
-                source_ip: "203.0.113.2".into()
+                source_ip: "203.0.113.2".into(),
+                invalid_user: true
             })
         );
+    }
+
+    #[test]
+    fn invalid_user_is_what_sshd_says_not_what_the_name_looks_like() {
+        // an account that exists is "known" even if it looks like a throw-away name
+        let known = parse_sshd_message("Failed password for admin from 203.0.113.7 port 1 ssh2");
+        assert_eq!(known.map(|f| f.invalid_user), Some(false));
+        // sshd marks a nonexistent account, even one that looks legitimate
+        let unknown = parse_sshd_message(
+            "Failed password for invalid user alice from 203.0.113.7 port 1 ssh2",
+        );
+        assert_eq!(unknown.map(|f| f.invalid_user), Some(true));
+        // a user literally named "invalid" is not misread
+        let literal =
+            parse_sshd_message("Failed password for invalid from 203.0.113.7 port 1 ssh2");
+        assert_eq!(literal.map(|f| f.invalid_user), Some(false));
     }
 
     #[test]

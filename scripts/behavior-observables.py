@@ -21,6 +21,7 @@ IGNORED = {"dedupe_key", "occurred_at", "resource", "source_ip", "destination_ip
 # event, so names and ordinary paths are abstracted away. What a classifier can use is how MANY
 # different account names were tried and how many paths match a secret-file signature.
 MIN_USERNAMES = 8
+MIN_INVALID_USERNAMES = 4
 MIN_SIGNATURE_PATHS = 3
 SECRET_PATHS = [re.compile(p, re.I) for p in (
     r"(^|/)\.env([._-][a-z0-9._-]*)?(\?.*)?$",
@@ -50,9 +51,13 @@ def shape(event):
 def behaviour(events):
     """The two counts the product derives, from the exported envelopes."""
     users = {str(e["username"]).lower() for e in events if "username" in e}
+    invalid = {str(e["username"]).lower() for e in events
+               if "username" in e and e.get("invalid_user") is True}
     secret = {e["path"] for e in events if is_secret_path(e.get("path"))}
-    return {"distinct_usernames": len(users), "signature_paths": len(secret),
+    return {"distinct_usernames": len(users), "distinct_invalid_usernames": len(invalid),
+            "signature_paths": len(secret),
             "account_enumeration": len(users) >= MIN_USERNAMES,
+            "invalid_account_probe": len(invalid) >= MIN_INVALID_USERNAMES,
             "secret_path_probe": len(secret) >= MIN_SIGNATURE_PATHS}
 
 
@@ -84,7 +89,7 @@ def compare(cases, alerting=None):
                 continue
             attack_shapes = {shape(e) for e in attack["events"]}
             attack_behaviour = behaviour(attack["events"])
-            flags = ("account_enumeration", "secret_path_probe")
+            flags = ("account_enumeration", "invalid_account_probe", "secret_path_probe")
             if legit_shapes == attack_shapes and all(
                     legit_behaviour[f] == attack_behaviour[f] for f in flags):
                 pairs.append({

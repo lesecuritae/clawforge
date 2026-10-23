@@ -4,6 +4,10 @@
 //! * `account_enumeration` - a source whose failed SSH logins tried many different account
 //!   names. Users behind a shared NAT mistype a few valid accounts; dictionary attacks walk
 //!   through dozens of names.
+//! * `invalid_account_probe` - a source that tried several different account names which sshd
+//!   itself reported as nonexistent. A user mistypes their OWN name once or twice; guessing walks
+//!   through names no one has. Needs a sensor that reports sshd's verdict (migration 0068);
+//!   events without it never count.
 //! * `secret_path_probe` - a source asking for several distinct paths that no legitimate client
 //!   requests (`/.env*`, `/.git/...`, `/.aws/...`, SSH keys, ...). A broken asset release or a
 //!   missing favicon produces many 404s too, but for application paths.
@@ -17,6 +21,7 @@ use clawforge_storage::AssessmentShape;
 use std::env;
 
 pub const DEFAULT_MIN_USERNAMES: i64 = 8;
+pub const DEFAULT_MIN_INVALID_USERNAMES: i64 = 4;
 pub const DEFAULT_MIN_SIGNATURE_PATHS: i64 = 3;
 
 /// POSIX extended expressions (matched case-insensitively in SQL) for paths a legitimate client
@@ -36,6 +41,7 @@ pub const DEFAULT_PATH_PATTERNS: &[&str] = &[
 pub struct ShapeConfig {
     pub enabled: bool,
     pub min_usernames: i64,
+    pub min_invalid_usernames: i64,
     pub min_signature_paths: i64,
     pub path_patterns: Vec<String>,
 }
@@ -43,6 +49,7 @@ pub struct ShapeConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShapeKind {
     AccountEnumeration,
+    InvalidAccountProbe,
     SecretPathProbe,
 }
 
@@ -50,6 +57,7 @@ impl ShapeKind {
     pub fn as_str(self) -> &'static str {
         match self {
             ShapeKind::AccountEnumeration => "account_enumeration",
+            ShapeKind::InvalidAccountProbe => "invalid_account_probe",
             ShapeKind::SecretPathProbe => "secret_path_probe",
         }
     }
@@ -90,6 +98,10 @@ impl ShapeConfig {
                 "CLAWFORGE_ATTACK_SHAPE_MIN_USERNAMES",
                 DEFAULT_MIN_USERNAMES,
             ),
+            min_invalid_usernames: number(
+                "CLAWFORGE_ATTACK_SHAPE_MIN_INVALID_USERNAMES",
+                DEFAULT_MIN_INVALID_USERNAMES,
+            ),
             min_signature_paths: number(
                 "CLAWFORGE_ATTACK_SHAPE_MIN_SIGNATURE_PATHS",
                 DEFAULT_MIN_SIGNATURE_PATHS,
@@ -107,6 +119,9 @@ impl ShapeConfig {
         if shape.distinct_usernames >= self.min_usernames {
             return Some(ShapeKind::AccountEnumeration);
         }
+        if shape.distinct_invalid_usernames >= self.min_invalid_usernames {
+            return Some(ShapeKind::InvalidAccountProbe);
+        }
         if shape.signature_paths >= self.min_signature_paths {
             return Some(ShapeKind::SecretPathProbe);
         }
@@ -122,7 +137,15 @@ mod tests {
         AssessmentShape {
             events: 20,
             distinct_usernames: users,
+            distinct_invalid_usernames: 0,
             signature_paths: paths,
+        }
+    }
+
+    fn invalid(users: i64, invalid: i64) -> AssessmentShape {
+        AssessmentShape {
+            distinct_invalid_usernames: invalid,
+            ..shape(users, 0)
         }
     }
 
@@ -130,6 +153,7 @@ mod tests {
         ShapeConfig {
             enabled: true,
             min_usernames: DEFAULT_MIN_USERNAMES,
+            min_invalid_usernames: DEFAULT_MIN_INVALID_USERNAMES,
             min_signature_paths: DEFAULT_MIN_SIGNATURE_PATHS,
             path_patterns: Vec::new(),
         }
@@ -147,6 +171,25 @@ mod tests {
         );
         assert_eq!(
             c.classify(&shape(40, 0)),
+            Some(ShapeKind::AccountEnumeration)
+        );
+    }
+
+    #[test]
+    fn a_few_mistyped_own_names_are_not_an_invalid_account_probe() {
+        let c = config();
+        // users behind a NAT with valid accounts: nothing invalid at all
+        assert_eq!(c.classify(&invalid(5, 0)), None);
+        // a forgetful user mistyping their own name two or three ways
+        assert_eq!(c.classify(&invalid(3, 2)), None);
+        assert_eq!(c.classify(&invalid(4, 3)), None);
+        assert_eq!(
+            c.classify(&invalid(5, 4)),
+            Some(ShapeKind::InvalidAccountProbe)
+        );
+        // enumeration (many names in total) is checked first
+        assert_eq!(
+            c.classify(&invalid(30, 29)),
             Some(ShapeKind::AccountEnumeration)
         );
     }
