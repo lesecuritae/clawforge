@@ -414,7 +414,11 @@ impl PostgresStore {
     /// between - is never touched by this, regardless of age: incident
     /// retention is its own, separately operator-agreed decision (see
     /// `docs/retention.md`), not something this method decides on its
-    /// behalf. `security_policy_decisions` referencing a deleted
+    /// behalf. The one further exception (migration `0070`): an assessment whose
+    /// decision backs a REAL (not simulation-only) execution request is kept with
+    /// that decision, because the request stores only ids and a hash while the
+    /// decision row holds the evidence snapshot an operator must be able to read
+    /// later. `security_policy_decisions` referencing a deleted
     /// assessment are removed first (no `ON DELETE CASCADE` from
     /// `security_assessments` to `security_policy_decisions` - migration
     /// `0034` left that FK`RESTRICT`, so this must happen in this order or
@@ -432,24 +436,14 @@ impl PostgresStore {
         &self,
         older_than: DateTime<Utc>,
     ) -> Result<u64> {
-        let mut tx = self.pool().begin().await?;
-        sqlx::query(
-            "DELETE FROM security_policy_decisions WHERE assessment_id IN ( \
-                 SELECT id FROM security_assessments \
-                 WHERE incident_id IS NULL AND last_seen < $1 \
-             )",
-        )
-        .bind(older_than)
-        .execute(&mut *tx)
-        .await?;
-        let result = sqlx::query(
-            "DELETE FROM security_assessments WHERE incident_id IS NULL AND last_seen < $1",
-        )
-        .bind(older_than)
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        Ok(result.rows_affected())
+        // The protection of assessments whose decision backs a real (non-simulated) execution request
+        // lives in the database function (migration 0070): this role cannot read execution_requests.
+        let removed: i64 =
+            sqlx::query_scalar("SELECT clawforge_delete_expired_security_assessments($1)")
+                .bind(older_than)
+                .fetch_one(self.pool())
+                .await?;
+        Ok(removed.max(0) as u64)
     }
 
     /// Same bucket membership as `list_events_for_bucket`, plus one evidence
