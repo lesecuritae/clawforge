@@ -467,3 +467,11 @@ mod tests {
         assert_eq!(groups[0].confidence, 63);
     }
 }
+
+#[cfg(test)]
+mod network_ids_policy_boundary {
+    #[test]
+    fn raw_ids_alert_does_not_implicitly_become_an_incident() {
+        assert!(!super::is_correlatable("network_ids_alert"));
+    }
+}

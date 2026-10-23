@@ -1,0 +1,10 @@
+%YAML 1.1
+---
+# Live capture only. Everything else (ruleset validation, offline replay, the rule updater) uses the
+# base suricata.yaml, which has no privilege change. The container starts with the few capabilities
+# needed to open the capture socket, then the engine drops to an unprivileged user for the whole
+# packet-processing lifetime.
+include: /opt/clawforge/suricata/suricata.yaml
+run-as:
+  user: suricata
+  group: suricata

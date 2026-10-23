@@ -1222,6 +1222,25 @@ async fn security_events_register_sensor_and_record_event() -> anyhow::Result<()
     );
     assert_eq!(stored_lifecycle["evidence"]["action"], "started");
 
+    // Passive network IDS: schema accepts it; both tuple endpoints remain
+    // pseudonymous and replay is idempotent. Packet source is not attribution.
+    let ids = fixtures::network_ids_alert();
+    let ids_id = store.record_security_event(sensor_id, &ids).await?;
+    assert_eq!(store.record_security_event(sensor_id, &ids).await?, ids_id);
+    let ids_stored = store
+        .get_security_event(ids_id)
+        .await?
+        .expect("IDS event exists");
+    assert_eq!(ids_stored["event_type"], "network_ids_alert");
+    for field in ["source_ip", "destination_ip"] {
+        assert!(ids_stored["evidence"][field]
+            .as_str()
+            .unwrap()
+            .starts_with("ip-pseudonym:"));
+    }
+    assert_eq!(ids_stored["evidence"]["signature_id"], 1000001);
+    assert_eq!(ids_stored["evidence"]["observed_action"], "allowed");
+
     let sensor = store
         .get_security_sensor(sensor_id)
         .await?

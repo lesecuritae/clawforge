@@ -184,3 +184,8 @@ backpressure, batching, retry with an explicit drop budget, and
 Docker's events carry no hostname field, unlike journald's `_HOSTNAME` -
 set `CLAWFORGE_DOCKER_SENSOR_HOST_LABEL` if more than one host's Docker
 daemon feeds the same Clawforge instance.
+
+## Optional passive network IDS
+
+See [network-ids.md](network-ids.md) for the owned EVE adapter, optional Suricata
+engine, placement constraints, durable delivery, tests and remaining rollout gates.

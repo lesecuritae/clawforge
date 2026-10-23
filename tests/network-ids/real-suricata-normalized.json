@@ -1,0 +1,42 @@
+[
+  {
+    "dedupe_key": "eve:df53af55dcb9b77a333a2869d36a2a2cb511d8febfe6d7ee3c9124b0f2a77f58",
+    "destination_ip": "198.51.100.10",
+    "destination_port": 9999,
+    "engine": "suricata",
+    "event_type": "network_ids_alert",
+    "flow_id": 281476037856739,
+    "generator_id": 1,
+    "native_severity": 3,
+    "observed_action": "allowed",
+    "occurred_at": "2026-10-23T08:58:01+00:00",
+    "protocol": "udp",
+    "resource": "203.0.113.8",
+    "severity": "low",
+    "signature_id": 1000001,
+    "signature_revision": 1,
+    "source": "suricata:lab",
+    "source_ip": "203.0.113.8",
+    "source_port": 41000
+  },
+  {
+    "dedupe_key": "eve:91545e35f8604895165462733a3510187966405cafc8b25c643228d1828b2a47",
+    "destination_ip": "198.51.100.10",
+    "destination_port": 9999,
+    "engine": "suricata",
+    "event_type": "network_ids_alert",
+    "flow_id": 290067201877168,
+    "generator_id": 1,
+    "native_severity": 3,
+    "observed_action": "allowed",
+    "occurred_at": "2026-10-23T08:58:01.002000+00:00",
+    "protocol": "udp",
+    "resource": "203.0.113.8",
+    "severity": "low",
+    "signature_id": 1000001,
+    "signature_revision": 1,
+    "source": "suricata:lab",
+    "source_ip": "203.0.113.8",
+    "source_port": 41002
+  }
+]

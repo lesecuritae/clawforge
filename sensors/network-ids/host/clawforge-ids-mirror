@@ -1,0 +1,65 @@
+#!/bin/sh
+# Passive traffic mirror for the Clawforge network IDS on a Linux/Proxmox host.
+#
+#   clawforge-ids-mirror up|down|status
+#
+# Copies the INGRESS side of each source port (tap devices of guests, and optionally the uplink) to
+# one target port with tc "mirred mirror". Ingress-only copies every frame exactly once (traffic
+# entering the host from a guest, traffic entering from the LAN); it never redirects, so the
+# original packet is always forwarded untouched. Idempotent. Nothing is changed on the bridge, the
+# routes, the addresses or the firewall.
+#
+# /etc/default/clawforge-ids-mirror:
+#   MIRROR_TARGET=tap100i1                # the sensor VM's dedicated mirror NIC (its own isolated bridge)
+#   MIRROR_SOURCES="tap100i0 tap101i0 nic0"
+set -eu
+[ -r /etc/default/clawforge-ids-mirror ] && . /etc/default/clawforge-ids-mirror
+TARGET="${MIRROR_TARGET:-}"; SOURCES="${MIRROR_SOURCES:-}"
+PREF=4242   # our filters only; anything else on the ports is never touched
+log() { logger -t clawforge-ids-mirror "$*" 2>/dev/null || true; echo "$*"; }
+exists() { [ -d "/sys/class/net/$1" ]; }
+master() { basename "$(readlink -f "/sys/class/net/$1/master" 2>/dev/null)" 2>/dev/null || true; }
+has_ours() { tc filter show dev "$1" ingress 2>/dev/null | grep -q "pref $PREF "; }
+
+up() {
+  [ -n "$TARGET" ] && [ -n "$SOURCES" ] || { echo "MIRROR_TARGET and MIRROR_SOURCES must be set" >&2; exit 2; }
+  exists "$TARGET" || { log "target $TARGET not present (guest stopped?): nothing mirrored"; return 0; }
+  for s in $SOURCES; do
+    [ "$s" != "$TARGET" ] || { echo "target must not be a source" >&2; exit 2; }
+  done
+  # The target must sit on its own bridge: a mirror target on a source's bridge would feed copies back.
+  tm="$(master "$TARGET")"
+  for s in $SOURCES; do
+    if [ -n "$tm" ] && [ "$tm" = "$(master "$s")" ]; then
+      echo "target $TARGET shares bridge $tm with source $s: refusing (feedback loop)" >&2; exit 2
+    fi
+  done
+  for s in $SOURCES; do
+    exists "$s" || { log "source $s not present, skipped"; continue; }
+    tc qdisc show dev "$s" | grep -q clsact || tc qdisc add dev "$s" clsact
+    tc filter del dev "$s" ingress pref $PREF 2>/dev/null || true   # re-install: the target's ifindex may be new
+    tc filter add dev "$s" ingress pref $PREF matchall action mirred egress mirror dev "$TARGET"
+    log "mirror $s (ingress) -> $TARGET"
+  done
+}
+down() {
+  for s in $SOURCES; do
+    exists "$s" || continue
+    tc filter del dev "$s" ingress pref $PREF 2>/dev/null || true
+    # remove the clsact qdisc only when nothing else uses it
+    if tc qdisc show dev "$s" | grep -q clsact \
+       && [ -z "$(tc filter show dev "$s" ingress 2>/dev/null)" ] && [ -z "$(tc filter show dev "$s" egress 2>/dev/null)" ]; then
+      tc qdisc del dev "$s" clsact 2>/dev/null || true
+    fi
+    log "mirror $s removed"
+  done
+}
+status() {
+  echo "target: ${TARGET:-unset} ($(exists "${TARGET:-none}" && echo present || echo absent))"
+  for s in $SOURCES; do
+    if exists "$s" && has_ours "$s"; then echo "source $s: mirroring"; else echo "source $s: NOT mirroring"; fi
+  done
+  exists "${TARGET:-none}" && ip -s link show "$TARGET" | sed -n 3,6p
+  return 0
+}
+case "${1:-}" in up) up ;; down) down ;; status) status ;; *) echo "usage: $0 up|down|status" >&2; exit 2 ;; esac

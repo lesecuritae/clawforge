@@ -85,10 +85,17 @@ fn pseudonymize_optional_field(value: &Option<String>) -> Result<Option<String>>
 fn pseudonymize_evidence(evidence: &SecurityEventEvidence) -> Result<SecurityEventEvidence> {
     use clawforge_security_events::{
         AuthAnomalyEvidence, AuthFailureEvidence, DnsAnomalyEvidence, FirewallBlockEvidence,
-        HttpAnomalyEvidence, PortScanDetectedEvidence, SshLoginAnomalyEvidence,
-        SshLoginFailureEvidence,
+        HttpAnomalyEvidence, NetworkIdsAlertEvidence, PortScanDetectedEvidence,
+        SshLoginAnomalyEvidence, SshLoginFailureEvidence,
     };
     Ok(match evidence.clone() {
+        SecurityEventEvidence::NetworkIdsAlert(e) => {
+            SecurityEventEvidence::NetworkIdsAlert(NetworkIdsAlertEvidence {
+                source_ip: pseudonymize_field(&e.source_ip)?,
+                destination_ip: pseudonymize_field(&e.destination_ip)?,
+                ..e
+            })
+        }
         SecurityEventEvidence::FirewallBlock(e) => {
             SecurityEventEvidence::FirewallBlock(FirewallBlockEvidence {
                 source_ip: pseudonymize_field(&e.source_ip)?,

@@ -1,3 +1,24 @@
+# Clawforge v1.2.4 Passive network IDS (Suricata), fewer feed incidents
+
+## Network IDS
+- Optional passive Suricata 8.0.7 integration (`docs/network-ids.md`): new `network_ids_alert` security
+  event (migration 0068), Clawforge-owned EVE adapter, hardened engine image, ET Open rule updater with
+  engine validation and atomic swap, reversible host mirror script, end-to-end self-test.
+- Observations are never correlated, never create incidents or enforcement requests, and add no
+  approval. Engine health (alive, packet drops) is visible through the sensor heartbeat and `status.json`.
+- Nothing is enabled by this release; the sensor is a separate, optional stack.
+
+## Fixes
+- A threat feed re-read on every sync no longer republishes its unchanged entries as
+  `new_threat_indicator` events: the hourly Spamhaus DROP/ASN sync had created about 2,150 `info`
+  incidents per hour. `asn_change` is no longer raised when two providers describe one ASN differently.
+  Existing incidents are not touched.
+
+## Upgrade
+- Migration 0068 is additive (ledger 67 to 68); the patch rollback is
+  `scripts/release/rollback-last-migration.sql -v top=68` (nothing is dropped).
+- Bridge, RIPEstat enrichment, live enforcement and quarantine stay off.
+
 # Clawforge v1.2.3 Attack-shape evidence, inventory events no longer incidents
 
 ## Detection
