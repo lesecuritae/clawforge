@@ -4,6 +4,7 @@
 
 Weitere Änderungen für die nächste Version werden hier gesammelt.
 
+- Tests/docs: an end-to-end regression test (real roles, positive control) proves that corroboration by attack shape, earlier-episode history or a second event family never creates a bridge request while the reputation requirement is on; the bridge documentation now states exactly what `REQUIRE_THREAT_INTEL=false` removes. No runtime change.
 ## [1.2.7] - 2026-10-23
 
 - Fix: the policy engine no longer leaves assessments undecided forever. It evaluated only the 200 newest assessments each poll, so an assessment that fell out of that window (after an outage, or in a distributed burst of more than 200 assessments per poll) never received a decision: 167 stayed undecided after the 1.2.3 incident. Each cycle now also evaluates, bounded (`CLAWFORGE_POLICY_ENGINE_BACKLOG_LIMIT`, default 100, at most 500), assessments of the last 24 hours that have no decision although an active policy exists for their rule. Same idempotent upsert and the same evidence logic as any other evaluation (a shared-NAT burst stays unconfirmed, an enumeration is corroborated); the bridge's database function still refuses stale evidence on its own. Bounded isolated lab drain: a 400-assessment backlog drains in 5 cycles at 50 + 100. No schema change.

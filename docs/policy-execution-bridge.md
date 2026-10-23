@@ -40,7 +40,7 @@ policy engine's `runtime_status.last_error`. Shadow decisions are unaffected.
 
 The compose file passes these through empty; empty counts as unset.
 
-`attack_shape` evidence (`behavior-validation.md`) can make a decision *corroborated* in shadow mode, but it never satisfies the bridge: a request still needs a counting reputation listing.
+`attack_shape` evidence (`behavior-validation.md`), the history of an earlier episode of the same source and a second event family can each make a decision *corroborated* in shadow mode, but with the default `..._REQUIRE_THREAT_INTEL=true` none of them satisfies the bridge: a request still needs a counting reputation listing (`history_shape_and_second_family_corroboration_never_create_a_bridge_request` proves it end to end with the real roles, with a positive control that does create a request). Setting `..._REQUIRE_THREAT_INTEL=false` (refused for `automatic`) removes that protection for `simulate` and `propose`: then a shape-, history- or family-corroborated `block` or `rate_limit` is enough for a request (the same test fails in that configuration). That is an explicit operator decision, and a repeating shared NAT is corroborated by its own history.
 
 ## What the database checks (all modes)
 
