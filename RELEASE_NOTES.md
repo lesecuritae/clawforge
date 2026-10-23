@@ -1,3 +1,23 @@
+# Clawforge v1.2.5 sshd invalid-user verdict as shape evidence
+
+## Detection
+- The Linux sensor carries sshd's own `invalid user` verdict (`invalid_user`, optional on the wire; older
+  sensors never count). The shape function counts `distinct_invalid_usernames` (migration 0069, output a
+  superset of 0067) and the policy engine adds the shape `invalid_account_probe` (>= 4 different account
+  names sshd reports as nonexistent; `CLAWFORGE_ATTACK_SHAPE_MIN_INVALID_USERNAMES`). It corroborates an
+  assessment as one more content-based observation; enforcement still needs a counting reputation listing.
+- Behaviour harness: fixed host account model and three new scenarios (24): stage 1 TP 12 / FP 6 / TN 6 /
+  FN 0, attacker finding TP 8 / FP 0 / TN 12 / FN 4. **The quality gate stays red**; the four false
+  negatives are unchanged (`docs/behavior-validation.md`).
+- Roll the new Linux sensor binary out to remote hosts to start sending the verdict; the server accepts
+  events with and without it.
+
+## Upgrade
+- Migration 0069 replaces one read-only function (ledger 68 to 69). The patch rollback is
+  `scripts/release/rollback-last-migration.sql -v top=69`; the replaced function body returns a superset
+  of the previous output, so the previous image keeps working (checked in the rehearsal).
+- Bridge, RIPEstat enrichment, live enforcement and quarantine stay off.
+
 # Clawforge v1.2.4 Passive network IDS (Suricata), fewer feed incidents
 
 ## Network IDS

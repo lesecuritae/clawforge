@@ -4,6 +4,8 @@
 
 Weitere Änderungen für die nächste Version werden hier gesammelt.
 
+## [1.2.5] - 2026-10-23
+
 - Detection: sshd's own `invalid user` verdict is carried by the Linux sensor (`invalid_user`, optional on the wire) and counted by the shape function (migration 0069, `distinct_invalid_usernames`). New shape `invalid_account_probe` (>= 4 different nonexistent account names); sensors that do not report the verdict never count. Behaviour harness: fixed host account model, three new scenarios (24): stage 1 TP 12 / FP 6 / TN 6 / FN 0, attacker finding TP 8 / FP 0 / TN 12 / FN 4, quality gate still false.
 ## [1.2.4] - 2026-10-23
 
