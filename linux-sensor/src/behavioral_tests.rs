@@ -33,7 +33,7 @@ fn ssh_message(plan: &Value, case: &Value, n: usize, ip: &str) -> String {
             let name = names[n % names.len()].as_str().unwrap();
             let exists = plan["host_accounts"]
                 .as_array()
-                .map_or(true, |hosts| hosts.iter().any(|h| h.as_str() == Some(name)));
+                .is_none_or(|hosts| hosts.iter().any(|h| h.as_str() == Some(name)));
             let invalid = if exists { "" } else { "invalid user " };
             format!("Failed password for {invalid}{name} from {ip} port 2222 ssh2")
         }
