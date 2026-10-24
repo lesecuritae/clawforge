@@ -53,6 +53,23 @@ Derived from this VM only: the LAN `192.168.0.0/24` (gateway 192.168.0.1, this V
 Tailscale `100.64.0.0/10`, the resolvers reached through 192.168.0.1. The operator must confirm
 these and add the ISP/remote ranges they administer from; nothing here has been applied.
 
+## abuse.ch feeds (ThreatFox, URLhaus, MalwareBazaar): what is wired and what is missing
+
+Checked 2026-10-24 without printing any value. Wiring is complete: the worker container gets
+`THREATFOX_AUTH_KEY_FILE`, `URLHAUS_AUTH_KEY_FILE` and `MALWAREBAZAAR_AUTH_KEY_FILE`, mounted from
+`secrets/threatfox_auth_key`, `secrets/urlhaus_auth_key` and `secrets/malwarebazaar_auth_key`. The three files exist
+but contain **one byte (no key)**; `provider_status` therefore records `provider configuration is missing: ...
+cannot be empty` and the worker backs off about an hour between tries. This is a missing credential, not a code
+defect, and nothing in the repository can fix it: the key is a free abuse.ch Auth-Key that only the account owner can
+create. Nothing is claimed fixed and no key is fabricated.
+
+Operator steps (no restart needed; the file is read on every fetch, so write it in place so the bind-mounted inode is
+kept): put the key, one line, mode 0600, into each of the three files, then request a manual provider sync or wait for
+the next scheduled attempt, and verify per feed: `provider_status.status = 'ok'` with a fresh `last_success_at`. The
+same key is expected to serve all three feeds; verify each, do not assume. These feeds are not "counting"
+reputation sources for the enforcement bridge, so the pilot does not depend on them. BGPView and BGPStream stay
+disabled as retired.
+
 ## Backup risk
 
 The 2026-10-23 cleanup removed the earlier dumps; the service wrote a new complete one at 00:55 UTC on 2026-10-24. A dump ages out of the release gate after 27 h. Retention math: 14 daily dumps of ~23 GiB need ~320 GiB; about 160 GiB are free. Either shorten
