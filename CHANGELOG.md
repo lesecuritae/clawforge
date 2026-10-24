@@ -4,9 +4,14 @@
 
 Weitere Änderungen für die nächste Version werden hier gesammelt.
 
+## [1.2.9] - 2026-10-24
+
 - Observability: the executor reads back every completed, unexpired firewall rule generation once per poll and reports (warning + `firewall_rule_drift_detected` audit event, id and scope only) when its element has vanished from the adapter state, or cannot be read; recovery is noticed. Read-only: no rollback, re-apply or status change. The reviewed pilot target "drift detection <= 1 poll" had no implementation for a block that disappears mid-TTL. Proven in a disposable real-kernel lab (out-of-band `nft delete element` / `add element`), with PostgreSQL tests and a mutation control for the listing query.
 
-- Tests/docs: an end-to-end regression test (real roles, positive control) proves that corroboration by attack shape, earlier-episode history or a second event family never creates a bridge request while the reputation requirement is on; the bridge documentation now states exactly what `REQUIRE_THREAT_INTEL=false` removes. No runtime change.
+- Fix (deployment config): `compose.yml` did not pass `CLAWFORGE_FIREWALL_MAX_TTL_SECONDS` and `CLAWFORGE_FIREWALL_MAX_CONCURRENT_APPLIES_PER_ADAPTER` to the executor although the binary reads them, so setting them in `.env` was silently ignored. They are passed through now (empty = built-in default); `scripts/test-compose-executor-env.py` fails on the old file and asserts that the live authorization is never wired into compose.
+- Fix (sensor host script): `clawforge-ids-mirror` no longer treats two ports without a bridge master as sharing one bridge (it refused such a pair; the safe direction, and Proxmox taps are always bridged).
+- Tests/tooling: PostgreSQL negative paths of the two-person live authorization with mutation controls; never-block tailnet test and an environment-driven candidate validator that uses the real parser; an isolated guest-restart equivalent for the mirror hook (`tests/network-ids/mirror_restart_lab.sh`, private network namespace, not a real reboot); `scripts/phase7b-observe.py` (pre-registered Phase 7B plan, bounded read-only probe, evaluator that never passes a gate); docs for the live canary check pack and the executed-versus-coded matrix.
+
 ## [1.2.8] - 2026-10-23
 
 - Observability: the API and the incident service refresh their runtime heartbeat every 30 s while they run (they wrote `running` once at startup, so `clawforge_component_up` was 0 for a healthy process after 2 minutes); the incident service reports `error` once when a cycle fails. No schema change.
@@ -14,6 +19,7 @@ Weitere Änderungen für die nächste Version werden hier gesammelt.
 - Fix (migration 0070): retention no longer deletes the assessment evidence behind a real (non-simulated) enforcement request; `clawforge_delete_expired_security_assessments(TIMESTAMPTZ)` is a SECURITY DEFINER function granted to the worker role only. Simulated requests do not keep evidence alive. Proven against PostgreSQL with positive and negative controls.
 - Tests: two kernel-lab tests in a disposable container with its own network namespace (40-cycle apply/block/rollback/restore/native-expiry series; never-block list protects real traffic and fails closed). No host network is touched.
 - Tooling: `scripts/live-readiness-check.py` is a read-only checklist (gates closed, pilot-limit prerequisites, runtime/sensor/feed freshness, backup, shape verdict). It never reports `live_ready: true`; unknown stays unknown. See `docs/live-readiness-audit.md`.
+- Tests/docs: an end-to-end regression test (real roles, positive control) proves that corroboration by attack shape, earlier-episode history or a second event family never creates a bridge request while the reputation requirement is on; the bridge documentation now states exactly what `REQUIRE_THREAT_INTEL=false` removes. No runtime change.
 ## [1.2.7] - 2026-10-23
 
 - Fix: the policy engine no longer leaves assessments undecided forever. It evaluated only the 200 newest assessments each poll, so an assessment that fell out of that window (after an outage, or in a distributed burst of more than 200 assessments per poll) never received a decision: 167 stayed undecided after the 1.2.3 incident. Each cycle now also evaluates, bounded (`CLAWFORGE_POLICY_ENGINE_BACKLOG_LIMIT`, default 100, at most 500), assessments of the last 24 hours that have no decision although an active policy exists for their rule. Same idempotent upsert and the same evidence logic as any other evaluation (a shared-NAT burst stays unconfirmed, an enumeration is corroborated); the bridge's database function still refuses stale evidence on its own. Bounded isolated lab drain: a 400-assessment backlog drains in 5 cycles at 50 + 100. No schema change.

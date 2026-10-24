@@ -1,3 +1,55 @@
+# Clawforge v1.2.9 Drift check for active blocks, executor limits reach the container
+
+Includes everything in v1.2.8 (runtime heartbeat, retention keeps real-request evidence, migration 0070,
+readiness checklist). No new migration.
+
+## Fix
+- The executor reads back every completed, unexpired firewall rule generation once per poll and reports a
+  vanished or unreadable element once (warning + `firewall_rule_drift_detected` audit event with ids and scope only),
+  and notices when it returns. The reviewed pilot target "drift detection <= 1 poll" had no implementation for a block
+  that disappears mid-TTL. Observation only: no rollback, re-apply or status change; an element added out of band that
+  Clawforge does not own is not detected. Proven in a disposable real-kernel lab (out-of-band `nft delete`/`add`
+  element), with PostgreSQL tests and a mutation control.
+- `compose.yml` passes `CLAWFORGE_FIREWALL_MAX_TTL_SECONDS` and `CLAWFORGE_FIREWALL_MAX_CONCURRENT_APPLIES_PER_ADAPTER`
+  to the executor. They were read by the binary but never passed through, so setting them in `.env` had no effect.
+- `clawforge-ids-mirror` (sensor host script): two ports without a bridge master are no longer mistaken for one
+  shared bridge.
+
+## Tooling and tests
+- `scripts/phase7b-observe.py`: pre-registered, hashed Phase 7B plan; bounded read-only probe with in-cycle retries
+  that keep every attempt as a row; evaluator that computes false positives, rollback p95, packet effect, lockout
+  and drift only from real measurements and never passes a gate. Replaying the first 48 h window gives
+  `CRITERIA_NOT_MET`. See `docs/phase7b-next-observation.md`.
+- PostgreSQL negative paths for the two-person live authorization (with mutation controls); an isolated
+  guest-restart equivalent for the mirror hook (not a real reboot); live canary check pack and an
+  executed-versus-coded matrix in `docs/live-canary-checkpack.md` / `docs/live-readiness-audit.md`.
+
+No gate, flag, approval or authorization changes. The executor stays in dry-run.
+
+# Clawforge v1.2.8 Runtime heartbeat, retention evidence, readiness checklist
+
+## Fix
+- The API and the incident service refresh their runtime heartbeat every 30 s while they run. They wrote `running`
+  once at startup, so `clawforge_component_up` was 0 for a healthy process after two minutes. The incident service
+  reports `error` once when a cycle fails.
+- Migration 0070: retention no longer deletes the assessment evidence behind a real (non-simulated) execution
+  request. `clawforge_delete_expired_security_assessments(TIMESTAMPTZ)` is a SECURITY DEFINER function granted to
+  the worker role only; simulation-only requests do not keep evidence alive. Additive; the previous image keeps
+  working.
+
+## Safety
+- The executor refuses a productive start (`DRY_RUN=false` with a live authorization) unless the operator has
+  defined a never-block list. Dry-run starts are unchanged.
+
+## Tooling and tests
+- `scripts/live-readiness-check.py`: a read-only checklist (gates closed, pilot-limit prerequisites, runtime, sensor
+  and feed freshness, backup, 24 h shape verdict). It never reports `live_ready: true`; unknown stays unknown.
+  See `docs/live-readiness-audit.md`.
+- Two kernel-lab tests in a disposable container with its own network namespace (a 40-cycle
+  apply/block/rollback/restore/native-expiry series and the never-block list against real traffic).
+
+No gate, flag, approval or authorization changes. The executor stays in dry-run.
+
 # Clawforge v1.2.7 Policy engine decides every assessment
 
 ## Fix
