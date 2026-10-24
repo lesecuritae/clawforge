@@ -37,7 +37,8 @@ controls that make the test fail when the check is weakened:
    plus a restricted recovery snapshot).
 3. Packet effect, measured from a controlled source that is NOT the operator's management path: baseline passes,
    blocked packet dropped, restored packet passes. Record in `measurements.jsonl` (`canary`).
-4. Expiry: the kernel removes the element at its timeout even with the executor stopped; the rollback receipt follows.
+4. Drift while the block is active: the executor reads every completed, unexpired generation back once per poll and writes a `firewall_rule_drift_detected` audit event (and a warning) if its element has vanished or cannot be read; it only observes. An element added out of band that Clawforge does not own is not detected.
+5. Expiry: the kernel removes the element at its timeout even with the executor stopped; the rollback receipt follows.
    `verified` rollback plus an empty set is the end state. A rule generation left `recovery_required` is a failed
    canary, not a pass (see the 2026-10-18 history).
 
