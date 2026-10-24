@@ -3370,11 +3370,11 @@ mod tests {
             )),
         };
         for protected in [
-            "100.78.9.15",
-            "100.103.212.17",
+            "100.64.0.5",
+            "100.127.255.254",
             "100.64.0.0/10",
             "100.0.0.0/8", // a broader target that merely contains the protected range
-            "fd7a:115c:a1e0::7c3b:910",
+            "fd7a:115c:a1e0::1",
         ] {
             assert!(
                 adapter.render(&action_for(indicator(protected))).is_err(),
