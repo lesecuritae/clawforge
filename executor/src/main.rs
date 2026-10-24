@@ -722,6 +722,86 @@ async fn recover_firewall_rule_generation(
     RecoveryOutcome::Restored
 }
 
+/// What the read-only check saw for one active generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DriftState {
+    InForce,
+    Absent,
+    Unreadable,
+}
+
+/// Transition-based reporting so a persistent condition is logged and audited once, not every poll:
+/// returns the message to emit when the state changed, `None` when there is nothing new to say.
+fn drift_transition(previous: Option<DriftState>, now: DriftState) -> Option<&'static str> {
+    match (previous, now) {
+        (Some(before), after) if before == after => None,
+        (None, DriftState::InForce) => None,
+        (_, DriftState::Absent) => {
+            Some("active firewall rule generation is no longer in the kernel/adapter state (drift)")
+        }
+        (_, DriftState::Unreadable) => {
+            Some("active firewall rule generation could not be read back (adapter unreadable)")
+        }
+        (Some(_), DriftState::InForce) => Some("active firewall rule generation is in force again"),
+    }
+}
+
+async fn verify_firewall_rule_generation_target(
+    adapter_name: &str,
+    target_json: &serde_json::Value,
+) -> anyhow::Result<VerificationResult> {
+    let target = firewall_rule_recovery_target(adapter_name, target_json)?;
+    let adapter = adapter_for(adapter_name)
+        .ok_or_else(|| anyhow::anyhow!("unrecognized firewall recovery adapter"))?;
+    adapter
+        .verify(&target)
+        .await
+        .map_err(|error| anyhow::anyhow!(error.to_string()))
+}
+
+/// Read-only drift check of every completed, unexpired rule generation, once per poll tick (the reviewed
+/// pilot target is "<= 1 poll"). It changes nothing: a missing element is reported (warning + audit event) and
+/// the generation keeps its owner and its TTL sweep; an element that was added out of band is not seen by it.
+async fn sweep_active_generation_drift(
+    store: &PostgresStore,
+    seen: &mut std::collections::HashMap<Uuid, DriftState>,
+) {
+    let intents = match store.active_completed_firewall_rule_intents().await {
+        Ok(intents) => intents,
+        Err(error) => {
+            tracing::warn!(%error, "could not list active firewall rule generations for the drift check");
+            return;
+        }
+    };
+    let live: std::collections::HashSet<Uuid> = intents.iter().map(|intent| intent.id).collect();
+    seen.retain(|id, _| live.contains(id));
+    for intent in intents {
+        let now = match verify_firewall_rule_generation_target(&intent.adapter, &intent.target_json)
+            .await
+        {
+            Ok(VerificationResult::Verified) => DriftState::InForce,
+            Ok(VerificationResult::NotPresent) => DriftState::Absent,
+            Err(_) => DriftState::Unreadable,
+        };
+        let message = drift_transition(seen.insert(intent.id, now), now);
+        if let Some(message) = message {
+            tracing::warn!(intent_id=%intent.id, adapter=%intent.adapter, state=?now, "{message}");
+            let observed = match now {
+                DriftState::Absent => Some("absent"),
+                DriftState::Unreadable => Some("unreadable"),
+                DriftState::InForce => None,
+            };
+            if let Some(observed) = observed {
+                if let Err(error) = store.record_firewall_rule_drift(&intent, observed).await {
+                    tracing::warn!(%error, intent_id=%intent.id, "could not record the drift observation");
+                    // report again next tick rather than losing the audit event
+                    seen.remove(&intent.id);
+                }
+            }
+        }
+    }
+}
+
 /// TTL/recovery sweep for durable firewall rule generations, run once per poll
 /// tick alongside `quarantine_runtime::sweep` and `sweep_expired_firewall_targets`.
 /// Consumes `recoverable_firewall_rule_intents` (prepared + completed-and-expired);
@@ -1844,6 +1924,8 @@ async fn main() -> anyhow::Result<()> {
         .max(2);
     let mut ticks = interval(Duration::from_secs(seconds));
     ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut drift_seen: std::collections::HashMap<Uuid, DriftState> =
+        std::collections::HashMap::new();
     loop {
         tokio::select! {
             _ = ticks.tick() => {
@@ -1853,6 +1935,7 @@ async fn main() -> anyhow::Result<()> {
                 sweep_expired_firewall_targets(&store).await;
                 sweep_kill_switch_requests(&store).await;
                 sweep_firewall_rule_generations(&store).await;
+                sweep_active_generation_drift(&store, &mut drift_seen).await;
                 let started = std::time::Instant::now();
                 match store.claim_execution_request_for_dispatch(Some(worker_id)).await {
                     Ok(Some(claimed)) => {
@@ -2073,6 +2156,32 @@ mod tests {
     static FIREWALL_ADAPTERS_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     #[test]
+    fn drift_is_reported_on_a_transition_only_and_recovery_is_noticed() {
+        use DriftState::*;
+        // healthy from the start: nothing to say, and nothing on every following poll
+        assert_eq!(drift_transition(None, InForce), None);
+        assert_eq!(drift_transition(Some(InForce), InForce), None);
+        // the element disappears: reported once, not on every poll afterwards
+        assert!(drift_transition(Some(InForce), Absent)
+            .unwrap()
+            .contains("drift"));
+        assert_eq!(drift_transition(Some(Absent), Absent), None);
+        // first sight of an already-missing element (executor restart) is reported
+        assert!(drift_transition(None, Absent).is_some());
+        // adapter unreadable is its own condition, also once
+        assert!(drift_transition(Some(InForce), Unreadable)
+            .unwrap()
+            .contains("read back"));
+        assert_eq!(drift_transition(Some(Unreadable), Unreadable), None);
+        // Absent <-> Unreadable changes the diagnosis and is reported
+        assert!(drift_transition(Some(Absent), Unreadable).is_some());
+        // recovery is visible too
+        assert!(drift_transition(Some(Absent), InForce)
+            .unwrap()
+            .contains("in force again"));
+    }
+
+    #[test]
     fn rule_recovery_decodes_internal_snapshot_and_rejects_scope_or_schema_drift() {
         let target = FirewallTarget::ThreatIntelIndicator {
             cidr: "203.0.113.18/32".into(),
@@ -2141,6 +2250,89 @@ mod tests {
                 VerificationResult::NotPresent
             );
         }
+    }
+
+    /// The drift check against a real kernel: an out-of-band removal of an active block is seen as `Absent`
+    /// (and reported once), a later out-of-band restore as `InForce` again. Uses the persisted versioned
+    /// snapshot exactly as the sweep does.
+    #[tokio::test]
+    #[ignore = "requires isolated nftables lab with NET_ADMIN"]
+    async fn active_generation_drift_check_sees_out_of_band_removal_and_restore_in_a_real_kernel() {
+        let adapter = clawforge_firewall_agent::NftablesAdapter::new();
+        let address = "203.0.113.221";
+        let action = FirewallAction {
+            target: FirewallTarget::ThreatIntelIndicator {
+                cidr: format!("{address}/32"),
+                source: "isolated drift regression".into(),
+            },
+            ttl_seconds: 120,
+            reason: "isolated drift regression".into(),
+        };
+        let snapshot = RecoveryTarget::new("nftables", action.target.clone()).to_json();
+        let nft = |args: Vec<String>| async move {
+            tokio::process::Command::new("nft")
+                .args(args)
+                .status()
+                .await
+                .unwrap()
+                .success()
+        };
+        let observe = || async {
+            match verify_firewall_rule_generation_target("nftables", &snapshot).await {
+                Ok(VerificationResult::Verified) => DriftState::InForce,
+                Ok(VerificationResult::NotPresent) => DriftState::Absent,
+                Err(_) => DriftState::Unreadable,
+            }
+        };
+        adapter.apply(&action, false).await.unwrap();
+        let mut previous = None;
+        let mut reports = Vec::new();
+        for step in 0..4 {
+            match step {
+                1 => assert!(
+                    nft([
+                        "delete",
+                        "element",
+                        "inet",
+                        "clawforge",
+                        "blocklist",
+                        &format!("{{ {address} }}")
+                    ]
+                    .map(String::from)
+                    .to_vec())
+                    .await
+                ),
+                3 => assert!(
+                    nft([
+                        "add",
+                        "element",
+                        "inet",
+                        "clawforge",
+                        "blocklist",
+                        &format!("{{ {address} timeout 120s }}")
+                    ]
+                    .map(String::from)
+                    .to_vec())
+                    .await
+                ),
+                _ => {}
+            }
+            let now = observe().await;
+            if let Some(message) = drift_transition(previous, now) {
+                reports.push((step, now, message));
+            }
+            previous = Some(now);
+            // step 2 repeats the missing state: it must not report again
+        }
+        assert_eq!(
+            reports
+                .iter()
+                .map(|(step, state, _)| (*step, *state))
+                .collect::<Vec<_>>(),
+            vec![(1, DriftState::Absent), (3, DriftState::InForce)],
+            "reported once when the element vanished and once when it returned: {reports:?}"
+        );
+        adapter.rollback(&action).await.unwrap();
     }
 
     fn claimed(action_name: &str, target: Option<serde_json::Value>) -> ClaimedExecutionRequest {

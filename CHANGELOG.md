@@ -4,6 +4,8 @@
 
 Weitere Änderungen für die nächste Version werden hier gesammelt.
 
+- Observability: the executor reads back every completed, unexpired firewall rule generation once per poll and reports (warning + `firewall_rule_drift_detected` audit event, id and scope only) when its element has vanished from the adapter state, or cannot be read; recovery is noticed. Read-only: no rollback, re-apply or status change. The reviewed pilot target "drift detection <= 1 poll" had no implementation for a block that disappears mid-TTL. Proven in a disposable real-kernel lab (out-of-band `nft delete element` / `add element`), with PostgreSQL tests and a mutation control for the listing query.
+
 - Tests/docs: an end-to-end regression test (real roles, positive control) proves that corroboration by attack shape, earlier-episode history or a second event family never creates a bridge request while the reputation requirement is on; the bridge documentation now states exactly what `REQUIRE_THREAT_INTEL=false` removes. No runtime change.
 ## [1.2.8] - 2026-10-23
 
