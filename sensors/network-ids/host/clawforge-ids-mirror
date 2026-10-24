@@ -18,7 +18,9 @@ TARGET="${MIRROR_TARGET:-}"; SOURCES="${MIRROR_SOURCES:-}"
 PREF=4242   # our filters only; anything else on the ports is never touched
 log() { logger -t clawforge-ids-mirror "$*" 2>/dev/null || true; echo "$*"; }
 exists() { [ -d "/sys/class/net/$1" ]; }
-master() { basename "$(readlink -f "/sys/class/net/$1/master" 2>/dev/null)" 2>/dev/null || true; }
+# Name of the bridge a port is enslaved to; empty when it has none (readlink -f would otherwise invent
+# ".../master" for a port without a master and two unbridged ports would look like one shared bridge).
+master() { if [ -e "/sys/class/net/$1/master" ]; then basename "$(readlink -f "/sys/class/net/$1/master")"; fi; }
 has_ours() { tc filter show dev "$1" ingress 2>/dev/null | grep -q "pref $PREF "; }
 
 up() {
