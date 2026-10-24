@@ -130,7 +130,7 @@ def evaluate(state, now):
     if verdict is None:
         prereq.append(item("shape_observation_24h", "UNKNOWN", "no evaluator verdict supplied (earliest 2026-10-24T12:50Z)"))
     else:
-        prereq.append(item("shape_observation_24h", "PASS" if verdict.get("status") == "OBSERVED" else "FAIL", f"evaluator status {verdict.get('status')}; it reports measurements only, never a pass"))
+        prereq.append(item("shape_observation_24h", "PASS" if verdict.get("status") == "OBSERVED" else "FAIL", f"evaluator status {verdict.get('status')}: the window was measured completely; this is NOT an acceptance of detection quality or of Gate 7B"))
 
     report = {
         "schema": SCHEMA,
