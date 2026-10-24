@@ -42,7 +42,7 @@ coverage 0.929 (< 0.95), and everything event-based `not_measured`.
 ```
 phase7b-observe.py plan --out plan.json --start 2026-10-26T08:00:00Z --hours 48 \
   --probe-argv-json '["ssh","-o","BatchMode=yes","-o","ConnectTimeout=7","-o","ServerAliveInterval=3","-o","ServerAliveCountMax=1",
-                      "root@100.103.212.17","python3","/root/clawforge-pilot-20261018/observe.py","snapshot","<existing-request-id>"]' \
+                      "root@<pilot-host>","python3","/root/clawforge-pilot-20261018/observe.py","snapshot","<existing-request-id>"]' \
   --stop-file ~/.local/state/phase7b/STOP --max-runtime-seconds 180000
 # operator edits only operator_confirmed_by / operator_confirmed_at (they are outside the plan hash)
 phase7b-observe.py probe --plan plan.json --samples samples.jsonl
