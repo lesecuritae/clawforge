@@ -495,6 +495,11 @@ services:
       # docs/firewall-agent.md's "Mass-block budget" section.
       CLAWFORGE_FIREWALL_RATE_WINDOW_SECONDS: ${CLAWFORGE_FIREWALL_RATE_WINDOW_SECONDS:-300}
       CLAWFORGE_FIREWALL_MAX_APPLIES_PER_WINDOW: ${CLAWFORGE_FIREWALL_MAX_APPLIES_PER_WINDOW:-20}
+      # Ceiling for the TTL of a REAL apply (a block must always self-expire) and the number of
+      # applies in flight per adapter. Empty = the executor's own built-in default. These were read by
+      # the executor but never passed through by this file, so setting them in .env had no effect.
+      CLAWFORGE_FIREWALL_MAX_TTL_SECONDS: ${CLAWFORGE_FIREWALL_MAX_TTL_SECONDS:-}
+      CLAWFORGE_FIREWALL_MAX_CONCURRENT_APPLIES_PER_ADAPTER: ${CLAWFORGE_FIREWALL_MAX_CONCURRENT_APPLIES_PER_ADAPTER:-}
       # Which adapters a firewall.* action fans out to (comma-separated) -
       # "nftables" (the host-wide, any-external-service guarantee) is
       # always included regardless of this list. See docs/firewall-agent.md's

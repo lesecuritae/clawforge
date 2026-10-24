@@ -39,11 +39,13 @@ jobs:
       - run: python3 -I scripts/test-pilot-observation-evaluate.py
       - run: python3 -I scripts/test-shape-observation-evaluate.py
       - run: python3 -I scripts/test-live-readiness-check.py
+      - run: python3 -I scripts/test-compose-executor-env.py
+      - run: python3 -I scripts/test-phase7b-observe.py
       - run: python3 -I scripts/test-behavior-observables.py
       - run: python3 -m unittest discover -s tests/network-ids
       - run: |
           sh -n sensors/network-ids/host/clawforge-ids-mirror
-          bash -n sensors/network-ids/host/ids-selftest.sh sensors/network-ids/update-rules.sh tests/network-ids/mirror_lab.sh tests/network-ids/update_rules_security.sh
+          bash -n sensors/network-ids/host/ids-selftest.sh sensors/network-ids/update-rules.sh tests/network-ids/mirror_lab.sh tests/network-ids/mirror_restart_lab.sh tests/network-ids/update_rules_security.sh
       - run: ./scripts/test-postgres.sh
       - run: cargo clippy --workspace --all-targets -- -D warnings
 

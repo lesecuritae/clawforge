@@ -18,6 +18,10 @@
 | `CLAWFORGE_THREATFOX_SECRET_FILE` | `./secrets/threatfox_auth_key` | Docker secret file mounted as the ThreatFox credential |
 | `CLAWFORGE_URLHAUS_SECRET_FILE` | `./secrets/urlhaus_auth_key` | Docker secret file mounted as the URLhaus credential |
 | `CLAWFORGE_MALWAREBAZAAR_SECRET_FILE` | `./secrets/malwarebazaar_auth_key` | Docker secret file mounted as the MalwareBazaar credential |
+| `CLAWFORGE_FIREWALL_NEVER_BLOCK_CIDRS` | empty (built-in loopback/link-local only) | Executor: operator-defined ranges that are never blocked (management, VPN, resolvers, gateway) |
+| `CLAWFORGE_FIREWALL_MAX_TTL_SECONDS` | empty (built-in default 3600) | Executor: ceiling for the TTL of a real apply; reviewed pilot value 900 |
+| `CLAWFORGE_FIREWALL_MAX_APPLIES_PER_WINDOW` / `CLAWFORGE_FIREWALL_RATE_WINDOW_SECONDS` | `20` / `300` | Executor: real applies allowed per window; reviewed pilot value 2 per 300 s |
+| `CLAWFORGE_FIREWALL_MAX_CONCURRENT_APPLIES_PER_ADAPTER` | empty (built-in 5) | Executor: applies in flight per adapter |
 | `CLAWFORGE_ANALYZER_PROVIDER` | `mock` | Optional analyzer provider (`mock` or an OpenAI-compatible provider name) |
 | `CLAWFORGE_ANALYZER_MODEL` | `offline` | Model identifier passed to the analyzer provider |
 | `CLAWFORGE_ANALYZER_BASE_URL` | unset | OpenAI-compatible `/chat/completions` base URL for non-mock providers |

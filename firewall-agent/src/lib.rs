@@ -3363,6 +3363,79 @@ mod tests {
     }
 
     #[test]
+    fn tailnet_ranges_protect_both_families_and_only_those_ranges() {
+        let adapter = NftablesAdapter {
+            never_block: never_block_list_from_configured(Some(
+                "100.64.0.0/10, fd7a:115c:a1e0::/48",
+            )),
+        };
+        for protected in [
+            "100.78.9.15",
+            "100.103.212.17",
+            "100.64.0.0/10",
+            "100.0.0.0/8", // a broader target that merely contains the protected range
+            "fd7a:115c:a1e0::7c3b:910",
+        ] {
+            assert!(
+                adapter.render(&action_for(indicator(protected))).is_err(),
+                "{protected} must be refused"
+            );
+        }
+        // Control: just outside the CGNAT /10 and outside the Tailscale ULA /48.
+        for allowed in ["100.128.0.1", "100.63.255.255", "fd7a:115c:a1e1::1"] {
+            assert!(
+                adapter.render(&action_for(indicator(allowed))).is_ok(),
+                "{allowed} must stay blockable"
+            );
+        }
+    }
+
+    /// Validates an operator-reviewed candidate with the REAL parser and overlap logic. Skipped unless
+    /// `CLAWFORGE_CANDIDATE_NEVER_BLOCK_CIDRS` is set, so the private values never live in the repository:
+    ///   CLAWFORGE_CANDIDATE_NEVER_BLOCK_CIDRS="a,b"  CLAWFORGE_CANDIDATE_MUST_PROTECT="x,y"
+    ///   CLAWFORGE_CANDIDATE_MUST_ALLOW="z"  cargo test -p clawforge-firewall-agent candidate_never_block -- --ignored
+    #[test]
+    #[ignore = "needs CLAWFORGE_CANDIDATE_* variables"]
+    fn candidate_never_block_list_protects_every_listed_address_and_allows_the_canary() {
+        let configured = std::env::var("CLAWFORGE_CANDIDATE_NEVER_BLOCK_CIDRS")
+            .expect("CLAWFORGE_CANDIDATE_NEVER_BLOCK_CIDRS");
+        let list = never_block_list_from_configured(Some(&configured));
+        assert!(list.is_ok(), "candidate list does not parse: {list:?}");
+        let adapter = NftablesAdapter { never_block: list };
+        let names = |key: &str| -> Vec<String> {
+            std::env::var(key)
+                .unwrap_or_default()
+                .split(',')
+                .map(|entry| entry.trim().to_string())
+                .filter(|entry| !entry.is_empty())
+                .collect()
+        };
+        let protect = names("CLAWFORGE_CANDIDATE_MUST_PROTECT");
+        let allow = names("CLAWFORGE_CANDIDATE_MUST_ALLOW");
+        assert!(
+            !protect.is_empty(),
+            "list at least one address that must be protected"
+        );
+        for address in &protect {
+            assert!(
+                adapter.render(&action_for(indicator(address))).is_err(),
+                "{address} is not protected by the candidate"
+            );
+        }
+        for address in &allow {
+            assert!(
+                adapter.render(&action_for(indicator(address))).is_ok(),
+                "{address} would be refused by the candidate"
+            );
+        }
+        println!(
+            "CANDIDATE_VALIDATED protect={} allow={}",
+            protect.len(),
+            allow.len()
+        );
+    }
+
+    #[test]
     fn render_refuses_a_resolved_incident_source_outright() {
         // The hard guardrail, not just the placeholder convention: even if
         // a caller mistakenly tries to render an already-resolved target,
