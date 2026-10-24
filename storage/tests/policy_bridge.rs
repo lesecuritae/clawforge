@@ -733,6 +733,31 @@ async fn intel_gates(owner_url: &str, policy_url: &str) -> Result<()> {
             assert_eq!(outcome, rejected("threat_intel_required"));
         }
     }
+    // One age bounds the decision, the assessment AND the listing. Counting feeds reconfirm a listing only at
+    // their sync (hourly for Spamhaus), so a listing reconfirmed 40 minutes ago is refused - as "not listed" -
+    // under the 600 s age used here, and counts under an age that covers the feed cadence. A source that is
+    // listed all along therefore looks unlisted for part of every cycle when the age is shorter than the interval.
+    {
+        let name = "ip-pseudonym:feed-cadence";
+        env.resolve(name, 600).await?;
+        let ip = env.ip_of(name);
+        env.list(&ip, 80, 2_400).await?;
+        let d = env.decision(policy, name, false, 0).await?;
+        assert_eq!(
+            env.run(d, &propose).await?,
+            rejected("threat_intel_required"),
+            "listed, but not reconfirmed within the 600 s age"
+        );
+        let mut covering = params(BridgeMode::Propose);
+        covering.requester_id = Some(operator);
+        covering.max_per_window = 50;
+        covering.window_seconds = 3600;
+        covering.max_evidence_age_seconds = 7_200;
+        assert!(
+            matches!(env.run(d, &covering).await?, BridgeOutcome::Enqueued(_)),
+            "the same listing counts under an age that covers the feed cadence"
+        );
+    }
     // An ingest-time snapshot is overruled by a current view that no longer lists the source.
     env.resolve("ip-pseudonym:snapshot", 600).await?;
     let snap = env

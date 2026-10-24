@@ -98,6 +98,21 @@ def evaluate(state, now):
         limit = 2 * (f.get("interval_seconds") or 3600)
         good = f.get("enabled") and f.get("state") == "ok" and f.get("last_success_age_seconds") is not None and f["last_success_age_seconds"] <= limit
         prereq.append(item(f"feed_{feed}", "PASS" if good else "FAIL", f"state={f.get('state')} last success {f.get('last_success_age_seconds')} s ago (need <= {limit})"))
+    # The bridge applies ONE age to the decision, the assessment AND the reputation listing. Counting feeds reconfirm
+    # a listing only at their sync (hourly for Spamhaus), so a listing is "fresh" for just age / interval of each cycle
+    # when the age is shorter than the interval; the refusal then reads threat_intel_required, as if it were unlisted.
+    mode = ((state.get("policy_engine_env") or {}).get("CLAWFORGE_POLICY_BRIDGE_MODE") or "").strip()
+    if mode in ("", "off"):
+        prereq.append(item("bridge_evidence_age_covers_feed_cadence", "PASS", "bridge off: not applicable until a mode is chosen (then the evidence age must be >= 2x the slowest counting feed interval)"))
+    else:
+        raw = ((state.get("policy_engine_env") or {}).get("CLAWFORGE_POLICY_BRIDGE_MAX_EVIDENCE_AGE_SECONDS") or "").strip()
+        intervals = [f.get("interval_seconds") for f in feeds.values() if f["id"] in COUNTING_FEEDS and f.get("enabled") and f.get("interval_seconds")]
+        if not raw.isdigit() or not intervals:
+            prereq.append(item("bridge_evidence_age_covers_feed_cadence", "UNKNOWN", f"evidence age {raw!r}, counting feed intervals {intervals}"))
+        else:
+            need = 2 * max(intervals)
+            prereq.append(item("bridge_evidence_age_covers_feed_cadence", "PASS" if int(raw) >= need else "FAIL",
+                               f"MAX_EVIDENCE_AGE={raw} s, need >= {need} s (2x the slowest counting feed, {max(intervals)} s); a shorter age refuses a genuinely listed source for part of every sync cycle"))
     failing = [f["id"] for f in state.get("providers", []) if f.get("enabled") and f.get("state") == "error"]
     if failing:
         warnings.append(f"enabled providers in error (not counting feeds, e.g. missing abuse.ch AuthKeys): {failing}")
@@ -168,7 +183,7 @@ def collect(args):
             "CLAWFORGE_EXECUTOR_DRY_RUN", "CLAWFORGE_EXECUTOR_LIVE_AUTHORIZATION", "CLAWFORGE_FIREWALL_NEVER_BLOCK_CIDRS",
             "CLAWFORGE_FIREWALL_MAX_TTL_SECONDS", "CLAWFORGE_FIREWALL_MAX_APPLIES_PER_WINDOW", "CLAWFORGE_FIREWALL_RATE_WINDOW_SECONDS",
             "CLAWFORGE_FIREWALL_MAX_CONCURRENT_APPLIES_PER_ADAPTER"]),
-        "policy_engine_env": container_env("clawforge-clawforge-policy-engine-1", ["CLAWFORGE_POLICY_BRIDGE_MODE"]),
+        "policy_engine_env": container_env("clawforge-clawforge-policy-engine-1", ["CLAWFORGE_POLICY_BRIDGE_MODE", "CLAWFORGE_POLICY_BRIDGE_MAX_EVIDENCE_AGE_SECONDS"]),
         "worker_env": container_env("clawforge-clawforge-worker-1", ["CLAWFORGE_ENABLE_IP_CONTEXT"]),
     }
     result = sh(["docker", "exec", "-i", "clawforge-postgres-1", "psql", "-X", "-At", "-U", "clawforge", "-d", "clawforge", "-v", "ON_ERROR_STOP=1"], QUERY)

@@ -31,7 +31,7 @@ policy engine's `runtime_status.last_error`. Shadow decisions are unaffected.
 | `CLAWFORGE_POLICY_BRIDGE_RATELIMIT_ACTION` | action for `RateLimit`: `haproxy_ratelimit.block_incident_source` (at least one of the two is required) |
 | `..._TTL_SECONDS` | block TTL carried in the request target, 1-86400 (required) |
 | `..._MAX_PER_WINDOW`, `..._WINDOW_SECONDS` | request budget enforced in SQL, 1-100 per 60-86400 s (required; also clamped in SQL) |
-| `..._MAX_EVIDENCE_AGE_SECONDS` | maximum age of the decision and the assessment, 1-604800 (required) |
+| `..._MAX_EVIDENCE_AGE_SECONDS` | maximum age of the decision and the assessment **and of the reputation listing's last reconfirmation**, 1-604800 (required); must be at least 2x the slowest counting feed interval (see below) |
 | `..._MIN_INTEL_CONFIDENCE` | minimum confidence (1-100, required) of the reputation listing that counts; judged on the current source view (`threat-intel-evidence.md`) |
 | `..._REQUIRE_THREAT_INTEL` | default `true`; `false` is refused for `automatic` |
 | `..._REQUESTER_ID` | `propose` only: UUID of an enabled **Operator** account (Administrators are refused) |
@@ -41,6 +41,20 @@ policy engine's `runtime_status.last_error`. Shadow decisions are unaffected.
 The compose file passes these through empty; empty counts as unset.
 
 `attack_shape` evidence (`behavior-validation.md`), the history of an earlier episode of the same source and a second event family can each make a decision *corroborated* in shadow mode, but with the default `..._REQUIRE_THREAT_INTEL=true` none of them satisfies the bridge: a request still needs a counting reputation listing (`history_shape_and_second_family_corroboration_never_create_a_bridge_request` proves it end to end with the real roles, with a positive control that does create a request). Setting `..._REQUIRE_THREAT_INTEL=false` (refused for `automatic`) removes that protection for `simulate` and `propose`: then a shape-, history- or family-corroborated `block` or `rate_limit` is enough for a request (the same test fails in that configuration). That is an explicit operator decision, and a repeating shared NAT is corroborated by its own history.
+
+### The evidence age also bounds the listing, and feeds only reconfirm at their sync
+
+One age judges three things: the decision, the assessment and the listing. A counting feed (Spamhaus DROP/EDROP/ASN,
+hourly; Feodo, every 30 minutes) rewrites `last_seen` of all its indicators at each sync, so a listing that is current
+all along is "reconfirmed" only within the last `interval` seconds of each cycle. With an age shorter than the
+interval, a genuinely listed source is refused as `threat_intel_required` - the same reason as for an unlisted one - for
+the rest of every cycle (age 900 s against an hourly feed: about three quarters of the time). The regression in
+`storage/tests/policy_bridge.rs` (`bridge_judges_the_current_intel_view_and_revalidates_at_dispatch`, block "feed
+cadence") shows the same 40-minute-old listing refused under 600 s and accepted under 7200 s. Choose at least twice the
+slowest counting feed interval (7200 s today); the trade-off is that decisions and assessments up to that age are then
+accepted too. `scripts/live-readiness-check.py` fails `bridge_evidence_age_covers_feed_cadence` for a configured mode
+whose age is shorter. Measured on production on 2026-10-24: all indicators of each counting feed share one `last_seen`,
+which cycles from 0 to the feed interval.
 
 ## What the database checks (all modes)
 
