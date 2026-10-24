@@ -2903,6 +2903,165 @@ async fn firewall_inflight_operation_count_rejects_non_positive_staleness_window
 /// with no linked policy decision shows `evidence: null` rather than
 /// erroring, that a nonexistent id returns `None` (not an error), and
 /// that recorded approvals show up in order.
+/// Negative paths of the live authorization for a TWO-PERSON firewall action (risk `high`): the requester's own
+/// approval, a repeated approval by the same identity, one approval of two, an approval bound to a changed context,
+/// an expired approval window and approvals recorded on a different request must never authorize a real apply. The
+/// production policy requires two distinct approvers for high/critical actions (`approval_policies`).
+#[tokio::test]
+#[ignore = "requires an isolated PostgreSQL test container"]
+async fn firewall_live_authorization_negative_paths_for_a_two_person_action() -> anyhow::Result<()>
+{
+    let url =
+        std::env::var("CLAWFORGE_TEST_DATABASE_URL").or_else(|_| std::env::var("DATABASE_URL"))?;
+    let store = PostgresStore::connect(&url).await?;
+    let uniq = uuid::Uuid::new_v4();
+    let required: i32 = sqlx::query_scalar(
+        "SELECT required_approvals FROM approval_policies WHERE risk_level='high'",
+    )
+    .fetch_one(store.pool())
+    .await?;
+    assert!(
+        required >= 2,
+        "the high-risk approval policy must require two people"
+    );
+
+    let make_user = |label: &'static str| {
+        let store = store.clone();
+        async move {
+            let name = format!("{label}-{uniq}");
+            let id = store
+                .create_admin_user(&name, "Administrator", "test-hash")
+                .await?;
+            anyhow::Ok((id, name))
+        }
+    };
+    let (requester, requester_name) = make_user("two-req").await?;
+    let (first, first_name) = make_user("two-apr1").await?;
+    let (second, second_name) = make_user("two-apr2").await?;
+    let action: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO actions(id,name,type,risk_level,required_scope,requires_approval,enabled) \
+         VALUES($1,$2,'connector_action','high','agent:action:read',TRUE,TRUE) RETURNING id",
+    )
+    .bind(uuid::Uuid::new_v4())
+    .bind(format!("nftables.block_two_person_{uniq}"))
+    .fetch_one(store.pool())
+    .await?;
+    let new_request = |ip: &'static str| {
+        let store = store.clone();
+        let requester_name = requester_name.clone();
+        async move {
+            store
+                .create_execution_request(&clawforge_storage::ExecutionRequestInput {
+                    action_id: action,
+                    workflow_run_id: None,
+                    decision_id: None,
+                    requested_by: requester_name,
+                    requested_by_id: Some(requester),
+                    idempotency_key: None,
+                    target: Some(json!({"kind":"threat_intel_indicator","cidr":ip,"source":"negative-path-test"})),
+                })
+                .await
+        }
+    };
+    // park a request so a parallel dispatch test can never claim it (authorization is status-agnostic)
+    let park = |id: uuid::Uuid| {
+        let pool = store.pool().clone();
+        async move {
+            sqlx::query("UPDATE execution_requests SET status='cancelled' WHERE id=$1")
+                .bind(id)
+                .execute(&pool)
+                .await?;
+            anyhow::Ok(())
+        }
+    };
+
+    let request = new_request("203.0.113.131").await?;
+    assert!(
+        !store.firewall_request_live_authorized(request).await?,
+        "no approval: not authorized"
+    );
+    // the requester's own approval is refused and does not count
+    let own = store
+        .approve_execution_request(request, requester, &requester_name)
+        .await;
+    assert!(own
+        .unwrap_err()
+        .to_string()
+        .contains("requester cannot approve"));
+    assert!(!store.firewall_request_live_authorized(request).await?);
+    // one of two is not enough, and the same identity cannot approve twice to make two
+    let one = store
+        .approve_execution_request(request, first, &first_name)
+        .await?;
+    assert_eq!(one["status"], "waiting_approval");
+    let again = store
+        .approve_execution_request(request, first, &first_name)
+        .await;
+    assert!(again.unwrap_err().to_string().contains("already approved"));
+    assert!(
+        !store.firewall_request_live_authorized(request).await?,
+        "1 of 2 approvals must not authorize"
+    );
+    // approvals recorded on another request never count here
+    let other = new_request("203.0.113.132").await?;
+    store
+        .approve_execution_request(other, first, &first_name)
+        .await?;
+    store
+        .approve_execution_request(other, second, &second_name)
+        .await?;
+    park(other).await?;
+    assert!(
+        store.firewall_request_live_authorized(other).await?,
+        "control: two distinct approvers authorize"
+    );
+    assert!(
+        !store.firewall_request_live_authorized(request).await?,
+        "approvals of another request must not transfer"
+    );
+    // the second distinct approver completes it - control for all the negatives above
+    let two = store
+        .approve_execution_request(request, second, &second_name)
+        .await?;
+    assert_eq!(two["status"], "approved");
+    park(request).await?;
+    assert!(store.firewall_request_live_authorized(request).await?);
+
+    // an expired approval window withdraws the authorization. The window itself is immutable (migration 0029), so
+    // the passing of time is simulated in one transaction with triggers bypassed (session_replication_role), which
+    // the isolated test owner may do; authorization was true for the very same request just before (control).
+    assert!(store.firewall_request_live_authorized(other).await?);
+    let mut tx = store.pool().begin().await?;
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("UPDATE execution_requests SET approval_expires_at = NOW() - INTERVAL '1 minute' WHERE id=$1")
+        .bind(other)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    assert!(
+        !store.firewall_request_live_authorized(other).await?,
+        "an expired approval window must not authorize"
+    );
+
+    // approvals are bound to the context hash and the database refuses to change that hash afterwards, so an
+    // approved request cannot be re-pointed at a different action context; authorization stays as it was
+    let tamper = sqlx::query("UPDATE execution_requests SET approval_context_hash = 'changed-after-approval' WHERE id=$1")
+        .bind(request)
+        .execute(store.pool())
+        .await;
+    assert!(
+        tamper.unwrap_err().to_string().contains("immutable"),
+        "the approval context must be immutable once set"
+    );
+    assert!(
+        store.firewall_request_live_authorized(request).await?,
+        "a refused tamper changes nothing"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 #[ignore = "requires an isolated PostgreSQL test container"]
 async fn execution_approval_detail_assembles_target_evidence_and_approvals() -> anyhow::Result<()> {
