@@ -43,7 +43,7 @@ in the `agent_firewall_status` projection).
 | Canary count | exactly 1 (`/32` or `/128`) | operator applies exactly one reviewed target in 7A. |
 | Max active blocks | 1 | operational during 7A (the rate budget bounds the rate, not the absolute live count). |
 | Rollback p95 | **≤ 5 s** | P7-3 rollback-latency p95 over the pilot window. |
-| Drift detection | ≤ 1 poll (~10 s) | verify-after-apply + TTL sweep each executor tick. |
+| Drift detection | ≤ 1 poll (~10 s) | verify-after-apply, and a read-only readback of every completed, unexpired rule generation on each executor tick (`sweep_active_generation_drift`): a vanished element is warned and audited once (`firewall_rule_drift_detected`), a returning one is noticed. It observes only: nothing is rolled back or re-applied, and an element added out of band that Clawforge does not own is not seen. Before this check existed only the immediate post-apply readback and the post-expiry rollback looked at kernel state, so the target had no implementation for a block that vanished mid-TTL. |
 | Lockout SLO | **0** management/own-IP blocks; self-unblock ≤ TTL (900 s) | never-block + ISP guard; the native timeout is the hard upper bound. |
 | False-positive budget | **0** accepted | with one hand-reviewed target; any FP stops the pilot immediately. |
 | Pilot duration (7B) | **48–72 h** | observation + a verified restore before 7C (the first automatic rule). |

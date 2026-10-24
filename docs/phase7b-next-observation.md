@@ -55,7 +55,7 @@ from an unlisted source would pollute the very SSH signals this system measures.
 
 `measurements.jsonl` record types: `canary` (`lab`, `distinct_human_approvals`, `baseline_ok`, `blocked_dropped`,
 `restored_ok`, `rollback_seconds`, `receipt_after_deadline_seconds`), `lockout_probe` (`protected_address`,
-`refused`), `drift_injection` (`injected_at`, `detected_at`), `false_positive_review` (`label_source`,
+`refused`), `drift_injection` (`injected_at`, `detected_at` = the `created_at` of the `firewall_rule_drift_detected` audit event of that generation; an injection without such an event is undetected), `false_positive_review` (`label_source`,
 `classification`, `was_blocked`). Lockout probes can be produced without touching a host by the real-parser
 validator (`candidate_never_block_list_protects_every_listed_address_and_allows_the_canary`).
 

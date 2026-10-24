@@ -337,3 +337,83 @@ async fn recoverable_sweep_set_covers_prepared_and_expired_only() -> Result<()> 
     );
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "requires an isolated firewall-rule PostgreSQL fixture with schema 0055"]
+async fn only_completed_unexpired_generations_are_listed_for_the_drift_check_and_drift_is_audited(
+) -> Result<()> {
+    let store = store().await?;
+    let adapter = "nftables";
+    let action = "nftables.block_indicator";
+    let scope = "clawforge_block_v4";
+    let state = json!({"set_present": false});
+    let plan = json!({"commands": [["nft", "delete", "element", "..."]]});
+    let execution = execution(&store, action).await?;
+    let mut ids = Vec::new();
+    for _ in 0..3 {
+        let fp = format!("203.0.113.{}/32", Uuid::new_v4().as_u128() % 250 + 1);
+        let target = json!({"cidr": fp, "scope": scope});
+        let id = store
+            .prepare_firewall_rule_intent(
+                execution, adapter, action, scope, &fp, &target, &state, &plan, 3600,
+            )
+            .await?;
+        ids.push((id, fp, target));
+    }
+    let listed = |store: PostgresStore, id: Uuid| async move {
+        anyhow::Ok(
+            store
+                .active_completed_firewall_rule_intents()
+                .await?
+                .iter()
+                .any(|intent| intent.id == id),
+        )
+    };
+    // prepared: not listed (it has its own recovery path)
+    assert!(!listed(store.clone(), ids[0].0).await?);
+    // completed and unexpired: listed
+    for (id, fp, target) in &ids[..2] {
+        let input = receipt(execution, adapter, action, fp, target, &state, &plan);
+        store.finish_firewall_rule_intent(*id, &input).await?;
+    }
+    assert!(listed(store.clone(), ids[0].0).await?);
+    assert!(listed(store.clone(), ids[1].0).await?);
+    // expired: no longer listed (the TTL sweep owns it now); the snapshot is immutable under a trigger, so
+    // the passing of time is modelled by disabling it for one statement in the lab
+    sqlx::query("ALTER TABLE firewall_action_intents DISABLE TRIGGER firewall_rule_intent_snapshot_immutable")
+        .execute(store.pool())
+        .await?;
+    sqlx::query("UPDATE firewall_action_intents SET fw_expires_at = NOW() - INTERVAL '1 minute' WHERE id=$1")
+        .bind(ids[1].0)
+        .execute(store.pool())
+        .await?;
+    sqlx::query("ALTER TABLE firewall_action_intents ENABLE TRIGGER firewall_rule_intent_snapshot_immutable")
+        .execute(store.pool())
+        .await?;
+    assert!(listed(store.clone(), ids[0].0).await?);
+    assert!(
+        !listed(store.clone(), ids[1].0).await?,
+        "an expired generation is not drift-checked"
+    );
+    // the drift observation is audited, by id and scope only, and changes nothing about the generation
+    let intent = store.firewall_rule_intent(ids[0].0).await?.unwrap();
+    store.record_firewall_rule_drift(&intent, "absent").await?;
+    let (details, count): (Value, i64) = sqlx::query_as(
+        "SELECT details, COUNT(*) OVER () FROM audit_events WHERE action='firewall_rule_drift_detected' AND resource=$1",
+    )
+    .bind(ids[0].0.to_string())
+    .fetch_one(store.pool())
+    .await?;
+    assert_eq!(count, 1);
+    assert_eq!(details["observed"], "absent");
+    assert_eq!(details["scope"], scope);
+    assert!(
+        !details.to_string().contains("203.0.113."),
+        "the audit event must not carry an address"
+    );
+    assert_eq!(
+        store.firewall_rule_intent(ids[0].0).await?.unwrap().status,
+        "completed"
+    );
+    Ok(())
+}

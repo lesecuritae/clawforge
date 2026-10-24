@@ -188,6 +188,35 @@ impl PostgresStore {
             .fetch_all(&self.pool).await?.into_iter().map(decode).collect())
     }
 
+    /// Completed generations that must still be in force right now (not yet expired): the input of the
+    /// executor's read-only drift check. Prepared, recovery_required, expired and resolved generations are
+    /// deliberately absent - they have their own recovery paths and a missing element is expected there.
+    pub async fn active_completed_firewall_rule_intents(&self) -> Result<Vec<FirewallRuleIntent>> {
+        Ok(sqlx::query("SELECT * FROM firewall_action_intents WHERE fw_rule_fingerprint IS NOT NULL AND status='completed' AND fw_expires_at>NOW() ORDER BY created_at,id LIMIT 100")
+            .fetch_all(&self.pool).await?.into_iter().map(decode).collect())
+    }
+
+    /// Audit trail for a drift observation on an active generation (`observed`: `absent` / `unreadable`).
+    /// Observation only: ownership, status and the TTL sweep are untouched, so nothing is rolled back or
+    /// re-applied because of it. The event carries ids and the scope, never an address.
+    pub async fn record_firewall_rule_drift(
+        &self,
+        intent: &FirewallRuleIntent,
+        observed: &str,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        Self::insert_audit_outbox(
+            &mut tx,
+            "executor",
+            "firewall_rule_drift_detected",
+            &intent.id.to_string(),
+            &json!({"intent_id":intent.id,"execution_id":intent.execution_id,"adapter":intent.adapter,"scope":intent.rule_scope,"expected":"present","observed":observed}),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// The single active generation (prepared/completed/recovery_required) that
     /// owns this concrete rule, if any. Lets an operator kill-switch for a
     /// journaled rule route through its generation instead of a target-only
