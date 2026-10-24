@@ -14,7 +14,7 @@ Output is JSON: `gates_closed` (must be PASS), `prerequisites` (PASS / FAIL / UN
 
 ## Requirement map
 
-| Requirement | Mechanism | Evidence | State on production (2026-10-23) |
+| Requirement | Mechanism | Evidence | State on production (2026-10-24, after 1.2.9) |
 | --- | --- | --- | --- |
 | Executor stays dry-run, no live authorization, bridge off, all actions disabled, active policies observe-only, RIPEstat off | env + DB flags, checked as `gates_closed` | checker output | all PASS |
 | Safe application of an incident source | policy decision (independent evidence order, reputation required by default) → DB bridge function → approval by risk level → executor | `docs/policy-execution-bridge.md`, PostgreSQL tests with real roles and positive controls | bridge off; simulated requests exist (Go-Away challenges, `simulation_only`) |
@@ -22,12 +22,13 @@ Output is JSON: `gates_closed` (must be PASS), `prerequisites` (PASS / FAIL / UN
 | Protective never-block list | `CLAWFORGE_FIREWALL_NEVER_BLOCK_CIDRS`, fail-closed; executor refuses a productive start without it | kernel-lab test `kernel_lab_never_block_list_protects_real_traffic_and_fails_closed`, executor unit test | **FAIL: not defined.** Candidates below, operator must confirm |
 | Pilot limits (TTL ≤ 900 s, ≤ 2 applies / 300 s, concurrency explicit) | env, read at each dispatch | checker | **FAIL: unset / defaults (3600 s, 20, implicit 5).** Setting `CLAWFORGE_FIREWALL_MAX_TTL_SECONDS` or `..._MAX_CONCURRENT_APPLIES_PER_ADAPTER` in `.env` had NO effect: compose did not pass them to the executor (fixed in the repository; the production compose fork needs the same two lines) |
 | TTL restore / rollback | write-ahead journal, native nftables element timeout, rollback readback | kernel-lab series (40 cycles apply → block → rollback → restore → native expiry) in a disposable container | proven in the lab; not in production |
-| Retention keeps evidence of real requests | migration 0070, `clawforge_delete_expired_security_assessments` | PostgreSQL test with positive/negative controls | in 1.2.8 |
-| Component health is truthful | runtime heartbeat every 30 s (api, incidents), policy engine `degraded` on failed cycles | `clawforge_component_up`, storage test | api/incidents showed stale heartbeat before 1.2.8 |
+| Retention keeps evidence of real requests | migration 0070, `clawforge_delete_expired_security_assessments` | PostgreSQL test with positive/negative controls | deployed with 1.2.9 (ledger 70/66) |
+| Component health is truthful | runtime heartbeat every 30 s (api, incidents), policy engine `degraded` on failed cycles | `clawforge_component_up`, storage test | fixed and deployed (1.2.8/1.2.9): api and incidents heartbeats 26 s and 2 s old, all seven runtime components PASS |
 | Feed freshness / failure handling | counting feeds (spamhaus drop/edrop/asn, feodo) must be fresh; failing non-counting feeds warn | checker | counting feeds fresh; threatfox, urlhaus, malwarebazaar fail (need operator AuthKeys) |
-| Sensor freshness | sensor `age_seconds ≤ 300` | checker | srv19680 sensors offline since ~22:30Z, cause unknown |
-| Observation sufficiency | `scripts/shape-observation-evaluate.py` (24 h, completeness checks, never passes a gate) | verdict file passed to the checker | not before 2026-10-24T12:50Z; a gap from the srv19680 outage yields INSUFFICIENT_DATA |
-| Quality gate | behaviour harness | `docs/behavior-validation.md` | RED; 6 FP / 4 FN fixtures are not tuned, no labelled legitimate bursts exist |
+| Bridge evidence age vs feed cadence | one age bounds decision, assessment and listing; counting feeds reconfirm only at sync | `bridge_evidence_age_covers_feed_cadence`, PostgreSQL regression | bridge off: not applicable; must be >= 2x the slowest counting feed (7200 s today) once a mode is chosen |
+| Sensor freshness | sensor `age_seconds ≤ 300` | checker | all sensors fresh; srv19680 is back online; the 22:27Z outage on 2026-10-23 stays a historical gap |
+| Observation sufficiency | `scripts/shape-observation-evaluate.py` (24 h, completeness checks, never passes a gate) | verdict file passed to the checker | collected 2026-10-24T12:50:31Z: evaluator `OBSERVED`, all 11 checks OK, `operator_gate_passed=false`; measurements only, not the quality acceptance and not Gate 7B |
+| Quality gate | behaviour harness | `docs/behavior-validation.md` | RED by definition (any stage-1 FP fails it). Reproduced on current code: stage 1 12/6/6/0, stage 2 8/0/12/4; no attributable code defect left, see `quality-case-reconciliation.md`; no labelled legitimate bursts exist |
 | Recent restorable backup | operator backup service | `--backup-dir`; `pg_restore --list` | a completed daily dump exists (2026-10-24 00:55 UTC, ~25.5 GB) and its table of contents lists; **no full restore has been proven**, and the release script's own freshness/size/TOC gate is still evaluated at deploy time |
 | Operator audit evidence | execution journal, approval records, receipts | storage tests | nothing live to audit |
 
