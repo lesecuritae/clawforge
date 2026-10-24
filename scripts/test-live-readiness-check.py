@@ -139,6 +139,18 @@ class Prerequisites(unittest.TestCase):
         self.assertTrue(any("threatfox" in w for w in report["warnings"]))
         self.assertEqual(report["summary"]["prerequisites_failing"], [])
 
+    def test_bridge_evidence_age_must_cover_the_feed_cadence_once_a_mode_is_chosen(self):
+        env = lambda mode, age: {"CLAWFORGE_POLICY_BRIDGE_MODE": mode, "CLAWFORGE_POLICY_BRIDGE_MAX_EVIDENCE_AGE_SECONDS": age}
+        check = lambda mode, age: self.status("bridge_evidence_age_covers_feed_cadence", policy_engine_env=env(mode, age))
+        # GOOD providers use a 3600 s interval, so 2x = 7200 s
+        self.assertEqual(check("", ""), "PASS")  # bridge off: not applicable
+        self.assertEqual(check("propose", "7200"), "PASS")
+        self.assertEqual(check("propose", "900"), "FAIL")
+        self.assertEqual(check("simulate", "3600"), "FAIL")
+        self.assertEqual(check("automatic", "604800"), "PASS")
+        self.assertEqual(check("propose", ""), "UNKNOWN")
+        self.assertEqual(check("propose", "abc"), "UNKNOWN")
+
     def test_backup_is_never_assumed(self):
         self.assertEqual(self.status("recent_restorable_backup", backup=None), "UNKNOWN")
         self.assertEqual(self.status("recent_restorable_backup", backup={"files": 0, "newest_age_seconds": None, "newest_bytes": None, "free_gib": 100}), "FAIL")
