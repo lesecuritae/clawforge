@@ -240,6 +240,17 @@ Everything below was measured on the live system, not inferred from container st
 * **Maintenance**: `clawforge-ids-maintenance.timer` (daily 03:30 UTC +-30 min) runs the validated rule
   update with live reload and deletes rotated EVE files older than seven days.
 
+### Engine not running after a host reboot (observed 2026-10-25)
+
+After a reboot the engine container stayed stopped (exit code 0) although `restart: unless-stopped` is set, and the
+sensor went stale (`all_sensors_fresh` FAIL in `scripts/live-readiness-check.py`); the adapter container came back.
+Docker's journal shows containers that needed the forced kill at shutdown being restarted, while the engine, which exits
+cleanly within the 10 s grace, was never restarted. That is the evidence-based explanation; the daemon's internal
+decision was not observed directly. `sensors/network-ids/host/clawforge-ids-ensure.service` is an idempotent one-shot
+that starts the engine at boot if it is not running (copy to `/etc/systemd/system/`, `systemctl enable`). It changes
+nothing else; rollback is `systemctl disable` and removing the file. Verified by stopping the container and running the
+unit, not by a real reboot.
+
 ### Exact rollback
 
 ```sh

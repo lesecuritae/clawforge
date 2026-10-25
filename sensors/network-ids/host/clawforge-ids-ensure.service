@@ -1,0 +1,19 @@
+[Unit]
+Description=Clawforge passive IDS: start the engine container after boot if it is not running
+# Observed 2026-10-25: after a host reboot the engine stayed stopped although its restart policy is unless-stopped.
+# The engine exits cleanly (code 0) within Docker's 10 s stop grace when the host shuts down; Docker then records it as
+# stopped and does not bring it back at boot, while containers that need the forced kill are restarted. The adapter
+# container (restart: unless-stopped) came back and the sensor went stale. This one-shot start is idempotent.
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=production
+Group=production
+ExecStart=/bin/sh -c 'for i in 1 2 3 4 5 6; do docker inspect clawforge-suricata >/dev/null 2>&1 && break; sleep 5; done; [ "$(docker inspect -f "{{.State.Running}}" clawforge-suricata 2>/dev/null)" = true ] || docker start clawforge-suricata'
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target
