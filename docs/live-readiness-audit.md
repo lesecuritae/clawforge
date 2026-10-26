@@ -71,6 +71,15 @@ same key is expected to serve all three feeds; verify each, do not assume. These
 reputation sources for the enforcement bridge, so the pilot does not depend on them. BGPView and BGPStream stay
 disabled as retired.
 
+## Backup versus restore evidence in the checklist
+
+`recent_restorable_backup` judges only the dump files (existence, age, size) and stays UNKNOWN when the backup volume is
+not readable by the user running the check; that is correct, not a defect. A completed restore drill is separate evidence:
+`--restore-receipt receipt.json` adds `restore_drill_verified`, PASS only for a self-consistent receipt of a full isolated
+restore (exit 0, all tables, no invalid index or constraint, the large relation tables holding rows, migrator current,
+drill within 30 days, dump at most 7 days older than the drill), FAIL for an inconsistent one, UNKNOWN without one. A
+receipt records what was done; the check does not re-run the restore, and it never upgrades the dump item.
+
 ## Backup risk
 
 The 2026-10-23 cleanup removed the earlier dumps; the service wrote a new complete one at 00:55 UTC on 2026-10-24. A dump ages out of the release gate after 27 h. Retention math: 14 daily dumps of ~23 GiB need ~320 GiB; about 160 GiB are free. Either shorten
