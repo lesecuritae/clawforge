@@ -10,7 +10,7 @@ maintenance-window reboot validation, the operator's protection values). Unknown
   prerequisites     what must hold before a canary may be proposed (PASS / FAIL / UNKNOWN).
   warnings          true observations that are not blockers.
 
-    live-readiness-check.py [--shape-verdict verdict.json] [--backup-dir DIR] [--out report.json]
+    live-readiness-check.py [--shape-verdict verdict.json] [--backup-dir DIR] [--restore-receipt receipt.json] [--out report.json]
     live-readiness-check.py --collected-fixture state.json      (isolated tests)
 Exit 0 always for a produced report (the report is the result), 2 on a collector failure.
 """
@@ -48,6 +48,42 @@ def as_int(value):
         return int(str(value).strip())
     except (TypeError, ValueError):
         return None
+
+
+RESTORE_RECEIPT_MAX_AGE_DAYS = 30
+RESTORE_RECEIPT_MAX_DUMP_AGE_DAYS = 7
+
+
+def restore_drill_item(receipt, now):
+    """PASS only for a self-consistent, recent receipt of a FULL isolated restore; FAIL for a present but inconsistent one."""
+    if receipt is None:
+        return item("restore_drill_verified", "UNKNOWN", "no restore receipt supplied (--restore-receipt); a dump existing is not a restore")
+    try:
+        verified = dt.datetime.strptime(receipt["verified_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)
+        dump = dt.datetime.strptime(receipt["dump_created_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)
+        problems = []
+        if receipt.get("kind") != "clawforge-restore-drill" or receipt.get("isolated") is not True:
+            problems.append("not an isolated restore-drill receipt")
+        if receipt.get("pg_restore_exit") != 0:
+            problems.append(f"pg_restore exit {receipt.get('pg_restore_exit')}")
+        if receipt.get("tables_restored") != receipt.get("tables_expected") or not receipt.get("tables_expected"):
+            problems.append("restored table count differs from the expected count")
+        if receipt.get("invalid_indexes") != 0 or receipt.get("unvalidated_constraints") != 0:
+            problems.append("invalid indexes or unvalidated constraints")
+        if not receipt.get("big_tables_with_rows"):
+            problems.append("the large relation tables were not shown to contain rows")
+        if receipt.get("migrator_current") is not True:
+            problems.append("application migrator did not report the ledger current")
+        if (verified - dump).total_seconds() > RESTORE_RECEIPT_MAX_DUMP_AGE_DAYS * 86400:
+            problems.append(f"dump was more than {RESTORE_RECEIPT_MAX_DUMP_AGE_DAYS} d older than the drill")
+        age_days = (now - verified).total_seconds() / 86400
+        if age_days < 0 or age_days > RESTORE_RECEIPT_MAX_AGE_DAYS:
+            problems.append(f"drill is {age_days:.1f} d old (allowed 0..{RESTORE_RECEIPT_MAX_AGE_DAYS})")
+    except (KeyError, ValueError, TypeError) as error:
+        return item("restore_drill_verified", "FAIL", f"receipt unreadable: {error}")
+    if problems:
+        return item("restore_drill_verified", "FAIL", "; ".join(problems))
+    return item("restore_drill_verified", "PASS", f"full isolated restore verified {receipt['verified_at']} of dump {receipt.get('dump_name')} (receipt is evidence, not an automated re-check)")
 
 
 def evaluate(state, now):
@@ -126,6 +162,9 @@ def evaluate(state, now):
             need = days * backup["newest_bytes"] / 2**30
             if need > backup["free_gib"]:
                 warnings.append(f"backup retention {days} d x newest dump ({backup['newest_bytes'] / 2**30:.1f} GiB) = {need:.0f} GiB exceeds {backup['free_gib']:.0f} GiB free")
+    # A restore drill is separate evidence from the existence/age of a dump: it never turns recent_restorable_backup
+    # into PASS, and without a receipt it stays UNKNOWN. The receipt is checked for internal consistency and age.
+    prereq.append(restore_drill_item(state.get("restore_receipt"), now))
     verdict = state.get("shape_verdict")
     if verdict is None:
         prereq.append(item("shape_observation_24h", "UNKNOWN", "no evaluator verdict supplied (earliest 2026-10-24T12:50Z)"))
@@ -206,6 +245,9 @@ def collect(args):
     if args.shape_verdict:
         with open(args.shape_verdict, encoding="utf-8") as handle:
             state["shape_verdict"] = json.load(handle)
+    if args.restore_receipt:
+        with open(args.restore_receipt, encoding="utf-8") as handle:
+            state["restore_receipt"] = json.load(handle)
     return state
 
 
@@ -213,6 +255,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--shape-verdict")
     parser.add_argument("--backup-dir")
+    parser.add_argument("--restore-receipt")
     parser.add_argument("--collected-fixture")
     parser.add_argument("--out")
     args = parser.parse_args(argv)

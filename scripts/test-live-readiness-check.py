@@ -34,6 +34,9 @@ GOOD = {
     "orphan_security_definer_functions": [],
     "backup": {"files": 1, "newest_age_seconds": 3600, "newest_bytes": 24 * 2**30, "free_gib": 400, "retention_days": 14},
     "shape_verdict": {"status": "OBSERVED"},
+    "restore_receipt": {"kind": "clawforge-restore-drill", "isolated": True, "dump_name": "d.dump", "dump_created_at": "2026-10-23T00:55:31Z",
+                        "verified_at": "2026-10-24T06:00:00Z", "pg_restore_exit": 0, "tables_expected": 87, "tables_restored": 87,
+                        "invalid_indexes": 0, "unvalidated_constraints": 0, "big_tables_with_rows": True, "migrator_current": True},
 }
 
 
@@ -158,6 +161,29 @@ class Prerequisites(unittest.TestCase):
         self.assertEqual(self.status("recent_restorable_backup", backup={"files": 1, "newest_age_seconds": 100, "newest_bytes": 1000, "free_gib": 400}), "FAIL")
         report = lr.evaluate(state(backup={"free_gib": 160}), NOW)
         self.assertTrue(any("exceeds" in w for w in report["warnings"]), report["warnings"])
+
+    def test_restore_drill_receipt_is_separate_evidence_and_never_upgrades_the_backup_item(self):
+        good = {"kind": "clawforge-restore-drill", "isolated": True, "dump_name": "d.dump", "dump_created_at": "2026-10-24T00:55:31Z",
+                "verified_at": "2026-10-26T04:35:00Z", "pg_restore_exit": 0, "tables_expected": 87, "tables_restored": 87,
+                "invalid_indexes": 0, "unvalidated_constraints": 0, "big_tables_with_rows": True, "migrator_current": True}
+        now = dt.datetime(2026, 10, 27, tzinfo=dt.timezone.utc)
+        def run(receipt, **kw):
+            s = state(**kw)
+            s["restore_receipt"] = receipt  # replaced, not merged: state() merges dicts and would refill a missing field
+            return by_id(lr.evaluate(s, now))
+        self.assertEqual(run(None)["restore_drill_verified"], "UNKNOWN")
+        self.assertEqual(run(good)["restore_drill_verified"], "PASS")
+        # the existence/age item is judged only on the dump files: an unreadable volume stays UNKNOWN even with a receipt
+        self.assertEqual(run(good, backup=None)["recent_restorable_backup"], "UNKNOWN")
+        bad_cases = {
+            "exit": dict(good, pg_restore_exit=1), "tables": dict(good, tables_restored=86), "indexes": dict(good, invalid_indexes=2),
+            "constraints": dict(good, unvalidated_constraints=1), "big tables": dict(good, big_tables_with_rows=False),
+            "migrator": dict(good, migrator_current=False), "kind": dict(good, kind="other"), "not isolated": dict(good, isolated=False),
+            "stale drill": dict(good, verified_at="2026-08-01T00:00:00Z", dump_created_at="2026-07-31T00:00:00Z"),
+            "old dump": dict(good, dump_created_at="2026-10-01T00:00:00Z"), "future": dict(good, verified_at="2026-12-01T00:00:00Z"),
+            "missing field": {k: v for k, v in good.items() if k != "verified_at"}, "zero tables": dict(good, tables_expected=0, tables_restored=0)}
+        for name, receipt in bad_cases.items():
+            self.assertEqual(run(receipt)["restore_drill_verified"], "FAIL", name)
 
     def test_shape_observation_follows_the_evaluator_verdict(self):
         self.assertEqual(self.status("shape_observation_24h", shape_verdict=None), "UNKNOWN")
