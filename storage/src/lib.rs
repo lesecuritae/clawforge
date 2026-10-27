@@ -2844,6 +2844,10 @@ impl PostgresStore {
             "approval_context_hash": row.get::<Option<String>, _>("approval_context_hash"),
             "required_approvals": row.get::<i32, _>("required_approvals"),
             "approval_expires_at": row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("approval_expires_at"),
+            "approval_profile": row.get::<serde_json::Value, _>("approval_context")
+                .get("approval_profile")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
             "evidence": evidence,
         })))
     }

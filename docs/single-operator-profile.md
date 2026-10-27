@@ -40,9 +40,33 @@ human operator. It is never on by default, never a request field and never avail
 ## What does not change
 
 Dry-run executor, explicit live authorization, never-block list, TTL/rate/concurrency limits, kill switch, rollback and
-recovery, the 15-minute approval windows, stale and changed-context refusal, and the policy -> execution bridge (whose
-`propose` requests keep the policy's count: the bridge is off, and extending it is a separate decision).
-The profile lowers neither a risk level nor any other policy, and it opens no gate by itself.
+recovery, the approval windows, stale and changed-context refusal. The profile lowers neither a risk level nor any other
+policy, and it opens no gate by itself (the bridge stays off, actions stay disabled until the operator changes them).
+
+## Bridge proposals (migration 0072)
+
+In `propose` mode the policy -> execution bridge builds its request context in `clawforge_policy_bridge_plan`. In the
+profile that plan gives a proposal for a listed action `required_approvals = 1` plus the same marker; evidence, current
+reputation (intel), routing context, budgets, duplicate and target-active checks, the requester rules and the hashed
+context are judged exactly as before. Tested with genuine proposals (`storage/tests/policy_bridge.rs`,
+`a_bridge_proposal_is_confirmable_by_the_single_operator_without_a_second_person`): by default a proposal keeps two
+approvals and no single confirmation exists; in the profile a proposal without current reputation is still refused
+(`threat_intel_required`), an eligible one is confirmable by the designated operator only (not by another administrator,
+not by the bridge's own requester account, not with a wrong hash, not twice), and after switching the profile off new
+proposals are back to two approvals. `automatic` mode is untouched (it creates `pending` requests without approvals and is
+refused unless the operator flips the action row deliberately).
+
+## Native UI
+
+Controlled Operations shows "Requests awaiting approval". Selecting a request shows the trusted profile (read from the
+database through the API, never chosen by the browser), the exact target, the context hash and the expiry. The "Confirm
+request" button exists only when the API reports the signed-in person as the designated operator of an eligible, unexpired
+request, and only after an explicit "I reviewed this exact request" tick; it posts the displayed hash to
+`/admin/executions/{id}/confirm-single-operator`. There is no fallback to the ordinary approval route: a refusal is shown as
+a refusal. The route needs an interactive login session of an Administrator; long-lived API tokens (scripts, agents) get
+403, unknown bearers 401. Tests: `frontend/src/ExecutionConfirmations.test.tsx` (6) and the router-level
+`single_operator_confirmation_route_accepts_only_the_designated_operators_session` in the API crate (API token, other
+administrator, wrong hash, ordinary approve route, double submit, profile switched off).
 
 ## Using it
 

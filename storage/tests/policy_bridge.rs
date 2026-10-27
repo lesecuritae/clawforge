@@ -178,6 +178,190 @@ fn restricted(grants: &str, start: &str, end: &str) -> String {
     tail[..to].to_string()
 }
 
+#[tokio::test]
+#[ignore = "requires explicit disposable owner, policy-engine and executor database URLs"]
+async fn a_bridge_proposal_is_confirmable_by_the_single_operator_without_a_second_person(
+) -> Result<()> {
+    let base = std::env::var("CLAWFORGE_TEST_DATABASE_URL")?;
+    let policy_base = std::env::var("CLAWFORGE_TEST_POLICY_ENGINE_DATABASE_URL")?;
+    let executor_base = std::env::var("CLAWFORGE_TEST_EXECUTOR_DATABASE_URL")?;
+    let admin = PgPool::connect(&base).await?;
+    let database = format!("policy_bridge_solo_{}", Uuid::new_v4().simple());
+    sqlx::query(&format!("CREATE DATABASE {database}"))
+        .execute(&admin)
+        .await?;
+    let url = |base: &str| -> Result<String> {
+        Ok(PgConnectOptions::from_str(base)?
+            .database(&database)
+            .to_url_lossy()
+            .to_string())
+    };
+    let (owner, policy, executor) = (url(&base)?, url(&policy_base)?, url(&executor_base)?);
+    let result = tokio::spawn(async move { solo_check(&owner, &policy, &executor).await }).await;
+    let cleanup = sqlx::query(&format!("DROP DATABASE {database} WITH (FORCE)"))
+        .execute(&admin)
+        .await;
+    admin.close().await;
+    cleanup?;
+    result??;
+    Ok(())
+}
+
+async fn solo_check(owner_url: &str, policy_url: &str, executor_url: &str) -> Result<()> {
+    let owner = PostgresStore::connect(owner_url).await?;
+    let provision = include_str!("../../scripts/provision-db-roles.sh");
+    sqlx::raw_sql(&restricted(
+        provision,
+        "GRANT SELECT ON TABLE _sqlx_migrations, security_policies, security_assessments,",
+        "GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO clawforge_policy_engine;",
+    ))
+    .execute(owner.pool())
+    .await?;
+    let env = Env {
+        bridge: PostgresStore::connect_runtime(policy_url).await?,
+        owner,
+        ips: Default::default(),
+        wanted: Default::default(),
+    };
+    let _ = executor_url;
+    let operator = env
+        .owner
+        .create_admin_user("solo-bridge-operator", "Operator", "!")
+        .await?;
+    let (solo, solo_name) = (
+        env.owner
+            .create_admin_user("solo-human", "Administrator", "!")
+            .await?,
+        "solo-human",
+    );
+    let other = env
+        .owner
+        .create_admin_user("solo-other-admin", "Administrator", "!")
+        .await?;
+    env.action(true, true).await?;
+    let policy = env.policy("approval", "ssh_bruteforce").await?;
+    let mut propose = params(BridgeMode::Propose);
+    propose.requester_id = Some(operator);
+    propose.max_per_window = 50;
+    propose.window_seconds = 3600;
+    let context = |request: Uuid| {
+        let pool = env.pool().clone();
+        async move {
+            let row: (i32, serde_json::Value, String) = sqlx::query_as(
+                "SELECT required_approvals, approval_context, approval_context_hash FROM execution_requests WHERE id=$1",
+            )
+            .bind(request)
+            .fetch_one(&pool)
+            .await?;
+            Ok::<_, anyhow::Error>(row)
+        }
+    };
+
+    // Default profile: a genuine bridge proposal keeps the policy's two approvals and has no marker.
+    env.resolve("ip-pseudonym:solo-default", 600).await?;
+    let d0 = env
+        .decision(policy, "ip-pseudonym:solo-default", true, 0)
+        .await?;
+    let BridgeOutcome::Enqueued(r0) = env.run(d0, &propose).await? else {
+        panic!("default proposal")
+    };
+    let (required, ctx, hash0) = context(r0).await?;
+    assert_eq!(required, 2);
+    assert!(ctx.get("approval_profile").is_none());
+    assert!(
+        env.owner
+            .confirm_single_operator_execution(r0, solo, solo_name, &hash0)
+            .await
+            .is_err(),
+        "no single confirmation by default"
+    );
+
+    // Opt in (owner-role configuration).
+    sqlx::query("UPDATE approval_profile SET mode='single_operator', operator_user_id=$1, allowed_actions=ARRAY['nftables.block_incident_source']::TEXT[]")
+        .bind(solo).execute(env.pool()).await?;
+
+    // Evidence constraints are unchanged: no current reputation listing -> still refused in the profile.
+    env.resolve("ip-pseudonym:solo-unlisted", 600).await?;
+    let d_unlisted = env
+        .decision(policy, "ip-pseudonym:solo-unlisted", false, 0)
+        .await?;
+    assert_eq!(
+        env.run(d_unlisted, &propose).await?,
+        rejected("threat_intel_required")
+    );
+
+    // A genuine proposal now needs ONE confirmation by the designated operator, recorded in the hashed context.
+    env.resolve("ip-pseudonym:solo-1", 600).await?;
+    let d1 = env.decision(policy, "ip-pseudonym:solo-1", true, 0).await?;
+    let BridgeOutcome::Enqueued(r1) = env.run(d1, &propose).await? else {
+        panic!("profile proposal")
+    };
+    let (required, ctx, hash1) = context(r1).await?;
+    assert_eq!(required, 1);
+    assert_eq!(ctx["approval_profile"]["mode"], "single_operator");
+    assert_eq!(ctx["approval_profile"]["policy_required_approvals"], 2);
+    assert_eq!(ctx["approval_profile"]["operator_user_id"], json!(solo));
+    assert_eq!(
+        ctx["policy_bridge"]["intel_required"],
+        json!(true),
+        "intel/routing context is still part of what the human confirms"
+    );
+    assert!(!env.owner.firewall_request_live_authorized(r1).await?);
+    // Ordinary approval, another administrator, a wrong hash and the bridge's own requester all fail safely.
+    assert!(env
+        .owner
+        .approve_execution_request(r1, other, "solo-other-admin")
+        .await
+        .is_err());
+    assert!(env
+        .owner
+        .approve_execution_request(r1, solo, solo_name)
+        .await
+        .is_err());
+    assert!(env
+        .owner
+        .confirm_single_operator_execution(r1, other, "solo-other-admin", &hash1)
+        .await
+        .is_err());
+    assert!(env
+        .owner
+        .confirm_single_operator_execution(r1, solo, solo_name, &"0".repeat(64))
+        .await
+        .is_err());
+    assert!(env
+        .owner
+        .confirm_single_operator_execution(r1, operator, "solo-bridge-operator", &hash1)
+        .await
+        .is_err());
+    // The one real person confirms; the request is approved and authorized; a replay is refused.
+    let done = env
+        .owner
+        .confirm_single_operator_execution(r1, solo, solo_name, &hash1)
+        .await?;
+    assert_eq!(done["status"], "approved");
+    assert!(env.owner.firewall_request_live_authorized(r1).await?);
+    assert!(env
+        .owner
+        .confirm_single_operator_execution(r1, solo, solo_name, &hash1)
+        .await
+        .is_err());
+
+    // Budget and duplicate protection are unchanged.
+    assert_eq!(env.run(d1, &propose).await?, BridgeOutcome::Duplicate(r1));
+
+    // Switching the profile off: a new proposal is back to two approvals, and the earlier single confirmation no longer authorizes.
+    sqlx::query("UPDATE approval_profile SET mode='multi_person', operator_user_id=NULL, allowed_actions='{}'")
+        .execute(env.pool()).await?;
+    assert!(!env.owner.firewall_request_live_authorized(r1).await?);
+    env.resolve("ip-pseudonym:solo-2", 600).await?;
+    let d2 = env.decision(policy, "ip-pseudonym:solo-2", true, 0).await?;
+    let BridgeOutcome::Enqueued(r2) = env.run(d2, &propose).await? else {
+        panic!("proposal after switching off")
+    };
+    assert_eq!(context(r2).await?.0, 2);
+    Ok(())
+}
+
 async fn check(owner_url: &str, policy_url: &str, executor_url: &str) -> Result<()> {
     let owner = PostgresStore::connect(owner_url).await?;
     let provision = include_str!("../../scripts/provision-db-roles.sh");

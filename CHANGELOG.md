@@ -4,7 +4,7 @@
 
 Weitere Änderungen für die nächste Version werden hier gesammelt.
 
-- Approval: explicit, opt-in single-operator profile (migration 0071, default OFF, deployment configuration in an owner-only table, never a request field). For the four incident-source firewall actions only, one authenticated, context-bound confirmation by the designated Administrator replaces the policy's two approvals; the lowering is recorded in the hashed context, quarantine can never be listed, the multi-person default and all gates are unchanged. Separate confirmation operation, database-enforced refusal paths and direct-insert bypass tests (storage/tests/single_operator_profile.rs, with mutation controls). Readiness checklist reports the profile; abuse.ch feeds are described as optional. See `docs/single-operator-profile.md`.
+- Approval: explicit, opt-in single-operator profile (migration 0071, default OFF, deployment configuration in an owner-only table, never a request field). For the four incident-source firewall actions only, one authenticated, context-bound confirmation by the designated Administrator replaces the policy's two approvals; the lowering is recorded in the hashed context, quarantine can never be listed, the multi-person default and all gates are unchanged. Separate confirmation operation, database-enforced refusal paths and direct-insert bypass tests (storage/tests/single_operator_profile.rs, with mutation controls). Readiness checklist reports the profile; abuse.ch feeds are described as optional. Migration 0072 makes bridge `propose` requests honour the profile; Controlled Operations gets a review-and-confirm view (interactive session only, no fallback to ordinary approval). See `docs/single-operator-profile.md`.
 
 ## [1.2.9] - 2026-10-24
 
