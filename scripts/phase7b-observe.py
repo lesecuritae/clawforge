@@ -26,9 +26,12 @@ import hashlib
 import json
 import math
 import os
+import re
 import subprocess
 import sys
 import time
+import uuid
+from collections import Counter
 
 SCHEMA = 1
 EXIT = {"OK": 0, "BAD_INPUT": 2, "OPERATOR_STOP": 3, "TELEMETRY_STOP": 4, "STATE_STOP": 5}
@@ -58,6 +61,56 @@ PROBE_DEFAULTS = {
 }
 REQUIRED_SNAPSHOT_KEYS = ("unresolved_generations", "executable_requests", "active_elements", "running_executors", "api_healthy")
 STATE_VIOLATIONS_STOP = True
+SINGLE_OPERATOR_ACTIONS = {
+    "nftables.block_incident_source", "haproxy.block_incident_source",
+    "firewall.block_incident_source", "haproxy_ratelimit.block_incident_source",
+}
+
+
+def valid_uuid(value):
+    try:
+        return isinstance(value, str) and str(uuid.UUID(value)) == value
+    except (ValueError, AttributeError):
+        return False
+
+
+def approval_profile(plan):
+    # Old registered plans retain the two-person default and their original hash.
+    profile = plan.get("approval_profile", {"mode": "multi_person"})
+    if not isinstance(profile, dict):
+        raise BadInput("approval_profile must be an owner-supplied object")
+    mode = profile.get("mode")
+    if (mode == "multi_person" and set(profile) <= {"mode", "operator_user_id", "allowed_actions"}
+            and profile.get("operator_user_id") is None and profile.get("allowed_actions", []) == []):
+        return profile
+    if mode == "single_operator" and set(profile) == {"mode", "operator_user_id", "allowed_actions"}:
+        actions = profile["allowed_actions"]
+        if (valid_uuid(profile["operator_user_id"]) and isinstance(actions, list) and actions
+                and all(isinstance(action, str) and action in SINGLE_OPERATOR_ACTIONS for action in actions)
+                and len(set(actions)) == len(actions)):
+            return profile
+    raise BadInput("invalid approval profile; single operator needs a named UUID and eligible incident-source actions")
+
+
+def approved_canary(row, profile):
+    if row.get("lab") is not False or type(row.get("distinct_human_approvals")) is not int:
+        return False
+    if profile["mode"] == "multi_person":
+        return row["distinct_human_approvals"] >= 2
+    evidence = row.get("approval_evidence")
+    marker = row.get("approval_profile")
+    context_hash = row.get("approval_context_hash")
+    return bool(row["distinct_human_approvals"] == 1 and type(row.get("required_approvals")) is int
+                and row["required_approvals"] == 1 and row.get("action") in profile["allowed_actions"]
+                and valid_uuid(row.get("request_id")) and isinstance(context_hash, str)
+                and re.fullmatch("[0-9a-f]{64}", context_hash)
+                and isinstance(marker, dict) and marker.get("mode") == "single_operator"
+                and marker.get("operator_user_id") == profile["operator_user_id"]
+                and isinstance(evidence, dict)
+                and evidence.get("execution_id") == row["request_id"]
+                and evidence.get("approver_id") == profile["operator_user_id"]
+                and evidence.get("approval_mode") == "single_operator_confirmation"
+                and evidence.get("context_hash") == context_hash)
 
 
 class BadInput(Exception):
@@ -83,7 +136,7 @@ def canonical_hash(plan):
     return hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
-def build_plan(start_ts, hours, probe_argv, probe=None, criteria=None, note=""):
+def build_plan(start_ts, hours, probe_argv, probe=None, criteria=None, note="", approval=None):
     if not (isinstance(probe_argv, list) and probe_argv and all(isinstance(a, str) for a in probe_argv)):
         raise BadInput("probe argv must be a non-empty list of strings (no shell)")
     if not 1 <= hours <= 168:
@@ -97,6 +150,7 @@ def build_plan(start_ts, hours, probe_argv, probe=None, criteria=None, note=""):
         "note": note,
         "operator_confirmed_by": None,
         "operator_confirmed_at": None,
+        "approval_profile": approval if approval is not None else {"mode": "multi_person"},
     }
     validate_plan(plan)
     plan["plan_sha256"] = canonical_hash(plan)
@@ -104,6 +158,7 @@ def build_plan(start_ts, hours, probe_argv, probe=None, criteria=None, note=""):
 
 
 def validate_plan(plan):
+    approval_profile(plan)
     try:
         window = plan["window"]
         start, end = parse_time(window["start"]), parse_time(window["end"])
@@ -319,8 +374,13 @@ def evaluate(plan, samples, measurements, now_ts):
     results.append(verdict("idle_state_invariants", not state_issues and bool(ok_cycles), f"issues seen in valid snapshots: {state_issues or 'none'}", bool(ok_cycles)))
 
     canaries = [m for m in measurements if m.get("type") == "canary"]
-    complete_canaries = [m for m in canaries if all(isinstance(m.get(k), (int, float)) for k in ("rollback_seconds", "receipt_after_deadline_seconds"))]
-    real = [m for m in complete_canaries if not m.get("lab") and m.get("distinct_human_approvals", 0) >= 2]
+    complete_canaries = [m for m in canaries if all(type(m.get(k)) in (int, float) and math.isfinite(m[k])
+                                                  for k in ("rollback_seconds", "receipt_after_deadline_seconds"))]
+    # Conflicting/duplicate rows cannot turn one real request into ten measurements.
+    counts = Counter(m["request_id"] for m in canaries if isinstance(m.get("request_id"), str))
+    profile = approval_profile(plan)
+    real = [m for m in complete_canaries if isinstance(m.get("request_id"), str) and m["request_id"]
+            and counts[m["request_id"]] == 1 and approved_canary(m, profile)]
     enough = len(real) >= criteria["min_canary_measurements"]
     if enough:
         p95 = percentile_nearest_rank([m["rollback_seconds"] for m in real], 0.95)
@@ -390,6 +450,7 @@ def evaluate(plan, samples, measurements, now_ts):
         "schema": SCHEMA,
         "evaluated_at": iso(now_ts),
         "plan_sha256": plan["plan_sha256"],
+        "approval_profile": profile,
         "status": status,
         "gate_passed": False,
         "requires_operator_review": True,
@@ -422,6 +483,7 @@ def main(argv=None):
     p.add_argument("--stop-file")
     p.add_argument("--max-runtime-seconds", type=int)
     p.add_argument("--note", default="")
+    p.add_argument("--approval-profile-file", help="trusted owner-exported native approval profile; frozen into the plan")
     q = sub.add_parser("probe")
     q.add_argument("--plan", required=True)
     q.add_argument("--samples", required=True)
@@ -436,7 +498,14 @@ def main(argv=None):
     try:
         if args.cmd == "plan":
             probe_cfg = {k: v for k, v in (("stop_file", args.stop_file), ("max_runtime_seconds", args.max_runtime_seconds)) if v}
-            plan = build_plan(parse_time(args.start), args.hours, json.loads(args.probe_argv_json), probe_cfg, note=args.note)
+            approval = None
+            if args.approval_profile_file:
+                try:
+                    with open(args.approval_profile_file, encoding="utf-8") as handle:
+                        approval = json.load(handle)
+                except (OSError, ValueError) as error:
+                    raise BadInput("owner approval profile file is unreadable or invalid JSON") from error
+            plan = build_plan(parse_time(args.start), args.hours, json.loads(args.probe_argv_json), probe_cfg, note=args.note, approval=approval)
             fd = os.open(args.out, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 json.dump(plan, handle, indent=2, sort_keys=True)
