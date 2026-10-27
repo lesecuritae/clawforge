@@ -19,22 +19,25 @@ export function ExecutionConfirmations({ token }: { token: string }) {
   const waiting = useApi<Waiting[]>("/executions?status=waiting_approval&page_size=50", token, []);
   const [selected, setSelected] = useState<string | null>(null);
   const detail = useApi<Detail | null>(selected ? `/executions/${selected}` : "/health", token, null);
-  const [reviewed, setReviewed] = useState(false);
+  const [reviewedContext, setReviewedContext] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
-  const current = selected && detail.data && "confirmation" in detail.data ? detail.data : null;
+  const current = selected && !detail.loading && !detail.error && detail.data
+    && "confirmation" in detail.data && detail.data.id === selected ? detail.data : null;
+  const contextKey = current?.approval_context_hash ? `${current.id}:${current.approval_context_hash}` : null;
+  const reviewed = contextKey !== null && reviewedContext === contextKey;
 
-  function choose(id: string) { setSelected(id); setReviewed(false); setMessage(""); }
+  function choose(id: string) { if (busy) return; setSelected(id); setReviewedContext(null); setMessage(""); }
 
   async function confirm() {
-    if (!current || !current.approval_context_hash || busy) return;
+    if (!current || !current.approval_context_hash || !reviewed || busy) return;
     setBusy(true); setMessage("");
     try {
       await api<Envelope<unknown>>(`/admin/executions/${current.id}/confirm-single-operator`, token, {
         method: "POST", body: JSON.stringify({ context_hash: current.approval_context_hash }),
       });
       setMessage("Confirmed. The request is approved; the executor's own gates still decide whether anything runs.");
-      setReviewed(false); waiting.reload(); detail.reload();
+      setReviewedContext(null); waiting.reload(); detail.reload();
     } catch (error) {
       setMessage(`Not confirmed: ${error instanceof Error ? error.message : "request refused"}`);
       detail.reload();
@@ -46,7 +49,7 @@ export function ExecutionConfirmations({ token }: { token: string }) {
     <ErrorNotice error={waiting.error || detail.error} />
     {waiting.loading ? <Loading /> : waiting.data.length ? <Table><thead><tr><th>Action</th><th>Risk</th><th>Requested by</th><th>Created</th><th /></tr></thead><tbody>
       {waiting.data.map((item) => <tr key={item.id}><td><b>{item.action_name}</b></td><td><Badge value={item.risk_level} /></td><td>{item.requested_by}</td><td>{formatDate(item.created_at)}</td>
-        <td><button type="button" onClick={() => choose(item.id)}>Review</button></td></tr>)}</tbody></Table> : <Empty text="No requests are waiting for approval." />}
+        <td><button type="button" disabled={busy} onClick={() => choose(item.id)}>Review</button></td></tr>)}</tbody></Table> : <Empty text="No requests are waiting for approval." />}
     {current ? <div className="card" role="region" aria-label="Request review">
       <h4>{current.action_name}</h4>
       <p>Approval profile: <Badge value={current.confirmation.profile_mode === "single_operator" ? "single operator (deliberate)" : "multi-person (default)"} /> {current.approval_profile?.mode === "single_operator" ? <span>policy normally requires {current.approval_profile.policy_required_approvals} approvals; this request needs 1 confirmation by the designated operator</span> : <span>requires {current.required_approvals} distinct approvals</span>}</p>
@@ -54,7 +57,7 @@ export function ExecutionConfirmations({ token }: { token: string }) {
       <p>Context hash: <code>{current.approval_context_hash}</code></p>
       <p>Expires: {current.approval_expires_at ? formatDate(current.approval_expires_at) : "—"} · Signed in as {current.confirmation.signed_in_as}</p>
       {current.confirmation.available ? <>
-        <label><input type="checkbox" checked={reviewed} onChange={(event) => setReviewed(event.target.checked)} /> I reviewed this exact request and confirm it myself</label>
+        <label><input type="checkbox" checked={reviewed} onChange={(event) => setReviewedContext(event.target.checked ? contextKey : null)} /> I reviewed this exact request and confirm it myself</label>
         <button type="button" disabled={!reviewed || busy} onClick={confirm}>Confirm request</button>
       </> : <p className="muted">{current.confirmation.profile_mode === "single_operator" && !current.confirmation.you_are_designated_operator
         ? "You are not the designated operator for the single-operator profile."

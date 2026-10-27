@@ -95,4 +95,52 @@ describe("ExecutionConfirmations (single-operator confirmation)", () => {
     expect(screen.queryByRole("button", { name: "Confirm request" })).not.toBeInTheDocument();
     await waitFor(() => expect(screen.getByText(/does not apply to this request/)).toBeInTheDocument());
   });
+
+  it("does not offer the previous request while a different request is still loading", async () => {
+    let resolveSecond!: (value: unknown) => void;
+    const second = new Promise((resolve) => { resolveSecond = resolve; });
+    vi.spyOn(apiModule, "api").mockImplementation(async (path: string) => {
+      if (path.startsWith("/executions?")) return { data: [waitingRow, { ...waitingRow, id: "exec-2" }] } as never;
+      if (path === "/executions/exec-1") return { data: detail() } as never;
+      if (path === "/executions/exec-2") return await second as never;
+      return { data: null } as never;
+    });
+    render(<ExecutionConfirmations token="session-token" />);
+    const buttons = await screen.findAllByRole("button", { name: "Review" });
+    await userEvent.click(buttons[0]);
+    await screen.findByRole("region", { name: "Request review" });
+    await userEvent.click(screen.getByRole("checkbox"));
+    await userEvent.click(buttons[1]);
+    expect(screen.queryByRole("region", { name: "Request review" })).not.toBeInTheDocument();
+    resolveSecond({ data: detail({ id: "exec-2", approval_context_hash: "b".repeat(64) }) });
+    await screen.findByText("b".repeat(64));
+    expect(screen.getByRole("checkbox")).not.toBeChecked();
+    expect(screen.getByRole("button", { name: "Confirm request" })).toBeDisabled();
+  });
+
+  it("does not let a pending confirmation be attributed to another selected request", async () => {
+    let release!: (value: unknown) => void;
+    const pending = new Promise((resolve) => { release = resolve; });
+    vi.spyOn(apiModule, "api").mockImplementation(async (path: string, _token?: string, init?: RequestInit) => {
+      if (init?.method === "POST") return await pending as never;
+      if (path.startsWith("/executions?")) return { data: [waitingRow, { ...waitingRow, id: "exec-2" }] } as never;
+      if (path === "/executions/exec-1") return { data: detail() } as never;
+      if (path === "/executions/exec-2") return { data: detail({ id: "exec-2" }) } as never;
+      return { data: null } as never;
+    });
+    render(<ExecutionConfirmations token="session-token" />);
+    const buttons = await screen.findAllByRole("button", { name: "Review" });
+    await userEvent.click(buttons[0]);
+    await screen.findByRole("region", { name: "Request review" });
+    await userEvent.click(screen.getByRole("checkbox"));
+    await userEvent.click(screen.getByRole("button", { name: "Confirm request" }));
+    try {
+      expect(buttons[1]).toBeDisabled();
+      await userEvent.click(buttons[1]);
+      expect(screen.queryByText("b".repeat(64))).not.toBeInTheDocument();
+    } finally {
+      release({ data: { status: "approved" } });
+    }
+    await screen.findByText(/Confirmed/);
+  });
 });

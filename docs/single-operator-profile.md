@@ -76,6 +76,11 @@ psql -v ON_ERROR_STOP=1 -v mode=single_operator -v operator=<admin-username> \
 psql -v ON_ERROR_STOP=1 -v mode=multi_person -f scripts/ops/set-approval-profile.sql     # back to the default
 ```
 
+`operator` and `actions` are needed only when enabling the profile; `note` is optional. The script enforces
+`ON_ERROR_STOP` itself, so invalid configuration returns a failing exit status even if the caller omits that flag.
+`python3 -I scripts/test-approval-profile-script.py` tests these commands against the actual migrations in a disposable,
+network-isolated PostgreSQL container (requires the cached `postgres:16-alpine` image).
+
 `scripts/live-readiness-check.py` reports the profile (`approval_profile`) and, when it is single-operator, words the human
 step as one explicit, context-bound confirmation by the designated operator. Detection quality, a real Phase 7B window,
 operator-labelled legitimate traffic and the live authorization stay separate acceptance items. The abuse.ch feeds are
