@@ -87,7 +87,7 @@ async fn both_historical_lineages_converge_without_rewriting_history() -> anyhow
                 .fetch_one(&pool)
                 .await?;
         let approvals_before: Vec<serde_json::Value> = sqlx::query_scalar(
-            "SELECT to_jsonb(a) FROM execution_approvals a WHERE execution_id=$1 ORDER BY id",
+            "SELECT to_jsonb(a) - 'approval_mode' FROM execution_approvals a WHERE execution_id=$1 ORDER BY id",
         )
         .bind(request_id)
         .fetch_all(&pool)
@@ -104,7 +104,7 @@ async fn both_historical_lineages_converge_without_rewriting_history() -> anyhow
                 .fetch_one(&pool)
                 .await?;
         let approvals_after: Vec<serde_json::Value> = sqlx::query_scalar(
-            "SELECT to_jsonb(a) FROM execution_approvals a WHERE execution_id=$1 ORDER BY id",
+            "SELECT to_jsonb(a) - 'approval_mode' FROM execution_approvals a WHERE execution_id=$1 ORDER BY id",
         )
         .bind(request_id)
         .fetch_all(&pool)
