@@ -69,8 +69,8 @@ SOLO_PROFILE = {"mode": "single_operator", "operator_user_id": OPERATOR_ID,
                 "allowed_actions": ["nftables.block_incident_source"]}
 
 
-def solo_plan():
-    value = plan()
+def solo_plan(**criteria):
+    value = plan(**criteria)
     value["approval_profile"] = copy.deepcopy(SOLO_PROFILE)
     value["plan_sha256"] = p7b.canonical_hash(value)
     return value
@@ -142,9 +142,11 @@ class SingleOperatorTests(unittest.TestCase):
             {"approval_evidence": {}},
             {"approval_evidence": {**solo_canary(0)["approval_evidence"], "approver_id": "00000000-0000-0000-0000-000000000088"}},
             {"approval_evidence": {**solo_canary(0)["approval_evidence"], "approval_mode": "distinct_person"}},
+            {"approval_evidence": {**solo_canary(0)["approval_evidence"], "execution_id": "00000000-0000-0000-0001-000000000088"}},
             {"approval_context_hash": "b" * 64},
             {"approval_context_hash": ""},
             {"approval_profile": {"mode": "multi_person"}},
+            {"approval_profile": {"mode": "single_operator", "operator_user_id": "00000000-0000-0000-0000-000000000088"}},
             {"action": "quarantine.host"},
             {"required_approvals": 2},
             {"distinct_human_approvals": True},
@@ -152,12 +154,11 @@ class SingleOperatorTests(unittest.TestCase):
         ]
         for change in mutations:
             with self.subTest(change=change):
-                rows = []
-                for i in range(10):
-                    row = solo_canary(i)
-                    row.update(copy.deepcopy(change))
-                    rows.append(row)
-                self.assertEqual(crit(status(window(), rows, p=solo_plan()), "rollback_p95"), "not_measured")
+                # One otherwise-valid row and a one-row threshold isolate each
+                # guard; a second mismatch must not mask a missing identity check.
+                row = solo_canary(0)
+                row.update(copy.deepcopy(change))
+                self.assertEqual(crit(status(window(), [row], p=solo_plan(min_canary_measurements=1)), "rollback_p95"), "not_measured")
 
     def test_duplicate_request_rows_cannot_fill_the_canary_sample_size(self):
         rows = [solo_canary(0) for _ in range(10)]
