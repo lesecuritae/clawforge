@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import copy
 
 HERE = pathlib.Path(__file__).parent
 spec = importlib.util.spec_from_file_location("p7b", HERE / "phase7b-observe.py")
@@ -61,6 +62,127 @@ def status(samples, measurements=(), now=END + 10, p=None):
 
 def crit(report, name):
     return next(c for c in report["criteria"] if c["criterion"] == name)["status"]
+
+
+OPERATOR_ID = "00000000-0000-0000-0000-000000000099"
+SOLO_PROFILE = {"mode": "single_operator", "operator_user_id": OPERATOR_ID,
+                "allowed_actions": ["nftables.block_incident_source"]}
+
+
+def solo_plan():
+    value = plan()
+    value["approval_profile"] = copy.deepcopy(SOLO_PROFILE)
+    value["plan_sha256"] = p7b.canonical_hash(value)
+    return value
+
+
+def solo_canary(i):
+    request = f"00000000-0000-0000-0001-{i + 1:012d}"
+    return canary(i, request_id=request, distinct_human_approvals=1,
+                  action="nftables.block_incident_source", required_approvals=1,
+                  approval_profile={"mode": "single_operator", "operator_user_id": OPERATOR_ID},
+                  approval_context_hash="a" * 64,
+                  approval_evidence={"execution_id": request, "approver_id": OPERATOR_ID,
+                                     "approval_mode": "single_operator_confirmation", "context_hash": "a" * 64})
+
+
+class SingleOperatorTests(unittest.TestCase):
+    def test_legacy_registered_plan_keeps_default_and_original_hash(self):
+        value = plan()
+        value.pop("approval_profile", None)
+        value["plan_sha256"] = p7b.canonical_hash(value)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "legacy.json"
+            path.write_text(json.dumps(value))
+            loaded = p7b.load_plan(path)
+        self.assertEqual(loaded["plan_sha256"], value["plan_sha256"])
+        self.assertEqual(crit(status(window(), full_measurements(), p=loaded), "rollback_p95"), "met")
+        self.assertEqual(crit(status(window(), [solo_canary(i) for i in range(10)], p=loaded), "rollback_p95"), "not_measured")
+
+    def test_cli_freezes_native_profile_file_and_keeps_operator_confirmation_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            profile = pathlib.Path(tmp) / "profile.json"
+            profile.write_text(json.dumps(SOLO_PROFILE))
+            out = pathlib.Path(tmp) / "plan.json"
+            args = [sys.executable, str(HERE / "phase7b-observe.py"), "plan", "--out", str(out),
+                    "--start", "2026-10-26T08:00:00Z", "--probe-argv-json", '["true"]',
+                    "--approval-profile-file", str(profile)]
+            result = subprocess.run(args, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            loaded = p7b.load_plan(out)
+            self.assertEqual(loaded["approval_profile"], SOLO_PROFILE)
+            self.assertIsNone(loaded["operator_confirmed_by"])
+            self.assertEqual(out.stat().st_mode & 0o777, 0o600)
+            profile.write_text(json.dumps({"mode": "automatic"}))
+            self.assertEqual(p7b.load_plan(out)["approval_profile"], SOLO_PROFILE)
+            args[args.index("--out") + 1] = str(pathlib.Path(tmp) / "invalid.json")
+            for contents in ("{broken", '{"mode":"automatic"}'):
+                profile.write_text(contents)
+                self.assertEqual(subprocess.run(args, capture_output=True).returncode, 2)
+            profile.unlink()
+            self.assertEqual(subprocess.run(args, capture_output=True).returncode, 2)
+
+    def test_native_multi_person_export_keeps_two_approval_accounting(self):
+        value = p7b.build_plan(START, HOURS, ARGV, approval={"mode": "multi_person", "operator_user_id": None, "allowed_actions": []})
+        self.assertEqual(crit(status(window(), full_measurements(), p=value), "rollback_p95"), "met")
+        self.assertEqual(crit(status(window(), [solo_canary(i) for i in range(10)], p=value), "rollback_p95"), "not_measured")
+
+    def test_designated_confirmation_counts_in_pinned_single_operator_plan(self):
+        rows = full_measurements()[10:] + [solo_canary(i) for i in range(10)]
+        report = status(window(), rows, p=solo_plan())
+        self.assertEqual(crit(report, "rollback_p95"), "met")
+        self.assertEqual(report["status"], "CRITERIA_MET_REQUIRES_OPERATOR_REVIEW")
+        self.assertFalse(report["gate_passed"])
+
+    def test_single_confirmation_never_changes_the_default_plan(self):
+        self.assertEqual(crit(status(window(), [solo_canary(i) for i in range(10)]), "rollback_p95"), "not_measured")
+
+    def test_foreign_missing_or_unbound_native_confirmation_does_not_count(self):
+        mutations = [
+            {"approval_evidence": {}},
+            {"approval_evidence": {**solo_canary(0)["approval_evidence"], "approver_id": "00000000-0000-0000-0000-000000000088"}},
+            {"approval_evidence": {**solo_canary(0)["approval_evidence"], "approval_mode": "distinct_person"}},
+            {"approval_context_hash": "b" * 64},
+            {"approval_context_hash": ""},
+            {"approval_profile": {"mode": "multi_person"}},
+            {"action": "quarantine.host"},
+            {"required_approvals": 2},
+            {"distinct_human_approvals": True},
+            {"lab": True},
+        ]
+        for change in mutations:
+            with self.subTest(change=change):
+                rows = []
+                for i in range(10):
+                    row = solo_canary(i)
+                    row.update(copy.deepcopy(change))
+                    rows.append(row)
+                self.assertEqual(crit(status(window(), rows, p=solo_plan()), "rollback_p95"), "not_measured")
+
+    def test_duplicate_request_rows_cannot_fill_the_canary_sample_size(self):
+        rows = [solo_canary(0) for _ in range(10)]
+        self.assertEqual(crit(status(window(), rows, p=solo_plan()), "rollback_p95"), "not_measured")
+        self.assertEqual(crit(status(window(), [canary(0)] * 10), "rollback_p95"), "not_measured")
+
+    def test_profile_is_registered_before_window_and_cannot_be_edited(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "plan.json"
+            value = solo_plan()
+            path.write_text(json.dumps(value))
+            p7b.load_plan(path)
+            value["approval_profile"]["operator_user_id"] = "00000000-0000-0000-0000-000000000088"
+            path.write_text(json.dumps(value))
+            with self.assertRaises(p7b.BadInput):
+                p7b.load_plan(path)
+
+    def test_invalid_or_out_of_scope_single_operator_profile_is_rejected(self):
+        for change in ({"operator_user_id": ""}, {"mode": "automatic"},
+                       {"allowed_actions": []}, {"allowed_actions": ["quarantine.host"]}):
+            with self.subTest(change=change):
+                value = solo_plan()
+                value["approval_profile"].update(change)
+                with self.assertRaises(p7b.BadInput):
+                    p7b.validate_plan(value)
 
 
 class PlanTests(unittest.TestCase):

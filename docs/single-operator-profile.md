@@ -85,3 +85,9 @@ network-isolated PostgreSQL container (requires the cached `postgres:16-alpine` 
 step as one explicit, context-bound confirmation by the designated operator. Detection quality, a real Phase 7B window,
 operator-labelled legitimate traffic and the live authorization stay separate acceptance items. The abuse.ch feeds are
 optional; no release, IDS or live gate depends on their keys.
+
+The separate Phase 7B observer supports a hash-pinned owner export of this
+profile through `plan --approval-profile-file`. It counts a single confirmation
+only with matching native request/approver/mode/context evidence; see
+`phase7b-next-observation.md`. Old plans keep two-person accounting. This does not
+replace the operator confirmation or the measured live observation.

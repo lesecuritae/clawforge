@@ -59,6 +59,54 @@ from an unlisted source would pollute the very SSH signals this system measures.
 `classification`, `was_blocked`). Lockout probes can be produced without touching a host by the real-parser
 validator (`candidate_never_block_list_protects_every_listed_address_and_allows_the_canary`).
 
+## Single-operator deployments
+
+The observation plan defaults to two distinct approvals. Existing registered
+plans keep that default and their original hashes; they are never reinterpreted
+as single-operator plans. For an explicitly configured single-operator deployment,
+the trusted owner may export `SELECT row_to_json(p) FROM clawforge_approval_profile() p`
+to a private JSON file and supply `plan --approval-profile-file profile.json`.
+The plan pins the mode, designated operator UUID and action allowlist in its hash.
+Changing the file afterwards does not change the plan. Confirmation of the plan
+remains a separate human step; the command does not supply it.
+
+An eligible single-operator `canary` measurement must additionally contain:
+
+```json
+{
+  "request_id": "00000000-0000-0000-0001-000000000001",
+  "lab": false,
+  "distinct_human_approvals": 1,
+  "required_approvals": 1,
+  "action": "nftables.block_incident_source",
+  "approval_context_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "approval_profile": {
+    "mode": "single_operator",
+    "operator_user_id": "00000000-0000-0000-0000-000000000099"
+  },
+  "approval_evidence": {
+    "execution_id": "00000000-0000-0000-0001-000000000001",
+    "approver_id": "00000000-0000-0000-0000-000000000099",
+    "approval_mode": "single_operator_confirmation",
+    "context_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  }
+}
+```
+
+The example IDs/hash are synthetic, not an approval. The trusted collector must
+copy these fields from the native request context and `execution_approvals` row,
+alongside the existing packet/rollback measurements. The action must be in the
+pinned allowlist; the native profile marker, request ID, approver ID and both
+context hashes must agree. Ordinary approvals, unknown/lab rows, malformed
+evidence and quarantines do not count as a single confirmation. Duplicate request
+IDs are excluded, so repeating one row cannot fill the sample size in either mode.
+
+The evaluator consumes trusted evidence files; it does not authenticate a human,
+read the current production profile, verify signatures, or create an approval.
+It never opens a live gate. A profile/action change requires a new registered
+observation plan and operator review. False-positive labels, telemetry, packet
+effect, rollback, lockout and drift criteria remain unchanged.
+
 ## Operator stop conditions
 
 Stop file present; any state violation; more than `max_consecutive_failed_cycles` consecutive failed cycles; a
