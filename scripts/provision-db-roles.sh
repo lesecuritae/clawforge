@@ -191,6 +191,10 @@ GRANT EXECUTE ON FUNCTION clawforge_enqueue_goaway_shadow_challenge(UUID)
 GRANT EXECUTE ON FUNCTION clawforge_assessment_event_types(UUID) TO clawforge_policy_engine;
 -- Behaviour counts of one assessment (migration 0067): numbers only, never usernames or paths.
 GRANT EXECUTE ON FUNCTION clawforge_assessment_shape(UUID, TEXT[]) TO clawforge_policy_engine;
+-- Approval profile (migration 0071): every role that creates, approves or claims approval-gated requests reads it through
+-- this function only; no runtime role has any privilege on the table, so the mode cannot be changed from the application.
+REVOKE ALL ON TABLE approval_profile FROM clawforge_api, clawforge_worker, clawforge_correlation, clawforge_security_engine, clawforge_policy_engine, clawforge_incidents, clawforge_executor, clawforge_operations, clawforge_decision;
+GRANT EXECUTE ON FUNCTION clawforge_approval_profile() TO clawforge_api, clawforge_executor, clawforge_policy_engine, clawforge_operations;
 -- Retention that keeps the evidence behind real execution requests (migration 0070): the worker cannot read execution_requests itself.
 GRANT EXECUTE ON FUNCTION clawforge_delete_expired_security_assessments(TIMESTAMPTZ) TO clawforge_worker;
 -- Current reputation/routing view of one pseudonymized source (migration 0063).

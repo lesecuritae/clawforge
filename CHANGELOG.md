@@ -4,6 +4,11 @@
 
 Weitere Änderungen für die nächste Version werden hier gesammelt.
 
+## [1.2.10] - 2026-10-27
+
+- Approval: explicit, opt-in single-operator profile (migration 0071, default OFF, deployment configuration in an owner-only table, never a request field). For the four incident-source firewall actions only, one authenticated, context-bound confirmation by the designated Administrator replaces the policy's two approvals; the lowering is recorded in the hashed context, quarantine can never be listed, the multi-person default and all gates are unchanged. Separate confirmation operation, database-enforced refusal paths and direct-insert bypass tests (storage/tests/single_operator_profile.rs, with mutation controls). Readiness checklist reports the profile; abuse.ch feeds are described as optional. Migration 0072 makes bridge `propose` requests honour the profile; Controlled Operations gets a review-and-confirm view (interactive session only, no fallback to ordinary approval). See `docs/single-operator-profile.md`.
+- Fix: review state is bound to the displayed request ID and context hash. Loading another request hides the previous details, and an in-flight confirmation prevents changing the selection. The owner configuration script supplies optional psql variables and stops on errors itself, including with PostgreSQL 16; switching back to the default needs only `mode=multi_person`. Native psql regressions and delayed-response UI tests cover these paths.
+
 ## [1.2.9] - 2026-10-24
 
 - Observability: the executor reads back every completed, unexpired firewall rule generation once per poll and reports (warning + `firewall_rule_drift_detected` audit event, id and scope only) when its element has vanished from the adapter state, or cannot be read; recovery is noticed. Read-only: no rollback, re-apply or status change. The reviewed pilot target "drift detection <= 1 poll" had no implementation for a block that disappears mid-TTL. Proven in a disposable real-kernel lab (out-of-band `nft delete element` / `add element`), with PostgreSQL tests and a mutation control for the listing query.

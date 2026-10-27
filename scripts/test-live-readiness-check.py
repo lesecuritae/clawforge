@@ -154,6 +154,27 @@ class Prerequisites(unittest.TestCase):
         self.assertEqual(check("propose", ""), "UNKNOWN")
         self.assertEqual(check("propose", "abc"), "UNKNOWN")
 
+    def test_single_operator_profile_is_reported_honestly_and_changes_only_the_human_step_wording(self):
+        base = lr.evaluate(state(), NOW)
+        self.assertEqual(by_id(base)["approval_profile"], "PASS")
+        self.assertIn("two independent", base["outstanding_human_items"][0])
+        single = lr.evaluate(state(approval_profile={"mode": "single_operator", "allowed_actions": ["nftables.block_incident_source"], "operator_enabled": True}), NOW)
+        self.assertEqual(by_id(single)["approval_profile"], "PASS")
+        self.assertIn("one explicit", single["outstanding_human_items"][0])
+        self.assertIn("cannot be created by an agent", single["outstanding_human_items"][0])
+        self.assertIs(single["live_ready"], False)
+        # all other human items stay, the gates are not touched
+        self.assertEqual(single["outstanding_human_items"][1:], base["outstanding_human_items"][1:])
+        self.assertEqual([g["status"] for g in single["gates_closed"]], [g["status"] for g in base["gates_closed"]])
+        broken = lr.evaluate(state(approval_profile={"mode": "single_operator", "allowed_actions": [], "operator_enabled": False}), NOW)
+        self.assertEqual(by_id(broken)["approval_profile"], "FAIL")
+
+    def test_abuse_ch_failures_are_informational_and_never_a_blocker(self):
+        providers = GOOD["providers"] + [{"id": "threatfox", "enabled": True, "interval_seconds": 900, "state": "error", "last_success_age_seconds": None}]
+        report = lr.evaluate(state(providers=providers), NOW)
+        self.assertTrue(any("OPTIONAL" in w for w in report["warnings"]))
+        self.assertEqual(report["summary"]["prerequisites_failing"], [])
+
     def test_backup_is_never_assumed(self):
         self.assertEqual(self.status("recent_restorable_backup", backup=None), "UNKNOWN")
         self.assertEqual(self.status("recent_restorable_backup", backup={"files": 0, "newest_age_seconds": None, "newest_bytes": None, "free_gib": 100}), "FAIL")

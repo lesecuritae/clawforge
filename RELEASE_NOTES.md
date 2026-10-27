@@ -1,3 +1,28 @@
+# Clawforge v1.2.10 Explicit single-operator approval profile
+
+Deployments with one human owner can explicitly select a designated Administrator and a small allow list of
+incident-source firewall actions. One genuine, context-bound confirmation then replaces the usual two distinct
+approvals for those actions. The default remains multi-person; no agent, API token or request parameter can select
+the profile or supply the human confirmation. Quarantine remains outside the single-operator profile.
+
+## Workflow and configuration
+- Migrations 0071 and 0072 add the owner-configured profile and make eligible bridge proposals honour it.
+- Controlled Operations displays the exact request, target, context hash and expiry before the explicit confirmation.
+  Review state is bound to that request and hash; delayed responses cannot carry a review onto another request.
+- The owner configuration script works with omitted optional fields, reliably reports errors on PostgreSQL 16,
+  and returns to the default with only `mode=multi_person`.
+- abuse.ch feeds are optional and do not block release, passive IDS operation or live acceptance.
+
+The profile does not enable actions, the bridge, live authorization or enforcement. Existing dry-run, protected
+networks, TTL/rate/concurrency limits, recovery and real-traffic acceptance requirements remain separate.
+See [single-operator profile](docs/single-operator-profile.md) for setup and the tested refusal cases.
+
+## Validation
+Native PostgreSQL tests cover profile constraints, wrong/expired/changed/replayed confirmations and the genuine bridge
+proposal path. Router tests reject API tokens for confirmation. UI regressions cover delayed detail loads and pending
+submissions; five standalone psql tests exercise the real configuration script in a disposable database without network
+access. These are functional tests, not a claim that production detection quality or live enforcement has been accepted.
+
 # Clawforge v1.2.9 Drift check for active blocks, executor limits reach the container
 
 Includes everything in v1.2.8 (runtime heartbeat, retention keeps real-request evidence, migration 0070,

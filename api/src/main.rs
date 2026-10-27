@@ -4107,6 +4107,37 @@ async fn admin_execution_detail(
             }))
         });
     let blast_radius = blast_radius_hint(&target);
+    // What the single-operator UI may offer THIS signed-in person. Presentation only: the database decides again at
+    // confirmation time. The profile comes from the trusted deployment table, never from the request.
+    let confirmation_state = {
+        let profile = state.store.approval_profile().await.ok();
+        let marked = detail
+            .get("approval_profile")
+            .and_then(|value| value.get("operator_user_id"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let waiting =
+            detail.get("status").and_then(serde_json::Value::as_str) == Some("waiting_approval");
+        let unexpired = detail
+            .get("approval_expires_at")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+            .is_some_and(|value| value > chrono::Utc::now());
+        let operator = profile.as_ref().and_then(|value| value.operator_user_id);
+        let single = profile
+            .as_ref()
+            .is_some_and(|value| value.mode == "single_operator");
+        let you_are_operator = single && operator == Some(principal.id);
+        let marker_matches = marked.as_deref()
+            == operator.map(|value| value.to_string()).as_deref()
+            && marked.is_some();
+        serde_json::json!({
+            "profile_mode": profile.as_ref().map(|value| value.mode.clone()).unwrap_or_else(|| "multi_person".into()),
+            "you_are_designated_operator": you_are_operator,
+            "available": single && you_are_operator && marker_matches && waiting && unexpired && principal.role == "Administrator" && principal.auth_kind == "session",
+            "signed_in_as": principal.username,
+        })
+    };
     if let Some(map) = detail.as_object_mut() {
         map.insert("approvals".to_string(), serde_json::json!(approvals));
         map.insert(
@@ -4114,6 +4145,7 @@ async fn admin_execution_detail(
             serde_json::json!(action_preview),
         );
         map.insert("blast_radius".to_string(), blast_radius);
+        map.insert("confirmation".to_string(), confirmation_state);
     }
     audit(
         &state,
@@ -4608,6 +4640,52 @@ async fn admin_approve_execution(
         })?;
     Ok(envelope(value, None))
 }
+#[derive(Deserialize)]
+struct SingleOperatorConfirmation {
+    /// The exact context hash of the request the operator has read. Anything else is refused.
+    context_hash: String,
+}
+
+/// Explicit single-operator confirmation. Reachable only with an authenticated ADMINISTRATOR session (agents and tools
+/// use agent tokens and never reach admin routes) and only inside the opt-in single-operator profile; the database
+/// decides whether this account, action, context and window qualify.
+async fn admin_confirm_single_operator_execution(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(body): Json<SingleOperatorConfirmation>,
+) -> ApiResult<Json<ApiEnvelope<serde_json::Value>>> {
+    let principal = authenticate(&state, &headers).await?;
+    require_role(&principal, &["Administrator"])?;
+    // A genuine human confirmation: an interactive login session, never a long-lived API token (scripts, agents).
+    if principal.auth_kind != "session" {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "an interactive login session is required",
+        ));
+    }
+    let value = state
+        .store
+        .confirm_single_operator_execution(
+            id,
+            principal.id,
+            &principal.username,
+            body.context_hash.trim(),
+        )
+        .await
+        .map_err(|error| {
+            if error.to_string().contains("not found") {
+                api_error(StatusCode::NOT_FOUND, "execution request not found")
+            } else {
+                api_error(
+                    StatusCode::CONFLICT,
+                    "single-operator confirmation is not available",
+                )
+            }
+        })?;
+    Ok(envelope(value, None))
+}
+
 async fn admin_cancel_execution(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -8412,6 +8490,10 @@ fn build_router(app_state: AppState) -> Router {
             post(admin_approve_execution),
         )
         .route(
+            "/admin/executions/{id}/confirm-single-operator",
+            post(admin_confirm_single_operator_execution),
+        )
+        .route(
             "/admin/executions/{id}/cancel",
             post(admin_cancel_execution),
         )
@@ -9854,6 +9936,283 @@ mod tests {
             "POST /firewall/kill-switch must require authentication"
         );
 
+        Ok(())
+    }
+
+    /// The single-operator confirmation route end to end through the real router: only an interactive Administrator
+    /// session of the designated operator, only with the exact context hash, never a long-lived API token, never an
+    /// unknown/agent bearer, never the ordinary approval route, never twice. The profile is switched in the database
+    /// by the owner role only (as in production) and restored at the end.
+    #[tokio::test]
+    #[ignore = "requires an isolated PostgreSQL test container"]
+    async fn single_operator_confirmation_route_accepts_only_the_designated_operators_session(
+    ) -> anyhow::Result<()> {
+        // Own disposable database: this test enables an action, creates approved requests and flips the profile, none of
+        // which may leak into the shared fixture other suites claim work from.
+        let base = std::env::var("CLAWFORGE_TEST_DATABASE_URL")
+            .or_else(|_| std::env::var("DATABASE_URL"))?;
+        let admin = sqlx::PgPool::connect(&base).await?;
+        let database = format!("single_operator_route_{}", Uuid::new_v4().simple());
+        sqlx::query(&format!("CREATE DATABASE {database}"))
+            .execute(&admin)
+            .await?;
+        let (prefix, _) = base
+            .split('?')
+            .next()
+            .unwrap_or(&base)
+            .rsplit_once('/')
+            .expect("database url has a path");
+        let url = format!("{prefix}/{database}");
+        let outcome = tokio::spawn(async move { single_operator_route_checks(&url).await }).await;
+        let cleanup = sqlx::query(&format!("DROP DATABASE {database} WITH (FORCE)"))
+            .execute(&admin)
+            .await;
+        admin.close().await;
+        cleanup?;
+        outcome??;
+        Ok(())
+    }
+
+    async fn single_operator_route_checks(url: &str) -> anyhow::Result<()> {
+        use tower::ServiceExt;
+
+        let store = PostgresStore::connect(url).await?;
+        let pool = store.pool().clone();
+        let app = build_router(test_app_state(store.clone()));
+        let uniq = Uuid::new_v4().simple().to_string();
+        let action = "nftables.block_incident_source";
+        sqlx::query("UPDATE actions SET enabled=TRUE, requires_approval=TRUE WHERE name=$1")
+            .bind(action)
+            .execute(&pool)
+            .await?;
+        let action_id: Uuid = sqlx::query_scalar("SELECT id FROM actions WHERE name=$1")
+            .bind(action)
+            .fetch_one(&pool)
+            .await?;
+        let solo_name = format!("solo-{uniq}");
+        let other_name = format!("other-{uniq}");
+        let solo = store
+            .create_admin_user(&solo_name, "Administrator", "!")
+            .await?;
+        let other = store
+            .create_admin_user(&other_name, "Administrator", "!")
+            .await?;
+        let expires = chrono::Utc::now() + chrono::Duration::hours(1);
+        let solo_session = format!("solo-session-{uniq}");
+        let other_session = format!("other-session-{uniq}");
+        let solo_api_token = format!("solo-api-token-{uniq}");
+        store
+            .create_session(solo, &digest(&solo_session), expires)
+            .await?;
+        store
+            .create_session(other, &digest(&other_session), expires)
+            .await?;
+        store
+            .create_api_token(
+                solo,
+                &digest(&solo_api_token),
+                "tok",
+                "test token",
+                Some(expires),
+            )
+            .await?;
+        sqlx::query("UPDATE approval_profile SET mode='single_operator', operator_user_id=$1, allowed_actions=ARRAY['nftables.block_incident_source']::TEXT[]")
+            .bind(solo).execute(&pool).await?;
+
+        let make_request = |ip: &'static str| {
+            let store = store.clone();
+            let name = solo_name.clone();
+            async move {
+                store.create_execution_request(&clawforge_storage::ExecutionRequestInput {
+                    action_id, workflow_run_id: None, decision_id: None, requested_by: name, requested_by_id: Some(solo),
+                    idempotency_key: None, target: Some(serde_json::json!({"kind":"threat_intel_indicator","cidr":ip,"source":"route-test"})),
+                }).await
+            }
+        };
+        let call = |method: &'static str,
+                    path: String,
+                    bearer: Option<String>,
+                    body: Option<serde_json::Value>| {
+            let app = app.clone();
+            async move {
+                let mut builder = Request::builder().method(method).uri(path);
+                if let Some(token) = bearer {
+                    builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
+                }
+                let request = if let Some(body) = body {
+                    builder
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap()
+                } else {
+                    builder.body(Body::empty()).unwrap()
+                };
+                let response = app.oneshot(request).await.unwrap();
+                let status = response.status();
+                let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+                (
+                    status,
+                    serde_json::from_slice::<serde_json::Value>(&bytes).unwrap_or_default(),
+                )
+            }
+        };
+
+        let request = make_request("203.0.113.151").await?;
+        let hash: String =
+            sqlx::query_scalar("SELECT approval_context_hash FROM execution_requests WHERE id=$1")
+                .bind(request)
+                .fetch_one(&pool)
+                .await?;
+        let confirm = format!("/admin/executions/{request}/confirm-single-operator");
+        let body = || Some(serde_json::json!({"context_hash": hash}));
+
+        // What the UI is told: only the designated operator's interactive session sees it as available.
+        let (_, detail) = call(
+            "GET",
+            format!("/executions/{request}"),
+            Some(solo_session.clone()),
+            None,
+        )
+        .await;
+        assert_eq!(detail["data"]["confirmation"]["available"], true);
+        assert_eq!(
+            detail["data"]["confirmation"]["profile_mode"],
+            "single_operator"
+        );
+        let (_, detail) = call(
+            "GET",
+            format!("/executions/{request}"),
+            Some(other_session.clone()),
+            None,
+        )
+        .await;
+        assert_eq!(detail["data"]["confirmation"]["available"], false);
+        let (_, detail) = call(
+            "GET",
+            format!("/executions/{request}"),
+            Some(solo_api_token.clone()),
+            None,
+        )
+        .await;
+        assert_eq!(
+            detail["data"]["confirmation"]["available"], false,
+            "an API token is not an interactive human session"
+        );
+
+        assert_eq!(
+            call("POST", confirm.clone(), None, body()).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            call(
+                "POST",
+                confirm.clone(),
+                Some("not-a-credential".into()),
+                body()
+            )
+            .await
+            .0,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            call(
+                "POST",
+                confirm.clone(),
+                Some(solo_api_token.clone()),
+                body()
+            )
+            .await
+            .0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            call("POST", confirm.clone(), Some(other_session.clone()), body())
+                .await
+                .0,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            call(
+                "POST",
+                confirm.clone(),
+                Some(solo_session.clone()),
+                Some(serde_json::json!({"context_hash": "0".repeat(64)}))
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            call(
+                "POST",
+                format!("/admin/executions/{request}/approve"),
+                Some(solo_session.clone()),
+                None
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT,
+            "the ordinary route never satisfies a profile request"
+        );
+        assert_eq!(
+            call(
+                "POST",
+                format!("/admin/executions/{request}/approve"),
+                Some(other_session.clone()),
+                None
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM execution_requests WHERE id=$1")
+                .bind(request)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(
+            status, "waiting_approval",
+            "every refusal left the request untouched"
+        );
+
+        let (code, done) = call("POST", confirm.clone(), Some(solo_session.clone()), body()).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(done["data"]["status"], "approved");
+        assert_eq!(
+            call("POST", confirm.clone(), Some(solo_session.clone()), body())
+                .await
+                .0,
+            StatusCode::CONFLICT,
+            "double submit"
+        );
+
+        // A changed profile withdraws the offer for a still-waiting request.
+        let second = make_request("203.0.113.152").await?;
+        sqlx::query("UPDATE approval_profile SET mode='multi_person', operator_user_id=NULL, allowed_actions='{}'").execute(&pool).await?;
+        let (_, detail) = call(
+            "GET",
+            format!("/executions/{second}"),
+            Some(solo_session.clone()),
+            None,
+        )
+        .await;
+        assert_eq!(detail["data"]["confirmation"]["available"], false);
+        let second_hash: String =
+            sqlx::query_scalar("SELECT approval_context_hash FROM execution_requests WHERE id=$1")
+                .bind(second)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(
+            call(
+                "POST",
+                format!("/admin/executions/{second}/confirm-single-operator"),
+                Some(solo_session.clone()),
+                Some(serde_json::json!({"context_hash": second_hash}))
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
         Ok(())
     }
 

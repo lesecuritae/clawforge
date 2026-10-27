@@ -142,6 +142,9 @@ export CLAWFORGE_TEST_WORKER_DATABASE_URL="$(cat "$secret_dir/database_worker_ur
 export CLAWFORGE_TEST_CORRELATION_DATABASE_URL="$(cat "$secret_dir/database_correlation_url")"
 run_cargo test -p clawforge-storage --test migration_lineages -- --ignored --test-threads=1
 run_cargo test -p clawforge-storage --test quarantine_approval -- --ignored --test-threads=1
+
+# Explicit single-operator approval profile (migration 0071): default, bounds, fail-closed paths, role privileges.
+run_cargo test -p clawforge-storage --test single_operator_profile -- --ignored --test-threads=1
 run_cargo test -p clawforge-storage --test event_delivery_claim -- --ignored --test-threads=1
 run_cargo test -p clawforge-storage --test sensor_metrics -- --ignored --test-threads=1
 run_cargo test -p clawforge-storage --test runtime_heartbeat -- --ignored --test-threads=1

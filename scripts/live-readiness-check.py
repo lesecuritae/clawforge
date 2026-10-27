@@ -38,6 +38,16 @@ OUTSTANDING_HUMAN_ITEMS = [
 ]
 
 
+def outstanding_items(profile):
+    """In the deliberate single-operator profile the human step is ONE explicit, authenticated confirmation by the
+    designated operator; it is still a human step that no model or script may perform."""
+    items = list(OUTSTANDING_HUMAN_ITEMS)
+    if profile and profile.get("mode") == "single_operator":
+        items[0] = ("one explicit, authenticated, context-bound confirmation by the designated operator per request "
+                    "(single-operator profile; cannot be created by an agent or tool)")
+    return items
+
+
 def item(item_id, status, detail):
     assert status in ("PASS", "FAIL", "UNKNOWN")
     return {"id": item_id, "status": status, "detail": detail}
@@ -151,7 +161,7 @@ def evaluate(state, now):
                                f"MAX_EVIDENCE_AGE={raw} s, need >= {need} s (2x the slowest counting feed, {max(intervals)} s); a shorter age refuses a genuinely listed source for part of every sync cycle"))
     failing = [f["id"] for f in state.get("providers", []) if f.get("enabled") and f.get("state") == "error"]
     if failing:
-        warnings.append(f"enabled providers in error (not counting feeds, e.g. missing abuse.ch AuthKeys): {failing}")
+        warnings.append(f"enabled providers in error: {failing} (informational only: abuse.ch feeds are OPTIONAL and no gate depends on them)")
     backup = state.get("backup")
     if backup is None:
         prereq.append(item("recent_restorable_backup", "UNKNOWN", "backup volume not readable by this check; nothing is assumed"))
@@ -165,6 +175,14 @@ def evaluate(state, now):
     # A restore drill is separate evidence from the existence/age of a dump: it never turns recent_restorable_backup
     # into PASS, and without a receipt it stays UNKNOWN. The receipt is checked for internal consistency and age.
     prereq.append(restore_drill_item(state.get("restore_receipt"), now))
+    profile = state.get("approval_profile")
+    if not profile or profile.get("mode") != "single_operator":
+        prereq.append(item("approval_profile", "PASS", "multi-person default (two distinct humans for high/critical actions)" if profile else "multi-person default (profile table not deployed yet)"))
+    else:
+        ok = bool(profile.get("operator_enabled")) and bool(profile.get("allowed_actions"))
+        prereq.append(item("approval_profile", "PASS" if ok else "FAIL",
+                           f"DELIBERATE single-operator profile for {profile.get('allowed_actions')}: one authenticated confirmation by the designated Administrator account, bound to the exact request context" if ok
+                           else "single-operator profile configured but its operator account is disabled or the action list is empty (the database treats this as the multi-person default)"))
     verdict = state.get("shape_verdict")
     if verdict is None:
         prereq.append(item("shape_observation_24h", "UNKNOWN", "no evaluator verdict supplied (earliest 2026-10-24T12:50Z)"))
@@ -179,7 +197,7 @@ def evaluate(state, now):
         "gates_closed": gates,
         "prerequisites": prereq,
         "warnings": warnings,
-        "outstanding_human_items": OUTSTANDING_HUMAN_ITEMS,
+        "outstanding_human_items": outstanding_items(profile),
         "summary": {
             "gates_open_or_unknown": [g["id"] for g in gates if g["status"] != "PASS"],
             "prerequisites_failing": [p["id"] for p in prereq if p["status"] == "FAIL"],
@@ -210,7 +228,8 @@ SELECT 'J ' || jsonb_build_object(
  'runtime', (SELECT coalesce(jsonb_agg(jsonb_build_object('component', component, 'state', state, 'heartbeat_age_seconds', extract(epoch FROM now() - coalesce(last_heartbeat_at, updated_at))::int)), '[]') FROM runtime_status),
  'sensors', (SELECT coalesce(jsonb_agg(jsonb_build_object('name', name, 'age_seconds', extract(epoch FROM now() - last_seen_at)::int)), '[]') FROM security_sensors WHERE enabled AND revoked_at IS NULL),
  'providers', (SELECT coalesce(jsonb_agg(jsonb_build_object('id', p.id, 'enabled', p.enabled, 'interval_seconds', p.interval_seconds, 'state', s.state, 'last_success_age_seconds', extract(epoch FROM now() - s.last_success_at)::int)), '[]') FROM providers p LEFT JOIN provider_status s ON s.provider_id = p.id),
- 'orphans', (SELECT coalesce(jsonb_agg(p.proname), '[]') FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'public' AND p.prosecdef AND p.proname LIKE 'clawforge\_%' AND NOT EXISTS (SELECT 1 FROM pg_roles r WHERE r.rolname LIKE 'clawforge\_%' AND has_function_privilege(r.rolname, p.oid, 'EXECUTE')))
+ 'orphans', (SELECT coalesce(jsonb_agg(p.proname), '[]') FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'public' AND p.prosecdef AND p.proname LIKE 'clawforge\_%' AND NOT EXISTS (SELECT 1 FROM pg_roles r WHERE r.rolname LIKE 'clawforge\_%' AND has_function_privilege(r.rolname, p.oid, 'EXECUTE'))),
+ 'profile_table', to_regclass('public.approval_profile') IS NOT NULL
 )::text;
 ROLLBACK;
 """
@@ -232,6 +251,14 @@ def collect(args):
     data = json.loads(lines[0][2:])
     state.update(actions=data["actions"], policies=data["policies"], runtime=data["runtime"], sensors=data["sensors"],
                  providers=data["providers"], orphan_security_definer_functions=data["orphans"])
+    state["approval_profile"] = None
+    if data.get("profile_table"):
+        pr = sh(["docker", "exec", "-i", "clawforge-postgres-1", "psql", "-X", "-At", "-U", "clawforge", "-d", "clawforge", "-v", "ON_ERROR_STOP=1"],
+                "BEGIN READ ONLY; SELECT 'J ' || jsonb_build_object('mode', p.mode, 'allowed_actions', p.allowed_actions, 'operator_enabled', "
+                "coalesce((SELECT u.enabled AND u.role='Administrator' FROM admin_users u WHERE u.id=p.operator_user_id), false))::text FROM approval_profile p; ROLLBACK;")
+        rows = [l for l in pr.stdout.splitlines() if l.startswith("J ")]
+        if pr.returncode == 0 and len(rows) == 1:
+            state["approval_profile"] = json.loads(rows[0][2:])
     state["backup"] = None
     if args.backup_dir:
         try:

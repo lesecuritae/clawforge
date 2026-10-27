@@ -39,6 +39,7 @@ jobs:
       - run: python3 -I scripts/test-pilot-observation-evaluate.py
       - run: python3 -I scripts/test-shape-observation-evaluate.py
       - run: python3 -I scripts/test-live-readiness-check.py
+      - run: python3 -I scripts/test-approval-profile-script.py
       - run: python3 -I scripts/test-compose-executor-env.py
       - run: python3 -I scripts/test-behavior-reconcile.py
       - run: python3 -I scripts/test-phase7b-observe.py
