@@ -4608,6 +4608,45 @@ async fn admin_approve_execution(
         })?;
     Ok(envelope(value, None))
 }
+#[derive(Deserialize)]
+struct SingleOperatorConfirmation {
+    /// The exact context hash of the request the operator has read. Anything else is refused.
+    context_hash: String,
+}
+
+/// Explicit single-operator confirmation. Reachable only with an authenticated ADMINISTRATOR session (agents and tools
+/// use agent tokens and never reach admin routes) and only inside the opt-in single-operator profile; the database
+/// decides whether this account, action, context and window qualify.
+async fn admin_confirm_single_operator_execution(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(body): Json<SingleOperatorConfirmation>,
+) -> ApiResult<Json<ApiEnvelope<serde_json::Value>>> {
+    let principal = authenticate(&state, &headers).await?;
+    require_role(&principal, &["Administrator"])?;
+    let value = state
+        .store
+        .confirm_single_operator_execution(
+            id,
+            principal.id,
+            &principal.username,
+            body.context_hash.trim(),
+        )
+        .await
+        .map_err(|error| {
+            if error.to_string().contains("not found") {
+                api_error(StatusCode::NOT_FOUND, "execution request not found")
+            } else {
+                api_error(
+                    StatusCode::CONFLICT,
+                    "single-operator confirmation is not available",
+                )
+            }
+        })?;
+    Ok(envelope(value, None))
+}
+
 async fn admin_cancel_execution(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -8410,6 +8449,10 @@ fn build_router(app_state: AppState) -> Router {
         .route(
             "/admin/executions/{id}/approve",
             post(admin_approve_execution),
+        )
+        .route(
+            "/admin/executions/{id}/confirm-single-operator",
+            post(admin_confirm_single_operator_execution),
         )
         .route(
             "/admin/executions/{id}/cancel",

@@ -78,6 +78,24 @@ pub struct WorkflowRunInput {
     pub audit_action: String,
 }
 
+/// Deployment approval profile (migration 0071). Default and fail-closed value: `multi_person`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalProfile {
+    pub mode: String,
+    pub operator_user_id: Option<Uuid>,
+    pub allowed_actions: Vec<String>,
+}
+
+impl ApprovalProfile {
+    pub fn multi_person() -> Self {
+        Self {
+            mode: "multi_person".into(),
+            operator_user_id: None,
+            allowed_actions: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ExecutionRequestInput {
     pub action_id: Uuid,
@@ -2857,6 +2875,74 @@ impl PostgresStore {
             .collect())
     }
 
+    /// The deployment's approval profile as seen through `clawforge_approval_profile()`: anything but a complete,
+    /// active single-operator row reads as the multi-person default.
+    pub async fn approval_profile(&self) -> Result<ApprovalProfile> {
+        let row = sqlx::query(
+            "SELECT mode, operator_user_id, allowed_actions FROM clawforge_approval_profile()",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(match row {
+            Some(row) => ApprovalProfile {
+                mode: row.get("mode"),
+                operator_user_id: row.get("operator_user_id"),
+                allowed_actions: row.get("allowed_actions"),
+            },
+            None => ApprovalProfile::multi_person(),
+        })
+    }
+
+    /// The separate, explicit single-operator confirmation. It exists only inside the single-operator profile and is
+    /// never reached by the ordinary approval route. The caller must present the exact context hash of the request it
+    /// has read; a changed context, an expired window, another account or another action is refused by the database.
+    pub async fn confirm_single_operator_execution(
+        &self,
+        id: Uuid,
+        approver_id: Uuid,
+        actor: &str,
+        expected_context_hash: &str,
+    ) -> Result<serde_json::Value> {
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query("SELECT status,approval_context,approval_context_hash,approval_expires_at FROM execution_requests WHERE id=$1 FOR UPDATE")
+            .bind(id).fetch_optional(&mut *tx).await?
+            .ok_or_else(|| anyhow::anyhow!("execution request not found"))?;
+        if row.get::<String, _>("status") != "waiting_approval" {
+            anyhow::bail!("execution request is not waiting for approval");
+        }
+        let stored_hash = row
+            .get::<Option<String>, _>("approval_context_hash")
+            .ok_or_else(|| anyhow::anyhow!("execution approval context missing"))?;
+        if execution_context_hash(&row.get::<serde_json::Value, _>("approval_context"))?
+            != stored_hash
+            || stored_hash != expected_context_hash
+        {
+            anyhow::bail!("execution approval context mismatch");
+        }
+        sqlx::query("INSERT INTO execution_approvals (id,execution_id,approver_id,approver_name,context_hash,approval_mode) VALUES ($1,$2,$3,$4,$5,'single_operator_confirmation')")
+            .bind(Uuid::new_v4()).bind(id).bind(approver_id).bind(actor).bind(&stored_hash)
+            .execute(&mut *tx).await
+            .map_err(|_| anyhow::anyhow!("single-operator confirmation is not available"))?;
+        sqlx::query("UPDATE execution_requests SET status='approved' WHERE id=$1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| anyhow::anyhow!("single-operator confirmation is not available"))?;
+        Self::insert_audit_outbox(
+            &mut tx,
+            actor,
+            "execution_single_operator_confirmed",
+            &id.to_string(),
+            &serde_json::json!({"approval_mode":"single_operator_confirmation","status":"approved","context_hash":stored_hash}),
+        )
+        .await?;
+        tx.commit().await?;
+        let _ = self.flush_audit_outbox(100).await;
+        Ok(
+            serde_json::json!({"id": id, "status": "approved", "approval_mode": "single_operator_confirmation"}),
+        )
+    }
+
     pub async fn create_execution_request(&self, input: &ExecutionRequestInput) -> Result<Uuid> {
         let action = sqlx::query("SELECT a.name,a.risk_level,a.enabled,a.requires_approval,p.required_approvals,p.approval_timeout FROM actions a LEFT JOIN approval_policies p ON p.risk_level=a.risk_level WHERE a.id=$1")
             .bind(input.action_id)
@@ -2879,7 +2965,7 @@ impl PostgresStore {
         {
             anyhow::bail!("quarantine requires a critical action and a two-person approval policy");
         }
-        let required_approvals = if requires_approval {
+        let mut required_approvals = if requires_approval {
             action
                 .get::<Option<i32>, _>("required_approvals")
                 .ok_or_else(|| anyhow::anyhow!("approval policy not found"))?
@@ -2887,6 +2973,25 @@ impl PostgresStore {
         } else {
             0
         };
+        // Explicit single-operator profile (deployment configuration, default off): for the few actions it lists, ONE
+        // confirmation by the designated operator replaces the policy's count. The policy count and the operator are
+        // written into the hashed context so nothing is lowered silently; the database re-checks all of it.
+        let mut approval_profile = serde_json::Value::Null;
+        if requires_approval && required_approvals > 1 {
+            let profile = self.approval_profile().await?;
+            if profile.mode == "single_operator"
+                && profile
+                    .allowed_actions
+                    .contains(&action.get::<String, _>("name"))
+            {
+                approval_profile = serde_json::json!({
+                    "mode": "single_operator",
+                    "operator_user_id": profile.operator_user_id,
+                    "policy_required_approvals": required_approvals,
+                });
+                required_approvals = 1;
+            }
+        }
         let approval_timeout = if requires_approval {
             Some(
                 action
@@ -2910,7 +3015,7 @@ impl PostgresStore {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(|value| value.chars().take(160).collect::<String>());
-        let approval_context = serde_json::json!({
+        let mut approval_context = serde_json::json!({
             "version": 1,
             "action_id": input.action_id,
             "action_name": action.get::<String, _>("name"),
@@ -2927,6 +3032,9 @@ impl PostgresStore {
             "idempotency_key": idempotency_key,
             "target": input.target,
         });
+        if !approval_profile.is_null() {
+            approval_context["approval_profile"] = approval_profile;
+        }
         let context_hash = execution_context_hash(&approval_context)?;
         if let Some(key) = idempotency_key.as_deref() {
             if let Some(existing) = sqlx::query(
@@ -3700,12 +3808,24 @@ impl PostgresStore {
                  a.requires_approval \
                  AND e.requested_by_id IS NOT NULL \
                  AND e.approval_expires_at IS NOT NULL AND e.approval_expires_at > NOW() \
-                 AND ( \
+                 AND ( ( \
                      SELECT COUNT(DISTINCT ea.approver_id) FROM execution_approvals ea \
                      WHERE ea.execution_id = e.id \
                        AND ea.context_hash = e.approval_context_hash \
                        AND ea.approver_id <> e.requested_by_id \
                  ) >= GREATEST(e.required_approvals, COALESCE(p.required_approvals, 1)) \
+                 OR EXISTS ( \
+                     SELECT 1 FROM clawforge_approval_profile() prof \
+                      JOIN execution_approvals ea ON ea.approver_id = prof.operator_user_id \
+                     WHERE prof.mode = 'single_operator' \
+                       AND a.name = ANY (prof.allowed_actions) \
+                       AND ea.execution_id = e.id \
+                       AND ea.approval_mode = 'single_operator_confirmation' \
+                       AND ea.context_hash = e.approval_context_hash \
+                       AND e.required_approvals = 1 \
+                       AND e.approval_context -> 'approval_profile' ->> 'mode' = 'single_operator' \
+                       AND e.approval_context -> 'approval_profile' ->> 'operator_user_id' = prof.operator_user_id::TEXT \
+                 ) ) \
              , FALSE) \
              FROM execution_requests e \
              JOIN actions a ON a.id = e.action_id \

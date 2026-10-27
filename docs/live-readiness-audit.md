@@ -18,13 +18,13 @@ Output is JSON: `gates_closed` (must be PASS), `prerequisites` (PASS / FAIL / UN
 | --- | --- | --- | --- |
 | Executor stays dry-run, no live authorization, bridge off, all actions disabled, active policies observe-only, RIPEstat off | env + DB flags, checked as `gates_closed` | checker output | all PASS |
 | Safe application of an incident source | policy decision (independent evidence order, reputation required by default) → DB bridge function → approval by risk level → executor | `docs/policy-execution-bridge.md`, PostgreSQL tests with real roles and positive controls | bridge off; simulated requests exist (Go-Away challenges, `simulation_only`) |
-| Two independent approvals for high/critical | approval by action risk level; roles are read-only grants | storage tests | no human approval given; cannot be produced by an agent |
+| Human approval for high/critical | default: two distinct humans by risk level; opt-in `single-operator-profile.md` for a sole owner: one authenticated, context-bound confirmation | storage tests incl. `single_operator_profile.rs` | profile off (default); no approval given; neither mode can be produced by an agent |
 | Protective never-block list | `CLAWFORGE_FIREWALL_NEVER_BLOCK_CIDRS`, fail-closed; executor refuses a productive start without it | kernel-lab test `kernel_lab_never_block_list_protects_real_traffic_and_fails_closed`, executor unit test | **FAIL: not defined.** Candidates below, operator must confirm |
 | Pilot limits (TTL ≤ 900 s, ≤ 2 applies / 300 s, concurrency explicit) | env, read at each dispatch | checker | **FAIL: unset / defaults (3600 s, 20, implicit 5).** Setting `CLAWFORGE_FIREWALL_MAX_TTL_SECONDS` or `..._MAX_CONCURRENT_APPLIES_PER_ADAPTER` in `.env` had NO effect: compose did not pass them to the executor (fixed in the repository; the production compose fork needs the same two lines) |
 | TTL restore / rollback | write-ahead journal, native nftables element timeout, rollback readback | kernel-lab series (40 cycles apply → block → rollback → restore → native expiry) in a disposable container | proven in the lab; not in production |
 | Retention keeps evidence of real requests | migration 0070, `clawforge_delete_expired_security_assessments` | PostgreSQL test with positive/negative controls | deployed with 1.2.9 (ledger 70/66) |
 | Component health is truthful | runtime heartbeat every 30 s (api, incidents), policy engine `degraded` on failed cycles | `clawforge_component_up`, storage test | fixed and deployed (1.2.8/1.2.9): api and incidents heartbeats 26 s and 2 s old, all seven runtime components PASS |
-| Feed freshness / failure handling | counting feeds (spamhaus drop/edrop/asn, feodo) must be fresh; failing non-counting feeds warn | checker | counting feeds fresh; threatfox, urlhaus, malwarebazaar fail (need operator AuthKeys) |
+| Feed freshness / failure handling | counting feeds (spamhaus drop/edrop/asn, feodo) must be fresh; failing non-counting feeds warn | checker | counting feeds fresh; threatfox, urlhaus, malwarebazaar fail (OPTIONAL feeds; no gate depends on them) |
 | Bridge evidence age vs feed cadence | one age bounds decision, assessment and listing; counting feeds reconfirm only at sync | `bridge_evidence_age_covers_feed_cadence`, PostgreSQL regression | bridge off: not applicable; must be >= 2x the slowest counting feed (7200 s today) once a mode is chosen |
 | Sensor freshness | sensor `age_seconds ≤ 300` | checker | all sensors fresh; srv19680 is back online; the 22:27Z outage on 2026-10-23 stays a historical gap |
 | Observation sufficiency | `scripts/shape-observation-evaluate.py` (24 h, completeness checks, never passes a gate) | verdict file passed to the checker | collected 2026-10-24T12:50:31Z: evaluator `OBSERVED`, all 11 checks OK, `operator_gate_passed=false`; measurements only, not the quality acceptance and not Gate 7B |
@@ -54,7 +54,9 @@ Derived from this VM only: the LAN `192.168.0.0/24` (gateway 192.168.0.1, this V
 Tailscale `100.64.0.0/10`, the resolvers reached through 192.168.0.1. The operator must confirm
 these and add the ISP/remote ranges they administer from; nothing here has been applied.
 
-## abuse.ch feeds (ThreatFox, URLhaus, MalwareBazaar): what is wired and what is missing
+## abuse.ch feeds (ThreatFox, URLhaus, MalwareBazaar): OPTIONAL
+
+These three feeds are optional additional context. No release, IDS or live-enforcement gate depends on their keys, and they are not counting reputation sources for the bridge. What follows is only how to enable them if wanted.
 
 Checked 2026-10-24 without printing any value. Wiring is complete: the worker container gets
 `THREATFOX_AUTH_KEY_FILE`, `URLHAUS_AUTH_KEY_FILE` and `MALWAREBAZAAR_AUTH_KEY_FILE`, mounted from
@@ -102,7 +104,7 @@ maintenance window:
 
 ## Outstanding human decisions
 
-Two independent human approvals; operator-labelled legitimate bursts; formal Phase 7B observation;
-confirmed protection values and pilot limits; abuse.ch AuthKeys; srv19680 availability;
+One human confirmation per request (two distinct humans in the default profile); operator-labelled legitimate bursts; formal Phase 7B observation;
+confirmed protection values and pilot limits; srv19680 availability;
 maintenance-window reboot validation; backup/restore proof; the final live-authorization decision.
 Until all are evidenced, the answer to "live-ready?" is no.

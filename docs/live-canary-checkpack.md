@@ -19,6 +19,8 @@ values (addresses, hosts, request ids) live in the operator's private notes, not
 
 ## 2. Independent approvers and context binding
 
+Default profile: two distinct humans, described below. A sole owner can opt in to the single-operator profile (`single-operator-profile.md`): one authenticated, context-bound confirmation by the one designated Administrator, for the four incident-source firewall actions only; the rest of this check pack (never-block list, limits, dry-run, live authorization, rollback) applies unchanged.
+
 A real apply is authorized only when `firewall_request_live_authorized` is true: the action requires approval,
 the request has a requester identity and an unexpired approval window, and the number of **distinct** approver
 identities (never the requester) whose approval carries the request's exact context hash reaches the larger of the
