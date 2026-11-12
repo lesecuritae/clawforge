@@ -4242,6 +4242,76 @@ mod tests {
         );
     }
 
+    /// Failure-injection scenario "failed read-back" (roadmap, still listed
+    /// as missing in `docs/firewall-agent.md`'s "What's deliberately not
+    /// built yet"): this is NOT the same as manual drift above. Drift is
+    /// "the element is gone but the set/table that would hold it still
+    /// answers cleanly" (`nft` exits 0, element absent -> `NotPresent`).
+    /// Here the *whole table* that `verify`'s `nft list set ...` reads from
+    /// is gone (e.g. an operator ran break-glass, or anything else removed
+    /// it, while a generation was still tracked as active) -> `nft` itself
+    /// exits non-zero. `verify` must surface that as `Err`, never silently
+    /// coerce it into `Ok(NotPresent)`: a caller that could not read the
+    /// state at all must not record "confirmed absent" (which, for a TTL
+    /// sweep or kill-switch rollback, would wrongly mark the rollback as
+    /// verified rather than retry or escalate).
+    #[tokio::test]
+    #[ignore = "requires nftables (NET_ADMIN/NET_RAW) - run via scripts/test-firewall-lab.sh"]
+    async fn verify_reports_an_error_not_not_present_when_the_whole_table_is_unreadable() {
+        let adapter = lab_adapter().await;
+        let action = FirewallAction {
+            target: indicator("203.0.113.224"),
+            ttl_seconds: 60,
+            reason: "failed read-back test".into(),
+        };
+        adapter
+            .apply(&action, false)
+            .await
+            .expect("apply must succeed");
+        assert_eq!(
+            adapter.verify(&action.target).await.unwrap(),
+            VerificationResult::Verified,
+            "the target must genuinely be blocked before the table is removed"
+        );
+
+        // Remove the entire table, not just the element - simulating
+        // break-glass (or anything else) running while this generation is
+        // still tracked as active, rather than a normal out-of-band element
+        // removal.
+        let break_glass_script = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../scripts/nftables-clawforge-break-glass.sh"
+        );
+        let status = tokio::process::Command::new("sh")
+            .arg(break_glass_script)
+            .status()
+            .await
+            .expect("the break-glass script must run");
+        assert!(status.success(), "the break-glass script must exit 0");
+
+        let error = adapter.verify(&action.target).await.expect_err(
+            "verify must fail, not report a clean NotPresent, when the table itself cannot be read",
+        );
+        assert!(
+            matches!(error, AdapterError::Verify(_)),
+            "an unreadable table must surface as AdapterError::Verify, got {error:?}"
+        );
+
+        let provision_script = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../scripts/nftables-clawforge-provision.sh"
+        );
+        let reprovisioned = tokio::process::Command::new("sh")
+            .arg(provision_script)
+            .status()
+            .await
+            .expect("reprovisioning must run");
+        assert!(
+            reprovisioned.success(),
+            "reprovisioning after the drill must succeed so later tests find a valid table"
+        );
+    }
+
     #[tokio::test]
     #[ignore = "requires nftables (NET_ADMIN/NET_RAW) - run via scripts/test-firewall-lab.sh"]
     async fn applying_an_unresolved_incident_source_fails_closed() {

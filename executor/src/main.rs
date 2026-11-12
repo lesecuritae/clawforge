@@ -2335,6 +2335,94 @@ mod tests {
         adapter.rollback(&action).await.unwrap();
     }
 
+    /// Failure-injection scenario "failed read-back" (roadmap, still listed as missing in
+    /// `docs/firewall-agent.md`'s "What's deliberately not built yet"). Distinct from the drift test above:
+    /// there, the set/table still answers cleanly and the element is simply gone (`Absent`). Here the whole
+    /// table that `verify` reads from is gone (e.g. break-glass ran while this generation was still tracked
+    /// as active) - the adapter's read-back command itself fails. The drift sweep must report `Unreadable`,
+    /// never misreport `Absent`: a TTL sweep or kill-switch rollback that can't read back true state must
+    /// not record "confirmed absent" (which would wrongly close out a rollback instead of retrying or
+    /// escalating). Recovering the table (reprovision + reapply) must then be seen as `InForce` again, not
+    /// stay stuck on a stale diagnosis.
+    #[tokio::test]
+    #[ignore = "requires isolated nftables lab with NET_ADMIN"]
+    async fn active_generation_drift_check_reports_unreadable_not_absent_when_the_whole_table_is_gone(
+    ) {
+        let adapter = clawforge_firewall_agent::NftablesAdapter::new();
+        let address = "203.0.113.225";
+        let action = FirewallAction {
+            target: FirewallTarget::ThreatIntelIndicator {
+                cidr: format!("{address}/32"),
+                source: "isolated unreadable-table regression".into(),
+            },
+            ttl_seconds: 120,
+            reason: "isolated unreadable-table regression".into(),
+        };
+        let snapshot = RecoveryTarget::new("nftables", action.target.clone()).to_json();
+        let observe = || async {
+            match verify_firewall_rule_generation_target("nftables", &snapshot).await {
+                Ok(VerificationResult::Verified) => DriftState::InForce,
+                Ok(VerificationResult::NotPresent) => DriftState::Absent,
+                Err(_) => DriftState::Unreadable,
+            }
+        };
+        adapter.apply(&action, false).await.unwrap();
+        assert_eq!(observe().await, DriftState::InForce);
+
+        let break_glass = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../scripts/nftables-clawforge-break-glass.sh"
+        );
+        assert!(
+            tokio::process::Command::new("sh")
+                .arg(break_glass)
+                .status()
+                .await
+                .unwrap()
+                .success(),
+            "the break-glass script must exit 0"
+        );
+        let unreadable = observe().await;
+        assert_eq!(
+            unreadable,
+            DriftState::Unreadable,
+            "an unreadable table must be its own diagnosis, never a false Absent"
+        );
+        assert!(
+            drift_transition(Some(DriftState::InForce), unreadable).is_some(),
+            "the transition into Unreadable must be reported, not swallowed"
+        );
+        // Observing the same unreadable state again must not re-report (mirrors the
+        // Absent-repeats-don't-report assertion in the sibling drift test above).
+        assert_eq!(drift_transition(Some(unreadable), observe().await), None);
+
+        let provision = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../scripts/nftables-clawforge-provision.sh"
+        );
+        assert!(
+            tokio::process::Command::new("sh")
+                .arg(provision)
+                .status()
+                .await
+                .unwrap()
+                .success(),
+            "reprovisioning after the drill must succeed so later tests find a valid table"
+        );
+        adapter.apply(&action, false).await.unwrap();
+        let recovered = observe().await;
+        assert_eq!(
+            recovered,
+            DriftState::InForce,
+            "re-applying after the table comes back must be seen as InForce again, not stuck on Unreadable"
+        );
+        assert!(
+            drift_transition(Some(unreadable), recovered).is_some(),
+            "the recovery out of Unreadable must be reported too"
+        );
+        adapter.rollback(&action).await.unwrap();
+    }
+
     fn claimed(action_name: &str, target: Option<serde_json::Value>) -> ClaimedExecutionRequest {
         ClaimedExecutionRequest {
             id: Uuid::new_v4(),
