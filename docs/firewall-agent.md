@@ -718,8 +718,20 @@ not permission to enable the action or deploy Go-Away in production.
   HAProxy analog: two applies of the same target run genuinely
   concurrently via `tokio::join!` over two independent adapter instances
   against a real lab, neither errors/crashes, and the target ends up
-  blocked exactly once). Still missing: process/host/DB failure between
-  intent/apply/receipt/audit, reboot, clock skew, failed read-back.
+  blocked exactly once), and failed read-back (proven by
+  `verify_reports_an_error_not_not_present_when_the_whole_table_is_unreadable`
+  and the executor-level
+  `active_generation_drift_check_reports_unreadable_not_absent_when_the_whole_table_is_gone`:
+  a real break-glass run removes the entire table - not just one element,
+  the manual-drift case above - while a generation is still tracked as
+  active, so the adapter's own read-back command itself fails rather than
+  cleanly reporting absence. `verify` surfaces `AdapterError::Verify`, never
+  a false `Ok(NotPresent)`, and the drift sweep's `DriftState::Unreadable`
+  is reached through a genuine failure, not just the pre-existing unit test
+  of `drift_transition` in isolation; reprovisioning and re-applying is then
+  seen as `InForce` again, not stuck on a stale diagnosis). Still missing:
+  process/host/DB failure between intent/apply/receipt/audit, reboot, clock
+  skew.
 - **Both registered actions stay `enabled=FALSE`** - nothing here changes
   that a reviewed, explicit change is required before any of this can run
   for real, in a lab or otherwise, and `CLAWFORGE_EXECUTOR_DRY_RUN` stays
