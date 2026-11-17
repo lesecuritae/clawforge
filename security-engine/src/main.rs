@@ -422,7 +422,19 @@ async fn evaluate_rule(
         // future producer publishes under the same event_type without one).
         return Ok(());
     };
-    for offset in grid_offsets(rule.window_seconds) {
+    // The second, half-window-shifted grid exists so a burst *spanning* a bucket
+    // boundary is still caught whole in at least one grid - irrelevant for
+    // threshold<=1, where the single qualifying event already satisfies the
+    // primary grid's own bucket on its own. Evaluating both grids there just
+    // persists the same event twice under two different bucket_start values
+    // (NETWORK_IDS_HIGH_PRIORITY_ALERT's threshold=1 did exactly that).
+    let all_offsets = grid_offsets(rule.window_seconds);
+    let offsets: &[i64] = if rule.threshold <= 1 {
+        &all_offsets[..1]
+    } else {
+        &all_offsets[..]
+    };
+    for &offset in offsets {
         let bucket = bucket_start(event.occurred_at, rule.window_seconds, offset);
         let bucket_end = bucket + Duration::seconds(rule.window_seconds);
         let members = store
