@@ -142,6 +142,15 @@ impl Fixture {
         .await
     }
 
+    async fn network_ids(&mut self, at: DateTime<Utc>, native_severity: u8) -> Result<EventRecord> {
+        self.event(
+            "network_ids_alert",
+            at,
+            serde_json::json!({"native_severity": native_severity, "signature": "test-signature"}),
+        )
+        .await
+    }
+
     /// `(rule_id, bucket_start, event_count)` of this resource's assessments.
     async fn assessments(&self) -> Result<Vec<(String, DateTime<Utc>, i32)>> {
         Ok(sqlx::query_as(
@@ -422,6 +431,61 @@ async fn server_error_burst_is_an_observation_not_client_abuse() -> Result<()> {
     }
     assert!(h.assessments().await?.is_empty());
     h.finish().await?;
+    f.finish().await
+}
+
+/// A single high-priority Suricata signature match (native_severity 1) is itself
+/// already incident-worthy - one hit must fire `network_ids_high_priority_alert`
+/// with a severity reflecting that (not the volumetric formula's weakest tier).
+#[tokio::test]
+#[ignore = "requires provisioned roles in an isolated PostgreSQL test container"]
+async fn single_high_priority_network_ids_hit_fires_with_high_severity() -> Result<()> {
+    let mut f = Fixture::new().await?;
+    let event = f.network_ids(t(19, 0, 0), 1).await?;
+    for rule in RULES {
+        if rule.event_type == event.event_type {
+            evaluate_rule(&f.engine, rule, &event).await?;
+        }
+    }
+    let rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT rule_id, severity FROM security_assessments WHERE resource=$1")
+            .bind(&f.resource)
+            .fetch_all(f.owner.pool())
+            .await?;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].0, "network_ids_high_priority_alert");
+    assert_eq!(
+        rows[0].1, "high",
+        "a single already-vetted match must not be scored as the weakest tier"
+    );
+    f.finish().await
+}
+
+/// Lower-priority signatures (native_severity >= 2) are operational noise under
+/// their own burst rule, mirroring `server_error_burst_is_an_observation_not_client_abuse`:
+/// a burst of them must fire only `network_ids_alert_burst`, never the high-priority rule.
+#[tokio::test]
+#[ignore = "requires provisioned roles in an isolated PostgreSQL test container"]
+async fn lower_priority_network_ids_burst_fires_only_the_burst_rule() -> Result<()> {
+    let mut f = Fixture::new().await?;
+    let base = t(19, 30, 0);
+    let mut events = Vec::new();
+    for i in 0..12 {
+        events.push(f.network_ids(base + Duration::seconds(i), 2).await?);
+    }
+    for event in &events {
+        for rule in RULES {
+            if rule.event_type == event.event_type {
+                evaluate_rule(&f.engine, rule, event).await?;
+            }
+        }
+    }
+    let rules: Vec<String> = f.assessments().await?.into_iter().map(|a| a.0).collect();
+    assert!(
+        rules.iter().all(|rule| rule == "network_ids_alert_burst"),
+        "{rules:?}"
+    );
+    assert!(!rules.is_empty());
     f.finish().await
 }
 

@@ -145,11 +145,53 @@ const HTTP_SERVER_FAULT_BURST: CountThresholdRule = CountThresholdRule {
     yields_to: None,
 };
 
+/// A single firing of a high-priority signature (native_severity 1, Suricata's own
+/// "most severe" classification, e.g. an actual exploit attempt) is itself already a
+/// specific, already-vetted match - not raw volume like a failed login, where a lone
+/// attempt means nothing. One firing is therefore enough to raise an incident; the
+/// window still exists so a burst of several extends one incident candidate
+/// (`persist_correlation`'s stable `candidate_key`) instead of spawning a new one
+/// every poll tick. `yields_to` is deliberately not set: an unrelated engine's
+/// high-priority match should never be suppressed by this rule's own lower-priority
+/// sibling firing on the same resource.
+const NETWORK_IDS_HIGH_PRIORITY_ALERT: CountThresholdRule = CountThresholdRule {
+    rule_id: "network_ids_high_priority_alert",
+    rule_version: "1",
+    event_type: "network_ids_alert",
+    status: EventStatusFilter::NetworkIdsHighPriority,
+    incident: true,
+    window_seconds: 300,
+    threshold: 1,
+    max_members: 50,
+    yields_to: None,
+};
+
+/// Lower-priority signatures (native_severity >= 2) fire far more often on an ET
+/// Open ruleset against ordinary local/home traffic than they indicate an attacker
+/// (observed on this deployment: a single benign device's SSDP discovery broadcasts
+/// alone repeatedly trip "Possible SSDP Amplification Scan"). Visible as an
+/// observe-only assessment - exactly `http_server_fault_burst`'s own reasoning,
+/// applied to a different kind of operational noise - never an attacker-style
+/// incident, and never counted as independent evidence by the policy engine.
+const NETWORK_IDS_ALERT_BURST: CountThresholdRule = CountThresholdRule {
+    rule_id: "network_ids_alert_burst",
+    rule_version: "1",
+    event_type: "network_ids_alert",
+    status: EventStatusFilter::NetworkIdsLowerPriority,
+    incident: false,
+    window_seconds: 300,
+    threshold: 10,
+    max_members: 1000,
+    yields_to: None,
+};
+
 const RULES: &[CountThresholdRule] = &[
     SSH_BRUTEFORCE,
     SSH_BRUTEFORCE_SLOW,
     HTTP_ANOMALY_BURST,
     HTTP_SERVER_FAULT_BURST,
+    NETWORK_IDS_HIGH_PRIORITY_ALERT,
+    NETWORK_IDS_ALERT_BURST,
 ];
 
 /// A scan/reconnaissance rule: not "how many events", but "how many
@@ -228,6 +270,26 @@ fn severity_for_count(count: usize, threshold: usize) -> &'static str {
 fn confidence_for_count(count: usize, threshold: usize) -> i16 {
     let over = count.saturating_sub(threshold) as i16;
     (60 + over * 4).clamp(60, 99)
+}
+
+/// `network_ids_high_priority_alert` fires on a single already-vetted Suricata
+/// high-priority signature match (see its doc comment) - a volumetric formula
+/// built for raw-count rules like failed logins would score even one hit as
+/// "medium"/60, the weakest possible tier, contradicting the rule's own premise
+/// that one firing is already incident-worthy. Every other rule still uses the
+/// shared volumetric formulas unchanged.
+fn severity_and_confidence_for_rule(
+    rule_id: &str,
+    count: usize,
+    threshold: usize,
+) -> (&'static str, i16) {
+    if rule_id == NETWORK_IDS_HIGH_PRIORITY_ALERT.rule_id {
+        return ("high", 90);
+    }
+    (
+        severity_for_count(count, threshold),
+        confidence_for_count(count, threshold),
+    )
 }
 
 /// The common tail every rule shares once it has decided to fire: persist
@@ -360,7 +422,19 @@ async fn evaluate_rule(
         // future producer publishes under the same event_type without one).
         return Ok(());
     };
-    for offset in grid_offsets(rule.window_seconds) {
+    // The second, half-window-shifted grid exists so a burst *spanning* a bucket
+    // boundary is still caught whole in at least one grid - irrelevant for
+    // threshold<=1, where the single qualifying event already satisfies the
+    // primary grid's own bucket on its own. Evaluating both grids there just
+    // persists the same event twice under two different bucket_start values
+    // (NETWORK_IDS_HIGH_PRIORITY_ALERT's threshold=1 did exactly that).
+    let all_offsets = grid_offsets(rule.window_seconds);
+    let offsets: &[i64] = if rule.threshold <= 1 {
+        &all_offsets[..1]
+    } else {
+        &all_offsets[..]
+    };
+    for &offset in offsets {
         let bucket = bucket_start(event.occurred_at, rule.window_seconds, offset);
         let bucket_end = bucket + Duration::seconds(rule.window_seconds);
         let members = store
@@ -394,8 +468,8 @@ async fn evaluate_rule(
             .map(|(_, at)| *at)
             .unwrap_or(event.occurred_at);
         let count = members.len();
-        let severity = severity_for_count(count, rule.threshold);
-        let confidence = confidence_for_count(count, rule.threshold);
+        let (severity, confidence) =
+            severity_and_confidence_for_rule(rule.rule_id, count, rule.threshold);
         let candidate_summary = format!(
             "{} events of type {} from the same source within {}s (rule {} v{})",
             count, rule.event_type, rule.window_seconds, rule.rule_id, rule.rule_version
@@ -1032,12 +1106,12 @@ mod tests {
     }
 }
 
-#[cfg(test)]
-mod network_ids_policy_boundary {
-    #[test]
-    fn raw_ids_alert_has_no_implicit_threshold_rule() {
-        assert!(super::RULES
-            .iter()
-            .all(|r| r.event_type != "network_ids_alert"));
-    }
-}
+// The `network_ids_policy_boundary` module's old guard
+// (`raw_ids_alert_has_no_implicit_threshold_rule`) asserted that no rule in
+// `RULES` ever had `event_type == "network_ids_alert"`. This branch is exactly
+// what supersedes that invariant: `NETWORK_IDS_HIGH_PRIORITY_ALERT` and
+// `NETWORK_IDS_ALERT_BURST` are deliberately added for that event type, with
+// their own window/severity/observation-only handling (see their doc comments
+// and `window_tests::single_high_priority_network_ids_hit_fires_with_high_severity`
+// / `lower_priority_network_ids_burst_fires_only_the_burst_rule`). The old guard
+// was left stale instead of being removed when those rules were added.

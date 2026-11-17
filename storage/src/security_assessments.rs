@@ -62,14 +62,23 @@ pub struct SecurityAssessment {
     pub threat_intel: Option<crate::IpReputationHit>,
 }
 
-/// Which events of a type an assessment bucket may count, by the HTTP status
-/// class in the payload. Events without a numeric status (SSH, ...) always
-/// pass `Any` and `ClientAttributable`; `ServerError` requires a 5xx status.
+/// Which events of a type an assessment bucket may count, by a field in the
+/// payload. `Any`, `ClientAttributable` and `ServerError` split by the HTTP
+/// status class; events without a numeric status (SSH, ...) always pass
+/// `Any` and `ClientAttributable`. `NetworkIdsHighPriority` and
+/// `NetworkIdsLowerPriority` split a `network_ids_alert`'s own
+/// `native_severity` (1 = highest priority, matching Suricata's convention)
+/// the same way: a malformed or missing value falls to whichever side never
+/// creates an incident on its own (`LowerPriority`), never the side that
+/// does (`HighPriority`), so a parsing gap can only under-count a real
+/// signature match, never fabricate one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventStatusFilter {
     Any,
     ClientAttributable,
     ServerError,
+    NetworkIdsHighPriority,
+    NetworkIdsLowerPriority,
 }
 
 impl EventStatusFilter {
@@ -81,6 +90,12 @@ impl EventStatusFilter {
             }
             Self::ServerError => {
                 "COALESCE((CASE WHEN payload->>'status_code' ~ '^[0-9]{3}$' THEN (payload->>'status_code')::int END) >= 500, FALSE)"
+            }
+            Self::NetworkIdsHighPriority => {
+                "COALESCE((CASE WHEN payload->>'native_severity' ~ '^[0-9]+$' THEN (payload->>'native_severity')::int END) <= 1, FALSE)"
+            }
+            Self::NetworkIdsLowerPriority => {
+                "COALESCE((CASE WHEN payload->>'native_severity' ~ '^[0-9]+$' THEN (payload->>'native_severity')::int END) >= 2, TRUE)"
             }
         }
     }

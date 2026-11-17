@@ -184,7 +184,7 @@ async fn evidence_sources_for(
 /// Rules that describe the system rather than the source's intent. They are
 /// recorded and shown, but never produce an attacker decision beyond `observe`
 /// and never count as corroborating evidence for another assessment.
-const OBSERVATION_ONLY_RULES: &[&str] = &["http_server_fault_burst"];
+const OBSERVATION_ONLY_RULES: &[&str] = &["http_server_fault_burst", "network_ids_alert_burst"];
 
 /// Matches `clawforge-security-engine`'s incident-candidate extension window:
 /// anything closer is the same ongoing episode, not independent history.
@@ -744,6 +744,21 @@ mod intel_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression guard: a new volumetric/noise rule that is never meant to
+    /// count as independent evidence or escalate past `observe` (like
+    /// `http_server_fault_burst`) must be added here, or `decide()` runs on
+    /// it normally and routine noise can inflate `evidence_sources` for an
+    /// unrelated real assessment on the same resource.
+    #[test]
+    fn observation_only_rules_cover_both_known_noise_rules() {
+        assert!(OBSERVATION_ONLY_RULES.contains(&"http_server_fault_burst"));
+        assert!(OBSERVATION_ONLY_RULES.contains(&"network_ids_alert_burst"));
+        assert!(
+            !OBSERVATION_ONLY_RULES.contains(&"network_ids_high_priority_alert"),
+            "the single-hit incident rule must still be able to corroborate/escalate normally"
+        );
+    }
 
     #[test]
     fn min_severity_met_ranks_correctly() {
